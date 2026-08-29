@@ -3,6 +3,7 @@ import {
   ContractVersionSchema,
   DomainErrorCodeSchema,
   IdentifierSchema,
+  MAX_GENERATION_WARNINGS,
   ProjectRevisionSchema,
 } from "./envelope";
 
@@ -17,7 +18,10 @@ const GenerationRunBaseSchema = z.object({
   projectId: IdentifierSchema,
   targetTrack: GenerationTargetTrackSchema,
   expectedProjectRevision: ProjectRevisionSchema,
-  warnings: z.array(z.string().trim().min(1)).optional(),
+  warnings: z
+    .array(z.string().trim().min(1).max(500))
+    .max(MAX_GENERATION_WARNINGS)
+    .optional(),
 });
 
 const GenerationProgressSchema = z.number().min(0).max(1);

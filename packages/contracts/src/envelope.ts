@@ -1,17 +1,28 @@
 import { z } from "zod";
 
 export const CONTRACT_VERSION = 1 as const;
+export const MAX_IDENTIFIER_LENGTH = 200 as const;
+export const MAX_CURSOR_LENGTH = 256 as const;
+export const MAX_TRACK_ITEMS_PER_PAGE = 100 as const;
+export const MAX_NEXT_ACTIONS = 12 as const;
+export const MAX_GENERATION_WARNINGS = 20 as const;
 
 export const ContractVersionSchema = z.literal(CONTRACT_VERSION);
 export const NonNegativeIntegerSchema = z.number().int().nonnegative();
 export const PositiveIntegerSchema = z.number().int().positive();
-export const IdentifierSchema = z.string().trim().min(1);
+export const IdentifierSchema = z
+  .string()
+  .trim()
+  .min(1)
+  .max(MAX_IDENTIFIER_LENGTH);
+export const CursorSchema = z.string().trim().min(1).max(MAX_CURSOR_LENGTH);
 
 export const MediaTimeSchema = NonNegativeIntegerSchema;
 export const ProjectRevisionSchema = PositiveIntegerSchema;
 export const ItemRevisionSchema = PositiveIntegerSchema;
 
 export const ExpectedProjectRevisionSchema = z.object({
+  contractVersion: ContractVersionSchema,
   expectedProjectRevision: ProjectRevisionSchema,
 });
 

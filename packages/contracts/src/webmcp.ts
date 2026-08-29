@@ -1,12 +1,14 @@
 import { z } from "zod";
 import {
-  CONTRACT_VERSION,
   ContractVersionSchema,
   DomainErrorCodeSchema,
+  MAX_NEXT_ACTIONS,
   ProjectRevisionSchema,
 } from "./envelope";
 
-export const NextActionsSchema = z.array(z.string().trim().min(1));
+export const NextActionsSchema = z
+  .array(z.string().trim().min(1).max(100))
+  .max(MAX_NEXT_ACTIONS);
 
 export const ToolSuccessSchema = <TData extends z.ZodType>(
   dataSchema: TData,
@@ -34,11 +36,9 @@ export const ToolResultSchema = <TData extends z.ZodType>(
 ) => z.union([ToolSuccessSchema(dataSchema), ToolErrorSchema]);
 
 export type ToolError = z.infer<typeof ToolErrorSchema>;
-export type ToolSuccess<TData> = {
-  ok: true;
-  contractVersion: typeof CONTRACT_VERSION;
-  projectRevision: number;
-  data: TData;
-  nextActions: string[];
-};
-export type ToolResult<TData> = ToolSuccess<TData> | ToolError;
+export type ToolSuccess<TDataSchema extends z.ZodType> = z.infer<
+  ReturnType<typeof ToolSuccessSchema<TDataSchema>>
+>;
+export type ToolResult<TDataSchema extends z.ZodType> = z.infer<
+  ReturnType<typeof ToolResultSchema<TDataSchema>>
+>;

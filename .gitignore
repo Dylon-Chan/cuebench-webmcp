@@ -2,3 +2,7 @@
 .impeccable/questions/
 cuebench-webmcp-tool-map*.png
 *.DS_Store
+node_modules/
+.pnpm-store/
+dist/
+coverage/
