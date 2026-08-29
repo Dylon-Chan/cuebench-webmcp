@@ -399,6 +399,72 @@ describe("project backups", () => {
     }
   });
 
+  it("rejects empty, retagged, and impossible current-v1 Court Record histories", () => {
+    const validated = applyCommand(fixtureProject(), {
+      type: "ValidateProject",
+      actor: { type: "System", id: "validator" },
+      expectedProjectRevision: 1,
+    }).project;
+    const validateEvent = validated.courtRecord[0];
+    if (validateEvent === undefined) throw new Error("expected validation Court Record event");
+
+    const emptyAtRevisionTwo = rehashBackup({
+      ...exportProjectBackup(validated),
+      project: { ...validated, courtRecord: [] },
+    });
+    const retaggedValidation = rehashBackup({
+      ...exportProjectBackup(validated),
+      project: {
+        ...validated,
+        selectedItem: { itemId: "c05", itemRevision: 1, kind: "CaptionCue" as const },
+        courtRecord: [{
+          ...validateEvent,
+          type: "SelectItem",
+          actor: human,
+          itemId: "c05",
+        }],
+      },
+    });
+
+    const sustained = fixtureProject({ cueState: "Sustained" });
+    const previous = sustained.captions.items.c05;
+    if (previous === undefined) throw new Error("expected sustained cue");
+    const impossibleSuccessor = {
+      ...previous.current,
+      itemRevision: 2,
+      parentItemRevision: 1,
+      state: "AgentReady" as const,
+      actor: { type: "BrowserAgent" as const, id: "browser-agent" },
+      cause: "MarkItemAgentReady",
+    };
+    const impossibleTransition = rehashBackup({
+      ...exportProjectBackup(sustained),
+      project: {
+        ...sustained,
+        projectRevision: 2,
+        captions: {
+          ...sustained.captions,
+          items: {
+            ...sustained.captions.items,
+            c05: { ...previous, revisions: [previous.current, impossibleSuccessor], current: impossibleSuccessor },
+          },
+        },
+        selectedItem: { itemId: "c05", itemRevision: 2, kind: "CaptionCue" as const },
+        courtRecord: [{
+          eventId: "project-1:2:1",
+          projectRevision: 2,
+          type: "MarkItemAgentReady",
+          actor: { type: "BrowserAgent", id: "browser-agent" },
+          itemId: "c05",
+        }],
+      },
+    });
+
+    for (const malformed of [emptyAtRevisionTwo, retaggedValidation, impossibleTransition]) {
+      expect(() => previewProjectImport(malformed, { actor: human })).toThrow(/court|history|transition|validation|aggregate/i);
+    }
+  });
+
   it("backfills old validation history and keeps persistent project findings unresolved across revisions", () => {
     const validated = applyCommand(fixtureProject(), {
       type: "ValidateProject",

@@ -223,7 +223,7 @@ const itemCourtEventTypes = new Set([
   "SustainItem",
 ]);
 
-const statefulItemCourtEventTypes = new Set([
+const revisionChangingCourtEventTypes = new Set([
   "AdjustCueTiming",
   "SplitCue",
   "MergeCue",
@@ -236,115 +236,352 @@ const statefulItemCourtEventTypes = new Set([
   "SustainItem",
 ]);
 
-const semanticRevisionCauseTypes = new Set([
-  "AdjustCueTiming",
-  "SplitCue",
-  "MergeCue",
-  "ReviseCue",
-  "AdjustAudioDescriptionTiming",
-  "ReviseAudioDescription",
-  "ProposeAudioDescriptionInGap",
-]);
-
 const sameActor = (left: Actor, right: Actor): boolean => left.type === right.type && left.id === right.id;
 
-const itemForCourtEvent = (project: CaptionProject, event: DomainEvent): CaptionCue | AudioDescriptionBeat => {
+type ProjectItem = CaptionCue | AudioDescriptionBeat;
+type ProjectItemRevision = CaptionCue["revisions"][number] | AudioDescriptionBeat["revisions"][number];
+
+const allItems = (project: CaptionProject): readonly ProjectItem[] => [
+  ...Object.values(project.captions.items),
+  ...Object.values(project.audioDescriptions.items),
+];
+
+const itemForCourtEvent = (project: CaptionProject, event: DomainEvent): ProjectItem => {
   requireAggregate(event.itemId !== undefined, `Court Record ${event.type} requires an item id.`);
   const item = project.captions.items[event.itemId] ?? project.audioDescriptions.items[event.itemId];
   requireAggregate(item !== undefined, `Court Record ${event.type} references an unknown item.`);
   return item;
 };
 
-const revisionClaim = (item: CaptionCue | AudioDescriptionBeat, itemRevision: number): string =>
+const revisionClaim = (item: ProjectItem, itemRevision: number): string =>
   `${item.kind}\u0000${item.itemId}\u0000${itemRevision}`;
 
-const assertCourtRecord = (
-  project: CaptionProject,
-  options: CaptionProjectAggregateValidationOptions,
+const withoutRevisionFields = (
+  revision: ProjectItemRevision,
+  ignored: readonly string[],
+): Readonly<Record<string, unknown>> => {
+  const copy: Record<string, unknown> = { ...revision };
+  for (const field of ignored) Reflect.deleteProperty(copy, field);
+  return copy;
+};
+
+const assertExactRevisionTransition = (
+  predecessor: ProjectItemRevision,
+  successor: ProjectItemRevision,
+  event: DomainEvent,
+  input: {
+    readonly resultingState: ProjectItemRevision["state"];
+    readonly cause: string;
+    readonly mutableFields?: readonly string[];
+    readonly predecessorStates?: readonly ProjectItemRevision["state"][];
+    readonly requireSamePredecessorActor?: boolean;
+  },
 ): void => {
-  const legacy = options.allowLegacyCourtRecord === true;
-  const events = project.courtRecord;
-  unique(events.map((event) => event.eventId), "Court Record event ids");
+  requireAggregate(
+    successor.itemId === predecessor.itemId
+      && successor.kind === predecessor.kind
+      && successor.itemRevision === predecessor.itemRevision + 1
+      && successor.parentItemRevision === predecessor.itemRevision,
+    `Court Record ${event.type} does not bind adjacent immutable item revisions.`,
+  );
+  requireAggregate(
+    successor.state === input.resultingState
+      && successor.cause === input.cause
+      && sameActor(successor.actor, event.actor),
+    `Court Record ${event.type} does not bind its recorded actor, cause, and resulting state.`,
+  );
+  if (input.predecessorStates !== undefined) {
+    requireAggregate(
+      input.predecessorStates.includes(predecessor.state),
+      `Court Record ${event.type} has an impossible predecessor review state.`,
+    );
+  }
+  if (input.requireSamePredecessorActor === true) {
+    requireAggregate(
+      sameActor(predecessor.actor, event.actor),
+      `Court Record ${event.type} must be performed by the authoring BrowserAgent.`,
+    );
+  }
+  const ignored = ["itemRevision", "parentItemRevision", "state", "actor", "cause", ...(input.mutableFields ?? [])];
+  requireAggregate(
+    sameValue(withoutRevisionFields(predecessor, ignored), withoutRevisionFields(successor, ignored)),
+    `Court Record ${event.type} changes fields outside its legal predecessor-to-successor diff.`,
+  );
+};
+
+const nextUnclaimedSuccessor = (
+  item: ProjectItem,
+  claimed: ReadonlySet<string>,
+  predicate: (revision: ProjectItemRevision) => boolean,
+  event: DomainEvent,
+): { readonly predecessor: ProjectItemRevision; readonly successor: ProjectItemRevision } => {
+  for (let index = 1; index < item.revisions.length; index += 1) {
+    const successor = item.revisions[index]!;
+    if (!claimed.has(revisionClaim(item, successor.itemRevision)) && predicate(successor)) {
+      return { predecessor: item.revisions[index - 1]!, successor };
+    }
+  }
+  throw new CaptionProjectAggregateError(`Court Record ${event.type} has no matching immutable item successor.`);
+};
+
+const claimRevision = (claimed: Set<string>, item: ProjectItem, revision: ProjectItemRevision, event: DomainEvent): void => {
+  const key = revisionClaim(item, revision.itemRevision);
+  requireAggregate(!claimed.has(key), `Court Record ${event.type} reuses an immutable item successor.`);
+  claimed.add(key);
+};
+
+const assertCurrentRevisionEvent = (
+  project: CaptionProject,
+  event: DomainEvent,
+  claimed: Set<string>,
+): void => {
+  if (!revisionChangingCourtEventTypes.has(event.type)) return;
+  const item = itemForCourtEvent(project, event);
+  const successorFor = (
+    predicate: (revision: ProjectItemRevision) => boolean,
+  ) => nextUnclaimedSuccessor(item, claimed, predicate, event);
+  const standard = (
+    resultingState: ProjectItemRevision["state"],
+    cause: string,
+    mutableFields: readonly string[] = [],
+    predecessorStates?: readonly ProjectItemRevision["state"][],
+    requireSamePredecessorActor?: boolean,
+  ) => {
+    const pair = successorFor((revision) =>
+      revision.state === resultingState && revision.cause === cause && sameActor(revision.actor, event.actor));
+    assertExactRevisionTransition(pair.predecessor, pair.successor, event, {
+      resultingState,
+      cause,
+      mutableFields,
+      ...(predecessorStates === undefined ? {} : { predecessorStates }),
+      ...(requireSamePredecessorActor === undefined ? {} : { requireSamePredecessorActor }),
+    });
+    claimRevision(claimed, item, pair.successor, event);
+    return pair;
+  };
+
+  if (event.type === "MarkItemAgentReady") {
+    standard("AgentReady", event.type, [], ["Proposed"], true);
+    return;
+  }
+  if (event.type === "ObjectItem") {
+    requireAggregate(typeof event.detail === "string" && event.detail.trim().length > 0, "Court Record objection requires its durable reason.");
+    standard("Objected", event.detail);
+    return;
+  }
+  if (event.type === "SustainItem") {
+    standard("Sustained", event.type);
+    return;
+  }
+  if (event.type === "AdjustCueTiming") {
+    requireAggregate(item.kind === "CaptionCue", "Court Record AdjustCueTiming must target a caption.");
+    standard("Proposed", event.type, ["startMs", "endMs"]);
+    return;
+  }
+  if (event.type === "ReviseCue") {
+    requireAggregate(item.kind === "CaptionCue", "Court Record ReviseCue must target a caption.");
+    standard("Proposed", event.type, ["text", "speaker", "startMs", "endMs"]);
+    return;
+  }
+  if (event.type === "AdjustAudioDescriptionTiming") {
+    requireAggregate(item.kind === "AudioDescriptionBeat", "Court Record AdjustAudioDescriptionTiming must target an audio description.");
+    standard("Proposed", event.type, ["startMs", "endMs"]);
+    return;
+  }
+  if (event.type === "ReviseAudioDescription") {
+    requireAggregate(item.kind === "AudioDescriptionBeat", "Court Record ReviseAudioDescription must target an audio description.");
+    standard("Proposed", event.type, ["description", "startMs", "endMs"]);
+    return;
+  }
+  if (event.type === "ProposeAudioDescriptionInGap") {
+    requireAggregate(item.kind === "AudioDescriptionBeat", "Court Record ProposeAudioDescriptionInGap must target an audio description.");
+    const initial = item.revisions[0]!;
+    requireAggregate(
+      initial.itemRevision === 1
+        && initial.parentItemRevision === null
+        && initial.state === "Proposed"
+        && initial.cause === event.type
+        && sameActor(initial.actor, event.actor),
+      "Court Record ProposeAudioDescriptionInGap does not bind its created audio-description revision.",
+    );
+    const consumedGap = Object.values(project.audioDescriptionGaps).some((gap) =>
+      gap.state === "Consumed" && initial.startMs >= gap.startMs && initial.endMs <= gap.endMs);
+    requireAggregate(consumedGap, "Court Record ProposeAudioDescriptionInGap has no matching consumed gap.");
+    claimRevision(claimed, item, initial, event);
+    return;
+  }
+  if (event.type === "SplitCue") {
+    requireAggregate(item.kind === "CaptionCue", "Court Record SplitCue must target a caption.");
+    const pair = standard("Proposed", event.type, ["endMs"]);
+    const predecessor = pair.predecessor as CaptionCue["revisions"][number];
+    const successor = pair.successor as CaptionCue["revisions"][number];
+    requireAggregate(
+      successor.endMs > predecessor.startMs && successor.endMs < predecessor.endMs,
+      "Court Record SplitCue has an impossible left-cue timing transition.",
+    );
+    const rightCandidates = Object.values(project.captions.items).filter((candidate) => {
+      const initial = candidate.revisions[0]!;
+      return candidate.itemId !== item.itemId
+        && candidate.mergedIntoItemId === null
+        && !claimed.has(revisionClaim(candidate, initial.itemRevision))
+        && initial.itemRevision === 1
+        && initial.parentItemRevision === null
+        && initial.state === "Proposed"
+        && initial.cause === event.type
+        && sameActor(initial.actor, event.actor)
+        && initial.startMs === successor.endMs
+        && initial.endMs === predecessor.endMs
+        && initial.text === predecessor.text
+        && initial.speaker === predecessor.speaker;
+    });
+    requireAggregate(rightCandidates.length === 1, "Court Record SplitCue has no unique matching created right cue.");
+    claimRevision(claimed, rightCandidates[0]!, rightCandidates[0]!.revisions[0]!, event);
+    return;
+  }
+  if (event.type === "MergeCue") {
+    requireAggregate(item.kind === "CaptionCue", "Court Record MergeCue must target a caption.");
+    const pair = standard("Proposed", event.type, ["endMs", "text"]);
+    const predecessor = pair.predecessor as CaptionCue["revisions"][number];
+    const successor = pair.successor as CaptionCue["revisions"][number];
+    const rightCandidates = Object.values(project.captions.items).flatMap((candidate) => candidate.revisions.slice(1).map((successor, index) => ({
+      item: candidate,
+      predecessor: candidate.revisions[index]!,
+      successor,
+    }))).filter((candidate) =>
+      candidate.item.itemId !== item.itemId
+      && candidate.item.mergedIntoItemId === item.itemId
+      && !claimed.has(revisionClaim(candidate.item, candidate.successor.itemRevision))
+      && candidate.successor.state === "Proposed"
+      && candidate.successor.cause === `MergedInto:${item.itemId}`
+      && sameActor(candidate.successor.actor, event.actor));
+    requireAggregate(rightCandidates.length === 1, "Court Record MergeCue has no unique matching merged-right cue transition.");
+    const right = rightCandidates[0]!;
+    assertExactRevisionTransition(right.predecessor, right.successor, event, {
+      resultingState: "Proposed",
+      cause: `MergedInto:${item.itemId}`,
+    });
+    if (right.predecessor.state === "Sustained") {
+      requireAggregate(event.actor.type === "Human", "Only a Human may merge a sustained right cue.");
+    }
+    requireAggregate(
+      right.predecessor.startMs >= predecessor.startMs
+        && successor.endMs === Math.max(predecessor.endMs, right.predecessor.endMs)
+        && successor.text === `${predecessor.text} ${right.predecessor.text}`.trim(),
+      "Court Record MergeCue does not bind the exact predecessor-to-successor merge diff.",
+    );
+    claimRevision(claimed, right.item, right.successor, event);
+    return;
+  }
+  throw new CaptionProjectAggregateError(`Court Record ${event.type} is not a supported revision transition.`);
+};
+
+const assertLegacyCourtRecord = (project: CaptionProject, events: readonly DomainEvent[]): void => {
+  let previousRevision = 0;
+  for (const event of events) {
+    requireAggregate(
+      event.projectRevision >= 1 && event.projectRevision <= project.projectRevision,
+      "Legacy Court Record event has an illegal project revision.",
+    );
+    requireAggregate(event.projectRevision >= previousRevision, "Legacy Court Record events must be ordered by project revision.");
+    previousRevision = event.projectRevision;
+    /** The aggregate schema already proves a known Actor shape; legacy event semantics are opaque. */
+    requireAggregate(event.actor.id.trim().length > 0, "Legacy Court Record actor must be named.");
+  }
+};
+
+const assertSideHistoryEvents = (project: CaptionProject, events: readonly DomainEvent[]): void => {
+  const eventsOf = (type: string) => events.filter((event) => event.type === type);
+
+  const validations = eventsOf("ValidateProject");
+  requireAggregate(validations.length === project.validationHistory.length, "Validation history and Court Record ValidateProject events must agree.");
+  for (const run of project.validationHistory) {
+    requireAggregate(
+      validations.filter((event) => event.projectRevision === run.projectRevision).length === 1,
+      "Each durable validation run requires one matching Court Record ValidateProject event.",
+    );
+  }
+
+  const exports = eventsOf("RecordExportRoundTrip");
+  requireAggregate(exports.length === project.exportHistory.length, "Export verification history and Court Record events must agree.");
+  for (const exported of project.exportHistory) {
+    requireAggregate(
+      exports.filter((event) => event.projectRevision === exported.projectRevision + 1).length === 1,
+      "Each export verification requires one matching Court Record event.",
+    );
+  }
+
+  const waivers = Object.values(project.warningWaivers);
+  const waiverEvents = eventsOf("WaiveWarning");
+  requireAggregate(waiverEvents.length === waivers.length, "Warning waiver history and Court Record events must agree.");
+  for (const waiver of waivers) {
+    requireAggregate(
+      waiverEvents.filter((event) => event.projectRevision === waiver.projectRevision && sameActor(event.actor, waiver.actor)).length === 1,
+      "Each warning waiver requires one matching Court Record event.",
+    );
+  }
+
+  const certificationEvents = eventsOf("CertifyProject");
+  requireAggregate(certificationEvents.length === project.certifications.length, "Certification history and Court Record events must agree.");
+  for (let index = 0; index < project.certifications.length; index += 1) {
+    const certification = project.certifications[index]!;
+    const event = certificationEvents[index];
+    requireAggregate(
+      event !== undefined
+        && sameActor(event.actor, certification.actor)
+        && event.projectRevision > certification.validationRun.projectRevision,
+      "Each certification requires its ordered Human Court Record event.",
+    );
+  }
+};
+
+const assertCurrentCourtRecord = (project: CaptionProject, events: readonly DomainEvent[]): void => {
+  requireAggregate(
+    events.length === project.projectRevision - 1,
+    "Current v1 Court Record must contain one event for every post-creation project revision.",
+  );
   if (events.length === 0) return;
 
-  const claimedRevisions = new Set<string>();
-  let previousRevision = 0;
-
+  const claimed = new Set<string>();
   for (let index = 0; index < events.length; index += 1) {
     const event = events[index]!;
     requireAggregate(
-      event.projectRevision >= (legacy ? 1 : 2) && event.projectRevision <= project.projectRevision,
-      "Court Record event has an illegal project revision.",
+      event.projectRevision === index + 2
+        && event.eventId === `${project.projectId}:${event.projectRevision}:${index + 1}`,
+      "Current v1 Court Record must be ordered, complete, and canonically identified.",
     );
-    requireAggregate(event.projectRevision >= previousRevision, "Court Record events must be ordered by project revision.");
-    previousRevision = event.projectRevision;
-
-    if (!legacy) {
-      requireAggregate(
-        events.length === project.projectRevision - 1
-          && event.projectRevision === index + 2
-          && event.eventId === `${project.projectId}:${event.projectRevision}:${index + 1}`,
-        "Court Record must contain the canonical, complete command history.",
-      );
-    }
-
     const allowedActors = courtActors[event.type];
-    requireAggregate(
-      allowedActors !== undefined || legacy,
-      `Court Record event type ${event.type} is not a known durable command.`,
-    );
-    if (allowedActors !== undefined) {
-      requireAggregate(
-        allowedActors.includes(event.actor.type),
-        `Court Record ${event.type} has invalid actor provenance.`,
-      );
-    }
-    if (!legacy && event.type !== "ObjectItem") {
+    requireAggregate(allowedActors !== undefined && event.type !== "LegacyItemRevisionPayloadHistoryUnavailable", `Court Record event type ${event.type} is not a current durable command.`);
+    requireAggregate(allowedActors.includes(event.actor.type), `Court Record ${event.type} has invalid actor provenance.`);
+    if (event.type !== "ObjectItem") {
       requireAggregate(event.detail === undefined, `Court Record ${event.type} cannot carry arbitrary detail.`);
     }
 
     if (event.type === "FocusGap") {
       requireAggregate(event.itemId !== undefined && project.audioDescriptionGaps[event.itemId] !== undefined, "Court Record FocusGap references an unknown gap.");
     } else if (itemCourtEventTypes.has(event.type)) {
-      const item = itemForCourtEvent(project, event);
-      if (statefulItemCourtEventTypes.has(event.type)) {
-        const matchingRevision = item.revisions.find((revision) => {
-          if (claimedRevisions.has(revisionClaim(item, revision.itemRevision)) || !sameActor(revision.actor, event.actor)) return false;
-          if (event.type === "MarkItemAgentReady") return revision.state === "AgentReady" && (legacy || revision.cause === event.type);
-          if (event.type === "ObjectItem") {
-            return revision.state === "Objected" && (legacy || (event.detail !== undefined && revision.cause === event.detail));
-          }
-          if (event.type === "SustainItem") return revision.state === "Sustained" && (legacy || revision.cause === event.type);
-          return legacy || revision.cause === event.type;
-        });
-        requireAggregate(matchingRevision !== undefined, `Court Record ${event.type} has no matching legal item transition.`);
-        claimedRevisions.add(revisionClaim(item, matchingRevision.itemRevision));
-        if (event.type === "ObjectItem" && !legacy) {
-          requireAggregate(
-            typeof event.detail === "string" && event.detail.trim().length > 0 && event.detail === matchingRevision.cause,
-            "Court Record objection detail does not bind its item transition.",
-          );
-        }
-      }
+      itemForCourtEvent(project, event);
+    } else if (["ValidateProject", "RecordExportRoundTrip", "WaiveWarning", "CertifyProject", "ApplyProfile", "RelinkMedia", "StartGenerationRun", "ReleaseGenerationRun"].includes(event.type)) {
+      requireAggregate(event.itemId === undefined, `Court Record ${event.type} cannot target an item.`);
+    }
+    assertCurrentRevisionEvent(project, event, claimed);
+  }
+
+  for (const item of allItems(project)) {
+    for (const successor of item.revisions.slice(1)) {
+      requireAggregate(
+        claimed.has(revisionClaim(item, successor.itemRevision)),
+        "Every successor item revision requires its exact Court Record transition.",
+      );
+    }
+  }
+  for (const item of Object.values(project.audioDescriptions.items)) {
+    const initial = item.revisions[0]!;
+    if (initial.cause === "ProposeAudioDescriptionInGap") {
+      requireAggregate(claimed.has(revisionClaim(item, initial.itemRevision)), "Proposed-in-gap audio description is missing its Court Record event.");
     }
   }
 
-  if (legacy) return;
-  for (const item of [...Object.values(project.captions.items), ...Object.values(project.audioDescriptions.items)]) {
-    for (const revision of item.revisions) {
-      const recordedTransition = revision.itemRevision > 1
-        && (revision.state === "AgentReady" || revision.state === "Objected" || revision.state === "Sustained" || semanticRevisionCauseTypes.has(revision.cause));
-      const proposedInGap = revision.itemRevision === 1 && revision.cause === "ProposeAudioDescriptionInGap";
-      if (recordedTransition || proposedInGap) {
-        requireAggregate(
-          claimedRevisions.has(revisionClaim(item, revision.itemRevision)),
-          "Item revision is missing its Court Record transition.",
-        );
-      }
-    }
-  }
-
-  /** The final command's visible selection must still be reflected by the durable projection. */
+  assertSideHistoryEvents(project, events);
   const last = events.at(-1)!;
   if (last.type === "FocusGap") {
     requireAggregate(
@@ -354,7 +591,7 @@ const assertCourtRecord = (
         && project.selectedItem.itemId === last.itemId,
       "Final Court Record gap focus does not match the current selection.",
     );
-  } else if (last.type === "SelectItem" || last.type === "FocusItem" || statefulItemCourtEventTypes.has(last.type)) {
+  } else if (last.type === "SelectItem" || last.type === "FocusItem" || revisionChangingCourtEventTypes.has(last.type)) {
     const item = itemForCourtEvent(project, last);
     requireAggregate(
       project.selectedItem !== null
@@ -364,6 +601,21 @@ const assertCourtRecord = (
       "Final Court Record item transition does not match the current selection.",
     );
   }
+};
+
+const assertCourtRecord = (
+  project: CaptionProject,
+  options: CaptionProjectAggregateValidationOptions,
+): void => {
+  const legacy = options.allowLegacyCourtRecord === true;
+  const events = project.courtRecord;
+  unique(events.map((event) => event.eventId), "Court Record event ids");
+  if (legacy) {
+    assertLegacyCourtRecord(project, events);
+    return;
+  }
+  /** Current-v1 count is checked before an empty record can be accepted. */
+  assertCurrentCourtRecord(project, events);
 };
 
 const normalizedMedia = <Media extends { readonly sha256: string }>(media: Media): Media => ({

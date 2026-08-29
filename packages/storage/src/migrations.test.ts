@@ -105,6 +105,40 @@ describe("project schema migrations", () => {
     expect(storage).not.toHaveProperty("importProject");
   });
 
+  it("preserves ordered v0 changes to one item by different actors without inventing unavailable revisions", () => {
+    const descriptor = describeImportedProject({
+      schemaVersion: 0,
+      project: {
+        projectId: "legacy-multi-actor-project",
+        revision: 4,
+        name: "Legacy multi-actor lesson",
+        sourceMedia: { id: "source-1", hash: "a".repeat(64), durationMs: 10_000, linked: true },
+        captionCues: [{
+          id: "c01",
+          startMs: 1_000,
+          endMs: 3_000,
+          text: "Final sustained cue.",
+          speaker: null,
+          revision: 3,
+          state: "Sustained",
+          actor: { type: "Human", id: "reviewer-b" },
+        }],
+        history: [
+          { id: "event-1", kind: "MarkItemAgentReady", revision: 2, actor: { type: "BrowserAgent", id: "browser-agent" }, itemId: "c01" },
+          { id: "event-2", kind: "ObjectItem", revision: 3, actor: { type: "Human", id: "reviewer-a" }, itemId: "c01", detail: "Needs revision." },
+          { id: "event-3", kind: "SustainItem", revision: 4, actor: { type: "Human", id: "reviewer-b" }, itemId: "c01" },
+        ],
+      },
+    });
+
+    if (descriptor.mode !== "preview") throw new Error("Expected preview descriptor.");
+    expect(descriptor.project.courtRecord.slice(0, 3)).toEqual([
+      { eventId: "event-1", type: "MarkItemAgentReady", projectRevision: 2, actor: { type: "BrowserAgent", id: "browser-agent" }, itemId: "c01" },
+      { eventId: "event-2", type: "ObjectItem", projectRevision: 3, actor: { type: "Human", id: "reviewer-a" }, itemId: "c01", detail: "Needs revision." },
+      { eventId: "event-3", type: "SustainItem", projectRevision: 4, actor: { type: "Human", id: "reviewer-b" }, itemId: "c01" },
+    ]);
+  });
+
   it("never reports backed-up v1 media as linked and stales derived artifacts", () => {
     const validated = applyCommand(createProject({
       projectId: "preview-project",
