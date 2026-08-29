@@ -524,7 +524,7 @@ describe("domain reducer", () => {
       media: { sourceId: "short", sha256: "b".repeat(64), durationMs: 10_000 },
     });
 
-    expect(result.error).toMatchObject({ code: "INVALID_ARGUMENT", message: "Media duration must contain every current item." });
+    expect(result.error).toMatchObject({ code: "INVALID_ARGUMENT", message: "Media duration must contain every stored item revision and gap." });
     expect(JSON.stringify(result.project)).toBe(before);
   });
 
@@ -551,7 +551,7 @@ describe("domain reducer", () => {
       media: { sourceId: "short", sha256: "b".repeat(64), durationMs: 10_000 },
     });
 
-    expect(result.error).toMatchObject({ code: "INVALID_ARGUMENT", message: "Media duration must contain every current item." });
+    expect(result.error).toMatchObject({ code: "INVALID_ARGUMENT", message: "Media duration must contain every stored item revision and gap." });
     expect(JSON.stringify(result.project)).toBe(before);
   });
 

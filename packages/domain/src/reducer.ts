@@ -1,6 +1,11 @@
 import type { Actor, CertificationSnapshot, ReviewState, ValidationSnapshot } from "@cuebench/contracts";
 import type { DomainCommand } from "./commands";
 import { domainError, type DomainError } from "./errors";
+import {
+  createCertificationSnapshot,
+  prepareCertificationReview,
+} from "./quality/certification";
+import { currentValidationRun, validateProject } from "./quality/validate";
 import type {
   AudioDescriptionBeat,
   AudioDescriptionBeatRevision,
@@ -275,13 +280,67 @@ export const applyCommand = (project: CaptionProject, command: DomainCommand): C
     if (!hasHumanAuthority(command.actor)) return fail(project, "HUMAN_AUTHORITY_REQUIRED", "Only a human may relink media.");
     if (project.activeGenerationRun !== null) return fail(project, "TARGET_TRACK_LEASE_CONFLICT", "Media cannot change while a generation run is active.");
     if (!isFiniteInteger(command.media.durationMs) || command.media.durationMs < 0) return fail(project, "INVALID_ARGUMENT", "Media duration must be a non-negative integer.");
-    if (!allTimesFit(project, command.media.durationMs)) return fail(project, "INVALID_ARGUMENT", "Media duration must contain every current item.");
+    if (!allTimesFit(project, command.media.durationMs)) return fail(project, "INVALID_ARGUMENT", "Media duration must contain every stored item revision and gap.");
     return commit(project, command, { media: { ...clone(command.media), relinkState: "Linked" }, ...withStaleArtifacts(project) });
+  }
+  if (command.type === "ValidateProject") {
+    if (command.actor.type !== "System") return fail(project, "INVALID_ARGUMENT", "Only System may persist deterministic validation.");
+    const validationRun = validateProject(project);
+    return commit(project, command, {
+      validation: {
+        status: "Current",
+        blockerCount: validationRun.blockerCount,
+        warningCount: validationRun.warningCount,
+      },
+      validationRun: clone(validationRun),
+    });
   }
   if (command.type === "WaiveWarning") {
     if (!hasHumanAuthority(command.actor)) return fail(project, "HUMAN_AUTHORITY_REQUIRED", "Only a human may waive a warning.");
     if (!command.findingId.trim() || !command.reason.trim()) return fail(project, "INVALID_ARGUMENT", "A warning waiver needs a finding and reason.");
+    const storedFinding = project.validationRun?.findings.find(
+      (candidate) => candidate.findingId === command.findingId,
+    );
+    if (storedFinding?.severity === "blocker") return fail(project, "VALIDATION_BLOCKER", "Blocking violations cannot be waived.");
+    const validationRun = currentValidationRun(project);
+    if (validationRun !== undefined) {
+      if (storedFinding === undefined) return fail(project, "NOT_FOUND", "The warning is not part of the current validation run.");
+    }
     return commit(project, command, { warningWaivers: { ...project.warningWaivers, [command.findingId]: { findingId: command.findingId, reason: command.reason, actor: clone(command.actor), projectRevision: project.projectRevision + 1 } }, ...withStaleCertification(project) });
+  }
+  if (command.type === "CertifyProject") {
+    if (!hasHumanAuthority(command.actor)) return fail(project, "HUMAN_AUTHORITY_REQUIRED", "Only a human may certify a project.");
+    if (!command.expectedReadinessHash.trim()) return fail(project, "INVALID_ARGUMENT", "Certification requires the expected readiness hash.");
+    const readiness = prepareCertificationReview(project);
+    if (command.expectedReadinessHash !== readiness.readinessHash) {
+      return fail(project, "CERTIFICATION_OUT_OF_DATE", "Certification readiness changed; prepare review again.");
+    }
+    if (!readiness.canCertify) {
+      if (readiness.currentBlockers.length > 0) return fail(project, "VALIDATION_BLOCKER", "Blocking validation findings must be resolved before certification.");
+      return fail(project, "CERTIFICATION_OUT_OF_DATE", "Certification requires current validation, no unwaived warnings, and a Sustained item.");
+    }
+    if (command.certificationId !== undefined && !command.certificationId.trim()) {
+      return fail(project, "INVALID_ARGUMENT", "Certification id cannot be empty.");
+    }
+    const certificationId = command.certificationId === undefined
+      ? `certification-${readiness.snapshotHash}`
+      : command.certificationId.trim();
+    if (project.certifications.some((snapshot) => snapshot.certificationId === certificationId)) {
+      return fail(project, "INVALID_ARGUMENT", "Certification id already exists.");
+    }
+    const certifiedAtMs = command.certifiedAtMs ?? project.projectRevision;
+    if (!isFiniteInteger(certifiedAtMs) || certifiedAtMs < 0) {
+      return fail(project, "INVALID_ARGUMENT", "Certification timestamp must be a non-negative integer.");
+    }
+    const certification = createCertificationSnapshot(project, readiness, {
+      certificationId,
+      certifiedAtMs,
+      actor: command.actor,
+    });
+    return commit(project, command, {
+      certification: { status: "Current", certificationId },
+      certifications: [...project.certifications, certification],
+    });
   }
   if (command.type === "AppendCourtRecord") {
     if (command.actor.type !== "System" || command.deterministic !== true) {

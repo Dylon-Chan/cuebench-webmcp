@@ -4,9 +4,14 @@ export const fixtureProject = (options: {
   cueState?: "Proposed" | "AgentReady" | "Objected" | "Sustained";
   itemRevision?: number;
   projectRevision?: number;
+  overlappingCues?: boolean;
+  readingSpeed?: number;
 } = {}): CaptionProject => {
   const itemRevision = options.itemRevision ?? 1;
   const currentState = options.cueState ?? "Proposed";
+  const firstCaptionText = options.readingSpeed === undefined
+    ? "Doctor Nguyen explains free energy."
+    : "x".repeat(Math.ceil(options.readingSpeed * 2));
   const project = createProject({
     projectId: "project-1",
     title: "Gibbs free energy lecture",
@@ -23,7 +28,7 @@ export const fixtureProject = (options: {
         state: "Proposed",
         startMs: 1_000,
         endMs: 3_000,
-        text: "Doctor Nguyen explains free energy.",
+        text: firstCaptionText,
         speaker: "Dr. Nguyen",
         actor: { type: "BrowserAgent", id: "browser-agent" },
         cause: "fixture",
@@ -32,7 +37,7 @@ export const fixtureProject = (options: {
         kind: "CaptionCue",
         itemId: "c06",
         state: "Proposed",
-        startMs: 3_000,
+        startMs: options.overlappingCues ? 2_500 : 3_000,
         endMs: 5_000,
         text: "The reaction is spontaneous.",
         speaker: "Dr. Nguyen",

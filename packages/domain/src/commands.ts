@@ -102,9 +102,20 @@ export type DomainCommand =
     })
   | (ItemCommandBase & { readonly type: "SustainItem" })
   | (CommandBase & {
+      /** Persists a complete deterministic validation run. Only System may execute it. */
+      readonly type: "ValidateProject";
+    })
+  | (CommandBase & {
       readonly type: "WaiveWarning";
       readonly findingId: string;
       readonly reason: string;
+    })
+  | (CommandBase & {
+      /** Human-only commit of the exact readiness hash returned for review. */
+      readonly type: "CertifyProject";
+      readonly expectedReadinessHash: string;
+      readonly certificationId?: string;
+      readonly certifiedAtMs?: number;
     })
   | (CommandBase & {
       readonly type: "ApplyProfile";

@@ -7,6 +7,8 @@ import type {
   ReviewState,
   ValidationSnapshot,
 } from "@cuebench/contracts";
+import { EDUCATION_PROFILE } from "./quality/profile";
+import type { ValidationRun } from "./quality/validate";
 
 export type ItemId = string;
 export type ProfileRevision = number;
@@ -98,6 +100,29 @@ export interface WarningWaiver {
   readonly projectRevision: number;
 }
 
+export interface CertificationItemRevision {
+  readonly kind: "CaptionCue" | "AudioDescriptionBeat";
+  readonly itemId: ItemId;
+  readonly itemRevision: number;
+}
+
+/**
+ * The immutable record behind the lightweight current/stale certification
+ * pointer exposed in contracts. Historical records are never rewritten.
+ */
+export interface ProjectCertification {
+  readonly certificationId: string;
+  readonly snapshotHash: string;
+  readonly readinessHash: string;
+  readonly certifiedAtMs: number;
+  readonly actor: Actor;
+  readonly media: MediaSourceSnapshot;
+  readonly itemRevisions: readonly CertificationItemRevision[];
+  readonly qualityProfile: QualityProfile;
+  readonly validationRun: ValidationRun;
+  readonly warningWaivers: readonly WarningWaiver[];
+}
+
 export interface GenerationLease {
   readonly runId: string;
   readonly targetTrack: GenerationTargetTrack;
@@ -124,7 +149,10 @@ export interface CaptionProject {
   readonly audioDescriptionGaps: Readonly<Record<string, AudioDescriptionGap>>;
   readonly selectedItem: Selection | null;
   readonly validation: ValidationSnapshot;
+  /** Full deterministic run retained for readiness and immutable certification. */
+  readonly validationRun: ValidationRun | null;
   readonly certification: CertificationSnapshot;
+  readonly certifications: readonly ProjectCertification[];
   readonly qualityProfile: QualityProfile;
   readonly warningWaivers: Readonly<Record<string, WarningWaiver>>;
   readonly activeGenerationRun: GenerationLease | null;
@@ -257,13 +285,15 @@ export const createProject = (input: CreateProjectInput): CaptionProject => {
     validation: initialValidation(),
     certification: initialCertification(),
     qualityProfile: {
-      profileId: input.profile?.profileId ?? "education-quality",
-      revision: input.profile?.revision ?? 1,
-      name: input.profile?.name ?? "Education Quality Profile",
-      rules: clone(input.profile?.rules ?? {}),
+      profileId: input.profile?.profileId ?? EDUCATION_PROFILE.profileId,
+      revision: input.profile?.revision ?? EDUCATION_PROFILE.revision,
+      name: input.profile?.name ?? EDUCATION_PROFILE.name,
+      rules: clone(input.profile?.rules ?? EDUCATION_PROFILE.rules),
     },
     warningWaivers: {},
+    validationRun: null,
     activeGenerationRun: null,
+    certifications: [],
     courtRecord: [],
   };
 };
