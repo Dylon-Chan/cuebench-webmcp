@@ -1,12 +1,15 @@
 import { describe, expect, it } from "vitest";
 import {
   applyCommand,
+  canonicalHash,
   certificationSnapshotHashFor,
   createProject,
   detectCertificationSnapshotHashVersion,
+  intermediateCertificationSnapshotHashFor,
   legacyCertificationSnapshotHashFor,
   prepareCertificationReview,
   upgradeLegacyCertificationSnapshot,
+  verifyIntermediateCertificationSnapshot,
   verifyCertificationSnapshot,
   type CaptionProject,
   type DomainCommand,
@@ -75,7 +78,8 @@ describe("human certification", () => {
 
     expect(verifyCertificationSnapshot(snapshot)).toBe(true);
     expect(snapshot.certificationSnapshotHash).toMatch(/^sha256:v2:[0-9a-f]{64}$/);
-    expect(detectCertificationSnapshotHashVersion(snapshot.certificationSnapshotHash)).toBe(2);
+    expect(detectCertificationSnapshotHashVersion(snapshot)).toBe(2);
+    expect(upgradeLegacyCertificationSnapshot(snapshot)).toEqual(snapshot);
     expect(verifyCertificationSnapshot({
       ...snapshot,
       actor: { type: "BrowserAgent", id: "browser-agent" },
@@ -84,13 +88,17 @@ describe("human certification", () => {
       ...snapshot,
       certificationSnapshotHash: `sha256:${"0".repeat(64)}`,
     })).toBe(false);
+    expect(detectCertificationSnapshotHashVersion({
+      ...snapshot,
+      certificationSnapshotHash: `sha256:v2:${"0".repeat(64)}`,
+    })).toBeNull();
     expect(verifyCertificationSnapshot({
       ...snapshot,
       itemRevisions: [...snapshot.itemRevisions, snapshot.itemRevisions[0]!],
     })).toBe(false);
   });
 
-  it("upgrades only a fully verified legacy certification snapshot to the versioned full hash", () => {
+  it("authenticates current, intermediate, and legacy hashes by recomputation before upgrade", () => {
     const validated = validate(sustainedProject());
     const readiness = prepareCertificationReview(validated.project);
     const snapshot = applyCommand(
@@ -102,13 +110,28 @@ describe("human certification", () => {
       ...snapshot,
       certificationSnapshotHash: legacyCertificationSnapshotHashFor(snapshot),
     };
+    const intermediate = {
+      ...snapshot,
+      certificationSnapshotHash: (() => {
+        const historicalContent = { ...snapshot };
+        Reflect.deleteProperty(historicalContent, "certificationSnapshotHash");
+        return canonicalHash("cuebench.certification-snapshot.v2", historicalContent);
+      })(),
+    };
 
-    expect(detectCertificationSnapshotHashVersion(legacy.certificationSnapshotHash)).toBe(1);
+    expect(detectCertificationSnapshotHashVersion(legacy)).toBe(1);
     expect(verifyCertificationSnapshot(legacy)).toBe(false);
     const upgraded = upgradeLegacyCertificationSnapshot(legacy);
     expect(upgraded).toBeDefined();
     expect(upgraded?.certificationSnapshotHash).toMatch(/^sha256:v2:[0-9a-f]{64}$/);
     expect(verifyCertificationSnapshot(upgraded!)).toBe(true);
+    expect(upgraded).toEqual(snapshot);
+
+    expect(detectCertificationSnapshotHashVersion(intermediate)).toBe("2-unversioned");
+    expect(intermediateCertificationSnapshotHashFor(snapshot)).toBe(intermediate.certificationSnapshotHash);
+    expect(verifyIntermediateCertificationSnapshot(intermediate)).toBe(true);
+    expect(verifyCertificationSnapshot(intermediate)).toBe(false);
+    expect(upgradeLegacyCertificationSnapshot(intermediate)).toEqual(snapshot);
 
     const evidence = legacy.evidence[0];
     if (evidence === undefined) throw new Error("Expected legacy evidence.");
@@ -116,6 +139,12 @@ describe("human certification", () => {
       ...legacy,
       evidence: [{ ...evidence, mediaSha256: "d".repeat(64) }],
     })).toBeUndefined();
+    const intermediateTampered = {
+      ...intermediate,
+      evidence: [{ ...evidence, mediaSha256: "d".repeat(64) }],
+    };
+    expect(detectCertificationSnapshotHashVersion(intermediateTampered)).toBeNull();
+    expect(upgradeLegacyCertificationSnapshot(intermediateTampered)).toBeUndefined();
   });
 
   it("recomputes the complete certified validation input and binds every immutable snapshot field", () => {

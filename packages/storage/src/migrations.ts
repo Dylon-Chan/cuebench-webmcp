@@ -222,10 +222,10 @@ const previewV1Project = (project: CaptionProject): CaptionProject => validateCa
 });
 
 /**
- * v1 backup envelopes can contain the former shallow certification hash.
- * Upgrade only after the domain verifier authenticates both that legacy hash
- * and all full snapshot/readiness contents; this function never mutates the
- * imported envelope and is used solely for the human-confirmation preview.
+ * v1 backup envelopes can contain either former unversioned certification
+ * hash. Upgrade only after the domain verifier authenticates its matching
+ * historical digest and all full snapshot/readiness contents; this function
+ * never mutates the imported envelope and is used solely for preview.
  */
 const upgradePreviewCertifications = (project: CaptionProject): CaptionProject => ({
   ...project,

@@ -3,7 +3,9 @@ import "fake-indexeddb/auto";
 import Dexie from "dexie";
 import {
   applyCommand,
+  canonicalHash,
   createProject,
+  intermediateCertificationSnapshotHashFor,
   legacyCertificationSnapshotHashFor,
   prepareCertificationReview,
   type CaptionProject,
@@ -464,6 +466,86 @@ describe("CueBenchDatabase", () => {
       },
     }));
     const tamperedName = `cuebench-storage-legacy-certified-tampered-${databaseNumber += 1}`;
+    await seed(tamperedName, tamperedRows);
+    const tampered = new CueBenchDatabase(tamperedName);
+    databases.push(tampered);
+    await expect(tampered.open()).rejects.toThrow(/certification/i);
+  });
+
+  it("upgrades authenticated intermediate certification rows from physical Dexie v2 to v3", async () => {
+    const aggregate = certifiedFixtureProject("intermediate-certified-physical-v2");
+    const snapshot = aggregate.certifications[0];
+    if (snapshot === undefined) throw new Error("Certified fixture is missing its snapshot.");
+    const normalized = normalizeProject(aggregate, { createdAtMs: 1, updatedAtMs: 1 });
+    const intermediateRows = normalized.certifications.map((row) => ({
+      ...row,
+      certification: {
+        ...row.certification,
+        certificationSnapshotHash: (() => {
+          const historicalContent = { ...snapshot };
+          Reflect.deleteProperty(historicalContent, "certificationSnapshotHash");
+          return canonicalHash("cuebench.certification-snapshot.v2", historicalContent);
+        })(),
+      },
+    }));
+    expect(intermediateCertificationSnapshotHashFor(snapshot)).toBe(
+      intermediateRows[0]?.certification.certificationSnapshotHash,
+    );
+    const seed = async (
+      databaseName: string,
+      certifications: readonly (typeof intermediateRows)[number][] = intermediateRows,
+    ) => {
+      const raw = new Dexie(databaseName);
+      raw.version(2).stores({
+        projectHeaders: "&projectId, projectRevision, [projectId+projectRevision], updatedAtMs",
+        items: "&key, projectId, itemId, [projectId+itemId], kind, currentItemRevision",
+        revisions: "&key, projectId, itemId, itemRevision, [projectId+itemId], [projectId+itemId+itemRevision], kind",
+        findings: "&key, projectId, scope, findingId, [projectId+scope], [projectId+scope+findingId]",
+        evidence: "&key, projectId, evidenceId, version, [projectId+evidenceId], [projectId+evidenceId+version]",
+        courtRecord: "&key, projectId, eventId, projectRevision, [projectId+eventId]",
+        certifications: "&key, projectId, certificationId, [projectId+certificationId]",
+        sourceBlobs: "&key, projectId, sourceId, sha256, [projectId+sha256], [projectId+sourceId]",
+        narrationBlobs: "&key, projectId, beatId, itemRevision, [projectId+beatId+itemRevision]",
+        runReceipts: "&key, projectId, runId, [projectId+runId]",
+        settings: "&key, updatedAtMs",
+      });
+      await raw.open();
+      await raw.table("projectHeaders").add(normalized.header);
+      await raw.table("items").bulkAdd([...normalized.items]);
+      await raw.table("revisions").bulkAdd([...normalized.revisions]);
+      await raw.table("findings").bulkAdd([...normalized.findings]);
+      await raw.table("evidence").bulkAdd([...normalized.evidence]);
+      await raw.table("courtRecord").bulkAdd([...normalized.courtRecord]);
+      await raw.table("certifications").bulkAdd(certifications);
+      raw.close();
+    };
+
+    const intermediateName = `cuebench-storage-intermediate-v2-${databaseNumber += 1}`;
+    await seed(intermediateName);
+    const upgraded = new CueBenchDatabase(intermediateName);
+    databases.push(upgraded);
+    await upgraded.open();
+    expect(upgraded.verno).toBe(3);
+    expect(await upgraded.certifications.get(normalized.certifications[0]!.key)).toEqual(normalized.certifications[0]);
+    expect(await loadProject(upgraded, aggregate.projectId)).toEqual(aggregate);
+
+    const currentName = `cuebench-storage-current-v2-${databaseNumber += 1}`;
+    await seed(currentName, normalized.certifications);
+    const current = new CueBenchDatabase(currentName);
+    databases.push(current);
+    await current.open();
+    expect(await current.certifications.get(normalized.certifications[0]!.key)).toEqual(normalized.certifications[0]);
+
+    const evidence = intermediateRows[0]?.certification.evidence[0];
+    if (evidence === undefined) throw new Error("Intermediate fixture is missing certification evidence.");
+    const tamperedRows = intermediateRows.map((row) => ({
+      ...row,
+      certification: {
+        ...row.certification,
+        evidence: [{ ...evidence, mediaSha256: "d".repeat(64) }],
+      },
+    }));
+    const tamperedName = `cuebench-storage-intermediate-v2-tampered-${databaseNumber += 1}`;
     await seed(tamperedName, tamperedRows);
     const tampered = new CueBenchDatabase(tamperedName);
     databases.push(tampered);

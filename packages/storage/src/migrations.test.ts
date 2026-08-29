@@ -2,7 +2,9 @@ import "fake-indexeddb/auto";
 
 import {
   applyCommand,
+  canonicalHash,
   createProject,
+  intermediateCertificationSnapshotHashFor,
   legacyCertificationSnapshotHashFor,
   prepareCertificationReview,
 } from "@cuebench/domain";
@@ -134,7 +136,7 @@ describe("project schema migrations", () => {
     expect(current.project.validation.status).toBe("Stale");
   });
 
-  it("upgrades a verified legacy certification in a v1 preview before marking it stale", () => {
+  it("upgrades authenticated legacy and intermediate certifications in a v1 preview before marking it stale", () => {
     let project = applyCommand(createProject({
       projectId: "legacy-certified-preview",
       title: "Legacy certified preview",
@@ -208,6 +210,41 @@ describe("project schema migrations", () => {
         }],
       },
     })).toThrow(/certification/i);
+
+    const intermediateProject = {
+      ...certified,
+      certifications: [{
+        ...snapshot,
+        certificationSnapshotHash: (() => {
+          const historicalContent = { ...snapshot };
+          Reflect.deleteProperty(historicalContent, "certificationSnapshotHash");
+          return canonicalHash("cuebench.certification-snapshot.v2", historicalContent);
+        })(),
+      }],
+    };
+    const intermediate = describeImportedProject({ schemaVersion: 1, project: intermediateProject });
+    if (intermediate.mode !== "preview") throw new Error("Expected intermediate preview descriptor.");
+    expect(intermediateCertificationSnapshotHashFor(snapshot)).toBe(
+      intermediateProject.certifications[0]?.certificationSnapshotHash,
+    );
+    expect(intermediate.project.certifications[0]?.certificationSnapshotHash).toBe(snapshot.certificationSnapshotHash);
+
+    const intermediateEvidence = intermediateProject.certifications[0]?.evidence[0];
+    if (intermediateEvidence === undefined) throw new Error("Expected intermediate certification evidence.");
+    expect(() => describeImportedProject({
+      schemaVersion: 1,
+      project: {
+        ...intermediateProject,
+        certifications: [{
+          ...intermediateProject.certifications[0]!,
+          evidence: [{ ...intermediateEvidence, mediaSha256: "d".repeat(64) }],
+        }],
+      },
+    })).toThrow(/certification/i);
+
+    const current = describeImportedProject({ schemaVersion: 1, project: certified });
+    if (current.mode !== "preview") throw new Error("Expected current preview descriptor.");
+    expect(current.project.certifications[0]?.certificationSnapshotHash).toBe(snapshot.certificationSnapshotHash);
   });
 
   it("does not fabricate an unavailable-history marker when every v0 item has only its current payload", () => {

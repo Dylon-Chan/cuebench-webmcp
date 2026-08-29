@@ -37,7 +37,7 @@ export const STORAGE_SCHEMA_VERSION = 1 as const;
  * envelopes. Keep this number monotonic even while backup schema v1 remains
  * readable, otherwise Dexie silently treats changed indexes as an upgrade.
  */
-export const DEXIE_DATABASE_VERSION = 2 as const;
+export const DEXIE_DATABASE_VERSION = 3 as const;
 
 const DEXIE_V1_STORES = {
   projectHeaders: "&projectId, projectRevision, updatedAtMs",
@@ -66,6 +66,9 @@ const DEXIE_V2_STORES = {
   runReceipts: "&key, projectId, runId, [projectId+runId]",
   settings: "&key, updatedAtMs",
 } as const;
+
+/** v3 changes immutable certification hash encoding, not table indexes. */
+const DEXIE_V3_STORES = DEXIE_V2_STORES;
 
 const clone = <Value>(value: Value): Value => structuredClone(value);
 const sameValue = (left: unknown, right: unknown): boolean => canonicalSerialize(left) === canonicalSerialize(right);
@@ -770,6 +773,41 @@ const sameStringSet = (left: readonly string[], right: readonly string[]): boole
   left.length === right.length && left.every((value) => right.includes(value));
 
 /**
+ * Authentication-only physical migration shared by v1→v2 and v2→v3.
+ * It rehydrates findings for each stored validation input, then asks the
+ * domain verifier to recompute and upgrade only authentic compatibility hashes.
+ */
+const upgradePhysicalCertificationRows = async (transaction: Transaction): Promise<void> => {
+  const findings = transaction.table("findings") as Table<FindingRow, string>;
+  const certifications = transaction.table("certifications") as Table<CertificationRow, string>;
+  const [findingRows, certificationRows] = await Promise.all([
+    findings.toArray(),
+    certifications.toArray(),
+  ]);
+  const findingsByScope = new Map<string, QualityFinding[]>();
+  for (const row of findingRows) {
+    const grouped = findingsByScope.get(row.scope) ?? [];
+    grouped.push(row.finding);
+    findingsByScope.set(row.scope, grouped);
+  }
+  const certificationsToPut: CertificationRow[] = [];
+  for (const row of certificationRows) {
+    const run = rehydrateValidationRun(
+      row.certification.validationRun,
+      findingsByScope.get(validationScope(row.certification.validationRun)) ?? [],
+    );
+    const upgraded = upgradeLegacyCertificationSnapshot({
+      ...clone(row.certification),
+      validationRun: run,
+    });
+    if (upgraded === undefined) throw new Error("Cannot upgrade invalid legacy certification snapshot.");
+    const next: CertificationRow = { ...row, certification: storedCertification(upgraded) };
+    if (!sameValue(row, next)) certificationsToPut.push(next);
+  }
+  if (certificationsToPut.length > 0) await certifications.bulkPut(certificationsToPut);
+};
+
+/**
  * Dexie v1 stored mutable evidence rows and omitted the header projection.
  * It may also contain row-by-row v2-shaped data from bb49027. This upgrade
  * derives only absent fields, leaves already-canonical records untouched, and
@@ -778,13 +816,9 @@ const sameStringSet = (left: readonly string[], right: readonly string[]): boole
 const upgradePhysicalV1ToV2 = async (transaction: Transaction): Promise<void> => {
   const headers = transaction.table("projectHeaders") as Table<PhysicalV1ProjectHeaderRow, string>;
   const evidence = transaction.table("evidence") as Table<PhysicalV1EvidenceRow, string>;
-  const findings = transaction.table("findings") as Table<FindingRow, string>;
-  const certifications = transaction.table("certifications") as Table<CertificationRow, string>;
-  const [physicalHeaders, physicalEvidence, findingRows, certificationRows] = await Promise.all([
+  const [physicalHeaders, physicalEvidence] = await Promise.all([
     headers.toArray(),
     evidence.toArray(),
-    findings.toArray(),
-    certifications.toArray(),
   ]);
 
   const rawEvidenceByKey = new Map(physicalEvidence.map((row) => [row.key, row]));
@@ -842,29 +876,12 @@ const upgradePhysicalV1ToV2 = async (transaction: Transaction): Promise<void> =>
     headersToPut.push({ ...header, evidenceOrder: derivedOrder } as ProjectHeaderRow);
   }
   if (headersToPut.length > 0) await headers.bulkPut(headersToPut as unknown as PhysicalV1ProjectHeaderRow[]);
-
-  const findingsByScope = new Map<string, QualityFinding[]>();
-  for (const row of findingRows) {
-    const grouped = findingsByScope.get(row.scope) ?? [];
-    grouped.push(row.finding);
-    findingsByScope.set(row.scope, grouped);
-  }
-  const certificationsToPut: CertificationRow[] = [];
-  for (const row of certificationRows) {
-    const run = rehydrateValidationRun(
-      row.certification.validationRun,
-      findingsByScope.get(validationScope(row.certification.validationRun)) ?? [],
-    );
-    const upgraded = upgradeLegacyCertificationSnapshot({
-      ...clone(row.certification),
-      validationRun: run,
-    });
-    if (upgraded === undefined) throw new Error("Cannot upgrade invalid legacy certification snapshot.");
-    const next: CertificationRow = { ...row, certification: storedCertification(upgraded) };
-    if (!sameValue(row, next)) certificationsToPut.push(next);
-  }
-  if (certificationsToPut.length > 0) await certifications.bulkPut(certificationsToPut);
+  await upgradePhysicalCertificationRows(transaction);
 };
+
+/** v2 data already has normalized evidence; v3 upgrades only certification hashes. */
+const upgradePhysicalV2ToV3 = async (transaction: Transaction): Promise<void> =>
+  upgradePhysicalCertificationRows(transaction);
 
 /** A validation run is immutable at its post-command project revision. */
 const validationScope = (run: StoredValidationRun) => `validation:${run.projectRevision}:${run.inputHash}`;
@@ -1363,7 +1380,8 @@ export class CueBenchDatabase extends Dexie {
   public constructor(name = "cuebench") {
     super(name);
     this.version(1).stores(DEXIE_V1_STORES);
-    this.version(DEXIE_DATABASE_VERSION).stores(DEXIE_V2_STORES).upgrade(upgradePhysicalV1ToV2);
+    this.version(2).stores(DEXIE_V2_STORES).upgrade(upgradePhysicalV1ToV2);
+    this.version(DEXIE_DATABASE_VERSION).stores(DEXIE_V3_STORES).upgrade(upgradePhysicalV2ToV3);
     this.projectHeaders = this.table("projectHeaders");
     this.items = this.table("items");
     this.revisions = this.table("revisions");

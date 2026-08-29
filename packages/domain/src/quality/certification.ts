@@ -21,17 +21,12 @@ const compareText = (left: string, right: string): number => left < right ? -1 :
 
 const SHA256_HASH = /^sha256:[0-9a-f]{64}$/;
 const SHA256 = /^[0-9a-f]{64}$/;
-const CERTIFICATION_SNAPSHOT_HASH_V2 = /^sha256:v2:[0-9a-f]{64}$/;
 
-export type CertificationSnapshotHashVersion = 1 | 2;
-
-/** v1 was an unversioned shallow tuple hash; v2 is explicitly content-versioned. */
-export const detectCertificationSnapshotHashVersion = (
-  hash: string,
-): CertificationSnapshotHashVersion | null => {
-  if (CERTIFICATION_SNAPSHOT_HASH_V2.test(hash)) return 2;
-  return SHA256_HASH.test(hash) ? 1 : null;
-};
+/**
+ * A hash format is reported only after its digest and all snapshot semantics
+ * have been recomputed. `2-unversioned` is the short-lived 69d6e59 format.
+ */
+export type CertificationSnapshotHashVersion = 1 | "2-unversioned" | 2;
 
 export type ValidationStaleCauseCode =
   | "NOT_RUN"
@@ -252,10 +247,24 @@ export const createCertificationSnapshot = (
   };
 };
 
+/** Defensively excludes an accidental outer hash before hashing immutable content. */
+const hashableCertificationContent = (
+  content: Omit<ProjectCertification, "certificationSnapshotHash">,
+): Omit<ProjectCertification, "certificationSnapshotHash"> => {
+  const immutable = { ...content } as Record<string, unknown>;
+  Reflect.deleteProperty(immutable, "certificationSnapshotHash");
+  return immutable as Omit<ProjectCertification, "certificationSnapshotHash">;
+};
+
+/** Exact full-content hash emitted by the short-lived 69d6e59 storage build. */
+export const intermediateCertificationSnapshotHashFor = (
+  content: Omit<ProjectCertification, "certificationSnapshotHash">,
+): string => canonicalHash("cuebench.certification-snapshot.v2", hashableCertificationContent(content));
+
 /** Hashes every immutable certification field except the hash itself. */
 export const certificationSnapshotHashFor = (
   content: Omit<ProjectCertification, "certificationSnapshotHash">,
-): string => canonicalHash("cuebench.certification-snapshot.v2", content).replace("sha256:", "sha256:v2:");
+): string => `sha256:v2:${intermediateCertificationSnapshotHashFor(content).slice("sha256:".length)}`;
 
 /**
  * The historic v1 tuple is intentionally retained only to authenticate an
@@ -454,11 +463,20 @@ const certificationContent = (
   warningWaivers: snapshot.warningWaivers,
 });
 
-/** Validates the old shallow tuple plus all semantic snapshot content before migration. */
-export const verifyLegacyCertificationSnapshot = (snapshot: ProjectCertification): boolean => {
+/** Recomputes the current full snapshot semantics without trusting its hash. */
+const hasVerifiedFullSnapshotContents = (snapshot: ProjectCertification): boolean => {
   try {
-    if (detectCertificationSnapshotHashVersion(snapshot.certificationSnapshotHash) !== 1) return false;
-    if (snapshot.certificationSnapshotHash !== legacyCertificationSnapshotHashFor(snapshot)) return false;
+    const input = snapshot.validationRun.input;
+    return hasValidCertificationContents(snapshot, itemRevisionsFor(allInputItems(input)), allInputItems(input))
+      && snapshot.readinessHash === certificationReadinessHashForSnapshot(snapshot);
+  } catch {
+    return false;
+  }
+};
+
+/** Recomputes the original v1 live-item semantics without trusting its hash. */
+const hasVerifiedLegacySnapshotContents = (snapshot: ProjectCertification): boolean => {
+  try {
     const input = snapshot.validationRun.input;
     const legacyItems = legacyInputItems(input);
     const expectedItems = itemRevisionsFor(legacyItems);
@@ -473,16 +491,59 @@ export const verifyLegacyCertificationSnapshot = (snapshot: ProjectCertification
   }
 };
 
+/** Validates the old shallow tuple plus all semantic snapshot content before migration. */
+export const verifyLegacyCertificationSnapshot = (snapshot: ProjectCertification): boolean =>
+  hasVerifiedLegacySnapshotContents(snapshot)
+  && snapshot.certificationSnapshotHash === legacyCertificationSnapshotHashFor(snapshot);
+
+/** Validates the exact, unversioned full-content hash emitted by 69d6e59. */
+export const verifyIntermediateCertificationSnapshot = (snapshot: ProjectCertification): boolean =>
+  hasVerifiedFullSnapshotContents(snapshot)
+  && snapshot.certificationSnapshotHash === intermediateCertificationSnapshotHashFor(certificationContent(snapshot));
+
 /**
- * Converts only an authenticated, semantically revalidated v1 snapshot into
- * the full v2 representation. Invalid legacy data is never merely rehashed.
+ * Recomputes snapshot semantics and hashes in deterministic compatibility
+ * order. This intentionally accepts no format merely because its string has
+ * a familiar prefix.
+ */
+export const detectCertificationSnapshotHashVersion = (
+  snapshot: ProjectCertification,
+): CertificationSnapshotHashVersion | null => {
+  if (hasVerifiedFullSnapshotContents(snapshot)) {
+    const content = certificationContent(snapshot);
+    if (snapshot.certificationSnapshotHash === certificationSnapshotHashFor(content)) return 2;
+    if (snapshot.certificationSnapshotHash === intermediateCertificationSnapshotHashFor(content)) return "2-unversioned";
+  }
+  if (verifyLegacyCertificationSnapshot(snapshot)) return 1;
+  return null;
+};
+
+/**
+ * Recomputes every deterministic validation fact from the immutable input.
+ * This deliberately does not trust serialized findings, readiness, or a
+ * partial item list: only a complete, certifiable validation input verifies.
+ */
+export const verifyCertificationSnapshot = (snapshot: ProjectCertification): boolean =>
+  detectCertificationSnapshotHashVersion(snapshot) === 2;
+
+/**
+ * Converts only authenticated compatibility snapshots to the current full
+ * v2 representation. Both old formats are recomputed before rehashing.
  */
 export const upgradeLegacyCertificationSnapshot = (
   snapshot: ProjectCertification,
 ): ProjectCertification | undefined => {
-  const version = detectCertificationSnapshotHashVersion(snapshot.certificationSnapshotHash);
-  if (version === 2) return verifyCertificationSnapshot(snapshot) ? clone(snapshot) : undefined;
-  if (version !== 1 || !verifyLegacyCertificationSnapshot(snapshot)) return undefined;
+  const version = detectCertificationSnapshotHashVersion(snapshot);
+  if (version === 2) return clone(snapshot);
+  if (version === "2-unversioned") {
+    const content = clone(certificationContent(snapshot));
+    const upgraded: ProjectCertification = {
+      ...content,
+      certificationSnapshotHash: certificationSnapshotHashFor(content),
+    };
+    return verifyCertificationSnapshot(upgraded) ? upgraded : undefined;
+  }
+  if (version !== 1) return undefined;
   const upgradedWithoutHash: Omit<ProjectCertification, "certificationSnapshotHash"> = {
     ...certificationContent(snapshot),
     itemRevisions: clone(inputItemRevisions(snapshot.validationRun.input)),
@@ -498,21 +559,4 @@ export const upgradeLegacyCertificationSnapshot = (
     certificationSnapshotHash: certificationSnapshotHashFor(content),
   };
   return verifyCertificationSnapshot(upgraded) ? upgraded : undefined;
-};
-
-/**
- * Recomputes every deterministic validation fact from the immutable input.
- * This deliberately does not trust serialized findings, readiness, or a
- * partial item list: only a complete, certifiable validation input verifies.
- */
-export const verifyCertificationSnapshot = (snapshot: ProjectCertification): boolean => {
-  try {
-    if (detectCertificationSnapshotHashVersion(snapshot.certificationSnapshotHash) !== 2) return false;
-    const input = snapshot.validationRun.input;
-    if (!hasValidCertificationContents(snapshot, itemRevisionsFor(allInputItems(input)), allInputItems(input))) return false;
-    if (snapshot.readinessHash !== certificationReadinessHashForSnapshot(snapshot)) return false;
-    return snapshot.certificationSnapshotHash === certificationSnapshotHashFor(certificationContent(snapshot));
-  } catch {
-    return false;
-  }
 };
