@@ -501,6 +501,90 @@ describe("domain reducer", () => {
     expect(result.error?.code).toBe("INVALID_ARGUMENT");
   });
 
+  it("rejects media relinks when an old cue revision is out of bounds without mutating state", () => {
+    const fixture = fixtureProject();
+    const project: CaptionProject = {
+      ...fixture,
+      audioDescriptionGaps: {
+        ...fixture.audioDescriptionGaps,
+        "gap-1": { ...fixture.audioDescriptionGaps["gap-1"]!, endMs: 10_000 },
+      },
+    };
+    const longRevision = applyCommand(project, {
+      type: "ReviseCue", actor: { type: "Human", id: "teacher" }, cueId: "c05",
+      expectedItemRevision: 1, expectedProjectRevision: 1, patch: { endMs: 12_000 },
+    });
+    const currentRevision = applyCommand(longRevision.project, {
+      type: "ReviseCue", actor: { type: "Human", id: "teacher" }, cueId: "c05",
+      expectedItemRevision: 2, expectedProjectRevision: 2, patch: { endMs: 3_000 },
+    });
+    const before = JSON.stringify(currentRevision.project);
+    const result = applyCommand(currentRevision.project, {
+      type: "RelinkMedia", actor: { type: "Human", id: "teacher" }, expectedProjectRevision: 3,
+      media: { sourceId: "short", sha256: "b".repeat(64), durationMs: 10_000 },
+    });
+
+    expect(result.error).toMatchObject({ code: "INVALID_ARGUMENT", message: "Media duration must contain every current item." });
+    expect(JSON.stringify(result.project)).toBe(before);
+  });
+
+  it("rejects media relinks when an old AD revision is out of bounds without mutating state", () => {
+    const fixture = fixtureProject();
+    const project: CaptionProject = {
+      ...fixture,
+      audioDescriptionGaps: {
+        ...fixture.audioDescriptionGaps,
+        "gap-1": { ...fixture.audioDescriptionGaps["gap-1"]!, endMs: 10_000 },
+      },
+    };
+    const longRevision = applyCommand(project, {
+      type: "ReviseAudioDescription", actor: { type: "Human", id: "teacher" }, beatId: "ad01",
+      expectedItemRevision: 1, expectedProjectRevision: 1, patch: { endMs: 12_000 },
+    });
+    const currentRevision = applyCommand(longRevision.project, {
+      type: "ReviseAudioDescription", actor: { type: "Human", id: "teacher" }, beatId: "ad01",
+      expectedItemRevision: 2, expectedProjectRevision: 2, patch: { endMs: 8_000 },
+    });
+    const before = JSON.stringify(currentRevision.project);
+    const result = applyCommand(currentRevision.project, {
+      type: "RelinkMedia", actor: { type: "Human", id: "teacher" }, expectedProjectRevision: 3,
+      media: { sourceId: "short", sha256: "b".repeat(64), durationMs: 10_000 },
+    });
+
+    expect(result.error).toMatchObject({ code: "INVALID_ARGUMENT", message: "Media duration must contain every current item." });
+    expect(JSON.stringify(result.project)).toBe(before);
+  });
+
+  it("allows media relinks at the exact boundary for current and historical item revisions and gaps", () => {
+    const fixture = fixtureProject();
+    const project: CaptionProject = {
+      ...fixture,
+      audioDescriptionGaps: {
+        ...fixture.audioDescriptionGaps,
+        "gap-1": { ...fixture.audioDescriptionGaps["gap-1"]!, endMs: 10_000 },
+      },
+    };
+    const longCueRevision = applyCommand(project, {
+      type: "ReviseCue", actor: { type: "Human", id: "teacher" }, cueId: "c05",
+      expectedItemRevision: 1, expectedProjectRevision: 1, patch: { endMs: 10_000 },
+    });
+    const currentCueRevision = applyCommand(longCueRevision.project, {
+      type: "ReviseCue", actor: { type: "Human", id: "teacher" }, cueId: "c05",
+      expectedItemRevision: 2, expectedProjectRevision: 2, patch: { endMs: 3_000 },
+    });
+    const currentAdRevision = applyCommand(currentCueRevision.project, {
+      type: "ReviseAudioDescription", actor: { type: "Human", id: "teacher" }, beatId: "ad01",
+      expectedItemRevision: 1, expectedProjectRevision: 3, patch: { endMs: 10_000 },
+    });
+    const result = applyCommand(currentAdRevision.project, {
+      type: "RelinkMedia", actor: { type: "Human", id: "teacher" }, expectedProjectRevision: 4,
+      media: { sourceId: "boundary", sha256: "b".repeat(64), durationMs: 10_000 },
+    });
+
+    expect(result.error).toBeUndefined();
+    expect(result.project.media.durationMs).toBe(10_000);
+  });
+
   it("requires proposed AD timing to fit inside the selected gap without consuming it on rejection", () => {
     const focused = applyCommand(fixtureProject(), {
       type: "FocusGap", actor: { type: "Human", id: "teacher" }, gapId: "gap-1", expectedGapRevision: 1, expectedProjectRevision: 1,

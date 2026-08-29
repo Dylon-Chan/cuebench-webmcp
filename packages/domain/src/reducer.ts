@@ -192,10 +192,22 @@ const resolvedItemId = (command: DomainCommand): string | DomainError => {
   return aliases[0]!;
 };
 
-const allCurrentTimesFit = (project: CaptionProject, durationMs: number) =>
-  Object.values(project.captions.items).every((item) => hasValidTime({ ...project, media: { ...project.media, durationMs } }, item.current.startMs, item.current.endMs))
-  && Object.values(project.audioDescriptions.items).every((item) => hasValidTime({ ...project, media: { ...project.media, durationMs } }, item.current.startMs, item.current.endMs))
-  && Object.values(project.audioDescriptionGaps).every((gap) => hasValidTime({ ...project, media: { ...project.media, durationMs } }, gap.startMs, gap.endMs));
+const allItemRevisionsFit = (
+  items: readonly (CaptionCue | AudioDescriptionBeat)[],
+  project: CaptionProject,
+) => items.every((item) =>
+  hasValidTime(project, item.current.startMs, item.current.endMs)
+  && item.revisions.every((revision) => hasValidTime(project, revision.startMs, revision.endMs)));
+
+const allTimesFit = (project: CaptionProject, durationMs: number) => {
+  const relinkedProject: CaptionProject = { ...project, media: { ...project.media, durationMs } };
+  return allItemRevisionsFit([
+    ...Object.values(project.captions.items),
+    ...Object.values(project.audioDescriptions.items),
+  ], relinkedProject)
+    && Object.values(project.audioDescriptionGaps).every((gap) =>
+      hasValidTime(relinkedProject, gap.startMs, gap.endMs));
+};
 
 const systemCourtRecordEventTypes = new Set([
   "ExportRoundTripVerified",
@@ -263,7 +275,7 @@ export const applyCommand = (project: CaptionProject, command: DomainCommand): C
     if (!hasHumanAuthority(command.actor)) return fail(project, "HUMAN_AUTHORITY_REQUIRED", "Only a human may relink media.");
     if (project.activeGenerationRun !== null) return fail(project, "TARGET_TRACK_LEASE_CONFLICT", "Media cannot change while a generation run is active.");
     if (!isFiniteInteger(command.media.durationMs) || command.media.durationMs < 0) return fail(project, "INVALID_ARGUMENT", "Media duration must be a non-negative integer.");
-    if (!allCurrentTimesFit(project, command.media.durationMs)) return fail(project, "INVALID_ARGUMENT", "Media duration must contain every current item.");
+    if (!allTimesFit(project, command.media.durationMs)) return fail(project, "INVALID_ARGUMENT", "Media duration must contain every current item.");
     return commit(project, command, { media: { ...clone(command.media), relinkState: "Linked" }, ...withStaleArtifacts(project) });
   }
   if (command.type === "WaiveWarning") {
