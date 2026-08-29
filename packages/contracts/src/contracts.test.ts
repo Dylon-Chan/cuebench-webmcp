@@ -390,6 +390,96 @@ describe("project snapshot contracts", () => {
     ).toBe(false);
   });
 
+  it("enforces cursor-page progress and cardinality boundaries", () => {
+    const parseCaptionPage = (pageValue: {
+      limit: number;
+      cursor: string | null;
+      nextCursor: string | null;
+      truncated: boolean;
+      totalCount: number;
+    }) =>
+      CaptionTrackSnapshotSchema.safeParse({
+        kind: "Captions",
+        items: [captionCue],
+        page: pageValue,
+      }).success;
+
+    // The lower boundaries prove that the page represents its stated position.
+    expect(
+      parseCaptionPage({
+        limit: 1,
+        cursor: null,
+        nextCursor: "next-page",
+        truncated: true,
+        totalCount: 2,
+      }),
+    ).toBe(true);
+    expect(
+      parseCaptionPage({
+        limit: 1,
+        cursor: "cursor-1",
+        nextCursor: null,
+        truncated: false,
+        totalCount: 2,
+      }),
+    ).toBe(true);
+    expect(
+      parseCaptionPage({
+        limit: 1,
+        cursor: "cursor-1",
+        nextCursor: "cursor-2",
+        truncated: true,
+        totalCount: 3,
+      }),
+    ).toBe(true);
+
+    expect(
+      parseCaptionPage({
+        limit: 1,
+        cursor: "same-cursor",
+        nextCursor: "same-cursor",
+        truncated: true,
+        totalCount: 3,
+      }),
+    ).toBe(false);
+    expect(
+      parseCaptionPage({
+        limit: 1,
+        cursor: null,
+        nextCursor: "next-page",
+        truncated: true,
+        totalCount: 1,
+      }),
+    ).toBe(false);
+    expect(
+      parseCaptionPage({
+        limit: 1,
+        cursor: "cursor-1",
+        nextCursor: null,
+        truncated: false,
+        totalCount: 1,
+      }),
+    ).toBe(false);
+    expect(
+      parseCaptionPage({
+        limit: 1,
+        cursor: "cursor-1",
+        nextCursor: "cursor-2",
+        truncated: true,
+        totalCount: 2,
+      }),
+    ).toBe(false);
+    expect(
+      parseCaptionPage({
+        limit: 1,
+        cursor: "cursor-1",
+        nextCursor: null,
+        truncated: true,
+        totalCount: 2,
+      }),
+    ).toBe(false);
+  });
+
   it("models certification state as a discriminated union", () => {
     expect(CertificationSnapshotSchema.safeParse({ status: "NotCertified" }).success).toBe(
       true,

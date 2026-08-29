@@ -101,8 +101,10 @@ export const ProjectItemSnapshotSchema = z
 /**
  * A track snapshot is a cursor page: `items` holds at most `limit` current
  * items, `totalCount` counts the complete track, and `truncated` is true
- * exactly when `nextCursor` identifies a following page. An initial page must
- * expose a continuation when its items do not account for the whole track.
+ * exactly when `nextCursor` identifies a following page. An initial terminal
+ * page accounts for the whole track; an initial continued page proves at least
+ * one later item. A subsequent terminal page proves at least one earlier item,
+ * while a subsequent continued page proves both an earlier and a later item.
  */
 export const TrackPageSchema = z
   .object({
@@ -119,13 +121,23 @@ type BoundedTrack = {
   page: z.infer<typeof TrackPageSchema>;
 };
 
-const hasConsistentTrackPage = (track: BoundedTrack) =>
-  track.items.length <= track.page.limit &&
-  track.page.totalCount >= track.items.length &&
-  track.page.truncated === (track.page.nextCursor !== null) &&
-  (track.page.cursor !== null ||
-    track.page.totalCount === track.items.length ||
-    track.page.nextCursor !== null);
+const hasConsistentTrackPage = (track: BoundedTrack) => {
+  const { items, page } = track;
+  const hasNextPage = page.nextCursor !== null;
+  const hasConsistentItemCount =
+    page.cursor === null
+      ? hasNextPage
+        ? page.totalCount >= items.length + 1
+        : page.totalCount === items.length
+      : page.totalCount >= items.length + (hasNextPage ? 2 : 1);
+
+  return (
+    items.length <= page.limit &&
+    hasConsistentItemCount &&
+    page.truncated === hasNextPage &&
+    (!hasNextPage || page.nextCursor !== page.cursor)
+  );
+};
 
 export const CaptionTrackSnapshotSchema = z
   .object({
