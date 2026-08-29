@@ -16,7 +16,6 @@ const GenerationRunBaseSchema = z.object({
   contractVersion: ContractVersionSchema,
   runId: IdentifierSchema,
   projectId: IdentifierSchema,
-  targetTrack: GenerationTargetTrackSchema,
   expectedProjectRevision: ProjectRevisionSchema,
   warnings: z
     .array(z.string().trim().min(1).max(500))
@@ -26,55 +25,87 @@ const GenerationRunBaseSchema = z.object({
 
 const GenerationProgressSchema = z.number().min(0).max(1);
 
-export const GenerationRunStatusSchema = z.discriminatedUnion("stage", [
-  GenerationRunBaseSchema.extend({
+const NeutralGenerationRunBaseSchema = GenerationRunBaseSchema.extend({
+  targetTrack: GenerationTargetTrackSchema,
+});
+
+const CaptionGenerationRunBaseSchema = GenerationRunBaseSchema.extend({
+  targetTrack: z.literal("Captions"),
+});
+
+const AudioDescriptionGenerationRunBaseSchema = GenerationRunBaseSchema.extend({
+  targetTrack: z.literal("AudioDescriptions"),
+});
+
+/**
+ * Queued, adoption, and terminal stages apply to either target track. Media
+ * preparation, evidence alignment, and transcription are caption-only; visual
+ * analysis and placement are audio-description-only.
+ */
+const GenerationRunStatusByStageSchema = z.discriminatedUnion("stage", [
+  NeutralGenerationRunBaseSchema.extend({
     stage: z.literal("Queued"),
   }),
-  GenerationRunBaseSchema.extend({
+  CaptionGenerationRunBaseSchema.extend({
     stage: z.literal("PreparingMedia"),
     progress: GenerationProgressSchema.optional(),
   }),
-  GenerationRunBaseSchema.extend({
+  CaptionGenerationRunBaseSchema.extend({
     stage: z.literal("Transcribing"),
     progress: GenerationProgressSchema.optional(),
   }),
-  GenerationRunBaseSchema.extend({
+  CaptionGenerationRunBaseSchema.extend({
     stage: z.literal("AligningEvidence"),
     progress: GenerationProgressSchema.optional(),
   }),
-  GenerationRunBaseSchema.extend({
+  CaptionGenerationRunBaseSchema.extend({
     stage: z.literal("ReconcilingTranscript"),
     progress: GenerationProgressSchema.optional(),
   }),
-  GenerationRunBaseSchema.extend({
+  CaptionGenerationRunBaseSchema.extend({
     stage: z.literal("SegmentingCaptions"),
     progress: GenerationProgressSchema.optional(),
   }),
-  GenerationRunBaseSchema.extend({
+  AudioDescriptionGenerationRunBaseSchema.extend({
     stage: z.literal("AnalyzingVisuals"),
     progress: GenerationProgressSchema.optional(),
   }),
-  GenerationRunBaseSchema.extend({
+  AudioDescriptionGenerationRunBaseSchema.extend({
     stage: z.literal("PlacingAudioDescriptions"),
     progress: GenerationProgressSchema.optional(),
   }),
-  GenerationRunBaseSchema.extend({
+  NeutralGenerationRunBaseSchema.extend({
     stage: z.literal("AwaitingAdoption"),
   }),
-  GenerationRunBaseSchema.extend({
+  NeutralGenerationRunBaseSchema.extend({
     stage: z.literal("Completed"),
     adoptedProjectRevision: ProjectRevisionSchema,
   }),
-  GenerationRunBaseSchema.extend({
+  NeutralGenerationRunBaseSchema.extend({
     stage: z.literal("Failed"),
     code: DomainErrorCodeSchema,
     message: z.string().trim().min(1),
     retryable: z.boolean(),
   }),
-  GenerationRunBaseSchema.extend({
+  NeutralGenerationRunBaseSchema.extend({
     stage: z.literal("Cancelled"),
   }),
 ]);
+
+export const GenerationRunStatusSchema =
+  GenerationRunStatusByStageSchema.superRefine((status, context) => {
+    if (
+      status.stage === "Completed" &&
+      status.adoptedProjectRevision <= status.expectedProjectRevision
+    ) {
+      context.addIssue({
+        code: "custom",
+        message:
+          "Completed generation must advance the expected project revision",
+        path: ["adoptedProjectRevision"],
+      });
+    }
+  });
 
 export type GenerationTargetTrack = z.infer<
   typeof GenerationTargetTrackSchema

@@ -171,6 +171,53 @@ describe("project snapshot contracts", () => {
     );
   });
 
+  it("requires current zero-blocker validation for a current certification", () => {
+    expect(
+      ProjectSnapshotSchema.safeParse({
+        ...projectSnapshot(),
+        validation: {
+          status: "Stale",
+          blockerCount: 0,
+          warningCount: 0,
+        },
+      }).success,
+    ).toBe(false);
+    expect(
+      ProjectSnapshotSchema.safeParse({
+        ...projectSnapshot(),
+        validation: {
+          status: "NotRun",
+          blockerCount: 0,
+          warningCount: 0,
+        },
+      }).success,
+    ).toBe(false);
+    expect(
+      ProjectSnapshotSchema.safeParse({
+        ...projectSnapshot(),
+        validation: {
+          status: "Current",
+          blockerCount: 1,
+          warningCount: 0,
+        },
+      }).success,
+    ).toBe(false);
+    expect(
+      ProjectSnapshotSchema.safeParse({
+        ...projectSnapshot(),
+        validation: {
+          status: "Stale",
+          blockerCount: 1,
+          warningCount: 0,
+        },
+        certification: {
+          status: "Stale",
+          certificationId: "certification-1",
+        },
+      }).success,
+    ).toBe(true);
+  });
+
   it("rejects wrong project versions, invalid enums, and malformed hashes", () => {
     expect(
       ProjectSnapshotSchema.safeParse({
@@ -269,6 +316,45 @@ describe("project snapshot contracts", () => {
         page: {
           limit: 1,
           cursor: null,
+          nextCursor: null,
+          truncated: false,
+          totalCount: 2,
+        },
+      }).success,
+    ).toBe(false);
+    expect(
+      CaptionTrackSnapshotSchema.safeParse({
+        kind: "Captions",
+        items: [captionCue],
+        page: {
+          limit: 1,
+          cursor: "cursor-1",
+          nextCursor: null,
+          truncated: false,
+          totalCount: 2,
+        },
+      }).success,
+    ).toBe(true);
+    expect(
+      CaptionTrackSnapshotSchema.safeParse({
+        kind: "Captions",
+        items: [captionCue],
+        page: {
+          limit: 1,
+          cursor: "cursor-1",
+          nextCursor: "cursor-2",
+          truncated: true,
+          totalCount: 3,
+        },
+      }).success,
+    ).toBe(true);
+    expect(
+      CaptionTrackSnapshotSchema.safeParse({
+        kind: "Captions",
+        items: [captionCue],
+        page: {
+          limit: 1,
+          cursor: null,
           nextCursor: "next-page",
           truncated: true,
           totalCount: 2,
@@ -340,6 +426,10 @@ describe("generation status contracts", () => {
     targetTrack: "Captions" as const,
     expectedProjectRevision: 3,
   };
+  const adRun = {
+    ...run,
+    targetTrack: "AudioDescriptions" as const,
+  };
 
   it("accepts every documented generation stage branch", () => {
     expect(GenerationTargetTrackSchema.safeParse("Captions").success).toBe(true);
@@ -352,8 +442,6 @@ describe("generation status contracts", () => {
       { ...run, stage: "AligningEvidence" as const, progress: 0.3 },
       { ...run, stage: "ReconcilingTranscript" as const, progress: 0.4 },
       { ...run, stage: "SegmentingCaptions" as const, progress: 0.5 },
-      { ...run, stage: "AnalyzingVisuals" as const, progress: 0.6 },
-      { ...run, stage: "PlacingAudioDescriptions" as const, progress: 0.7 },
       { ...run, stage: "AwaitingAdoption" as const },
       {
         ...run,
@@ -368,6 +456,27 @@ describe("generation status contracts", () => {
         retryable: true,
       },
       { ...run, stage: "Cancelled" as const },
+      { ...adRun, stage: "Queued" as const },
+      { ...adRun, stage: "AnalyzingVisuals" as const, progress: 0.6 },
+      {
+        ...adRun,
+        stage: "PlacingAudioDescriptions" as const,
+        progress: 0.7,
+      },
+      { ...adRun, stage: "AwaitingAdoption" as const },
+      {
+        ...adRun,
+        stage: "Completed" as const,
+        adoptedProjectRevision: 4,
+      },
+      {
+        ...adRun,
+        stage: "Failed" as const,
+        code: "GENERATION_STAGE_FAILED" as const,
+        message: "The visual-analysis pass did not complete.",
+        retryable: true,
+      },
+      { ...adRun, stage: "Cancelled" as const },
     ];
 
     for (const status of statuses) {
@@ -375,7 +484,7 @@ describe("generation status contracts", () => {
     }
   });
 
-  it("rejects invalid stage data and unbounded warning lists", () => {
+  it("correlates target tracks, stages, and completed adoptions", () => {
     expect(
       GenerationRunStatusSchema.safeParse({
         ...run,
@@ -383,6 +492,44 @@ describe("generation status contracts", () => {
         progress: 1.1,
       }).success,
     ).toBe(false);
+    expect(
+      GenerationRunStatusSchema.safeParse({
+        ...run,
+        stage: "PlacingAudioDescriptions",
+        progress: 0.7,
+      }).success,
+    ).toBe(false);
+    expect(
+      GenerationRunStatusSchema.safeParse({
+        ...adRun,
+        stage: "PreparingMedia",
+        progress: 0.1,
+      }).success,
+    ).toBe(false);
+    expect(
+      GenerationRunStatusSchema.safeParse({
+        ...adRun,
+        stage: "Transcribing",
+        progress: 0.2,
+      }).success,
+    ).toBe(false);
+    expect(
+      GenerationRunStatusSchema.safeParse({
+        ...adRun,
+        stage: "SegmentingCaptions",
+        progress: 0.5,
+      }).success,
+    ).toBe(false);
+    expect(
+      GenerationRunStatusSchema.safeParse({
+        ...run,
+        stage: "Completed",
+        adoptedProjectRevision: run.expectedProjectRevision,
+      }).success,
+    ).toBe(false);
+  });
+
+  it("rejects invalid stage data and unbounded warning lists", () => {
     expect(
       GenerationRunStatusSchema.safeParse({
         ...run,

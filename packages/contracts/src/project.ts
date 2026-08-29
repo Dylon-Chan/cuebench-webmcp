@@ -101,7 +101,8 @@ export const ProjectItemSnapshotSchema = z
 /**
  * A track snapshot is a cursor page: `items` holds at most `limit` current
  * items, `totalCount` counts the complete track, and `truncated` is true
- * exactly when `nextCursor` identifies a following page.
+ * exactly when `nextCursor` identifies a following page. An initial page must
+ * expose a continuation when its items do not account for the whole track.
  */
 export const TrackPageSchema = z
   .object({
@@ -121,7 +122,10 @@ type BoundedTrack = {
 const hasConsistentTrackPage = (track: BoundedTrack) =>
   track.items.length <= track.page.limit &&
   track.page.totalCount >= track.items.length &&
-  track.page.truncated === (track.page.nextCursor !== null);
+  track.page.truncated === (track.page.nextCursor !== null) &&
+  (track.page.cursor !== null ||
+    track.page.totalCount === track.items.length ||
+    track.page.nextCursor !== null);
 
 export const CaptionTrackSnapshotSchema = z
   .object({
@@ -219,7 +223,18 @@ export const ProjectSnapshotSchema = z
     validation: ValidationSnapshotSchema,
     certification: CertificationSnapshotSchema,
   })
-  .strict();
+  .strict()
+  .refine(
+    (project) =>
+      project.certification.status !== "Current" ||
+      (project.validation.status === "Current" &&
+        project.validation.blockerCount === 0),
+    {
+      message:
+        "Current certification requires current validation with no blockers",
+      path: ["certification", "status"],
+    },
+  );
 
 export type ActorType = z.infer<typeof ActorTypeSchema>;
 export type Actor = z.infer<typeof ActorSchema>;
