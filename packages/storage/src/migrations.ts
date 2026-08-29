@@ -249,7 +249,10 @@ export const describeImportedProject = (value: unknown): ImportedProjectDescript
   }
   try {
     /** Domain first authenticates legacy hashes and proves aggregate invariants; storage then proves its row model. */
-    const checked = validateCaptionProject(validateCaptionProjectAggregate(project));
+    const checked = validateCaptionProject(validateCaptionProjectAggregate(project, {
+      /** Only an already-parsed v0 envelope may retain its incomplete Court Record. */
+      allowLegacyCourtRecord: migratedFrom === 0,
+    }));
     return {
       mode: "preview",
       requiresHumanConfirmation: true,

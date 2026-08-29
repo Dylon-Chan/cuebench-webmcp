@@ -70,9 +70,6 @@ export type ClassifiedProjectBackupEnvelope =
   | { readonly kind: "legacy"; readonly backup: LegacyProjectBackupEnvelopeV0 }
   | { readonly kind: "newer"; readonly backup: NewerProjectBackupEnvelope };
 
-const OMIT = Symbol("cuebench-backup-omit");
-type Sanitized = BackupJsonValue | typeof OMIT;
-
 const isRecord = (value: unknown): value is Readonly<Record<string, unknown>> =>
   typeof value === "object" && value !== null && !Array.isArray(value);
 
@@ -132,25 +129,32 @@ const isExportMetadata = (value: unknown): value is ProjectBackupExportMetadata 
 
 const isBlob = (value: unknown): boolean => typeof Blob !== "undefined" && value instanceof Blob;
 
-const artifactKey = (key: string): boolean => {
+const isBinaryPayload = (value: unknown): boolean =>
+  isBlob(value)
+  || (typeof ArrayBuffer !== "undefined" && value instanceof ArrayBuffer)
+  || (typeof ArrayBuffer !== "undefined" && ArrayBuffer.isView(value));
+
+/**
+ * These are old UI-only fields, never members of CaptionProject. They are
+ * deliberately recognized only at the aggregate root so a quality-profile
+ * rule named e.g. `blob` is not silently erased from a backup.
+ */
+const rootArtifactKey = (key: string): boolean => {
   const normalized = key.replace(/[_-]/g, "").toLowerCase();
   return normalized === "objecturl"
     || normalized === "sourcevideo"
     || normalized === "sourcevideofile"
     || normalized === "sourceblob"
     || normalized === "mediablob"
-    || normalized === "blob"
-    || normalized.endsWith("blob")
+    || normalized === "narrationaudio"
+    || normalized === "narrationblob"
+    || normalized === "narrationpreview"
+    || normalized === "narrationurl"
+    || normalized === "narrationobjecturl"
     || /^narration(?:audio|blob|preview|url|objecturl)?$/.test(normalized);
 };
 
 const isMediaDataUri = (value: string): boolean => /^data:(?:video|audio)\//i.test(value);
-
-/** Byte arrays are source/narration payloads, not portable project metadata. */
-const isBinaryLikeNumericArray = (value: unknown): boolean =>
-  Array.isArray(value)
-  && value.length >= 4
-  && value.every((entry) => typeof entry === "number" && Number.isInteger(entry) && entry >= 0 && entry <= 255);
 
 const assertPortableManifestValue = (
   value: unknown,
@@ -163,21 +167,18 @@ const assertPortableManifestValue = (
     return;
   }
   if (typeof value === "string") {
-    if (value.startsWith("blob:") || isMediaDataUri(value)) {
+    if (/^blob:/i.test(value) || isMediaDataUri(value)) {
       throw new ProjectBackupManifestError(`Portable backup cannot retain media URL data at ${path}.`);
     }
     return;
   }
-  if (isBlob(value)) throw new ProjectBackupManifestError(`Portable backup cannot retain Blob data at ${path}.`);
+  if (isBinaryPayload(value)) throw new ProjectBackupManifestError(`Portable backup cannot retain binary media data at ${path}.`);
   if (typeof value !== "object" || value === undefined) {
     throw new ProjectBackupManifestError(`Portable backup value at ${path} is not JSON-compatible.`);
   }
   if (ancestors.has(value)) throw new ProjectBackupManifestError(`Portable backup cannot contain a cyclic value at ${path}.`);
   ancestors.add(value);
   if (Array.isArray(value)) {
-    if (isBinaryLikeNumericArray(value)) {
-      throw new ProjectBackupManifestError(`Portable backup cannot retain binary-like numeric data at ${path}.`);
-    }
     value.forEach((entry, index) => assertPortableManifestValue(entry, `${path}[${index}]`, ancestors));
   } else {
     const prototype = Object.getPrototypeOf(value);
@@ -185,7 +186,9 @@ const assertPortableManifestValue = (
       throw new ProjectBackupManifestError(`Portable backup value at ${path} must be a plain object.`);
     }
     for (const [key, entry] of Object.entries(value)) {
-      if (artifactKey(key)) throw new ProjectBackupManifestError(`Portable backup cannot retain ${key} at ${path}.`);
+      if (path === "project" && rootArtifactKey(key)) {
+        throw new ProjectBackupManifestError(`Portable backup cannot retain legacy media artifact ${path}.${key}.`);
+      }
       assertPortableManifestValue(entry, path.length === 0 ? key : `${path}.${key}`, ancestors);
     }
   }
@@ -199,58 +202,49 @@ const timestamp = (value: number | undefined, label: string): number | undefined
 };
 
 /**
- * Removes non-portable artifacts recursively. Paths are retained in metadata
- * so a restore preview can truthfully explain why media/narration is absent.
+ * Preserves the aggregate exactly except known legacy UI media fields at its
+ * root. A hidden binary/media value is rejected rather than quietly deleting
+ * legitimate project data from the portable history.
  */
-const sanitizeForBackup = (value: unknown, path: string, excluded: string[]): Sanitized => {
+const sanitizeForBackup = (value: unknown, path: string, excluded: string[]): BackupJsonValue => {
   if (value === null || typeof value === "boolean" || typeof value === "number" || typeof value === "string") {
     if (typeof value === "number" && !Number.isFinite(value)) throw new TypeError(`Backup cannot serialize non-finite number at ${path}.`);
-    if (typeof value === "string" && (value.startsWith("blob:") || isMediaDataUri(value))) {
-      excluded.push(path);
-      return OMIT;
+    if (typeof value === "string" && (/^blob:/i.test(value) || isMediaDataUri(value))) {
+      throw new TypeError(`Backup cannot retain media URL data at ${path}.`);
     }
     return value;
   }
   if (value === undefined || typeof value === "function" || typeof value === "symbol" || typeof value === "bigint") {
-    excluded.push(path);
-    return OMIT;
+    throw new TypeError(`Backup value at ${path} is not JSON-compatible.`);
   }
-  if (isBlob(value)) {
-    excluded.push(path);
-    return OMIT;
+  if (isBinaryPayload(value)) {
+    throw new TypeError(`Backup cannot retain binary media data at ${path}.`);
   }
   if (Array.isArray(value)) {
-    if (isBinaryLikeNumericArray(value)) {
-      excluded.push(path);
-      return OMIT;
-    }
     const result: BackupJsonValue[] = [];
     for (let index = 0; index < value.length; index += 1) {
-      const child = sanitizeForBackup(value[index], `${path}[${index}]`, excluded);
-      if (child !== OMIT) result.push(child);
+      result.push(sanitizeForBackup(value[index], `${path}[${index}]`, excluded));
     }
     return result;
   }
   if (!isRecord(value) || (Object.getPrototypeOf(value) !== Object.prototype && Object.getPrototypeOf(value) !== null)) {
-    excluded.push(path);
-    return OMIT;
+    throw new TypeError(`Backup value at ${path} must be a plain JSON object.`);
   }
   const result: Record<string, BackupJsonValue> = {};
   for (const [key, childValue] of Object.entries(value)) {
     const childPath = path.length === 0 ? key : `${path}.${key}`;
-    if (artifactKey(key)) {
+    if (path === "project" && rootArtifactKey(key)) {
       excluded.push(childPath);
       continue;
     }
-    const child = sanitizeForBackup(childValue, childPath, excluded);
-    if (child !== OMIT) result[key] = child;
+    result[key] = sanitizeForBackup(childValue, childPath, excluded);
   }
   return result;
 };
 
 const sanitizedRecord = (value: unknown, path: string, excluded: string[]): Readonly<Record<string, BackupJsonValue>> => {
   const sanitized = sanitizeForBackup(value, path, excluded);
-  if (sanitized === OMIT || Array.isArray(sanitized) || !isRecord(sanitized)) {
+  if (Array.isArray(sanitized) || !isRecord(sanitized)) {
     throw new TypeError(`${path || "Backup value"} must be a portable object.`);
   }
   return sanitized;

@@ -14,7 +14,12 @@ const nonBlankText = z.string().min(1).refine((value) => value.trim().length > 0
   message: "Text must contain a non-whitespace character.",
 });
 const boundedText = (maximum: number) => nonBlankText.max(maximum);
-const sha256 = z.string().regex(/^[0-9a-f]{64}$/, "Expected a canonical lowercase SHA-256 hash.");
+/**
+ * Media digests follow MediaSourceSnapshotSchema: legacy backups may carry
+ * uppercase hexadecimal, which the domain import canonicalizes to lowercase
+ * only after authenticating their aggregate relationships.
+ */
+const sha256 = z.string().regex(/^[0-9a-f]{64}$/i, "Expected a SHA-256 hash.");
 const hash = z.string().regex(/^sha256:[0-9a-f]{64}$/, "Expected a SHA-256 hash.");
 /** Includes authenticated legacy forms so the domain can deterministically upgrade them. */
 const certificationHash = z.string().regex(/^sha256(?::v2)?:[0-9a-f]{64}$/, "Expected a certification snapshot hash.");

@@ -283,16 +283,20 @@ export const previewProjectImport = (
   }
 
   let checkedProject: CaptionProject;
+  /** A current v1 input cannot claim legacy Court Record leniency through a custom adapter. */
+  const aggregateOptions = {
+    allowLegacyCourtRecord: envelope.kind === "legacy" && migrated.migratedFrom === 0,
+  };
   try {
     /** A custom storage migration is never a substitute for the public aggregate proof. */
-    checkedProject = validateCaptionProjectAggregate(migrated.project);
+    checkedProject = validateCaptionProjectAggregate(migrated.project, aggregateOptions);
   } catch (error) {
     if (error instanceof CaptionProjectAggregateError) {
       throw new BackupImportError("INVALID_ARGUMENT", error.message);
     }
     throw error;
   }
-  const project = validateCaptionProjectAggregate(staleDerivedArtifacts(checkedProject));
+  const project = validateCaptionProjectAggregate(staleDerivedArtifacts(checkedProject), aggregateOptions);
   const expectedSha256 = normalSha256(project.media.sha256);
   const relink = options.relinkedMedia === undefined
     ? { status: "required" as const, expectedSha256 }
@@ -311,7 +315,7 @@ export const previewProjectImport = (
   let validatedRelinkedProject: CaptionProject;
   try {
     /** Mirrors RelinkMedia's all-revision/gap timing invariant before canImport becomes true. */
-    validatedRelinkedProject = validateCaptionProjectAggregate(relinkedProject);
+    validatedRelinkedProject = validateCaptionProjectAggregate(relinkedProject, aggregateOptions);
   } catch (error) {
     if (error instanceof CaptionProjectAggregateError) {
       throw new BackupImportError("INVALID_ARGUMENT", error.message);

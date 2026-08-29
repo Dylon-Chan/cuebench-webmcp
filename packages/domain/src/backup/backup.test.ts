@@ -59,6 +59,24 @@ describe("project backups", () => {
     expect(json).not.toContain("preview");
   });
 
+  it("preserves legitimate aggregate configuration arrays exactly instead of treating them as media bytes", () => {
+    const project: CaptionProject = {
+      ...fixtureProject(),
+      qualityProfile: {
+        ...fixtureProject().qualityProfile,
+        rules: {
+          ...fixtureProject().qualityProfile.rules,
+          presentation: { rgba: [0, 127, 255, 255], stops: [0, 25, 50, 100] },
+        },
+      },
+    };
+
+    const backup = exportProjectBackup(project);
+
+    expect(backup.project.qualityProfile.rules).toEqual(project.qualityProfile.rules);
+    expect(backup.exportMetadata.excludedArtifactPaths).toEqual([]);
+  });
+
   it("uses an injected storage preview migration and requires a safety backup", () => {
     const project = fixtureProject();
     const backup = exportProjectBackup(project);
@@ -266,7 +284,7 @@ describe("project backups", () => {
     }
   });
 
-  it("accepts b8 v1 round-trip metadata while rejecting embedded media-like metadata", () => {
+  it("accepts b8 v1 round-trip metadata and safe legacy extras while rejecting actual media payloads", () => {
     const backup = exportProjectBackup(fixtureProject());
     const b8Compatible = rehashBackup({
       ...backup,
@@ -274,33 +292,111 @@ describe("project backups", () => {
     });
     expect(previewProjectImport(b8Compatible, { actor: human })).toMatchObject({ mode: "preview" });
 
+    const safeLegacyMetadata = rehashBackup({
+      ...backup,
+      exportMetadata: {
+        ...backup.exportMetadata,
+        additional: { palette: [0, 1, 2, 255], captionTheme: "high-contrast" },
+      },
+    });
+    expect(previewProjectImport(safeLegacyMetadata, { actor: human })).toMatchObject({ mode: "preview" });
+
     const mediaLikeMetadata = rehashBackup({
       ...backup,
       exportMetadata: {
         ...backup.exportMetadata,
-        additional: { retained: "data:audio/wav;base64,AAAA", byteValues: [0, 1, 2, 255] },
+        additional: { retained: "data:audio/wav;base64,AAAA" },
       },
     });
     expect(() => previewProjectImport(mediaLikeMetadata, { actor: human })).toThrow(/portable|media|backup/i);
+
+    const typedMediaMetadata = rehashBackup({
+      ...backup,
+      exportMetadata: {
+        ...backup.exportMetadata,
+        additional: { retained: new Uint8Array([0, 1, 2, 255]) },
+      } as unknown as typeof backup.exportMetadata,
+    });
+    expect(() => previewProjectImport(typedMediaMetadata, { actor: human })).toThrow(/portable|media|backup/i);
   });
 
-  it("removes data-media URLs and byte payloads even when their keys do not disclose the artifact type", () => {
+  it("does not silently strip unmodeled aggregate fields while refusing actual media URLs", () => {
     const project = {
       ...fixtureProject(),
       arbitrary: {
-        alpha: "data:video/mp4;base64,AAAA",
         beta: [0, 1, 2, 255, 4],
       },
     } as CaptionProject & Record<string, unknown>;
     const backup = exportProjectBackup(project);
-    const json = JSON.stringify(backup);
 
-    expect(json).not.toContain("data:video/");
-    expect(json).not.toContain("[0,1,2,255,4]");
-    expect(backup.exportMetadata.excludedArtifactPaths).toEqual(expect.arrayContaining([
-      "project.arbitrary.alpha",
-      "project.arbitrary.beta",
-    ]));
+    expect((backup.project as unknown as Record<string, unknown>).arbitrary).toEqual({ beta: [0, 1, 2, 255, 4] });
+    expect(backup.exportMetadata.excludedArtifactPaths).toEqual([]);
+
+    expect(() => exportProjectBackup({
+      ...fixtureProject(),
+      arbitrary: { retained: "data:video/mp4;base64,AAAA" },
+    } as CaptionProject & Record<string, unknown>)).toThrow(/media|portable|backup/i);
+  });
+
+  it("normalizes uppercase media digests from old and current v1 backups before relink comparison", () => {
+    const uppercaseProject: CaptionProject = {
+      ...fixtureProject(),
+      media: { ...fixtureProject().media, sha256: "A".repeat(64) },
+    };
+    const current = exportProjectBackup(uppercaseProject);
+    const { validationHistory: _history, exportHistory: _exports, ...oldProject } = uppercaseProject;
+    void _history;
+    void _exports;
+    const old = exportProjectBackup(oldProject as CaptionProject);
+
+    for (const backup of [current, old]) {
+      const preview = previewProjectImport(backup, {
+        actor: human,
+        relinkedMedia: { sourceId: "media-1", sha256: "a".repeat(64), durationMs: 60_000 },
+      });
+      if (preview.mode !== "preview") throw new Error("expected preview");
+      expect(preview.mediaRelink.status).toBe("verified");
+      expect(preview.project.media.sha256).toBe("a".repeat(64));
+    }
+  });
+
+  it("rejects forged, out-of-order, and actor-illegal Court Record events before they can inflate human interventions", () => {
+    const sustained = applyCommand(fixtureProject(), {
+      type: "SustainItem",
+      actor: human,
+      itemId: "c05",
+      expectedItemRevision: 1,
+      expectedProjectRevision: 1,
+    }).project;
+    const focused = applyCommand(sustained, {
+      type: "FocusItem",
+      actor: human,
+      itemId: "c05",
+      expectedItemRevision: 2,
+      expectedProjectRevision: 2,
+    }).project;
+    const sustainEvent = sustained.courtRecord[0];
+    const focusEvent = focused.courtRecord[1];
+    if (sustainEvent === undefined || focusEvent === undefined) throw new Error("expected durable court events");
+    const forged = rehashBackup({
+      ...exportProjectBackup(sustained),
+      project: { ...sustained, courtRecord: [...sustained.courtRecord, { ...sustainEvent, eventId: "forged-sustain" }] },
+    });
+    const outOfOrder = rehashBackup({
+      ...exportProjectBackup(focused),
+      project: { ...focused, courtRecord: [focusEvent, sustainEvent] },
+    });
+    const illegalActor = rehashBackup({
+      ...exportProjectBackup(sustained),
+      project: {
+        ...sustained,
+        courtRecord: [{ ...sustainEvent, actor: { type: "BrowserAgent" as const, id: "browser-agent" } }],
+      },
+    });
+
+    for (const malformed of [forged, outOfOrder, illegalActor]) {
+      expect(() => previewProjectImport(malformed, { actor: human })).toThrow(/court|human|order|transition|aggregate/i);
+    }
   });
 
   it("backfills old validation history and keeps persistent project findings unresolved across revisions", () => {

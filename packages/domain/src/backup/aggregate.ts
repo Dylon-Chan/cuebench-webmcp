@@ -4,12 +4,15 @@ import type {
   AudioDescriptionBeat,
   CaptionCue,
   CaptionProject,
+  DomainEvent,
   EvidenceProvenance,
   ProjectCertification,
 } from "../model";
 import { canonicalSerialize } from "../quality/hash";
 import {
   applicableWarningWaivers,
+  certificationReadinessHashForSnapshot,
+  certificationSnapshotHashFor,
   upgradeLegacyCertificationSnapshot,
   verifyCertificationSnapshot,
 } from "../quality/certification";
@@ -20,6 +23,7 @@ import {
   validateValidationInput,
   validationInputHash,
   validationInputHashFor,
+  type ValidationInputSnapshot,
   type ValidationRun,
 } from "../quality/validate";
 
@@ -29,6 +33,14 @@ export class CaptionProjectAggregateError extends Error {
     super(message);
     this.name = "CaptionProjectAggregateError";
   }
+}
+
+/**
+ * Only the storage v0 migration may opt into a deliberately incomplete Court
+ * Record. Current v1 import always proves the complete command history.
+ */
+export interface CaptionProjectAggregateValidationOptions {
+  readonly allowLegacyCourtRecord?: boolean;
 }
 
 const clone = <Value>(value: Value): Value => structuredClone(value);
@@ -166,7 +178,246 @@ const assertCertificationPointer = (project: CaptionProject): void => {
   );
 };
 
-const assertRelationships = (project: CaptionProject): void => {
+const courtActors: Readonly<Record<string, readonly Actor["type"][]>> = {
+  SelectItem: ["Human", "BrowserAgent", "CueBenchAI", "System"],
+  FocusItem: ["Human", "BrowserAgent", "CueBenchAI", "System"],
+  FocusGap: ["Human", "BrowserAgent", "CueBenchAI", "System"],
+  AdjustCueTiming: ["Human", "BrowserAgent", "CueBenchAI"],
+  SplitCue: ["Human", "BrowserAgent", "CueBenchAI"],
+  MergeCue: ["Human", "BrowserAgent", "CueBenchAI"],
+  ReviseCue: ["Human", "BrowserAgent", "CueBenchAI"],
+  AdjustAudioDescriptionTiming: ["Human", "BrowserAgent", "CueBenchAI"],
+  ReviseAudioDescription: ["Human", "BrowserAgent", "CueBenchAI"],
+  ProposeAudioDescriptionInGap: ["Human", "BrowserAgent", "CueBenchAI"],
+  MarkItemAgentReady: ["BrowserAgent"],
+  ObjectItem: ["Human"],
+  SustainItem: ["Human"],
+  ValidateProject: ["System"],
+  RecordExportRoundTrip: ["System"],
+  WaiveWarning: ["Human"],
+  CertifyProject: ["Human"],
+  ApplyProfile: ["Human"],
+  RelinkMedia: ["Human"],
+  StartGenerationRun: ["CueBenchAI"],
+  ReleaseGenerationRun: ["CueBenchAI", "System"],
+  ExportRoundTripVerified: ["System"],
+  GenerationRunStageChanged: ["System"],
+  ProjectSerialized: ["System"],
+  RecoveryPerformed: ["System"],
+  ValidationMigrated: ["System"],
+  LegacyItemRevisionPayloadHistoryUnavailable: ["System"],
+};
+
+const itemCourtEventTypes = new Set([
+  "SelectItem",
+  "FocusItem",
+  "AdjustCueTiming",
+  "SplitCue",
+  "MergeCue",
+  "ReviseCue",
+  "AdjustAudioDescriptionTiming",
+  "ReviseAudioDescription",
+  "ProposeAudioDescriptionInGap",
+  "MarkItemAgentReady",
+  "ObjectItem",
+  "SustainItem",
+]);
+
+const statefulItemCourtEventTypes = new Set([
+  "AdjustCueTiming",
+  "SplitCue",
+  "MergeCue",
+  "ReviseCue",
+  "AdjustAudioDescriptionTiming",
+  "ReviseAudioDescription",
+  "ProposeAudioDescriptionInGap",
+  "MarkItemAgentReady",
+  "ObjectItem",
+  "SustainItem",
+]);
+
+const semanticRevisionCauseTypes = new Set([
+  "AdjustCueTiming",
+  "SplitCue",
+  "MergeCue",
+  "ReviseCue",
+  "AdjustAudioDescriptionTiming",
+  "ReviseAudioDescription",
+  "ProposeAudioDescriptionInGap",
+]);
+
+const sameActor = (left: Actor, right: Actor): boolean => left.type === right.type && left.id === right.id;
+
+const itemForCourtEvent = (project: CaptionProject, event: DomainEvent): CaptionCue | AudioDescriptionBeat => {
+  requireAggregate(event.itemId !== undefined, `Court Record ${event.type} requires an item id.`);
+  const item = project.captions.items[event.itemId] ?? project.audioDescriptions.items[event.itemId];
+  requireAggregate(item !== undefined, `Court Record ${event.type} references an unknown item.`);
+  return item;
+};
+
+const revisionClaim = (item: CaptionCue | AudioDescriptionBeat, itemRevision: number): string =>
+  `${item.kind}\u0000${item.itemId}\u0000${itemRevision}`;
+
+const assertCourtRecord = (
+  project: CaptionProject,
+  options: CaptionProjectAggregateValidationOptions,
+): void => {
+  const legacy = options.allowLegacyCourtRecord === true;
+  const events = project.courtRecord;
+  unique(events.map((event) => event.eventId), "Court Record event ids");
+  if (events.length === 0) return;
+
+  const claimedRevisions = new Set<string>();
+  let previousRevision = 0;
+
+  for (let index = 0; index < events.length; index += 1) {
+    const event = events[index]!;
+    requireAggregate(
+      event.projectRevision >= (legacy ? 1 : 2) && event.projectRevision <= project.projectRevision,
+      "Court Record event has an illegal project revision.",
+    );
+    requireAggregate(event.projectRevision >= previousRevision, "Court Record events must be ordered by project revision.");
+    previousRevision = event.projectRevision;
+
+    if (!legacy) {
+      requireAggregate(
+        events.length === project.projectRevision - 1
+          && event.projectRevision === index + 2
+          && event.eventId === `${project.projectId}:${event.projectRevision}:${index + 1}`,
+        "Court Record must contain the canonical, complete command history.",
+      );
+    }
+
+    const allowedActors = courtActors[event.type];
+    requireAggregate(
+      allowedActors !== undefined || legacy,
+      `Court Record event type ${event.type} is not a known durable command.`,
+    );
+    if (allowedActors !== undefined) {
+      requireAggregate(
+        allowedActors.includes(event.actor.type),
+        `Court Record ${event.type} has invalid actor provenance.`,
+      );
+    }
+    if (!legacy && event.type !== "ObjectItem") {
+      requireAggregate(event.detail === undefined, `Court Record ${event.type} cannot carry arbitrary detail.`);
+    }
+
+    if (event.type === "FocusGap") {
+      requireAggregate(event.itemId !== undefined && project.audioDescriptionGaps[event.itemId] !== undefined, "Court Record FocusGap references an unknown gap.");
+    } else if (itemCourtEventTypes.has(event.type)) {
+      const item = itemForCourtEvent(project, event);
+      if (statefulItemCourtEventTypes.has(event.type)) {
+        const matchingRevision = item.revisions.find((revision) => {
+          if (claimedRevisions.has(revisionClaim(item, revision.itemRevision)) || !sameActor(revision.actor, event.actor)) return false;
+          if (event.type === "MarkItemAgentReady") return revision.state === "AgentReady" && (legacy || revision.cause === event.type);
+          if (event.type === "ObjectItem") {
+            return revision.state === "Objected" && (legacy || (event.detail !== undefined && revision.cause === event.detail));
+          }
+          if (event.type === "SustainItem") return revision.state === "Sustained" && (legacy || revision.cause === event.type);
+          return legacy || revision.cause === event.type;
+        });
+        requireAggregate(matchingRevision !== undefined, `Court Record ${event.type} has no matching legal item transition.`);
+        claimedRevisions.add(revisionClaim(item, matchingRevision.itemRevision));
+        if (event.type === "ObjectItem" && !legacy) {
+          requireAggregate(
+            typeof event.detail === "string" && event.detail.trim().length > 0 && event.detail === matchingRevision.cause,
+            "Court Record objection detail does not bind its item transition.",
+          );
+        }
+      }
+    }
+  }
+
+  if (legacy) return;
+  for (const item of [...Object.values(project.captions.items), ...Object.values(project.audioDescriptions.items)]) {
+    for (const revision of item.revisions) {
+      const recordedTransition = revision.itemRevision > 1
+        && (revision.state === "AgentReady" || revision.state === "Objected" || revision.state === "Sustained" || semanticRevisionCauseTypes.has(revision.cause));
+      const proposedInGap = revision.itemRevision === 1 && revision.cause === "ProposeAudioDescriptionInGap";
+      if (recordedTransition || proposedInGap) {
+        requireAggregate(
+          claimedRevisions.has(revisionClaim(item, revision.itemRevision)),
+          "Item revision is missing its Court Record transition.",
+        );
+      }
+    }
+  }
+
+  /** The final command's visible selection must still be reflected by the durable projection. */
+  const last = events.at(-1)!;
+  if (last.type === "FocusGap") {
+    requireAggregate(
+      last.itemId !== undefined
+        && project.selectedItem !== null
+        && project.selectedItem.kind === "AudioDescriptionGap"
+        && project.selectedItem.itemId === last.itemId,
+      "Final Court Record gap focus does not match the current selection.",
+    );
+  } else if (last.type === "SelectItem" || last.type === "FocusItem" || statefulItemCourtEventTypes.has(last.type)) {
+    const item = itemForCourtEvent(project, last);
+    requireAggregate(
+      project.selectedItem !== null
+        && project.selectedItem.kind === item.kind
+        && project.selectedItem.itemId === item.itemId
+        && project.selectedItem.itemRevision === item.current.itemRevision,
+      "Final Court Record item transition does not match the current selection.",
+    );
+  }
+};
+
+const normalizedMedia = <Media extends { readonly sha256: string }>(media: Media): Media => ({
+  ...media,
+  sha256: media.sha256.toLowerCase(),
+});
+
+const normalizedEvidence = <Evidence extends { readonly mediaSha256: string }>(
+  evidence: readonly Evidence[],
+): readonly Evidence[] => evidence.map((entry) => ({ ...entry, mediaSha256: entry.mediaSha256.toLowerCase() }));
+
+const normalizedValidationInput = (input: ValidationInputSnapshot): ValidationInputSnapshot => ({
+  ...input,
+  media: normalizedMedia(input.media),
+  evidence: normalizedEvidence(input.evidence),
+});
+
+const normalizedValidationRun = (run: ValidationRun): ValidationRun =>
+  validateValidationInput(normalizedValidationInput(run.input));
+
+const normalizedCertification = (certification: ProjectCertification): ProjectCertification => {
+  const { certificationSnapshotHash: _previousHash, ...content } = certification;
+  void _previousHash;
+  const withoutHash: Omit<ProjectCertification, "certificationSnapshotHash"> = {
+    ...content,
+    media: normalizedMedia(certification.media),
+    evidence: normalizedEvidence(certification.evidence),
+    validationRun: normalizedValidationRun(certification.validationRun),
+  };
+  const readinessHash = certificationReadinessHashForSnapshot({
+    ...withoutHash,
+    certificationSnapshotHash: `sha256:v2:${"0".repeat(64)}`,
+  });
+  const normalizedContent = { ...withoutHash, readinessHash };
+  return {
+    ...normalizedContent,
+    certificationSnapshotHash: certificationSnapshotHashFor(normalizedContent),
+  };
+};
+
+/** Normalizes only raw media-digest casing after the original aggregate authenticates. */
+const normalizeMediaDigestCasing = (project: CaptionProject): CaptionProject => ({
+  ...project,
+  media: normalizedMedia(project.media),
+  evidence: normalizedEvidence(project.evidence),
+  validationRun: project.validationRun === null ? null : normalizedValidationRun(project.validationRun),
+  validationHistory: project.validationHistory.map(normalizedValidationRun),
+  certifications: project.certifications.map(normalizedCertification),
+});
+
+const assertRelationships = (
+  project: CaptionProject,
+  options: CaptionProjectAggregateValidationOptions,
+): void => {
   const globalIds = new Set<string>();
   const claimGlobalId = (id: string) => {
     requireAggregate(!globalIds.has(id), "Caption, audio-description, and gap ids must be globally unique.");
@@ -272,10 +523,6 @@ const assertRelationships = (project: CaptionProject): void => {
   if (project.activeGenerationRun !== null) {
     requireAggregate(project.activeGenerationRun.actor.type === "CueBenchAI", "Only CueBench AI may hold a generation write lease.");
   }
-  unique(project.courtRecord.map((event) => event.eventId), "Court Record event ids");
-  for (const event of project.courtRecord) {
-    requireAggregate(event.projectRevision <= project.projectRevision, "Court Record event is from a future project revision.");
-  }
   for (const [findingId, waiver] of Object.entries(project.warningWaivers)) {
     requireAggregate(
       findingId === waiver.findingId && waiver.projectRevision <= project.projectRevision && waiver.actor.type === "Human",
@@ -283,6 +530,7 @@ const assertRelationships = (project: CaptionProject): void => {
     );
   }
   assertCertificationPointer(project);
+  assertCourtRecord(project, options);
 };
 
 /**
@@ -291,7 +539,10 @@ const assertRelationships = (project: CaptionProject): void => {
  * It is intentionally in domain so public import does not need a storage
  * dependency or optional adapter to validate untrusted v1 JSON.
  */
-export const validateCaptionProjectAggregate = (value: unknown): CaptionProject => {
+export const validateCaptionProjectAggregate = (
+  value: unknown,
+  options: CaptionProjectAggregateValidationOptions = {},
+): CaptionProject => {
   const parsed = CaptionProjectAggregateSchema.safeParse(normalizeLegacyHistories(value));
   if (!parsed.success) {
     const issue = parsed.error.issues[0];
@@ -304,6 +555,9 @@ export const validateCaptionProjectAggregate = (value: unknown): CaptionProject 
     return upgraded;
   });
   const project: CaptionProject = { ...parsedProject, certifications: upgradedCertifications };
-  assertRelationships(project);
-  return clone(project);
+  /** Authenticate original case-sensitive hashes before canonicalizing raw digests. */
+  assertRelationships(project, options);
+  const normalized = normalizeMediaDigestCasing(project);
+  assertRelationships(normalized, options);
+  return clone(normalized);
 };

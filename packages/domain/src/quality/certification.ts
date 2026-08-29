@@ -20,7 +20,8 @@ import {
 const compareText = (left: string, right: string): number => left < right ? -1 : left > right ? 1 : 0;
 
 const SHA256_HASH = /^sha256:[0-9a-f]{64}$/;
-const SHA256 = /^[0-9a-f]{64}$/;
+/** Raw media digests retain MediaSourceSnapshot's case-insensitive wire compatibility. */
+const SHA256 = /^[0-9a-f]{64}$/i;
 
 /**
  * A hash format is reported only after its digest and all snapshot semantics
