@@ -83,13 +83,13 @@ export type DomainCommand =
   | (CommandBase & {
       readonly type: "FocusGap";
       readonly gapId: string;
-      readonly gapRevision: number;
+      readonly expectedGapRevision: number;
     })
   | (CommandBase & {
       readonly type: "ProposeAudioDescriptionInGap";
       readonly gapId: string;
-      readonly expectedSelectionId?: string;
-      readonly expectedGapRevision?: number;
+      readonly expectedSelectionId: string;
+      readonly expectedGapRevision: number;
       readonly beatId: string;
       readonly startMs: number;
       readonly endMs: number;
@@ -120,6 +120,7 @@ export type DomainCommand =
       readonly type: "AppendCourtRecord";
       readonly eventType: SystemCourtRecordEventType;
       readonly detail?: string;
+      readonly payload?: Readonly<Record<string, unknown>>;
       readonly itemId?: string;
       readonly deterministic?: boolean;
     })

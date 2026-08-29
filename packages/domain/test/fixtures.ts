@@ -20,7 +20,7 @@ export const fixtureProject = (options: {
       {
         kind: "CaptionCue",
         itemId: "c05",
-        state: currentState,
+        state: "Proposed",
         startMs: 1_000,
         endMs: 3_000,
         text: "Doctor Nguyen explains free energy.",
@@ -52,6 +52,9 @@ export const fixtureProject = (options: {
         cause: "fixture",
       },
     ],
+    audioDescriptionGaps: [
+      { gapId: "gap-1", gapRevision: 1, state: "Available", startMs: 9_000, endMs: 11_000 },
+    ],
   });
   const base = project.captions.items.c05;
   if (base === undefined) throw new Error("fixture cue missing");
@@ -61,6 +64,9 @@ export const fixtureProject = (options: {
       ...base.current,
       itemRevision: revision,
       state: revision === itemRevision ? currentState : "Proposed",
+      actor: revision === itemRevision && (currentState === "Objected" || currentState === "Sustained")
+        ? { type: "Human", id: "teacher" }
+        : base.current.actor,
       parentItemRevision: revision === 1 ? null : revision - 1,
     });
   }

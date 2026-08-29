@@ -208,15 +208,21 @@ describe("domain reducer", () => {
   });
 
   it("proposes a gap beat and records deterministic Court Record events", () => {
-    const proposal = applyCommand(fixtureProject(), {
+    const project = applyCommand(fixtureProject(), {
+      type: "FocusGap", actor: { type: "Human", id: "teacher" }, gapId: "gap-1",
+      expectedGapRevision: 1, expectedProjectRevision: 1,
+    }).project;
+    const proposal = applyCommand(project, {
       type: "ProposeAudioDescriptionInGap",
       actor: { type: "CueBenchAI", id: "cuebench-ai" },
       gapId: "gap-1",
+      expectedSelectionId: "gap-1",
+      expectedGapRevision: 1,
       beatId: "ad02",
       startMs: 9_000,
       endMs: 11_000,
       description: "A graph label highlights delta G.",
-      expectedProjectRevision: 1,
+      expectedProjectRevision: 2,
     });
     expect(proposal.project.audioDescriptions.items.ad02?.current.state).toBe("Proposed");
     const record = applyCommand(proposal.project, {
@@ -225,7 +231,7 @@ describe("domain reducer", () => {
       eventType: "ValidationMigrated",
       detail: "Schema version 1",
       deterministic: true,
-      expectedProjectRevision: 2,
+      expectedProjectRevision: 3,
     });
     expect(record.events[0]).toMatchObject({ type: "ValidationMigrated", detail: "Schema version 1" });
   });
@@ -291,24 +297,56 @@ describe("domain reducer", () => {
     }).error?.code).toBe("STALE_SELECTION");
   });
 
+  it("binds a scoped selection to its mutation target rather than another same-kind item", () => {
+    const focused = applyCommand(fixtureProject(), {
+      type: "FocusItem", actor: { type: "Human", id: "teacher" }, itemId: "c05",
+      expectedItemRevision: 1, expectedProjectRevision: 1,
+    }).project;
+    const before = JSON.stringify(focused);
+    const result = applyCommand(focused, {
+      type: "ReviseCue", actor: { type: "Human", id: "teacher" }, cueId: "c06",
+      expectedSelectionId: "c05", expectedItemRevision: 1, expectedProjectRevision: 2,
+      patch: { text: "This must not edit c06." },
+    });
+    expect(result.error?.code).toBe("STALE_SELECTION");
+    expect(JSON.stringify(result.project)).toBe(before);
+  });
+
   it("uses selected gap identity, revision, and availability when a scoped gap proposal is supplied", () => {
     const gap = applyCommand(fixtureProject(), {
       type: "FocusGap", actor: { type: "Human", id: "teacher" }, gapId: "gap-1",
-      gapRevision: 4, expectedProjectRevision: 1,
+      expectedGapRevision: 1, expectedProjectRevision: 1,
     }).project;
     const result = applyCommand(gap, {
       type: "ProposeAudioDescriptionInGap", actor: { type: "BrowserAgent", id: "browser-agent" },
-      gapId: "gap-1", expectedSelectionId: "gap-1", expectedGapRevision: 4,
+      gapId: "gap-1", expectedSelectionId: "gap-1", expectedGapRevision: 1,
       beatId: "ad02", startMs: 9_000, endMs: 11_000, description: "A graph appears.",
       expectedProjectRevision: 2,
     });
     expect(result.error).toBeUndefined();
     expect(applyCommand(gap, {
       type: "ProposeAudioDescriptionInGap", actor: { type: "BrowserAgent", id: "browser-agent" },
-      gapId: "gap-1", expectedSelectionId: "gap-1", expectedGapRevision: 3,
+      gapId: "gap-1", expectedSelectionId: "gap-1", expectedGapRevision: 2,
       beatId: "ad02", startMs: 9_000, endMs: 11_000, description: "A graph appears.",
       expectedProjectRevision: 2,
     }).error?.code).toBe("STALE_SELECTION");
+    expect(applyCommand(result.project, {
+      type: "FocusGap", actor: { type: "Human", id: "teacher" }, gapId: "gap-1",
+      expectedGapRevision: 2, expectedProjectRevision: 3,
+    }).error?.code).toBe("STALE_SELECTION");
+  });
+
+  it("requires a known focused available gap for every gap proposal", () => {
+    const project = fixtureProject();
+    const before = JSON.stringify(project);
+    const result = applyCommand(project, {
+      type: "ProposeAudioDescriptionInGap", actor: { type: "Human", id: "teacher" },
+      gapId: "invented-gap", expectedSelectionId: "invented-gap", expectedGapRevision: 1,
+      beatId: "ad02", startMs: 9_000, endMs: 11_000, description: "No invented gaps.",
+      expectedProjectRevision: 1,
+    });
+    expect(result.error?.code).toBe("STALE_SELECTION");
+    expect(JSON.stringify(result.project)).toBe(before);
   });
 
   it("rejects conflicting aliases, short media relinks, and non-system Court Record authority", () => {
@@ -352,5 +390,88 @@ describe("domain reducer", () => {
       type: "MergeCue", actor: { type: "Human", id: "teacher" }, cueId: "c05", adjacentCueId: "c06",
       expectedItemRevision: 1, expectedAdjacentItemRevision: 1, expectedProjectRevision: 1,
     }).error?.code).toBe("INVALID_ARGUMENT");
+  });
+
+  it("enforces initial actor/state authority and global IDs for split and AD additions", () => {
+    expect(() => createProject({
+      projectId: "bad-actor", title: "Bad actor", media: { sourceId: "m", sha256: "c".repeat(64), durationMs: 1_000, relinkState: "Linked" },
+      captions: [{ kind: "CaptionCue", itemId: "c1", state: "Sustained", startMs: 0, endMs: 500, text: "Bad", speaker: null, actor: { type: "BrowserAgent", id: "agent" }, cause: "test" }],
+    })).toThrow(RangeError);
+    expect(() => createProject({
+      projectId: "duplicate", title: "Duplicate", media: { sourceId: "m", sha256: "c".repeat(64), durationMs: 1_000, relinkState: "Linked" },
+      captions: [{ kind: "CaptionCue", itemId: "same", state: "Proposed", startMs: 0, endMs: 500, text: "One", speaker: null, actor: { type: "Human", id: "teacher" }, cause: "test" }],
+      audioDescriptions: [{ kind: "AudioDescriptionBeat", itemId: "same", state: "Proposed", startMs: 500, endMs: 900, description: "Two", actor: { type: "Human", id: "teacher" }, cause: "test" }],
+    })).toThrow(RangeError);
+    const project = fixtureProject();
+    expect(applyCommand(project, {
+      type: "SplitCue", actor: { type: "Human", id: "teacher" }, cueId: "c05", newCueId: "ad01", splitMs: 2_000,
+      expectedItemRevision: 1, expectedProjectRevision: 1,
+    }).error?.code).toBe("INVALID_ARGUMENT");
+    const focused = applyCommand(project, {
+      type: "FocusGap", actor: { type: "Human", id: "teacher" }, gapId: "gap-1", expectedGapRevision: 1, expectedProjectRevision: 1,
+    }).project;
+    expect(applyCommand(focused, {
+      type: "ProposeAudioDescriptionInGap", actor: { type: "Human", id: "teacher" }, gapId: "gap-1", expectedSelectionId: "gap-1", expectedGapRevision: 1,
+      beatId: "c05", startMs: 9_000, endMs: 11_000, description: "Duplicate item id.", expectedProjectRevision: 2,
+    }).error?.code).toBe("INVALID_ARGUMENT");
+  });
+
+  it("deep-clones caller-owned media, profile rules, actors, and Court Record payloads", () => {
+    const media = { sourceId: "media-1", sha256: "a".repeat(64), durationMs: 60_000, relinkState: "Linked" as const };
+    const rules: Record<string, unknown> = { nested: { maxLines: 2 } };
+    const actor = { type: "Human" as const, id: "teacher" };
+    const project = createProject({
+      projectId: "clone", title: "Clone", media, profile: { profileId: "p", name: "P", rules },
+      captions: [{ kind: "CaptionCue", itemId: "c1", state: "Proposed", startMs: 0, endMs: 1_000, text: "Text", speaker: null, actor, cause: "test" }],
+    });
+    (media as { durationMs: number }).durationMs = 1;
+    ((rules.nested as { maxLines: number }).maxLines) = 99;
+    actor.id = "mutated";
+    expect(project.media.durationMs).toBe(60_000);
+    expect((project.qualityProfile.rules.nested as { maxLines: number }).maxLines).toBe(2);
+    expect(project.captions.items.c1?.current.actor.id).toBe("teacher");
+    const recordActor = { type: "System" as const, id: "system" };
+    const payload: Record<string, unknown> = { nested: { stage: "before" } };
+    const recorded = applyCommand(project, {
+      type: "AppendCourtRecord", actor: recordActor, eventType: "ValidationMigrated", detail: "v1", payload, deterministic: true, expectedProjectRevision: 1,
+    });
+    recordActor.id = "mutated-system";
+    ((payload.nested as { stage: string }).stage) = "after";
+    expect(recorded.events[0]?.actor.id).toBe("system");
+    expect((recorded.events[0]?.payload?.nested as { stage: string }).stage).toBe("before");
+
+    const revisedActor = { type: "BrowserAgent" as const, id: "browser-agent" };
+    const revised = applyCommand(project, {
+      type: "ReviseCue", actor: revisedActor, cueId: "c1", expectedItemRevision: 1, expectedProjectRevision: 1,
+      patch: { text: "Revision clone." },
+    });
+    revisedActor.id = "changed-agent";
+    expect(revised.project.captions.items.c1?.current.actor.id).toBe("browser-agent");
+
+    const profileRules: Record<string, unknown> = { nested: { maxLines: 3 } };
+    const profiled = applyCommand(project, {
+      type: "ApplyProfile", actor: { type: "Human", id: "teacher" }, profileId: "p2", name: "P2", rules: profileRules, expectedProjectRevision: 1,
+    });
+    ((profileRules.nested as { maxLines: number }).maxLines) = 99;
+    expect((profiled.project.qualityProfile.rules.nested as { maxLines: number }).maxLines).toBe(3);
+
+    const replacement = { sourceId: "replacement", sha256: "b".repeat(64), durationMs: 60_000 };
+    const relinked = applyCommand(project, {
+      type: "RelinkMedia", actor: { type: "Human", id: "teacher" }, media: replacement, expectedProjectRevision: 1,
+    });
+    replacement.durationMs = 1;
+    expect(relinked.project.media.durationMs).toBe(60_000);
+  });
+
+  it("stales validation and certification for all review states and waivers", () => {
+    const certified = { ...fixtureProject(), validation: { status: "Current" as const, blockerCount: 0, warningCount: 1 }, certification: { status: "Current" as const, certificationId: "cert-1" } };
+    const mark = applyCommand(certified, { type: "MarkItemAgentReady", actor: { type: "BrowserAgent", id: "browser-agent" }, itemId: "c05", expectedItemRevision: 1, expectedProjectRevision: 1 });
+    expect(mark.project.validation.status).toBe("Stale");
+    const objected = applyCommand(certified, { type: "ObjectItem", actor: { type: "Human", id: "teacher" }, itemId: "c05", expectedItemRevision: 1, expectedProjectRevision: 1, reason: "Reason" });
+    expect(objected.project.certification.status).toBe("Stale");
+    const sustained = applyCommand(certified, { type: "SustainItem", actor: { type: "Human", id: "teacher" }, itemId: "c05", expectedItemRevision: 1, expectedProjectRevision: 1 });
+    expect(sustained.project.validation.status).toBe("Stale");
+    const waived = applyCommand(certified, { type: "WaiveWarning", actor: { type: "Human", id: "teacher" }, findingId: "w1", reason: "Reason", expectedProjectRevision: 1 });
+    expect(waived.project.certification.status).toBe("Stale");
   });
 });

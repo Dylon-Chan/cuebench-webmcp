@@ -61,6 +61,14 @@ export interface AudioDescriptionTrack {
   readonly items: Readonly<Record<ItemId, AudioDescriptionBeat>>;
 }
 
+export interface AudioDescriptionGap {
+  readonly gapId: string;
+  readonly gapRevision: number;
+  readonly state: "Available" | "Consumed";
+  readonly startMs: number;
+  readonly endMs: number;
+}
+
 export interface ItemSelection {
   readonly itemId: ItemId;
   readonly itemRevision: number;
@@ -103,6 +111,7 @@ export interface DomainEvent {
   readonly actor: Actor;
   readonly itemId?: string;
   readonly detail?: string;
+  readonly payload?: Readonly<Record<string, unknown>>;
 }
 
 export interface CaptionProject {
@@ -113,6 +122,7 @@ export interface CaptionProject {
   readonly media: MediaSourceSnapshot;
   readonly captions: CaptionTrack;
   readonly audioDescriptions: AudioDescriptionTrack;
+  readonly audioDescriptionGaps: Readonly<Record<string, AudioDescriptionGap>>;
   readonly selectedItem: Selection | null;
   readonly validation: ValidationSnapshot;
   readonly certification: CertificationSnapshot;
@@ -132,6 +142,7 @@ export interface CreateProjectInput {
     AudioDescriptionBeatRevision,
     "itemRevision" | "parentItemRevision"
   >[];
+  readonly audioDescriptionGaps?: readonly AudioDescriptionGap[];
 }
 
 const initialValidation = (): ValidationSnapshot => ({
@@ -162,8 +173,29 @@ const assertInitialProjectInvariant = (input: CreateProjectInput) => {
     if (!hasValidInitialTiming(input.media.durationMs, item.startMs, item.endMs)) {
       throw new RangeError("Project item timing must be integer milliseconds within media bounds.");
     }
+    if (!isInitialActorStateValid(item.actor, item.state)) {
+      throw new RangeError("Initial item actor is not permitted for its review state.");
+    }
+  }
+  for (const gap of input.audioDescriptionGaps ?? []) {
+    if (knownIds.has(gap.gapId)) throw new RangeError("Project ids must be globally unique.");
+    knownIds.add(gap.gapId);
+    if (
+      !Number.isSafeInteger(gap.gapRevision)
+      || gap.gapRevision <= 0
+      || !hasValidInitialTiming(input.media.durationMs, gap.startMs, gap.endMs)
+    ) throw new RangeError("Audio-description gaps must have valid integer timing and revision.");
   }
 };
+
+const isInitialActorStateValid = (actor: Actor, state: ReviewState) => {
+  if (!actor.id.trim() || actor.type === "System") return false;
+  if (state === "AgentReady") return actor.type === "BrowserAgent";
+  if (state === "Objected" || state === "Sustained") return actor.type === "Human";
+  return state === "Proposed";
+};
+
+const clone = <Value>(value: Value): Value => structuredClone(value);
 
 export const createProject = (input: CreateProjectInput): CaptionProject => {
   assertInitialProjectInvariant(input);
@@ -172,6 +204,7 @@ export const createProject = (input: CreateProjectInput): CaptionProject => {
   for (const source of input.captions ?? []) {
     const revision: CaptionCueRevision = {
       ...source,
+      actor: clone(source.actor),
       itemRevision: 1,
       parentItemRevision: null,
     };
@@ -190,6 +223,7 @@ export const createProject = (input: CreateProjectInput): CaptionProject => {
   for (const source of input.audioDescriptions ?? []) {
     const revision: AudioDescriptionBeatRevision = {
       ...source,
+      actor: clone(source.actor),
       itemRevision: 1,
       parentItemRevision: null,
     };
@@ -202,18 +236,24 @@ export const createProject = (input: CreateProjectInput): CaptionProject => {
     audioDescriptionOrder.push(revision.itemId);
   }
 
+  const audioDescriptionGaps: Record<string, AudioDescriptionGap> = {};
+  for (const gap of input.audioDescriptionGaps ?? []) {
+    audioDescriptionGaps[gap.gapId] = clone(gap);
+  }
+
   return {
     contractVersion: 1,
     projectId: input.projectId,
     projectRevision: 1,
     title: input.title,
-    media: input.media,
+    media: clone(input.media),
     captions: { kind: "Captions", order: captionOrder, items: captions },
     audioDescriptions: {
       kind: "AudioDescriptions",
       order: audioDescriptionOrder,
       items: audioDescriptions,
     },
+    audioDescriptionGaps,
     selectedItem: null,
     validation: initialValidation(),
     certification: initialCertification(),
@@ -221,7 +261,7 @@ export const createProject = (input: CreateProjectInput): CaptionProject => {
       profileId: input.profile?.profileId ?? "education-quality",
       revision: input.profile?.revision ?? 1,
       name: input.profile?.name ?? "Education Quality Profile",
-      rules: input.profile?.rules ?? {},
+      rules: clone(input.profile?.rules ?? {}),
     },
     warningWaivers: {},
     activeGenerationRun: null,
