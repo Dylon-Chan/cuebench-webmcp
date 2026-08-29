@@ -227,6 +227,23 @@ const sameBrowserAgent = (actor: Actor, authoredBy: Actor) =>
 
 const clone = <Value>(value: Value): Value => structuredClone(value);
 
+/**
+ * Evidence is a current binding projection rather than a mutable history.
+ * A state-only review transition preserves the exact provenance by cloning
+ * every binding that targeted the previous item revision onto the new one.
+ * Semantic edits deliberately do not use this helper.
+ */
+const carryEvidenceForReviewState = (
+  project: CaptionProject,
+  previous: CaptionCue | AudioDescriptionBeat,
+  revised: CaptionCue | AudioDescriptionBeat,
+): CaptionProject["evidence"] => project.evidence.map((evidence) => {
+  const copied = clone(evidence);
+  return evidence.itemId === previous.itemId && evidence.itemRevision === previous.current.itemRevision
+    ? { ...copied, itemRevision: revised.current.itemRevision }
+    : copied;
+});
+
 export const applyCommand = (project: CaptionProject, command: DomainCommand): CommandResult => {
   const projectError = staleProject(project, command.expectedProjectRevision);
   if (projectError !== undefined) return { project, events: [], error: projectError };
@@ -398,10 +415,20 @@ export const applyCommand = (project: CaptionProject, command: DomainCommand): C
     if (item.current.state !== "Proposed") return fail(project, "INVALID_ARGUMENT", "Only Proposed work may be marked Agent Ready.");
     if (item.kind === "CaptionCue") {
       const revised = appendCaptionRevision(item, command.actor, "AgentReady", command.type);
-      return commit(project, command, { captions: replaceCaption(project, revised), selectedItem: selectFor(revised), ...withStaleArtifacts(project) }, item.itemId);
+      return commit(project, command, {
+        captions: replaceCaption(project, revised),
+        evidence: carryEvidenceForReviewState(project, item, revised),
+        selectedItem: selectFor(revised),
+        ...withStaleArtifacts(project),
+      }, item.itemId);
     }
     const revised = appendAudioDescriptionRevision(item, command.actor, "AgentReady", command.type);
-    return commit(project, command, { audioDescriptions: replaceAudioDescription(project, revised), selectedItem: selectFor(revised), ...withStaleArtifacts(project) }, item.itemId);
+    return commit(project, command, {
+      audioDescriptions: replaceAudioDescription(project, revised),
+      evidence: carryEvidenceForReviewState(project, item, revised),
+      selectedItem: selectFor(revised),
+      ...withStaleArtifacts(project),
+    }, item.itemId);
   }
   if (command.type === "ObjectItem" || command.type === "SustainItem") {
     const leaseError = assertMutable(project, item.kind === "CaptionCue" ? "Captions" : "AudioDescriptions");
@@ -412,10 +439,20 @@ export const applyCommand = (project: CaptionProject, command: DomainCommand): C
     const cause = command.type === "ObjectItem" ? command.reason : command.type;
     if (item.kind === "CaptionCue") {
       const revised = appendCaptionRevision(item, command.actor, state, cause);
-      return commit(project, command, { captions: replaceCaption(project, revised), selectedItem: selectFor(revised), ...withStaleArtifacts(project) }, item.itemId);
+      return commit(project, command, {
+        captions: replaceCaption(project, revised),
+        evidence: carryEvidenceForReviewState(project, item, revised),
+        selectedItem: selectFor(revised),
+        ...withStaleArtifacts(project),
+      }, item.itemId);
     }
     const revised = appendAudioDescriptionRevision(item, command.actor, state, cause);
-    return commit(project, command, { audioDescriptions: replaceAudioDescription(project, revised), selectedItem: selectFor(revised), ...withStaleArtifacts(project) }, item.itemId);
+    return commit(project, command, {
+      audioDescriptions: replaceAudioDescription(project, revised),
+      evidence: carryEvidenceForReviewState(project, item, revised),
+      selectedItem: selectFor(revised),
+      ...withStaleArtifacts(project),
+    }, item.itemId);
   }
 
   if (command.type === "AdjustCueTiming" || command.type === "ReviseCue" || command.type === "SplitCue" || command.type === "MergeCue") {

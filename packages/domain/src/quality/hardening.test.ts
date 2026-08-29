@@ -40,6 +40,35 @@ const sustainedProject = (): CaptionProject => createProject({
   }],
 });
 
+const generatedEvidenceProject = (): CaptionProject => createProject({
+  projectId: "generated-evidence-project",
+  title: "Generated evidence lesson",
+  media: {
+    sourceId: "generated-evidence-media",
+    sha256: "9".repeat(64),
+    durationMs: 60_000,
+    relinkState: "Linked",
+  },
+  captions: [{
+    kind: "CaptionCue",
+    itemId: "c01",
+    state: "Proposed",
+    startMs: 1_000,
+    endMs: 3_000,
+    text: "An evidence-grounded generated caption.",
+    speaker: "Teacher",
+    actor: { type: "BrowserAgent", id: "browser-agent" },
+    cause: "generated",
+  }],
+  evidence: [{
+    evidenceId: "generated-c01-evidence",
+    projectId: "generated-evidence-project",
+    mediaSha256: "9".repeat(64),
+    itemId: "c01",
+    itemRevision: 1,
+  }],
+});
+
 const validate = (project: CaptionProject) => applyCommand(project, {
   type: "ValidateProject",
   actor: system,
@@ -217,6 +246,115 @@ describe("quality hardening regressions", () => {
         itemRevision: null,
       }],
     })).toThrow();
+  });
+
+  it("carries exact evidence bindings through state-only review transitions and can certify", () => {
+    const generated = generatedEvidenceProject();
+    const originalBinding = generated.evidence[0];
+    if (originalBinding === undefined) throw new Error("Expected generated evidence binding.");
+
+    const agentReady = applyCommand(generated, {
+      type: "MarkItemAgentReady",
+      actor: { type: "BrowserAgent", id: "browser-agent" },
+      itemId: "c01",
+      expectedItemRevision: 1,
+      expectedProjectRevision: generated.projectRevision,
+    });
+    expect(agentReady.error).toBeUndefined();
+    expect(originalBinding.itemRevision).toBe(1);
+    expect(agentReady.project.evidence).toEqual([{ ...originalBinding, itemRevision: 2 }]);
+    expect(validateProject(agentReady.project).findings.some((finding) => finding.ruleId === "evidence.stale")).toBe(false);
+
+    const sustained = applyCommand(agentReady.project, {
+      type: "SustainItem",
+      actor: human,
+      itemId: "c01",
+      expectedItemRevision: 2,
+      expectedProjectRevision: agentReady.project.projectRevision,
+    });
+    expect(sustained.error).toBeUndefined();
+    expect(sustained.project.evidence).toEqual([{ ...originalBinding, itemRevision: 3 }]);
+    expect(validateProject(sustained.project).findings.some((finding) => finding.ruleId === "evidence.stale")).toBe(false);
+
+    const validated = validate(sustained.project);
+    const readiness = prepareCertificationReview(validated.project);
+    expect(readiness.canCertify).toBe(true);
+    expect(applyCommand(validated.project, {
+      type: "CertifyProject",
+      actor: human,
+      expectedProjectRevision: validated.project.projectRevision,
+      expectedReadinessHash: readiness.readinessHash,
+      certificationId: "generated-evidence-certification",
+      certifiedAtMs: 1_700_000_000_000,
+    }).error).toBeUndefined();
+  });
+
+  it("carries each matching binding through an objection without changing its provenance", () => {
+    const generated = generatedEvidenceProject();
+    const objected = applyCommand(generated, {
+      type: "ObjectItem",
+      actor: human,
+      itemId: "c01",
+      expectedItemRevision: 1,
+      expectedProjectRevision: generated.projectRevision,
+      reason: "The interpretation needs correction.",
+    });
+    expect(objected.error).toBeUndefined();
+    expect(objected.project.evidence).toEqual([{
+      ...generated.evidence[0]!,
+      itemRevision: 2,
+    }]);
+    const evidenceFindings = validateProject(objected.project).findings.filter(
+      (finding) => finding.ruleId === "evidence.stale",
+    );
+    expect(evidenceFindings).toHaveLength(0);
+    expect(validateProject(objected.project).findings).toEqual(expect.arrayContaining([
+      expect.objectContaining({ ruleId: "review.objected-revision", severity: "blocker" }),
+    ]));
+  });
+
+  it("leaves evidence stale after text or timing revisions", () => {
+    const generated = generatedEvidenceProject();
+    const textRevised = applyCommand(generated, {
+      type: "ReviseCue",
+      actor: { type: "BrowserAgent", id: "browser-agent" },
+      cueId: "c01",
+      expectedItemRevision: 1,
+      expectedProjectRevision: generated.projectRevision,
+      patch: { text: "A semantically revised caption." },
+    });
+    expect(textRevised.error).toBeUndefined();
+    expect(textRevised.project.evidence[0]?.itemRevision).toBe(1);
+    expect(validateProject(textRevised.project).findings).toEqual(expect.arrayContaining([
+      expect.objectContaining({ ruleId: "evidence.stale", severity: "blocker" }),
+    ]));
+    const textThenAgentReady = applyCommand(textRevised.project, {
+      type: "MarkItemAgentReady",
+      actor: { type: "BrowserAgent", id: "browser-agent" },
+      itemId: "c01",
+      expectedItemRevision: 2,
+      expectedProjectRevision: textRevised.project.projectRevision,
+    });
+    expect(textThenAgentReady.error).toBeUndefined();
+    expect(textThenAgentReady.project.evidence[0]?.itemRevision).toBe(1);
+    expect(validateProject(textThenAgentReady.project).findings).toEqual(expect.arrayContaining([
+      expect.objectContaining({ ruleId: "evidence.stale", severity: "blocker" }),
+    ]));
+
+    const timingRevised = applyCommand(generated, {
+      type: "AdjustCueTiming",
+      actor: { type: "BrowserAgent", id: "browser-agent" },
+      cueId: "c01",
+      expectedItemRevision: 1,
+      expectedProjectRevision: generated.projectRevision,
+      startDeltaMs: 100,
+      endDeltaMs: 100,
+    });
+    expect(timingRevised.error).toBeUndefined();
+    expect(timingRevised.project.evidence[0]?.itemRevision).toBe(1);
+    expect(validateProject(timingRevised.project).findings).toEqual(expect.arrayContaining([
+      expect.objectContaining({ ruleId: "evidence.stale", severity: "blocker" }),
+    ]));
   });
 
   it("requires a current validation warning before a Human can waive it", () => {

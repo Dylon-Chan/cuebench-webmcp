@@ -159,6 +159,11 @@ export interface CaptionProject {
   readonly projectRevision: number;
   readonly title: string;
   readonly media: MediaSourceSnapshot;
+  /**
+   * Current evidence-binding projection. State-only review transitions carry
+   * matching bindings to the next revision; semantic revisions leave them on
+   * their prior revision so validation requires fresh evidence.
+   */
   readonly evidence: readonly EvidenceProvenance[];
   readonly captions: CaptionTrack;
   readonly audioDescriptions: AudioDescriptionTrack;
