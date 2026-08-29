@@ -9,6 +9,7 @@ import type {
   CaptionProject,
   DomainEvent,
   GenerationLease,
+  ItemSelection,
   Selection,
 } from "./model";
 
@@ -36,7 +37,7 @@ const staleProject = (project: CaptionProject, expected: number) =>
     ? domainError("STALE_PROJECT", "The project revision is no longer current.")
     : undefined;
 
-const selectFor = (item: CaptionCue | AudioDescriptionBeat): Selection => ({
+const selectFor = (item: CaptionCue | AudioDescriptionBeat): ItemSelection => ({
   itemId: item.itemId,
   itemRevision: item.current.itemRevision,
   kind: item.kind,
@@ -76,6 +77,18 @@ const commit = (
 const itemAt = (project: CaptionProject, itemId: string): CaptionCue | AudioDescriptionBeat | undefined =>
   project.captions.items[itemId] ?? project.audioDescriptions.items[itemId];
 
+const selectionMatches = (
+  selection: Selection | null,
+  item: CaptionCue | AudioDescriptionBeat,
+  expectedSelectionId: string | undefined,
+  expectedItemRevision: number,
+) => expectedSelectionId === undefined || (
+  selection !== null
+  && selection.kind === item.kind
+  && selection.itemId === expectedSelectionId
+  && selection.itemRevision === expectedItemRevision
+);
+
 const requireItem = (
   project: CaptionProject,
   command: Extract<DomainCommand, { readonly expectedItemRevision: number }> & { readonly itemId: string },
@@ -83,9 +96,12 @@ const requireItem = (
 ): CaptionCue | AudioDescriptionBeat | DomainError => {
   const item = itemAt(project, command.itemId);
   if (item === undefined) return domainError("NOT_FOUND", "The requested item does not exist.");
+  if (item.kind === "CaptionCue" && item.mergedIntoItemId !== null) {
+    return domainError("STALE_ITEM", "The requested cue has been merged into another cue.");
+  }
   if (expectedKind !== undefined && item.kind !== expectedKind) return domainError("INVALID_ARGUMENT", "The command targets the wrong track.");
   if (item.current.itemRevision !== command.expectedItemRevision) return domainError("STALE_ITEM", "The item revision is no longer current.");
-  if (command.expectedSelectionId !== undefined && project.selectedItem?.itemId !== command.expectedSelectionId) {
+  if (!selectionMatches(project.selectedItem, item, command.expectedSelectionId, command.expectedItemRevision)) {
     return domainError("STALE_SELECTION", "The selected item is no longer current.");
   }
   return item;
@@ -161,12 +177,28 @@ const assertMutable = (
   ? domainError("TARGET_TRACK_LEASE_CONFLICT", "A generation run currently leases this track.")
   : undefined;
 
-const itemCommandId = (command: DomainCommand): string | undefined => {
-  if ("itemId" in command && typeof command.itemId === "string") return command.itemId;
-  if ("cueId" in command && typeof command.cueId === "string") return command.cueId;
-  if ("beatId" in command && typeof command.beatId === "string") return command.beatId;
-  return undefined;
+const resolvedItemId = (command: DomainCommand): string | DomainError => {
+  const aliases = [
+    "itemId" in command ? command.itemId : undefined,
+    "cueId" in command ? command.cueId : undefined,
+    "beatId" in command ? command.beatId : undefined,
+  ].filter((id): id is string => typeof id === "string");
+  if (aliases.length === 0) return domainError("INVALID_ARGUMENT", "The command needs an item id.");
+  if (new Set(aliases).size !== 1) return domainError("INVALID_ARGUMENT", "Item id aliases must agree.");
+  return aliases[0]!;
 };
+
+const allCurrentTimesFit = (project: CaptionProject, durationMs: number) =>
+  Object.values(project.captions.items).every((item) => hasValidTime({ ...project, media: { ...project.media, durationMs } }, item.current.startMs, item.current.endMs))
+  && Object.values(project.audioDescriptions.items).every((item) => hasValidTime({ ...project, media: { ...project.media, durationMs } }, item.current.startMs, item.current.endMs));
+
+const systemCourtRecordEventTypes = new Set([
+  "ExportRoundTripVerified",
+  "GenerationRunStageChanged",
+  "ProjectSerialized",
+  "RecoveryPerformed",
+  "ValidationMigrated",
+]);
 
 const sameBrowserAgent = (actor: Actor, authoredBy: Actor) =>
   actor.type === "BrowserAgent" && authoredBy.type === "BrowserAgent" && actor.id === authoredBy.id;
@@ -175,7 +207,6 @@ export const applyCommand = (project: CaptionProject, command: DomainCommand): C
   const projectError = staleProject(project, command.expectedProjectRevision);
   if (projectError !== undefined) return { project, events: [], error: projectError };
 
-  const rawItemId = itemCommandId(command);
   if (command.type === "SelectItem" || command.type === "FocusItem") {
     const item = itemAt(project, command.itemId);
     if (item === undefined) return fail(project, "NOT_FOUND", "The requested item does not exist.");
@@ -183,6 +214,20 @@ export const applyCommand = (project: CaptionProject, command: DomainCommand): C
       return fail(project, "STALE_ITEM", "The item revision is no longer current.");
     }
     return commit(project, command, { selectedItem: selectFor(item) }, item.itemId);
+  }
+
+  if (command.type === "FocusGap") {
+    if (!command.gapId.trim() || !Number.isSafeInteger(command.gapRevision) || command.gapRevision <= 0) {
+      return fail(project, "INVALID_ARGUMENT", "A gap focus needs a stable id and positive revision.");
+    }
+    return commit(project, command, {
+      selectedItem: {
+        itemId: command.gapId,
+        itemRevision: command.gapRevision,
+        kind: "AudioDescriptionGap",
+        state: "Available",
+      },
+    }, command.gapId);
   }
 
   if (command.type === "StartGenerationRun") {
@@ -209,6 +254,7 @@ export const applyCommand = (project: CaptionProject, command: DomainCommand): C
     if (!hasHumanAuthority(command.actor)) return fail(project, "HUMAN_AUTHORITY_REQUIRED", "Only a human may relink media.");
     if (project.activeGenerationRun !== null) return fail(project, "TARGET_TRACK_LEASE_CONFLICT", "Media cannot change while a generation run is active.");
     if (!isFiniteInteger(command.media.durationMs) || command.media.durationMs < 0) return fail(project, "INVALID_ARGUMENT", "Media duration must be a non-negative integer.");
+    if (!allCurrentTimesFit(project, command.media.durationMs)) return fail(project, "INVALID_ARGUMENT", "Media duration must contain every current item.");
     return commit(project, command, { media: { ...command.media, relinkState: "Linked" }, ...withStaleArtifacts(project) });
   }
   if (command.type === "WaiveWarning") {
@@ -217,13 +263,30 @@ export const applyCommand = (project: CaptionProject, command: DomainCommand): C
     return commit(project, command, { warningWaivers: { ...project.warningWaivers, [command.findingId]: { findingId: command.findingId, reason: command.reason, actor: command.actor, projectRevision: project.projectRevision + 1 } } });
   }
   if (command.type === "AppendCourtRecord") {
-    if (command.actor.type === "System" && command.deterministic !== true) return fail(project, "INVALID_ARGUMENT", "System Court Record events must be deterministic.");
+    if (command.actor.type !== "System" || command.deterministic !== true) {
+      return fail(project, "INVALID_ARGUMENT", "Only System may append a deterministic Court Record event.");
+    }
+    if (!systemCourtRecordEventTypes.has(command.eventType)) {
+      return fail(project, "INVALID_ARGUMENT", "System Court Record event types must be deterministic application events.");
+    }
     return commit(project, command, {}, command.itemId);
   }
   if (command.type === "ProposeAudioDescriptionInGap") {
     const leaseError = assertMutable(project, "AudioDescriptions");
     if (leaseError !== undefined) return { project, events: [], error: leaseError };
-    if (command.expectedSelectionId !== undefined && project.selectedItem?.itemId !== command.expectedSelectionId) return fail(project, "STALE_SELECTION", "The selected gap is no longer current.");
+    if (!command.gapId.trim()) return fail(project, "INVALID_ARGUMENT", "The proposed beat needs a gap id.");
+    if (command.expectedSelectionId !== undefined) {
+      const selected = project.selectedItem;
+      if (
+        command.expectedSelectionId !== command.gapId
+        || command.expectedGapRevision === undefined
+        || selected === null
+        || selected.kind !== "AudioDescriptionGap"
+        || selected.state !== "Available"
+        || selected.itemId !== command.expectedSelectionId
+        || selected.itemRevision !== command.expectedGapRevision
+      ) return fail(project, "STALE_SELECTION", "The selected gap is no longer current.");
+    }
     if (project.audioDescriptions.items[command.beatId] !== undefined) return fail(project, "INVALID_ARGUMENT", "The proposed beat id already exists.");
     if (!hasValidTime(project, command.startMs, command.endMs) || !command.description.trim()) return fail(project, "INVALID_ARGUMENT", "The proposed beat needs valid timing and description.");
     if (command.actor.type === "System") return fail(project, "INVALID_ARGUMENT", "System cannot author semantic work.");
@@ -232,24 +295,37 @@ export const applyCommand = (project: CaptionProject, command: DomainCommand): C
     return commit(project, command, { audioDescriptions: { ...project.audioDescriptions, order: [...project.audioDescriptions.order, item.itemId], items: { ...project.audioDescriptions.items, [item.itemId]: item } }, selectedItem: selectFor(item), ...withStaleArtifacts(project) }, item.itemId);
   }
 
-  if (rawItemId === undefined) return fail(project, "INVALID_ARGUMENT", "The command needs an item id.");
+  const rawItemId = resolvedItemId(command);
+  if (typeof rawItemId !== "string") return { project, events: [], error: rawItemId };
   const expectedItemCommand = { ...command, itemId: rawItemId } as Extract<DomainCommand, { readonly expectedItemRevision: number }> & { readonly itemId: string };
   const item = requireItem(project, expectedItemCommand);
   if ("code" in item) return { project, events: [], error: item };
 
   if (command.type === "MarkItemAgentReady") {
+    const leaseError = assertMutable(project, item.kind === "CaptionCue" ? "Captions" : "AudioDescriptions");
+    if (leaseError !== undefined) return { project, events: [], error: leaseError };
     if (!sameBrowserAgent(command.actor, item.current.actor)) return fail(project, "HUMAN_AUTHORITY_REQUIRED", "Only the Browser Agent that authored this revision may mark it Agent Ready.");
     if (item.current.state !== "Proposed") return fail(project, "INVALID_ARGUMENT", "Only Proposed work may be marked Agent Ready.");
-    if (item.kind === "CaptionCue") return commit(project, command, { captions: replaceCaption(project, appendCaptionRevision(item, command.actor, "AgentReady", command.type)) }, item.itemId);
-    return commit(project, command, { audioDescriptions: replaceAudioDescription(project, appendAudioDescriptionRevision(item, command.actor, "AgentReady", command.type)) }, item.itemId);
+    if (item.kind === "CaptionCue") {
+      const revised = appendCaptionRevision(item, command.actor, "AgentReady", command.type);
+      return commit(project, command, { captions: replaceCaption(project, revised), selectedItem: selectFor(revised), ...withStaleArtifacts(project) }, item.itemId);
+    }
+    const revised = appendAudioDescriptionRevision(item, command.actor, "AgentReady", command.type);
+    return commit(project, command, { audioDescriptions: replaceAudioDescription(project, revised), selectedItem: selectFor(revised), ...withStaleArtifacts(project) }, item.itemId);
   }
   if (command.type === "ObjectItem" || command.type === "SustainItem") {
+    const leaseError = assertMutable(project, item.kind === "CaptionCue" ? "Captions" : "AudioDescriptions");
+    if (leaseError !== undefined) return { project, events: [], error: leaseError };
     if (!hasHumanAuthority(command.actor)) return fail(project, "HUMAN_AUTHORITY_REQUIRED", "Only a human may issue a ruling.");
     if (command.type === "ObjectItem" && !command.reason.trim()) return fail(project, "INVALID_ARGUMENT", "An objection requires a reason.");
     const state: ReviewState = command.type === "ObjectItem" ? "Objected" : "Sustained";
     const cause = command.type === "ObjectItem" ? command.reason : command.type;
-    if (item.kind === "CaptionCue") return commit(project, command, { captions: replaceCaption(project, appendCaptionRevision(item, command.actor, state, cause)) }, item.itemId);
-    return commit(project, command, { audioDescriptions: replaceAudioDescription(project, appendAudioDescriptionRevision(item, command.actor, state, cause)) }, item.itemId);
+    if (item.kind === "CaptionCue") {
+      const revised = appendCaptionRevision(item, command.actor, state, cause);
+      return commit(project, command, { captions: replaceCaption(project, revised), selectedItem: selectFor(revised), ...withStaleArtifacts(project) }, item.itemId);
+    }
+    const revised = appendAudioDescriptionRevision(item, command.actor, state, cause);
+    return commit(project, command, { audioDescriptions: replaceAudioDescription(project, revised), selectedItem: selectFor(revised), ...withStaleArtifacts(project) }, item.itemId);
   }
 
   if (command.type === "AdjustCueTiming" || command.type === "ReviseCue" || command.type === "SplitCue" || command.type === "MergeCue") {
@@ -261,7 +337,7 @@ export const applyCommand = (project: CaptionProject, command: DomainCommand): C
       if (command.cueId !== item.itemId || project.captions.items[command.newCueId] !== undefined || !isFiniteInteger(command.splitMs) || command.splitMs <= item.current.startMs || command.splitMs >= item.current.endMs) return fail(project, "INVALID_ARGUMENT", "A split must create a new id inside the current cue.");
       const left = appendCaptionRevision(item, command.actor, "Proposed", command.type, { endMs: command.splitMs });
       const rightCurrent: CaptionCueRevision = { ...item.current, itemId: command.newCueId, itemRevision: 1, state: "Proposed", startMs: command.splitMs, actor: command.actor, cause: command.type, parentItemRevision: null };
-      const right: CaptionCue = { itemId: command.newCueId, kind: "CaptionCue", revisions: [rightCurrent], current: rightCurrent };
+      const right: CaptionCue = { itemId: command.newCueId, kind: "CaptionCue", revisions: [rightCurrent], current: rightCurrent, mergedIntoItemId: null };
       const index = project.captions.order.indexOf(item.itemId);
       const order = [...project.captions.order]; order.splice(index + 1, 0, right.itemId);
       return commit(project, command, { captions: { ...project.captions, order, items: { ...project.captions.items, [left.itemId]: left, [right.itemId]: right } }, selectedItem: selectFor(left), ...withStaleArtifacts(project) }, item.itemId);
@@ -270,12 +346,20 @@ export const applyCommand = (project: CaptionProject, command: DomainCommand): C
       if (command.cueId !== item.itemId) return fail(project, "INVALID_ARGUMENT", "The merge cue must be the selected cue.");
       const right = project.captions.items[command.adjacentCueId];
       const currentIndex = project.captions.order.indexOf(item.itemId);
-      if (right === undefined || project.captions.order[currentIndex + 1] !== right.itemId) return fail(project, "INVALID_ARGUMENT", "Cues may merge only with their adjacent successor.");
+      if (
+        right === undefined
+        || right.mergedIntoItemId !== null
+        || project.captions.order[currentIndex + 1] !== right.itemId
+        || right.current.itemRevision !== command.expectedAdjacentItemRevision
+      ) return fail(project, right !== undefined && right.current.itemRevision !== command.expectedAdjacentItemRevision ? "STALE_ITEM" : "INVALID_ARGUMENT", "Cues may merge only with their current adjacent successor.");
       if (right.current.state === "Sustained" && !hasHumanAuthority(command.actor)) return fail(project, "HUMAN_AUTHORITY_REQUIRED", "Only a human may alter Sustained work.");
+      if (!hasValidTime(project, item.current.startMs, right.current.endMs)) return fail(project, "INVALID_ARGUMENT", "Merged cue timing must remain within media bounds.");
       const merged = appendCaptionRevision(item, command.actor, "Proposed", command.type, { endMs: right.current.endMs, text: `${item.current.text} ${right.current.text}`.trim() });
-      const items = { ...project.captions.items };
-      delete items[right.itemId];
-      return commit(project, command, { captions: { ...project.captions, order: project.captions.order.filter((id) => id !== right.itemId), items: { ...items, [merged.itemId]: merged } }, selectedItem: selectFor(merged), ...withStaleArtifacts(project) }, item.itemId);
+      const mergedRight: CaptionCue = {
+        ...appendCaptionRevision(right, command.actor, "Proposed", `MergedInto:${item.itemId}`),
+        mergedIntoItemId: item.itemId,
+      };
+      return commit(project, command, { captions: { ...project.captions, order: project.captions.order.filter((id) => id !== right.itemId), items: { ...project.captions.items, [merged.itemId]: merged, [mergedRight.itemId]: mergedRight } }, selectedItem: selectFor(merged), ...withStaleArtifacts(project) }, item.itemId);
     }
     const patch = command.type === "ReviseCue"
       ? command.patch
@@ -296,7 +380,7 @@ export const applyCommand = (project: CaptionProject, command: DomainCommand): C
     const leaseError = assertMutable(project, "AudioDescriptions");
     if (leaseError !== undefined) return { project, events: [], error: leaseError };
     if (command.actor.type === "System") return fail(project, "INVALID_ARGUMENT", "System cannot author semantic work.");
-    if (command.type === "ReviseAudioDescription" && command.beatId !== item.itemId) return fail(project, "INVALID_ARGUMENT", "The revision targets the wrong beat.");
+    if (command.type === "ReviseAudioDescription" && command.beatId !== undefined && command.beatId !== item.itemId) return fail(project, "INVALID_ARGUMENT", "The revision targets the wrong beat.");
     const patch = command.type === "ReviseAudioDescription"
       ? command.patch
       : {

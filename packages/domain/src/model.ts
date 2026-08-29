@@ -38,6 +38,8 @@ export interface CaptionCue {
   readonly kind: "CaptionCue";
   readonly revisions: readonly CaptionCueRevision[];
   readonly current: CaptionCueRevision;
+  /** A merged cue remains recoverable in the item map but is no longer live in track order. */
+  readonly mergedIntoItemId: ItemId | null;
 }
 
 export interface AudioDescriptionBeat {
@@ -59,11 +61,20 @@ export interface AudioDescriptionTrack {
   readonly items: Readonly<Record<ItemId, AudioDescriptionBeat>>;
 }
 
-export interface Selection {
+export interface ItemSelection {
   readonly itemId: ItemId;
   readonly itemRevision: number;
   readonly kind: ProjectItemKind;
 }
+
+export interface GapSelection {
+  readonly itemId: ItemId;
+  readonly itemRevision: number;
+  readonly kind: "AudioDescriptionGap";
+  readonly state: "Available";
+}
+
+export type Selection = ItemSelection | GapSelection;
 
 export interface QualityProfile {
   readonly profileId: string;
@@ -131,7 +142,31 @@ const initialValidation = (): ValidationSnapshot => ({
 
 const initialCertification = (): CertificationSnapshot => ({ status: "NotCertified" });
 
+const hasValidInitialTiming = (durationMs: number, startMs: number, endMs: number) =>
+  Number.isSafeInteger(durationMs)
+  && Number.isSafeInteger(startMs)
+  && Number.isSafeInteger(endMs)
+  && durationMs >= 0
+  && startMs >= 0
+  && startMs < endMs
+  && endMs <= durationMs;
+
+const assertInitialProjectInvariant = (input: CreateProjectInput) => {
+  if (!Number.isSafeInteger(input.media.durationMs) || input.media.durationMs < 0) {
+    throw new RangeError("Media duration must be a non-negative integer.");
+  }
+  const knownIds = new Set<string>();
+  for (const item of [...(input.captions ?? []), ...(input.audioDescriptions ?? [])]) {
+    if (knownIds.has(item.itemId)) throw new RangeError("Project item ids must be unique.");
+    knownIds.add(item.itemId);
+    if (!hasValidInitialTiming(input.media.durationMs, item.startMs, item.endMs)) {
+      throw new RangeError("Project item timing must be integer milliseconds within media bounds.");
+    }
+  }
+};
+
 export const createProject = (input: CreateProjectInput): CaptionProject => {
+  assertInitialProjectInvariant(input);
   const captions: Record<string, CaptionCue> = {};
   const captionOrder: string[] = [];
   for (const source of input.captions ?? []) {
@@ -145,6 +180,7 @@ export const createProject = (input: CreateProjectInput): CaptionProject => {
       kind: "CaptionCue",
       revisions: [revision],
       current: revision,
+      mergedIntoItemId: null,
     };
     captionOrder.push(revision.itemId);
   }

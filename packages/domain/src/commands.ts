@@ -22,6 +22,13 @@ interface ExpectedItemCommandBase extends CommandBase {
   readonly expectedSelectionId?: string;
 }
 
+export type SystemCourtRecordEventType =
+  | "ExportRoundTripVerified"
+  | "GenerationRunStageChanged"
+  | "ProjectSerialized"
+  | "RecoveryPerformed"
+  | "ValidationMigrated";
+
 export type CuePatch = Partial<
   Pick<CaptionCueRevision, "text" | "speaker" | "startMs" | "endMs">
 >;
@@ -53,6 +60,7 @@ export type DomainCommand =
       readonly type: "MergeCue";
       readonly cueId: string;
       readonly adjacentCueId: string;
+      readonly expectedAdjacentItemRevision: number;
     })
   | (ExpectedItemCommandBase & {
       readonly type: "ReviseCue";
@@ -73,9 +81,15 @@ export type DomainCommand =
       readonly patch: AudioDescriptionPatch;
     })
   | (CommandBase & {
+      readonly type: "FocusGap";
+      readonly gapId: string;
+      readonly gapRevision: number;
+    })
+  | (CommandBase & {
       readonly type: "ProposeAudioDescriptionInGap";
       readonly gapId: string;
       readonly expectedSelectionId?: string;
+      readonly expectedGapRevision?: number;
       readonly beatId: string;
       readonly startMs: number;
       readonly endMs: number;
@@ -104,7 +118,7 @@ export type DomainCommand =
     })
   | (CommandBase & {
       readonly type: "AppendCourtRecord";
-      readonly eventType: string;
+      readonly eventType: SystemCourtRecordEventType;
       readonly detail?: string;
       readonly itemId?: string;
       readonly deterministic?: boolean;

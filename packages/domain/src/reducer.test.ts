@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { applyCommand } from "./index";
+import { applyCommand, createProject, type CaptionProject, type DomainCommand } from "./index";
 import { fixtureProject } from "../test/fixtures";
 
 describe("domain reducer", () => {
@@ -98,6 +98,7 @@ describe("domain reducer", () => {
       cueId: "c05",
       adjacentCueId: "missing",
       expectedItemRevision: 1,
+      expectedAdjacentItemRevision: 1,
       expectedProjectRevision: 1,
     });
     expect(result.error?.code).toBe("INVALID_ARGUMENT");
@@ -180,10 +181,13 @@ describe("domain reducer", () => {
       cueId: "c05",
       adjacentCueId: "c05b",
       expectedItemRevision: 2,
+      expectedAdjacentItemRevision: 1,
       expectedProjectRevision: 2,
     });
     expect(merged.error).toBeUndefined();
     expect(merged.project.captions.order).toEqual(["c05", "c06"]);
+    expect(merged.project.captions.items.c05b).toMatchObject({ mergedIntoItemId: "c05" });
+    expect(merged.project.captions.items.c05b?.revisions).toHaveLength(2);
   });
 
   it("limits rulings, warning waivers, and media relinks to humans", () => {
@@ -224,5 +228,129 @@ describe("domain reducer", () => {
       expectedProjectRevision: 2,
     });
     expect(record.events[0]).toMatchObject({ type: "ValidationMigrated", detail: "Schema version 1" });
+  });
+
+  it("stale-guards both merge revisions and preserves the rejected project byte-for-byte", () => {
+    const project = fixtureProject();
+    const before = JSON.stringify(project);
+    const result = applyCommand(project, {
+      type: "MergeCue",
+      actor: { type: "BrowserAgent", id: "browser-agent" },
+      cueId: "c05",
+      adjacentCueId: "c06",
+      expectedItemRevision: 1,
+      expectedAdjacentItemRevision: 2,
+      expectedProjectRevision: 1,
+    });
+    expect(result.error?.code).toBe("STALE_ITEM");
+    expect(JSON.stringify(result.project)).toBe(before);
+  });
+
+  it("leases review-state mutations on the target track", () => {
+    const leased = applyCommand(fixtureProject(), {
+      type: "StartGenerationRun",
+      actor: { type: "CueBenchAI", id: "cuebench-ai" },
+      runId: "run-1",
+      targetTrack: "Captions",
+      expectedProjectRevision: 1,
+    }).project;
+    for (const command of [
+      { type: "MarkItemAgentReady" as const, actor: { type: "BrowserAgent" as const, id: "browser-agent" }, itemId: "c05", expectedItemRevision: 1, expectedProjectRevision: 2 },
+      { type: "SustainItem" as const, actor: { type: "Human" as const, id: "teacher" }, itemId: "c05", expectedItemRevision: 1, expectedProjectRevision: 2 },
+    ]) {
+      expect(applyCommand(leased, command).error?.code).toBe("TARGET_TRACK_LEASE_CONFLICT");
+    }
+  });
+
+  it("checks selected item id, kind, and revision, then refreshes selection for review revisions", () => {
+    const focused = applyCommand(fixtureProject(), {
+      type: "FocusItem", actor: { type: "Human", id: "teacher" }, itemId: "c05",
+      expectedItemRevision: 1, expectedProjectRevision: 1,
+    }).project;
+    const sustained = applyCommand(focused, {
+      type: "SustainItem", actor: { type: "Human", id: "teacher" }, itemId: "c05",
+      expectedSelectionId: "c05", expectedItemRevision: 1, expectedProjectRevision: 2,
+    });
+    expect(sustained.project.selectedItem).toMatchObject({ itemId: "c05", kind: "CaptionCue", itemRevision: 2 });
+    const staleSelection: CaptionProject = {
+      ...sustained.project,
+      selectedItem: { itemId: "c05", kind: "CaptionCue", itemRevision: 1 },
+    };
+    const stale = applyCommand(staleSelection, {
+      type: "ReviseCue", actor: { type: "Human", id: "teacher" }, cueId: "c05",
+      expectedSelectionId: "c05", expectedItemRevision: 2, expectedProjectRevision: 3,
+      patch: { text: "Current selection is stale." },
+    });
+    expect(stale.error?.code).toBe("STALE_SELECTION");
+
+    const wrongKind: CaptionProject = { ...focused, selectedItem: { itemId: "c05", itemRevision: 1, kind: "AudioDescriptionBeat" } };
+    expect(applyCommand(wrongKind, {
+      type: "ReviseCue", actor: { type: "Human", id: "teacher" }, cueId: "c05",
+      expectedSelectionId: "c05", expectedItemRevision: 1, expectedProjectRevision: 2,
+      patch: { text: "Wrong selection kind." },
+    }).error?.code).toBe("STALE_SELECTION");
+  });
+
+  it("uses selected gap identity, revision, and availability when a scoped gap proposal is supplied", () => {
+    const gap = applyCommand(fixtureProject(), {
+      type: "FocusGap", actor: { type: "Human", id: "teacher" }, gapId: "gap-1",
+      gapRevision: 4, expectedProjectRevision: 1,
+    }).project;
+    const result = applyCommand(gap, {
+      type: "ProposeAudioDescriptionInGap", actor: { type: "BrowserAgent", id: "browser-agent" },
+      gapId: "gap-1", expectedSelectionId: "gap-1", expectedGapRevision: 4,
+      beatId: "ad02", startMs: 9_000, endMs: 11_000, description: "A graph appears.",
+      expectedProjectRevision: 2,
+    });
+    expect(result.error).toBeUndefined();
+    expect(applyCommand(gap, {
+      type: "ProposeAudioDescriptionInGap", actor: { type: "BrowserAgent", id: "browser-agent" },
+      gapId: "gap-1", expectedSelectionId: "gap-1", expectedGapRevision: 3,
+      beatId: "ad02", startMs: 9_000, endMs: 11_000, description: "A graph appears.",
+      expectedProjectRevision: 2,
+    }).error?.code).toBe("STALE_SELECTION");
+  });
+
+  it("rejects conflicting aliases, short media relinks, and non-system Court Record authority", () => {
+    const project = fixtureProject();
+    expect(applyCommand(project, {
+      type: "AdjustCueTiming", actor: { type: "Human", id: "teacher" }, itemId: "c05", cueId: "c06",
+      expectedItemRevision: 1, expectedProjectRevision: 1, startDeltaMs: 1, endDeltaMs: 1,
+    }).error?.code).toBe("INVALID_ARGUMENT");
+    expect(applyCommand(project, {
+      type: "ReviseAudioDescription", actor: { type: "Human", id: "teacher" }, itemId: "ad01",
+      expectedItemRevision: 1, expectedProjectRevision: 1, patch: { description: "Updated." },
+    }).error).toBeUndefined();
+    expect(applyCommand(project, {
+      type: "RelinkMedia", actor: { type: "Human", id: "teacher" }, expectedProjectRevision: 1,
+      media: { sourceId: "media-2", sha256: "b".repeat(64), durationMs: 2_000 },
+    }).error?.code).toBe("INVALID_ARGUMENT");
+    const forbidden: DomainCommand = {
+      type: "AppendCourtRecord", actor: { type: "CueBenchAI", id: "cuebench-ai" },
+      eventType: "ValidationMigrated", deterministic: true, expectedProjectRevision: 1,
+    };
+    expect(applyCommand(project, forbidden).error?.code).toBe("INVALID_ARGUMENT");
+    const forged = {
+      type: "AppendCourtRecord", actor: { type: "System", id: "system" },
+      eventType: "SustainItem", deterministic: true, expectedProjectRevision: 1,
+    } as unknown as DomainCommand;
+    expect(applyCommand(project, forged).error?.code).toBe("INVALID_ARGUMENT");
+  });
+
+  it("rejects invalid initial timings and nonchronological merges", () => {
+    expect(() => createProject({
+      projectId: "bad", title: "Bad timing", media: { sourceId: "m", sha256: "c".repeat(64), durationMs: 1_000, relinkState: "Linked" },
+      captions: [{ kind: "CaptionCue", itemId: "c1", state: "Proposed", startMs: 100, endMs: 1_001, text: "Bad", speaker: null, actor: { type: "Human", id: "teacher" }, cause: "test" }],
+    })).toThrow(RangeError);
+    const project = fixtureProject();
+    const c06 = project.captions.items.c06!;
+    const nonchronological: CaptionProject = {
+      ...project,
+      captions: { ...project.captions, items: { ...project.captions.items, c06: { ...c06, current: { ...c06.current, startMs: 0, endMs: 900 } } } },
+    };
+    expect(applyCommand(nonchronological, {
+      type: "MergeCue", actor: { type: "Human", id: "teacher" }, cueId: "c05", adjacentCueId: "c06",
+      expectedItemRevision: 1, expectedAdjacentItemRevision: 1, expectedProjectRevision: 1,
+    }).error?.code).toBe("INVALID_ARGUMENT");
   });
 });
