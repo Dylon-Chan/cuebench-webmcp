@@ -1,13 +1,15 @@
-import Dexie, { type Table } from "dexie";
+import Dexie, { type Table, type Transaction } from "dexie";
 import type {
   CertificationSnapshot,
   MediaSourceSnapshot,
   ValidationSnapshot,
 } from "@cuebench/contracts";
 import {
+  buildValidationInput,
   canonicalSerialize,
   currentValidationRun,
-  currentProjectItems,
+  semanticValidationInput,
+  validationInputHash,
   verifyCertificationSnapshot,
   type AudioDescriptionBeat,
   type AudioDescriptionBeatRevision,
@@ -28,9 +30,44 @@ import { z } from "zod";
 
 /** The durable project-envelope schema, independent of Dexie's internal schema number. */
 export const STORAGE_SCHEMA_VERSION = 1 as const;
+/**
+ * IndexedDB's physical schema evolves independently from portable backup
+ * envelopes. Keep this number monotonic even while backup schema v1 remains
+ * readable, otherwise Dexie silently treats changed indexes as an upgrade.
+ */
+export const DEXIE_DATABASE_VERSION = 2 as const;
+
+const DEXIE_V1_STORES = {
+  projectHeaders: "&projectId, projectRevision, updatedAtMs",
+  items: "&key, projectId, itemId, [projectId+itemId], kind, currentItemRevision",
+  revisions: "&key, projectId, itemId, itemRevision, [projectId+itemId], [projectId+itemId+itemRevision], kind",
+  findings: "&key, projectId, scope, findingId, [projectId+scope], [projectId+scope+findingId]",
+  evidence: "&key, projectId, evidenceId, [projectId+evidenceId]",
+  courtRecord: "&key, projectId, eventId, projectRevision, [projectId+eventId]",
+  certifications: "&key, projectId, certificationId, [projectId+certificationId]",
+  sourceBlobs: "&key, projectId, sourceId, sha256, [projectId+sha256], [projectId+sourceId]",
+  narrationBlobs: "&key, projectId, beatId, itemRevision, [projectId+beatId+itemRevision]",
+  runReceipts: "&key, projectId, runId, [projectId+runId]",
+  settings: "&key, updatedAtMs",
+} as const;
+
+const DEXIE_V2_STORES = {
+  projectHeaders: "&projectId, projectRevision, [projectId+projectRevision], updatedAtMs",
+  items: "&key, projectId, itemId, [projectId+itemId], kind, currentItemRevision",
+  revisions: "&key, projectId, itemId, itemRevision, [projectId+itemId], [projectId+itemId+itemRevision], kind",
+  findings: "&key, projectId, scope, findingId, [projectId+scope], [projectId+scope+findingId]",
+  evidence: "&key, projectId, evidenceId, version, [projectId+evidenceId], [projectId+evidenceId+version]",
+  courtRecord: "&key, projectId, eventId, projectRevision, [projectId+eventId]",
+  certifications: "&key, projectId, certificationId, [projectId+certificationId]",
+  sourceBlobs: "&key, projectId, sourceId, sha256, [projectId+sha256], [projectId+sourceId]",
+  narrationBlobs: "&key, projectId, beatId, itemRevision, [projectId+beatId+itemRevision]",
+  runReceipts: "&key, projectId, runId, [projectId+runId]",
+  settings: "&key, updatedAtMs",
+} as const;
 
 const clone = <Value>(value: Value): Value => structuredClone(value);
 const sameValue = (left: unknown, right: unknown): boolean => canonicalSerialize(left) === canonicalSerialize(right);
+const compareText = (left: string, right: string): number => left < right ? -1 : left > right ? 1 : 0;
 
 const positiveSafeInteger = z.number().int().refine(Number.isSafeInteger).positive();
 const nonNegativeSafeInteger = z.number().int().refine(Number.isSafeInteger).nonnegative();
@@ -282,6 +319,9 @@ const ValidationRunSchema = StoredValidationRunSchema.extend({
   }
   if (!sameIds(run.blockers, blockers) || !sameIds(run.warnings, warnings)) {
     context.addIssue({ code: "custom", message: "Validation finding partitions do not match findings." });
+  }
+  if (new Set(run.findings.map((finding) => finding.findingId)).size !== run.findings.length) {
+    context.addIssue({ code: "custom", message: "Validation finding ids must be unique." });
   }
 });
 
@@ -644,6 +684,74 @@ export const narrationBlobKey = (projectId: string, beatId: string, itemRevision
   recordKey(projectId, beatId, String(itemRevision));
 export const runReceiptKey = (projectId: string, runId: string) => recordKey(projectId, runId);
 
+/** Physical v1 header rows predate the explicit evidence projection. */
+type PhysicalV1ProjectHeaderRow = Omit<ProjectHeaderRow, "evidenceOrder">;
+/** Physical v1 evidence rows were mutable/current rows without a version column. */
+type PhysicalV1EvidenceRow = Omit<EvidenceRow, "version">;
+
+const physicalV1EvidenceKey = (projectId: string, evidenceId: string): string => recordKey(projectId, evidenceId);
+
+/**
+ * Dexie v1 stored one mutable evidence row per id. v2 makes it append-only,
+ * adds the header's current projection, and installs the CAS compound index.
+ * This migration runs entirely inside Dexie's versionchange transaction.
+ */
+const upgradePhysicalV1ToV2 = async (transaction: Transaction): Promise<void> => {
+  const headers = transaction.table("projectHeaders") as Table<PhysicalV1ProjectHeaderRow, string>;
+  const evidence = transaction.table("evidence") as Table<PhysicalV1EvidenceRow, string>;
+  const [legacyHeaders, legacyEvidence] = await Promise.all([headers.toArray(), evidence.toArray()]);
+  const headerHasCurrentProjection = (header: PhysicalV1ProjectHeaderRow): boolean =>
+    Array.isArray((header as unknown as { readonly evidenceOrder?: unknown }).evidenceOrder);
+  const evidenceHasCurrentVersion = (row: PhysicalV1EvidenceRow): boolean =>
+    typeof (row as unknown as { readonly version?: unknown }).version === "number";
+  const currentHeaderCount = legacyHeaders.filter(headerHasCurrentProjection).length;
+  const currentEvidenceCount = legacyEvidence.filter(evidenceHasCurrentVersion).length;
+  /** A short-lived v1 build wrote v2-shaped rows without a physical version bump. Keep it lossless. */
+  if (currentHeaderCount === legacyHeaders.length && currentEvidenceCount === legacyEvidence.length) return;
+  if (currentHeaderCount !== 0 || currentEvidenceCount !== 0) {
+    throw new Error("Cannot upgrade a mixed physical v1/v2 evidence layout.");
+  }
+  const evidenceByProject = new Map<string, PhysicalV1EvidenceRow[]>();
+  const oldEvidenceKeys: string[] = [];
+  const upgradedEvidence: EvidenceRow[] = [];
+  const seenNewEvidenceKeys = new Set<string>();
+
+  for (const row of legacyEvidence) {
+    if (
+      typeof row.projectId !== "string"
+      || typeof row.evidenceId !== "string"
+      || !Number.isSafeInteger(row.sequence)
+      || row.sequence < 0
+      || row.key !== physicalV1EvidenceKey(row.projectId, row.evidenceId)
+    ) throw new Error("Cannot upgrade malformed physical v1 evidence row.");
+    const rows = evidenceByProject.get(row.projectId) ?? [];
+    rows.push(row);
+    evidenceByProject.set(row.projectId, rows);
+    oldEvidenceKeys.push(row.key);
+    const key = evidenceKey(row.projectId, row.evidenceId, 1);
+    if (seenNewEvidenceKeys.has(key)) throw new Error("Cannot upgrade duplicate physical v1 evidence rows.");
+    seenNewEvidenceKeys.add(key);
+    upgradedEvidence.push({ ...row, key, version: 1 });
+  }
+
+  const upgradedHeaders = legacyHeaders.map((header): ProjectHeaderRow => {
+    if (typeof header.projectId !== "string") throw new Error("Cannot upgrade malformed physical v1 project header.");
+    const rows = [...(evidenceByProject.get(header.projectId) ?? [])]
+      .sort((left, right) => left.sequence - right.sequence || compareText(left.evidenceId, right.evidenceId));
+    const evidenceIds = rows.map((row) => row.evidenceId);
+    if (new Set(evidenceIds).size !== evidenceIds.length || rows.some((row, index) => row.sequence !== index)) {
+      throw new Error("Cannot upgrade noncanonical physical v1 evidence projection.");
+    }
+    return { ...header, evidenceOrder: evidenceIds };
+  });
+
+  if (upgradedHeaders.length > 0) await headers.bulkPut(upgradedHeaders as unknown as PhysicalV1ProjectHeaderRow[]);
+  if (upgradedEvidence.length > 0) {
+    await evidence.bulkAdd(upgradedEvidence as unknown as PhysicalV1EvidenceRow[]);
+    await evidence.bulkDelete(oldEvidenceKeys);
+  }
+};
+
 /** A validation run is immutable at its post-command project revision. */
 const validationScope = (run: StoredValidationRun) => `validation:${run.projectRevision}:${run.inputHash}`;
 
@@ -729,11 +837,17 @@ const assertContiguousSequences = (
 const canonicalEvidence = (evidence: readonly EvidenceProvenance[]): readonly EvidenceProvenance[] =>
   [...evidence].sort((left, right) => left.evidenceId.localeCompare(right.evidenceId));
 
-const currentItemBindings = (project: CaptionProject) => currentProjectItems(project).map((item) => ({
-  kind: item.kind,
-  itemId: item.itemId,
-  itemRevision: item.current.itemRevision,
-}));
+const currentItemBindings = (project: CaptionProject) => {
+  const input = buildValidationInput(project);
+  return [...input.captions.items, ...input.audioDescriptions.items].map((item) => ({
+    kind: item.kind,
+    itemId: item.itemId,
+    itemRevision: item.itemRevision,
+  }));
+};
+
+const currentWarningWaivers = (project: CaptionProject): readonly WarningWaiver[] =>
+  Object.values(project.warningWaivers).sort((left, right) => compareText(left.findingId, right.findingId));
 
 const assertCertificationPointer = (project: CaptionProject): void => {
   const certificationIds = project.certifications.map((certification) => certification.certificationId);
@@ -763,6 +877,12 @@ const assertCertificationPointer = (project: CaptionProject): void => {
     || !sameValue(snapshot.itemRevisions, currentItemBindings(project))
     || !sameValue(snapshot.qualityProfile, project.qualityProfile)
     || !sameValue(snapshot.validationRun, project.validationRun)
+    || snapshot.validationRun.inputHash !== validationInputHash(project)
+    || !sameValue(
+      semanticValidationInput(snapshot.validationRun.input),
+      semanticValidationInput(buildValidationInput(project)),
+    )
+    || !sameValue(snapshot.warningWaivers, currentWarningWaivers(project))
   ) {
     throw new StorageReadValidationError("project headers", "Current certification does not bind the current project projection.");
   }
@@ -874,6 +994,7 @@ export interface NormalizedProjectRows {
 }
 
 const appendRunFindings = (target: FindingRow[], projectId: string, run: ValidationRun): void => {
+  assertUnique(run.findings.map((finding) => finding.findingId), "findings", "Validation finding ids");
   const stored = storedValidationRun(run);
   const scope = validationScope(stored);
   for (const finding of run.findings) {
@@ -1127,19 +1248,8 @@ export class CueBenchDatabase extends Dexie {
 
   public constructor(name = "cuebench") {
     super(name);
-    this.version(STORAGE_SCHEMA_VERSION).stores({
-      projectHeaders: "&projectId, projectRevision, [projectId+projectRevision], updatedAtMs",
-      items: "&key, projectId, itemId, [projectId+itemId], kind, currentItemRevision",
-      revisions: "&key, projectId, itemId, itemRevision, [projectId+itemId], [projectId+itemId+itemRevision], kind",
-      findings: "&key, projectId, scope, findingId, [projectId+scope], [projectId+scope+findingId]",
-      evidence: "&key, projectId, evidenceId, version, [projectId+evidenceId], [projectId+evidenceId+version]",
-      courtRecord: "&key, projectId, eventId, projectRevision, [projectId+eventId]",
-      certifications: "&key, projectId, certificationId, [projectId+certificationId]",
-      sourceBlobs: "&key, projectId, sourceId, sha256, [projectId+sha256], [projectId+sourceId]",
-      narrationBlobs: "&key, projectId, beatId, itemRevision, [projectId+beatId+itemRevision]",
-      runReceipts: "&key, projectId, runId, [projectId+runId]",
-      settings: "&key, updatedAtMs",
-    });
+    this.version(1).stores(DEXIE_V1_STORES);
+    this.version(DEXIE_DATABASE_VERSION).stores(DEXIE_V2_STORES).upgrade(upgradePhysicalV1ToV2);
     this.projectHeaders = this.table("projectHeaders");
     this.items = this.table("items");
     this.revisions = this.table("revisions");

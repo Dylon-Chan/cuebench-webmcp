@@ -1,5 +1,6 @@
 export {
   CueBenchDatabase,
+  DEXIE_DATABASE_VERSION,
   STORAGE_SCHEMA_VERSION,
   StorageImmutableWriteError,
   StorageReadValidationError,

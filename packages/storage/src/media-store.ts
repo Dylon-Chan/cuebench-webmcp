@@ -1,5 +1,4 @@
 import type { MediaSourceSnapshot } from "@cuebench/contracts";
-import { sha256Hex } from "@cuebench/domain";
 import {
   CueBenchDatabase,
   StorageReadValidationError,
@@ -53,7 +52,13 @@ const sourceInputFrom = (
   return { sourceId: source.sourceId, ...(source.sha256 === undefined ? {} : { sha256: source.sha256 }), blob };
 };
 
-const sourceBytesHash = async (blob: Blob): Promise<string> => sha256Hex(new Uint8Array(await blob.arrayBuffer()));
+/** Browser-native SHA-256 over source bytes. Digest output is canonical lowercase hex. */
+const sourceBytesHash = async (blob: Blob): Promise<string> => {
+  const crypto = globalThis.crypto;
+  if (crypto?.subtle === undefined) throw new Error("Web Crypto SHA-256 is required for source-media storage.");
+  const digest = await crypto.subtle.digest("SHA-256", await blob.arrayBuffer());
+  return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+};
 
 const verifySourceBlob = async (row: SourceBlobRow): Promise<SourceBlobRow> => {
   const checked = validateSourceBlobRow(row);
@@ -116,11 +121,12 @@ export async function saveSourceMedia(
   try {
     const stored = await db.transaction("rw", db.sourceBlobs, async () => {
       const existing = await db.sourceBlobs.get(key);
-      if (existing !== undefined) return existing;
+      if (existing !== undefined) return { row: existing, inserted: false };
       await db.sourceBlobs.add(validatedCandidate);
-      return validatedCandidate;
+      return { row: validatedCandidate, inserted: true };
     });
-    return verifySourceBlob(stored);
+    /** A fresh candidate was already schema-validated and byte-hashed above. Do not hash it twice. */
+    return stored.inserted ? stored.row : verifySourceBlob(stored.row);
   } catch (error) {
     // A second database connection may win after this transaction read but
     // before its add. Re-read the deterministic key rather than writing a

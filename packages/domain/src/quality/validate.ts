@@ -1,9 +1,11 @@
 import type {
   AudioDescriptionBeat,
+  AudioDescriptionGap,
   CaptionCue,
   CaptionProject,
   QualityProfile,
 } from "../model";
+import type { ReviewState } from "@cuebench/contracts";
 import { canonicalHash, tupleHash } from "./hash";
 import { resolveEducationProfileRules } from "./profile";
 
@@ -226,7 +228,11 @@ export const buildValidationInput = (project: CaptionProject): ValidationInputSn
     .map((gap) => ({ ...gap })),
 });
 
-const semanticValidationInput = (input: ValidationInputSnapshot) => ({
+/**
+ * Validation input has audit-only project revision metadata. Every other
+ * field is semantic and therefore binds a current validation run.
+ */
+export const semanticValidationInput = (input: ValidationInputSnapshot) => ({
   projectId: input.projectId,
   media: input.media,
   evidence: input.evidence,
@@ -236,8 +242,11 @@ const semanticValidationInput = (input: ValidationInputSnapshot) => ({
   audioDescriptionGaps: input.audioDescriptionGaps,
 });
 
+export const validationInputHashFor = (input: ValidationInputSnapshot): string =>
+  stableHash(semanticValidationInput(input));
+
 export const validationInputHash = (project: CaptionProject): string =>
-  stableHash(semanticValidationInput(buildValidationInput(project)));
+  validationInputHashFor(buildValidationInput(project));
 
 const isFiniteInteger = (value: number): boolean => Number.isSafeInteger(value);
 const hasBounds = (project: CaptionProject, startMs: number, endMs: number): boolean =>
@@ -571,7 +580,7 @@ export const validateProject = (project: CaptionProject): ValidationRun => {
     profileId: project.qualityProfile.profileId,
     profileRevision: project.qualityProfile.revision,
     input,
-    inputHash: stableHash(semanticValidationInput(input)),
+    inputHash: validationInputHashFor(input),
     findings,
     blockers,
     warnings,
@@ -579,6 +588,103 @@ export const validateProject = (project: CaptionProject): ValidationRun => {
     warningCount: warnings.length,
   };
 };
+
+const reviewStates = new Set<ReviewState>(["Proposed", "AgentReady", "Objected", "Sustained"]);
+
+/**
+ * Rebuilds the minimum aggregate required by the deterministic rule engine
+ * from an immutable validation input. This is intentionally pure: callers
+ * can verify stored validation findings without trusting a serialized result.
+ */
+const projectFromValidationInput = (input: ValidationInputSnapshot): CaptionProject => {
+  const actor = { type: "System" as const, id: "validation-input" };
+  const captions: Record<string, CaptionCue> = {};
+  const audioDescriptions: Record<string, AudioDescriptionBeat> = {};
+  const gaps: Record<string, AudioDescriptionGap> = {};
+  for (const item of input.captions.items) {
+    if (item.kind !== "CaptionCue" || !reviewStates.has(item.state as ReviewState)) {
+      throw new TypeError("Validation input contains an invalid caption item.");
+    }
+    const revision = {
+      kind: "CaptionCue" as const,
+      itemId: item.itemId,
+      itemRevision: item.itemRevision,
+      state: item.state as ReviewState,
+      startMs: item.startMs,
+      endMs: item.endMs,
+      text: item.text,
+      speaker: item.speaker,
+      actor,
+      cause: "Validation input reconstruction.",
+      parentItemRevision: null,
+    };
+    captions[item.itemId] = {
+      itemId: item.itemId,
+      kind: "CaptionCue",
+      revisions: [revision],
+      current: revision,
+      mergedIntoItemId: item.mergedIntoItemId ?? null,
+    };
+  }
+  for (const item of input.audioDescriptions.items) {
+    if (item.kind !== "AudioDescriptionBeat" || !reviewStates.has(item.state as ReviewState)) {
+      throw new TypeError("Validation input contains an invalid audio-description item.");
+    }
+    const revision = {
+      kind: "AudioDescriptionBeat" as const,
+      itemId: item.itemId,
+      itemRevision: item.itemRevision,
+      state: item.state as ReviewState,
+      startMs: item.startMs,
+      endMs: item.endMs,
+      description: item.text,
+      actor,
+      cause: "Validation input reconstruction.",
+      parentItemRevision: null,
+    };
+    audioDescriptions[item.itemId] = {
+      itemId: item.itemId,
+      kind: "AudioDescriptionBeat",
+      revisions: [revision],
+      current: revision,
+    };
+  }
+  for (const gap of input.audioDescriptionGaps) {
+    if (gap.state !== "Available" && gap.state !== "Consumed") {
+      throw new TypeError("Validation input contains an invalid audio-description gap.");
+    }
+    gaps[gap.gapId] = { ...gap, state: gap.state };
+  }
+  return {
+    contractVersion: 1,
+    projectId: input.projectId,
+    projectRevision: input.projectRevision,
+    title: "Validation input reconstruction",
+    media: { ...input.media } as CaptionProject["media"],
+    evidence: input.evidence.map((evidence) => ({ ...evidence })),
+    captions: { kind: "Captions", order: [...input.captions.order], items: captions },
+    audioDescriptions: { kind: "AudioDescriptions", order: [...input.audioDescriptions.order], items: audioDescriptions },
+    audioDescriptionGaps: gaps,
+    selectedItem: null,
+    validation: { status: "NotRun", blockerCount: 0, warningCount: 0 },
+    validationRun: null,
+    certification: { status: "NotCertified" },
+    certifications: [],
+    qualityProfile: {
+      profileId: input.qualityProfile.profileId,
+      revision: input.qualityProfile.revision,
+      name: input.qualityProfile.name,
+      rules: structuredClone(input.qualityProfile.rules),
+    },
+    warningWaivers: {},
+    activeGenerationRun: null,
+    courtRecord: [],
+  };
+};
+
+/** Re-evaluates a stored validation input without trusting stored findings. */
+export const validateValidationInput = (input: ValidationInputSnapshot): ValidationRun =>
+  validateProject(projectFromValidationInput(input));
 
 export const currentValidationRun = (project: CaptionProject): ValidationRun | undefined => {
   const run = project.validationRun;

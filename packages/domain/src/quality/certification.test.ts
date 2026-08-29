@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   applyCommand,
+  certificationSnapshotHashFor,
   createProject,
   prepareCertificationReview,
   verifyCertificationSnapshot,
@@ -31,6 +32,13 @@ const sustainedProject = (): CaptionProject => createProject({
     speaker: "Dr. Nguyen",
     actor: human,
     cause: "fixture",
+  }],
+  evidence: [{
+    evidenceId: "evidence-1",
+    projectId: "certification-project",
+    mediaSha256: "c".repeat(64),
+    itemId: "c01",
+    itemRevision: 1,
   }],
 });
 
@@ -75,6 +83,107 @@ describe("human certification", () => {
       ...snapshot,
       itemRevisions: [...snapshot.itemRevisions, snapshot.itemRevisions[0]!],
     })).toBe(false);
+  });
+
+  it("recomputes the complete certified validation input and binds every immutable snapshot field", () => {
+    const validated = validate(sustainedProject());
+    const readiness = prepareCertificationReview(validated.project);
+    const snapshot = applyCommand(
+      validated.project,
+      certificationCommand(validated.project, readiness.readinessHash),
+    ).project.certifications[0];
+    if (snapshot === undefined) throw new Error("Expected certification snapshot.");
+
+    const snapshotContent = <Snapshot extends typeof snapshot>(candidate: Snapshot) => ({
+      certificationId: candidate.certificationId,
+      readinessHash: candidate.readinessHash,
+      certifiedAtMs: candidate.certifiedAtMs,
+      actor: candidate.actor,
+      media: candidate.media,
+      evidence: candidate.evidence,
+      itemRevisions: candidate.itemRevisions,
+      qualityProfile: candidate.qualityProfile,
+      validationRun: candidate.validationRun,
+      warningWaivers: candidate.warningWaivers,
+    });
+    const rehash = <Snapshot extends typeof snapshot>(candidate: Snapshot) => {
+      const content = snapshotContent(candidate);
+      return { ...candidate, certificationSnapshotHash: certificationSnapshotHashFor(content) };
+    };
+    const firstEvidence = snapshot.evidence[0];
+    const firstInputCaption = snapshot.validationRun.input.captions.items[0];
+    if (firstEvidence === undefined || firstInputCaption === undefined) throw new Error("Expected certified inputs.");
+
+    const evidenceTampered = rehash({
+      ...snapshot,
+      evidence: [{ ...firstEvidence, mediaSha256: "d".repeat(64) }],
+    });
+    const findingTampered = rehash({
+      ...snapshot,
+      validationRun: {
+        ...snapshot.validationRun,
+        findings: [{
+          id: "forged-finding",
+          findingId: "forged-finding",
+          ruleId: "forged.rule",
+          severity: "warning" as const,
+          message: "Forged finding.",
+          target: { type: "project" as const, projectId: snapshot.validationRun.projectId, projectRevision: snapshot.validationRun.projectRevision },
+        }],
+        blockers: [],
+        warnings: [{
+          id: "forged-finding",
+          findingId: "forged-finding",
+          ruleId: "forged.rule",
+          severity: "warning" as const,
+          message: "Forged finding.",
+          target: { type: "project" as const, projectId: snapshot.validationRun.projectId, projectRevision: snapshot.validationRun.projectRevision },
+        }],
+        blockerCount: 0,
+        warningCount: 1,
+      },
+    });
+    const waiverTampered = rehash({
+      ...snapshot,
+      warningWaivers: [{
+        findingId: "forged-finding",
+        reason: "Forged waiver.",
+        actor: human,
+        projectRevision: snapshot.validationRun.projectRevision,
+      }],
+    });
+    const omittedItem = rehash({ ...snapshot, itemRevisions: [] });
+    const stateTampered = rehash({
+      ...snapshot,
+      validationRun: {
+        ...snapshot.validationRun,
+        input: {
+          ...snapshot.validationRun.input,
+          captions: {
+            ...snapshot.validationRun.input.captions,
+            items: [{ ...firstInputCaption, state: "Proposed" }],
+          },
+        },
+      },
+    });
+    const readinessTampered = rehash({ ...snapshot, readinessHash: `sha256:${"0".repeat(64)}` });
+
+    for (const candidate of [
+      evidenceTampered,
+      findingTampered,
+      waiverTampered,
+      omittedItem,
+      stateTampered,
+      readinessTampered,
+    ]) expect(verifyCertificationSnapshot(candidate)).toBe(false);
+
+    const actorTampered = { ...snapshot, actor: { type: "Human" as const, id: "another-teacher" } };
+    const timeTampered = { ...snapshot, certifiedAtMs: snapshot.certifiedAtMs + 1 };
+    expect(certificationSnapshotHashFor(snapshotContent(actorTampered))).not.toBe(snapshot.certificationSnapshotHash);
+    expect(certificationSnapshotHashFor(snapshotContent(timeTampered))).not.toBe(snapshot.certificationSnapshotHash);
+    expect(verifyCertificationSnapshot(actorTampered)).toBe(false);
+    expect(verifyCertificationSnapshot(timeTampered)).toBe(false);
+    expect(verifyCertificationSnapshot({ ...snapshot, certificationSnapshotHash: `sha256:${"0".repeat(64)}` })).toBe(false);
   });
 
   it("does not allow blockers to be waived and requires a Human and reason for warnings", () => {

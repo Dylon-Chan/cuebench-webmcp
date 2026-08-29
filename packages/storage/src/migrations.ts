@@ -115,9 +115,10 @@ export type LegacyProjectV0 = z.infer<typeof LegacyProjectV0Schema>;
  * v0 held a single mutable item state and counters claiming past revisions.
  * It did not retain the earlier revision payloads, so fabricating proposed
  * predecessors would create false audit history. v1 therefore starts every
- * migrated item at one explicit `migrated-current` revision and records one
- * deterministic System event that legacy history is unavailable. Source blobs
- * are not part of backups, so even a formerly linked source must be relinked.
+ * migrated item at one explicit `migrated-current` revision. Available Court
+ * Record events are preserved exactly; only unavailable item-revision payload
+ * history is disclosed with deterministic System provenance. Source blobs are
+ * not part of backups, so even a formerly linked source must be relinked.
  */
 export const migrateV0ToV1 = (value: unknown): ProjectEnvelopeV1 => {
   const parsed = LegacyProjectV0Schema.safeParse(value);
@@ -157,18 +158,36 @@ export const migrateV0ToV1 = (value: unknown): ProjectEnvelopeV1 => {
         cause: beat.cause,
       })),
     });
-    const unavailableDetail = `Legacy v0 history (${source.history.length} event(s), revision ${source.revision}) is unavailable; migrated current state is the only retained audit point.`;
+    const preservedCourtRecord = source.history.map((event) => ({
+      eventId: event.id,
+      projectRevision: event.revision,
+      type: event.kind,
+      actor: event.actor,
+      ...(event.itemId === undefined ? {} : { itemId: event.itemId }),
+      ...(event.detail === undefined ? {} : { detail: event.detail }),
+    }));
+    const unavailableItemPayloadCount = [...source.captionCues, ...source.audioDescriptionBeats]
+      .filter((item) => item.revision > 1)
+      .length;
+    const historyMarker = unavailableItemPayloadCount === 0 ? [] : [{
+      eventId: "legacy-item-revision-payload-history-unavailable",
+      projectRevision: source.revision,
+      type: "LegacyItemRevisionPayloadHistoryUnavailable",
+      actor: { type: "System" as const, id: "cuebench-migration" },
+      detail: `Legacy v0 omits ${unavailableItemPayloadCount} prior item revision payload(s); each migrated item retains only its explicit current payload as revision 1.`,
+    }];
+    if (new Set(preservedCourtRecord.map((event) => event.eventId)).size !== preservedCourtRecord.length) {
+      throw new StorageMigrationError("Legacy Court Record event ids must be unique.");
+    }
+    if (preservedCourtRecord.some((event) => event.eventId === "legacy-item-revision-payload-history-unavailable")) {
+      throw new StorageMigrationError("Legacy Court Record event id collides with the migration provenance marker.");
+    }
     return {
       schemaVersion: STORAGE_SCHEMA_VERSION,
       project: validateCaptionProject({
         ...project,
-        courtRecord: [{
-          eventId: "legacy-history-unavailable",
-          projectRevision: 1,
-          type: "LegacyHistoryUnavailable",
-          actor: { type: "System", id: "cuebench-migration" },
-          detail: unavailableDetail,
-        }],
+        projectRevision: source.revision,
+        courtRecord: [...preservedCourtRecord, ...historyMarker],
       }),
     };
   } catch (error) {
@@ -186,6 +205,18 @@ export interface ProjectMigration {
 export const PROJECT_MIGRATIONS: readonly ProjectMigration[] = [
   { from: 0, to: 1, migrate: migrateV0ToV1 },
 ];
+
+/** Backups exclude source blobs, so imported v1 projects can only be previewed as relink-required. */
+const previewV1Project = (project: CaptionProject): CaptionProject => validateCaptionProject({
+  ...project,
+  media: { ...project.media, relinkState: "Missing" },
+  validation: project.validation.status === "NotRun"
+    ? project.validation
+    : { ...project.validation, status: "Stale" },
+  certification: project.certification.status === "NotCertified"
+    ? project.certification
+    : { ...project.certification, status: "Stale" },
+});
 
 export const describeImportedProject = (value: unknown): ImportedProjectDescriptor => {
   const envelope = ImportedEnvelopeSchema.safeParse(value);
@@ -216,7 +247,7 @@ export const describeImportedProject = (value: unknown): ImportedProjectDescript
     requiresHumanConfirmation: true,
     schemaVersion: STORAGE_SCHEMA_VERSION,
     migratedFrom,
-    project: validateCaptionProject(project),
+    project: previewV1Project(validateCaptionProject(project)),
   };
 };
 

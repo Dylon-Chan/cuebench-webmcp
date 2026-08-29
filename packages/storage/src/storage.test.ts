@@ -1,12 +1,13 @@
 import "fake-indexeddb/auto";
 
+import Dexie from "dexie";
 import {
   applyCommand,
   createProject,
   prepareCertificationReview,
   type CaptionProject,
 } from "@cuebench/domain";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   CueBenchDatabase,
   StorageImmutableWriteError,
@@ -20,6 +21,7 @@ import {
   saveSourceMedia,
 } from "./index";
 import { sha256Hex } from "@cuebench/domain";
+import { normalizeProject } from "./database";
 
 let databaseNumber = 0;
 const databases: CueBenchDatabase[] = [];
@@ -217,6 +219,63 @@ describe("CueBenchDatabase", () => {
     expect((await loadProject(secondTab, "project-1"))?.projectRevision).toBe(2);
   });
 
+  it("upgrades a physical Dexie v1 database without confusing it with the backup schema version", async () => {
+    const databaseName = `cuebench-storage-physical-v1-${databaseNumber += 1}`;
+    const legacy = new Dexie(databaseName);
+    legacy.version(1).stores({
+      projectHeaders: "&projectId, projectRevision, updatedAtMs",
+      items: "&key, projectId, itemId, [projectId+itemId], kind, currentItemRevision",
+      revisions: "&key, projectId, itemId, itemRevision, [projectId+itemId], [projectId+itemId+itemRevision], kind",
+      findings: "&key, projectId, scope, findingId, [projectId+scope], [projectId+scope+findingId]",
+      evidence: "&key, projectId, evidenceId, [projectId+evidenceId]",
+      courtRecord: "&key, projectId, eventId, projectRevision, [projectId+eventId]",
+      certifications: "&key, projectId, certificationId, [projectId+certificationId]",
+      sourceBlobs: "&key, projectId, sourceId, sha256, [projectId+sha256], [projectId+sourceId]",
+      narrationBlobs: "&key, projectId, beatId, itemRevision, [projectId+beatId+itemRevision]",
+      runReceipts: "&key, projectId, runId, [projectId+runId]",
+      settings: "&key, updatedAtMs",
+    });
+    await legacy.open();
+    const aggregate = {
+      ...fixtureProject(),
+      evidence: [{
+        evidenceId: "evidence-1",
+        projectId: "project-1",
+        mediaSha256: "a".repeat(64),
+        itemId: "c05",
+        itemRevision: 1,
+      }],
+    } as CaptionProject;
+    const normalized = normalizeProject(aggregate, { createdAtMs: 1, updatedAtMs: 1 });
+    const legacyHeader = { ...normalized.header } as Record<string, unknown>;
+    Reflect.deleteProperty(legacyHeader, "evidenceOrder");
+    const legacyEvidence = normalized.evidence.map((row) => ({
+      key: JSON.stringify([row.projectId, row.evidenceId]),
+      projectId: row.projectId,
+      evidenceId: row.evidenceId,
+      sequence: row.sequence,
+      evidence: row.evidence,
+    }));
+    await legacy.table("projectHeaders").add(legacyHeader);
+    await legacy.table("items").bulkAdd([...normalized.items]);
+    await legacy.table("revisions").bulkAdd([...normalized.revisions]);
+    await legacy.table("findings").bulkAdd([...normalized.findings]);
+    await legacy.table("evidence").bulkAdd(legacyEvidence);
+    await legacy.table("courtRecord").bulkAdd([...normalized.courtRecord]);
+    await legacy.table("certifications").bulkAdd([...normalized.certifications]);
+    legacy.close();
+
+    const upgraded = new CueBenchDatabase(databaseName);
+    databases.push(upgraded);
+    await upgraded.open();
+
+    expect(await loadProject(upgraded, "project-1")).toEqual(aggregate);
+    const result = await executePersistentCommand(upgraded, "project-1", humanSustainCommand());
+    expect(result.error).toBeUndefined();
+    expect((await upgraded.evidence.where("projectId").equals("project-1").toArray()).map((row) => row.version).sort()).toEqual([1, 2]);
+    expect(await loadProject(upgraded, "project-1")).toEqual(result.project);
+  });
+
   it("rejects malformed normalized records at the read boundary", async () => {
     const db = testDatabase();
     await initializeProject(db, fixtureProject());
@@ -314,6 +373,22 @@ describe("CueBenchDatabase", () => {
       },
     } as CaptionProject;
     await expect(initializeProject(testDatabase(), duplicateRevision)).rejects.toBeInstanceOf(StorageReadValidationError);
+
+    const validated = applyCommand(project, {
+      type: "ValidateProject",
+      actor: { type: "System", id: "validator" },
+      expectedProjectRevision: 1,
+    }).project;
+    const firstFinding = validated.validationRun?.findings[0];
+    if (firstFinding === undefined || validated.validationRun === null) throw new Error("Fixture must produce a finding.");
+    const duplicateFinding = {
+      ...validated,
+      validationRun: {
+        ...validated.validationRun,
+        findings: [...validated.validationRun.findings, firstFinding],
+      },
+    } as CaptionProject;
+    await expect(initializeProject(testDatabase(), duplicateFinding)).rejects.toBeInstanceOf(StorageReadValidationError);
   });
 
   it("rehydrates normalized evidence, findings, and immutable certifications", async () => {
@@ -395,6 +470,11 @@ describe("CueBenchDatabase", () => {
     );
     expect(saved).toEqual(certified.project);
 
+    await db.projectHeaders.update("certification-project", { warningWaivers: {} } as never);
+    await expect(loadProject(db, "certification-project")).rejects.toBeInstanceOf(StorageReadValidationError);
+    await db.projectHeaders.update("certification-project", {
+      warningWaivers: certified.project.warningWaivers,
+    } as never);
     await db.projectHeaders.update("certification-project", {
       certification: { status: "Current", certificationId: "missing-certification" },
     } as never);
@@ -494,23 +574,35 @@ describe("CueBenchDatabase", () => {
     const db = testDatabase();
     const bytes = new TextEncoder().encode("verified source bytes");
     const actualHash = sha256Hex(bytes);
-    const first = await saveSourceMedia(db, "project-1", { sourceId: "media-1", blob: new Blob([bytes]) });
-    const duplicate = await saveSourceMedia(db, "project-1", {
-      sourceId: "media-alias",
-      blob: new Blob([bytes]),
-      sha256: actualHash.toUpperCase(),
-    });
-    expect(duplicate.key).toBe(first.key);
-    await expect(saveSourceMedia(db, "project-1", {
-      sourceId: "media-bad",
-      blob: new Blob([bytes]),
-      sha256: "0".repeat(64),
-    })).rejects.toThrow("does not match");
+    const digest = vi.spyOn(globalThis.crypto.subtle, "digest");
+    try {
+      const first = await saveSourceMedia(db, "project-1", { sourceId: "media-1", blob: new Blob([bytes]) });
+      expect(digest).toHaveBeenCalledTimes(1);
+      const duplicate = await saveSourceMedia(db, "project-1", {
+        sourceId: "media-alias",
+        blob: new Blob([bytes]),
+        sha256: actualHash.toUpperCase(),
+      });
+      expect(duplicate.key).toBe(first.key);
+      await expect(saveSourceMedia(db, "project-1", {
+        sourceId: "media-bad",
+        blob: new Blob([bytes]),
+        sha256: "0".repeat(64),
+      })).rejects.toThrow("does not match");
 
-    const row = await db.sourceBlobs.get(first.key);
-    if (row === undefined) throw new Error("Stored source missing.");
-    await db.sourceBlobs.put({ ...row, byteLength: row.byteLength + 1 });
-    await expect(loadSourceMedia(db, "project-1", actualHash)).rejects.toBeInstanceOf(StorageReadValidationError);
+      const row = await db.sourceBlobs.get(first.key);
+      if (row === undefined) throw new Error("Stored source missing.");
+      const digestCallsBeforeVerifiedRead = digest.mock.calls.length;
+      await expect(loadSourceMedia(db, "project-1", actualHash)).resolves.toMatchObject({ key: first.key });
+      expect(digest).toHaveBeenCalledTimes(digestCallsBeforeVerifiedRead + 1);
+      await db.sourceBlobs.put({ ...row, byteLength: row.byteLength + 1 });
+      await expect(loadSourceMedia(db, "project-1", actualHash)).rejects.toBeInstanceOf(StorageReadValidationError);
+      const replacement = new Blob([new Uint8Array(row.byteLength).fill(1)], { type: row.contentType });
+      await db.sourceBlobs.put({ ...row, blob: replacement, byteLength: replacement.size });
+      await expect(loadSourceMedia(db, "project-1", actualHash)).rejects.toBeInstanceOf(StorageReadValidationError);
+    } finally {
+      digest.mockRestore();
+    }
   });
 
   it("rejects a source blob whose stored primary key no longer binds its hash", async () => {
