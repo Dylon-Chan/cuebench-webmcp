@@ -560,6 +560,16 @@ describe("project backups", () => {
     };
     expect(() => previewProjectImport(exportProjectBackup(retaggedOlderValidation as unknown as CaptionProject), { actor: human })).toThrow(/selection|court|validation/i);
 
+    const retaggedOlderValidationAsProfile = {
+      ...preHistoryProject,
+      courtRecord: [{
+        ...firstValidationEvent,
+        type: "ApplyProfile",
+        actor: human,
+      }, ...preHistoryProject.courtRecord.slice(1)],
+    };
+    expect(() => previewProjectImport(exportProjectBackup(retaggedOlderValidationAsProfile as unknown as CaptionProject), { actor: human })).toThrow(/pre-history|court|validation|profile/i);
+
     const currentWithTruncatedHistory = {
       ...second,
       validationHistory: [second.validationRun!],

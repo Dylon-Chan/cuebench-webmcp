@@ -592,6 +592,42 @@ const assertSideHistoryEvents = (
   }
 };
 
+/**
+ * Older v1 aggregates retained only the latest validation payload. That is
+ * the sole gap we can safely replay after a manifest authenticates the
+ * original pre-history shape. Other command types without durable projection
+ * data (for example ApplyProfile or app lifecycle events) must be migrated
+ * manually instead of being trusted as editable import history.
+ */
+const assertPreHistoryCompatibilityEvents = (project: CaptionProject, events: readonly DomainEvent[]): void => {
+  const provenEventTypes = new Set<string>([
+    ...revisionChangingCourtEventTypes,
+    "RecordExportRoundTrip",
+    "WaiveWarning",
+    "CertifyProject",
+  ]);
+  const retainedValidationRevisions = new Set(project.validationHistory.map((run) => run.projectRevision));
+  const oldestRetainedValidationRevision = project.validationHistory[0]?.projectRevision;
+
+  for (const event of events) {
+    if (provenEventTypes.has(event.type)) continue;
+    if (event.type === "ValidateProject") {
+      requireAggregate(
+        event.actor.type === "System"
+          && (
+            retainedValidationRevisions.has(event.projectRevision)
+            || (oldestRetainedValidationRevision !== undefined && event.projectRevision < oldestRetainedValidationRevision)
+          ),
+        "Authenticated pre-history v1 may replay only ordered System ValidateProject events without durable validation history.",
+      );
+      continue;
+    }
+    throw new CaptionProjectAggregateError(
+      `Authenticated pre-history v1 cannot prove Court Record ${event.type}; import requires manual migration.`,
+    );
+  }
+};
+
 const assertCurrentCourtRecord = (
   project: CaptionProject,
   events: readonly DomainEvent[],
@@ -654,6 +690,9 @@ const assertCurrentCourtRecord = (
   }
 
   assertSideHistoryEvents(project, events, options);
+  if (options.allowPreHistoryValidationReplay === true) {
+    assertPreHistoryCompatibilityEvents(project, events);
+  }
   if (projectedSelection === null) {
     requireAggregate(
       project.selectedItem === null,
