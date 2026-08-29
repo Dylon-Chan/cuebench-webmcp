@@ -391,6 +391,46 @@ describe("domain reducer", () => {
     }).error?.code).toBe("INVALID_ARGUMENT");
   });
 
+  it("rejects invalid source cue intervals before merge without mutating the project", () => {
+    const project = fixtureProject();
+    const left = project.captions.items.c05!;
+    const right = project.captions.items.c06!;
+    const invalidLeft: CaptionProject = {
+      ...project,
+      captions: {
+        ...project.captions,
+        items: {
+          ...project.captions.items,
+          c05: { ...left, current: { ...left.current, endMs: left.current.startMs } },
+        },
+      },
+    };
+    const invalidRight: CaptionProject = {
+      ...project,
+      captions: {
+        ...project.captions,
+        items: {
+          ...project.captions.items,
+          c06: { ...right, current: { ...right.current, startMs: 4_000, endMs: 3_500 } },
+        },
+      },
+    };
+    const invalidLeftBefore = JSON.stringify(invalidLeft);
+    const before = JSON.stringify(invalidRight);
+    const leftResult = applyCommand(invalidLeft, {
+      type: "MergeCue", actor: { type: "Human", id: "teacher" }, cueId: "c05", adjacentCueId: "c06",
+      expectedItemRevision: 1, expectedAdjacentItemRevision: 1, expectedProjectRevision: 1,
+    });
+    const result = applyCommand(invalidRight, {
+      type: "MergeCue", actor: { type: "Human", id: "teacher" }, cueId: "c05", adjacentCueId: "c06",
+      expectedItemRevision: 1, expectedAdjacentItemRevision: 1, expectedProjectRevision: 1,
+    });
+    expect(leftResult.error?.code).toBe("INVALID_ARGUMENT");
+    expect(JSON.stringify(leftResult.project)).toBe(invalidLeftBefore);
+    expect(result.error?.code).toBe("INVALID_ARGUMENT");
+    expect(JSON.stringify(result.project)).toBe(before);
+  });
+
   it("merges to an interval containing both source cues when the right cue ends inside the left", () => {
     const project = fixtureProject();
     const c06 = project.captions.items.c06!;
@@ -417,6 +457,24 @@ describe("domain reducer", () => {
     expect(result.events[0]).toMatchObject({ type: "ValidationMigrated" });
     expect("detail" in (result.events[0] ?? {})).toBe(false);
     expect("payload" in (result.events[0] ?? {})).toBe(false);
+  });
+
+  it("rejects unknown Court Record item references without mutating the project", () => {
+    const project = fixtureProject();
+    const before = JSON.stringify(project);
+    const unknown = applyCommand(project, {
+      type: "AppendCourtRecord", actor: { type: "System", id: "system" }, eventType: "ValidationMigrated",
+      itemId: "missing", deterministic: true, expectedProjectRevision: 1,
+    });
+    expect(unknown.error?.code).toBe("NOT_FOUND");
+    expect(JSON.stringify(unknown.project)).toBe(before);
+
+    const known = applyCommand(project, {
+      type: "AppendCourtRecord", actor: { type: "System", id: "system" }, eventType: "ValidationMigrated",
+      itemId: "c05", deterministic: true, expectedProjectRevision: 1,
+    });
+    expect(known.error).toBeUndefined();
+    expect(known.events[0]?.itemId).toBe("c05");
   });
 
   it("clones split actor identity before storing the successor revision", () => {
@@ -535,5 +593,21 @@ describe("domain reducer", () => {
     expect(sustained.project.validation.status).toBe("Stale");
     const waived = applyCommand(certified, { type: "WaiveWarning", actor: { type: "Human", id: "teacher" }, findingId: "w1", reason: "Reason", expectedProjectRevision: 1 });
     expect(waived.project.certification.status).toBe("Stale");
+  });
+
+  it("preserves current validation but stales current certification for a warning waiver", () => {
+    const project: CaptionProject = {
+      ...fixtureProject(),
+      validation: { status: "Current", blockerCount: 0, warningCount: 1 },
+      certification: { status: "Current", certificationId: "cert-1" },
+    };
+    const result = applyCommand(project, {
+      type: "WaiveWarning", actor: { type: "Human", id: "teacher" }, findingId: "w1", reason: "Intentional pacing",
+      expectedProjectRevision: 1,
+    });
+    expect(result.error).toBeUndefined();
+    expect(result.project.validation.status).toBe("Current");
+    expect(result.project.validation).toEqual(project.validation);
+    expect(result.project.certification).toEqual({ status: "Stale", certificationId: "cert-1" });
   });
 });

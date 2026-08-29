@@ -111,10 +111,14 @@ const withStaleArtifacts = (project: CaptionProject): Pick<CaptionProject, "vali
   const validation: ValidationSnapshot = project.validation.status === "NotRun"
     ? project.validation
     : { ...project.validation, status: "Stale" };
+  return { validation, ...withStaleCertification(project) };
+};
+
+const withStaleCertification = (project: CaptionProject): Pick<CaptionProject, "certification"> => {
   const certification: CertificationSnapshot = project.certification.status === "Current"
     ? { ...project.certification, status: "Stale" }
     : project.certification;
-  return { validation, certification };
+  return { certification };
 };
 
 const appendCaptionRevision = (
@@ -265,7 +269,7 @@ export const applyCommand = (project: CaptionProject, command: DomainCommand): C
   if (command.type === "WaiveWarning") {
     if (!hasHumanAuthority(command.actor)) return fail(project, "HUMAN_AUTHORITY_REQUIRED", "Only a human may waive a warning.");
     if (!command.findingId.trim() || !command.reason.trim()) return fail(project, "INVALID_ARGUMENT", "A warning waiver needs a finding and reason.");
-    return commit(project, command, { warningWaivers: { ...project.warningWaivers, [command.findingId]: { findingId: command.findingId, reason: command.reason, actor: clone(command.actor), projectRevision: project.projectRevision + 1 } }, ...withStaleArtifacts(project) });
+    return commit(project, command, { warningWaivers: { ...project.warningWaivers, [command.findingId]: { findingId: command.findingId, reason: command.reason, actor: clone(command.actor), projectRevision: project.projectRevision + 1 } }, ...withStaleCertification(project) });
   }
   if (command.type === "AppendCourtRecord") {
     if (command.actor.type !== "System" || command.deterministic !== true) {
@@ -273,6 +277,9 @@ export const applyCommand = (project: CaptionProject, command: DomainCommand): C
     }
     if (!systemCourtRecordEventTypes.has(command.eventType)) {
       return fail(project, "INVALID_ARGUMENT", "System Court Record event types must be deterministic application events.");
+    }
+    if (command.itemId !== undefined && itemAt(project, command.itemId) === undefined) {
+      return fail(project, "NOT_FOUND", "The Court Record item reference does not exist.");
     }
     return commit(project, command, {}, command.itemId);
   }
@@ -359,6 +366,10 @@ export const applyCommand = (project: CaptionProject, command: DomainCommand): C
         || project.captions.order[currentIndex + 1] !== right.itemId
         || right.current.itemRevision !== command.expectedAdjacentItemRevision
       ) return fail(project, right !== undefined && right.current.itemRevision !== command.expectedAdjacentItemRevision ? "STALE_ITEM" : "INVALID_ARGUMENT", "Cues may merge only with their current adjacent successor.");
+      if (
+        !hasValidTime(project, item.current.startMs, item.current.endMs)
+        || !hasValidTime(project, right.current.startMs, right.current.endMs)
+      ) return fail(project, "INVALID_ARGUMENT", "Each source cue must have valid timing before merge.");
       if (right.current.state === "Sustained" && !hasHumanAuthority(command.actor)) return fail(project, "HUMAN_AUTHORITY_REQUIRED", "Only a human may alter Sustained work.");
       if (right.current.startMs < item.current.startMs) return fail(project, "INVALID_ARGUMENT", "Merged cues must remain in chronological order.");
       const mergedEndMs = Math.max(item.current.endMs, right.current.endMs);
