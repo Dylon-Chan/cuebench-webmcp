@@ -26,7 +26,7 @@ import {
   saveSourceMedia,
 } from "./index";
 import { sha256Hex } from "@cuebench/domain";
-import { normalizeProject } from "./database";
+import { normalizeProject, rehydrateProject } from "./database";
 
 let databaseNumber = 0;
 const databases: CueBenchDatabase[] = [];
@@ -171,6 +171,20 @@ describe("CueBenchDatabase", () => {
     expect(persisted?.validationHistory).toEqual([validated.project.validationRun]);
     expect(persisted?.exportHistory).toEqual(recorded.project.exportHistory);
     expect(persisted === undefined ? null : buildImpactSummary(persisted).roundTripResult).toEqual({ ok: true });
+  });
+
+  it("backfills a pre-history normalized header from its durable current validation run", () => {
+    const validated = applyCommand(fixtureProject(), {
+      type: "ValidateProject",
+      actor: { type: "System", id: "validator" },
+      expectedProjectRevision: 1,
+    }).project;
+    const rows = normalizeProject(validated, { createdAtMs: 1, updatedAtMs: 2 });
+    const { validationHistory: _history, ...legacyHeader } = rows.header;
+    void _history;
+    const rehydrated = rehydrateProject({ ...rows, header: legacyHeader as typeof rows.header });
+
+    expect(rehydrated.validationHistory).toEqual([validated.validationRun]);
   });
 
   it("persists project revision and Court Record atomically", async () => {

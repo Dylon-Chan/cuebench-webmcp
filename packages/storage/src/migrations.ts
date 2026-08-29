@@ -2,7 +2,7 @@ import {
   classifyProjectBackupEnvelope,
   createProject,
   ProjectBackupManifestError,
-  upgradeLegacyCertificationSnapshot,
+  validateCaptionProjectAggregate,
   type CaptionProject,
 } from "@cuebench/domain";
 import { z } from "zod";
@@ -218,23 +218,6 @@ const previewV1Project = (project: CaptionProject): CaptionProject => validateCa
     : { ...project.certification, status: "Stale" },
 });
 
-/**
- * v1 backup envelopes can contain either former unversioned certification
- * hash. Upgrade only after the domain verifier authenticates its matching
- * historical digest and all full snapshot/readiness contents; this function
- * never mutates the imported envelope and is used solely for preview.
- */
-const upgradePreviewCertifications = (project: CaptionProject): CaptionProject => ({
-  ...project,
-  certifications: project.certifications.map((certification) => {
-    const upgraded = upgradeLegacyCertificationSnapshot(certification);
-    if (upgraded === undefined) {
-      throw new StorageMigrationError("Legacy certification snapshot cannot be verified for migration.");
-    }
-    return upgraded;
-  }),
-});
-
 export const describeImportedProject = (value: unknown): ImportedProjectDescriptor => {
   let envelope;
   try {
@@ -265,8 +248,8 @@ export const describeImportedProject = (value: unknown): ImportedProjectDescript
     project = migrated.project;
   }
   try {
-    /** Validate after, not before, the authenticated legacy-hash upgrade. */
-    const checked = validateCaptionProject(upgradePreviewCertifications(project as CaptionProject));
+    /** Domain first authenticates legacy hashes and proves aggregate invariants; storage then proves its row model. */
+    const checked = validateCaptionProject(validateCaptionProjectAggregate(project));
     return {
       mode: "preview",
       requiresHumanConfirmation: true,

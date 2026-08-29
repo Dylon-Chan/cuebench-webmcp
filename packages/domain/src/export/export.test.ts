@@ -83,6 +83,48 @@ describe("track exports", () => {
     ].join("\n"), "vtt")).toThrow(TrackParseError);
   });
 
+  it("rejects non-canonical VTT payload arrows and cue start regressions", () => {
+    const rawArrow = [
+      "WEBVTT",
+      "",
+      "cue-1",
+      "00:00:01.000 --> 00:00:02.000",
+      "A literal --> timing delimiter.",
+      "",
+    ].join("\n");
+    const backwards = [
+      "WEBVTT",
+      "",
+      "cue-1",
+      "00:00:03.000 --> 00:00:04.000",
+      "Later cue.",
+      "",
+      "cue-2",
+      "00:00:01.000 --> 00:00:02.000",
+      "Earlier cue.",
+      "",
+    ].join("\n");
+
+    expect(() => parseTrack(rawArrow, "vtt")).toThrow(TrackParseError);
+    expect(() => parseTrack(backwards, "vtt")).toThrow(TrackParseError);
+
+    const project = fixtureProject();
+    const cue = project.captions.items.c05;
+    if (cue === undefined) throw new Error("fixture cue missing");
+    const reversible = {
+      ...project.captions,
+      items: {
+        ...project.captions.items,
+        c05: { ...cue, current: { ...cue.current, text: "Literal --> content remains text." } },
+      },
+    };
+    const serialized = serializeTrack(reversible, "vtt");
+    expect(serialized).toContain("--&gt;");
+    expect(verifyRoundTrip(reversible, parseTrack(serialized, "vtt"))).toEqual({ ok: true });
+
+    expect(() => serializeTrack({ ...project.captions, order: ["c06", "c05"] }, "vtt")).toThrow(TrackSerializationError);
+  });
+
   it("round-trips interior backslashes and multiline text, but rejects unrepresentable blank payload lines", () => {
     const project = fixtureProject();
     const cue = project.captions.items.c05;

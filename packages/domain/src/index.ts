@@ -1,5 +1,6 @@
 export * from "./commands";
 export * from "./backup/import";
+export * from "./backup/aggregate";
 export * from "./backup/schema";
 export * from "./errors";
 export * from "./export/ad-text";

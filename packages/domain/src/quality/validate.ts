@@ -320,6 +320,39 @@ export const findingIdFor = (
   ...targetParts(target),
 ]);
 
+/**
+ * A display/audit finding id intentionally includes evaluated revisions. This
+ * separate identity answers a different question for the local Impact
+ * Summary: whether the same rule still affects the same project/item pair
+ * after a later revision has been evaluated.
+ */
+export const findingIdentityFor = (finding: Pick<QualityFinding, "ruleId" | "target">): string => {
+  const target = finding.target;
+  if (target.type === "project") {
+    return tupleHash("cuebench.finding-identity.v1", ["rule", finding.ruleId, "target", "project", target.projectId]);
+  }
+  if (target.type === "item") {
+    return tupleHash("cuebench.finding-identity.v1", [
+      "rule",
+      finding.ruleId,
+      "target",
+      "item",
+      target.kind,
+      target.itemId,
+    ]);
+  }
+  const pair = [target.first, target.second]
+    .map((item) => [item.kind, item.itemId] as const)
+    .sort(([leftKind, leftId], [rightKind, rightId]) => leftKind.localeCompare(rightKind) || leftId.localeCompare(rightId));
+  return tupleHash("cuebench.finding-identity.v1", [
+    "rule",
+    finding.ruleId,
+    "target",
+    "pair",
+    ...pair.flat(),
+  ]);
+};
+
 const normalizedText = (text: string): string => text.replace(/\s+/g, " ").trim().toLowerCase();
 const textLength = (text: string): number => [...text].length;
 const lineLength = (line: string): number => [...line].length;

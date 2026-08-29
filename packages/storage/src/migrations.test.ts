@@ -135,6 +135,25 @@ describe("project schema migrations", () => {
     expect(current.project.validation.status).toBe("Stale");
   });
 
+  it("backfills validation history when reading a pre-history v1 backup", () => {
+    const validated = applyCommand(createProject({
+      projectId: "history-backfill-preview",
+      title: "History backfill preview",
+      media: { sourceId: "source-1", sha256: "a".repeat(64), durationMs: 60_000, relinkState: "Linked" },
+    }), {
+      type: "ValidateProject",
+      actor: { type: "System", id: "validator" },
+      expectedProjectRevision: 1,
+    }).project;
+    const { validationHistory: _history, exportHistory: _exports, ...preHistoryProject } = validated;
+    void _history;
+    void _exports;
+    const descriptor = describeImportedProject(exportProjectBackup(preHistoryProject as typeof validated));
+
+    if (descriptor.mode !== "preview") throw new Error("Expected preview descriptor.");
+    expect(descriptor.project.validationHistory).toEqual([validated.validationRun]);
+  });
+
   it("rejects an unmanifested or tampered v1 envelope instead of treating it as legacy data", () => {
     const project = createProject({
       projectId: "strict-manifest-preview",

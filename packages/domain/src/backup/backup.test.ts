@@ -1,8 +1,10 @@
 import { describe, expect, it } from "vitest";
 import {
   buildImpactSummary,
+  canonicalHash,
   exportProjectBackup,
   applyCommand,
+  projectBackupManifestHash,
   prepareTrackExport,
   previewProjectImport,
   type CaptionProject,
@@ -10,6 +12,31 @@ import {
 import { fixtureProject } from "../../test/fixtures";
 
 const human = { type: "Human" as const, id: "teacher" };
+
+const rehashBackup = (backup: ReturnType<typeof exportProjectBackup>): ReturnType<typeof exportProjectBackup> => {
+  const { manifestHash: _manifestHash, ...payload } = backup;
+  void _manifestHash;
+  const reboundMetadata = {
+    ...payload.exportMetadata,
+    projectHash: canonicalHash("cuebench.project-backup.project.v1", payload.project),
+    sourceMediaSha256: payload.project.media.sha256,
+    tracks: {
+      captions: {
+        itemCount: payload.project.captions.order.length,
+        hash: canonicalHash("cuebench.project-backup.captions.v1", payload.project.captions),
+      },
+      audioDescriptions: {
+        itemCount: payload.project.audioDescriptions.order.length,
+        hash: canonicalHash("cuebench.project-backup.audio-descriptions.v1", payload.project.audioDescriptions),
+      },
+    },
+  };
+  const reboundPayload = { ...payload, exportMetadata: reboundMetadata };
+  return {
+    ...reboundPayload,
+    manifestHash: projectBackupManifestHash(reboundPayload),
+  };
+};
 
 describe("project backups", () => {
   it("keeps project history and export metadata while excluding media artifacts", () => {
@@ -142,6 +169,177 @@ describe("project backups", () => {
       canImport: false,
       mediaRelink: { status: "mismatch", error: { code: "MEDIA_HASH_MISMATCH" } },
     });
+  });
+
+  it("validates current-v1 aggregates before and after relink rather than trusting an authenticated envelope", () => {
+    const project = fixtureProject();
+    const backup = exportProjectBackup(project);
+    const badOrder = rehashBackup({
+      ...backup,
+      project: {
+        ...backup.project,
+        captions: { ...backup.project.captions, order: ["missing-cue"] },
+      },
+    });
+
+    expect(() => previewProjectImport(badOrder, {
+      actor: human,
+      relinkedMedia: { sourceId: "media-1", sha256: "a".repeat(64), durationMs: 60_000 },
+    })).toThrow(/order|aggregate|project/i);
+    expect(() => previewProjectImport(backup, {
+      actor: human,
+      migration: () => ({
+        mode: "preview" as const,
+        requiresHumanConfirmation: true as const,
+        schemaVersion: 1 as const,
+        migratedFrom: null,
+        project: { ...project, audioDescriptions: { ...project.audioDescriptions, order: ["missing-ad"] } },
+      }),
+    })).toThrow(/order|aggregate|project/i);
+    expect(() => previewProjectImport(backup, {
+      actor: human,
+      relinkedMedia: { sourceId: "media-1", sha256: "a".repeat(64), durationMs: 1_500 },
+    })).toThrow(/timing|duration|aggregate|project/i);
+  });
+
+  it("rejects malformed aggregate relationships for revisions, provenance, history, certifications, and export evidence", () => {
+    const project = fixtureProject();
+    const base = exportProjectBackup(project);
+    const caption = base.project.captions.items.c05;
+    if (caption === undefined) throw new Error("fixture cue missing");
+    const badRevision = {
+      ...caption.current,
+      parentItemRevision: 1,
+    };
+    const revisedCaption = { ...caption, current: badRevision, revisions: [badRevision] };
+    const badActor = {
+      ...caption.current,
+      actor: { type: "System" as const, id: "forged-system" },
+    };
+    const actorCaption = { ...caption, current: badActor, revisions: [badActor] };
+    const validated = applyCommand(project, {
+      type: "ValidateProject",
+      actor: { type: "System", id: "validator" },
+      expectedProjectRevision: 1,
+    }).project;
+    const historyBackup = exportProjectBackup(validated);
+    const cases = [
+      rehashBackup({
+        ...base,
+        project: { ...base.project, captions: { ...base.project.captions, items: { ...base.project.captions.items, c05: revisedCaption } } },
+      }),
+      rehashBackup({
+        ...base,
+        project: { ...base.project, captions: { ...base.project.captions, items: { ...base.project.captions.items, c05: actorCaption } } },
+      }),
+      rehashBackup({
+        ...historyBackup,
+        project: {
+          ...historyBackup.project,
+          validationHistory: [{ ...historyBackup.project.validationHistory[0]!, projectRevision: 99 }],
+        },
+      }),
+      rehashBackup({
+        ...base,
+        project: { ...base.project, certification: { status: "Stale" as const, certificationId: "missing-certification" } },
+      }),
+      rehashBackup({
+        ...base,
+        project: {
+          ...base.project,
+          exportHistory: [{
+            exportId: "future-export",
+            projectRevision: 99,
+            trackKind: "Captions" as const,
+            format: "vtt" as const,
+            disposition: "draft" as const,
+            verifiedAtMs: 1,
+            serializedTextHash: "sha256:" + "a".repeat(64),
+            roundTrip: { ok: true as const },
+          }],
+        },
+      }),
+    ];
+
+    for (const malformed of cases) {
+      expect(() => previewProjectImport(malformed, { actor: human })).toThrow();
+    }
+  });
+
+  it("accepts b8 v1 round-trip metadata while rejecting embedded media-like metadata", () => {
+    const backup = exportProjectBackup(fixtureProject());
+    const b8Compatible = rehashBackup({
+      ...backup,
+      exportMetadata: { ...backup.exportMetadata, roundTripResult: { ok: true } },
+    });
+    expect(previewProjectImport(b8Compatible, { actor: human })).toMatchObject({ mode: "preview" });
+
+    const mediaLikeMetadata = rehashBackup({
+      ...backup,
+      exportMetadata: {
+        ...backup.exportMetadata,
+        additional: { retained: "data:audio/wav;base64,AAAA", byteValues: [0, 1, 2, 255] },
+      },
+    });
+    expect(() => previewProjectImport(mediaLikeMetadata, { actor: human })).toThrow(/portable|media|backup/i);
+  });
+
+  it("removes data-media URLs and byte payloads even when their keys do not disclose the artifact type", () => {
+    const project = {
+      ...fixtureProject(),
+      arbitrary: {
+        alpha: "data:video/mp4;base64,AAAA",
+        beta: [0, 1, 2, 255, 4],
+      },
+    } as CaptionProject & Record<string, unknown>;
+    const backup = exportProjectBackup(project);
+    const json = JSON.stringify(backup);
+
+    expect(json).not.toContain("data:video/");
+    expect(json).not.toContain("[0,1,2,255,4]");
+    expect(backup.exportMetadata.excludedArtifactPaths).toEqual(expect.arrayContaining([
+      "project.arbitrary.alpha",
+      "project.arbitrary.beta",
+    ]));
+  });
+
+  it("backfills old validation history and keeps persistent project findings unresolved across revisions", () => {
+    const validated = applyCommand(fixtureProject(), {
+      type: "ValidateProject",
+      actor: { type: "System", id: "validator" },
+      expectedProjectRevision: 1,
+    }).project;
+    const { validationHistory: _history, exportHistory: _exports, ...legacyProject } = validated;
+    void _history;
+    void _exports;
+    const preview = previewProjectImport(exportProjectBackup(legacyProject as CaptionProject), { actor: human });
+    if (preview.mode !== "preview") throw new Error("expected preview");
+    expect(preview.project.validationHistory).toEqual([validated.validationRun]);
+
+    const initialFinding = {
+      id: "initial-project-finding",
+      findingId: "initial-project-finding",
+      ruleId: "evidence.stale",
+      severity: "blocker" as const,
+      message: "Media needs relinking.",
+      target: { type: "project" as const, projectId: validated.projectId, projectRevision: 1 },
+    };
+    const currentFinding = {
+      ...initialFinding,
+      id: "current-project-finding",
+      findingId: "current-project-finding",
+      target: { ...initialFinding.target, projectRevision: 2 },
+    };
+    const initialRun = { findings: [initialFinding] } as unknown as CaptionProject["validationHistory"][number];
+    const currentRun = { findings: [currentFinding] } as unknown as CaptionProject["validationHistory"][number];
+    const summary = buildImpactSummary({
+      ...validated,
+      projectRevision: 2,
+      validationHistory: [initialRun],
+      validationRun: currentRun,
+    });
+    expect(summary.initialFindings.total).toBe(1);
+    expect(summary.resolvedFindings.total).toBe(0);
   });
 
   it("reports only durable local history, human interventions, certification state, and recorded round-trip data", () => {

@@ -2,6 +2,7 @@ import type { Actor } from "@cuebench/contracts";
 import { domainError, type DomainError } from "../errors";
 import type { CaptionProject } from "../model";
 import { canonicalHash } from "../quality/hash";
+import { CaptionProjectAggregateError, validateCaptionProjectAggregate } from "./aggregate";
 import {
   classifyProjectBackupEnvelope,
   exportProjectBackup,
@@ -157,7 +158,7 @@ const basicPreview = (value: unknown): ImportMigrationPreview => {
   if (envelope.kind === "legacy") {
     throw new BackupImportError("BACKUP_SCHEMA_UNSUPPORTED", "A legacy project backup requires the explicit storage migration preview.");
   }
-  const project = envelope.backup.project;
+  const project = validateCaptionProjectAggregate(envelope.backup.project);
   if (!isRecord(project.media) || typeof project.media.sha256 !== "string" || !isSha256(project.media.sha256)) {
     throw new BackupImportError("INVALID_ARGUMENT", "Backup project media must record a SHA-256 hash for Media Relink.");
   }
@@ -261,6 +262,9 @@ export const previewProjectImport = (
     migrated = migration(value);
   } catch (error) {
     if (error instanceof BackupImportError) throw error;
+    if (error instanceof CaptionProjectAggregateError) {
+      throw new BackupImportError("INVALID_ARGUMENT", error.message);
+    }
     throw new BackupImportError("BACKUP_SCHEMA_UNSUPPORTED", error instanceof Error ? error.message : "Project backup migration failed.");
   }
   if (migrated.mode === "read-only") {
@@ -278,7 +282,17 @@ export const previewProjectImport = (
     };
   }
 
-  const project = staleDerivedArtifacts(migrated.project);
+  let checkedProject: CaptionProject;
+  try {
+    /** A custom storage migration is never a substitute for the public aggregate proof. */
+    checkedProject = validateCaptionProjectAggregate(migrated.project);
+  } catch (error) {
+    if (error instanceof CaptionProjectAggregateError) {
+      throw new BackupImportError("INVALID_ARGUMENT", error.message);
+    }
+    throw error;
+  }
+  const project = validateCaptionProjectAggregate(staleDerivedArtifacts(checkedProject));
   const expectedSha256 = normalSha256(project.media.sha256);
   const relink = options.relinkedMedia === undefined
     ? { status: "required" as const, expectedSha256 }
@@ -294,6 +308,16 @@ export const previewProjectImport = (
       },
     }
     : project;
+  let validatedRelinkedProject: CaptionProject;
+  try {
+    /** Mirrors RelinkMedia's all-revision/gap timing invariant before canImport becomes true. */
+    validatedRelinkedProject = validateCaptionProjectAggregate(relinkedProject);
+  } catch (error) {
+    if (error instanceof CaptionProjectAggregateError) {
+      throw new BackupImportError("INVALID_ARGUMENT", error.message);
+    }
+    throw error;
+  }
   return {
     mode: "preview",
     readOnly: false,
@@ -305,7 +329,7 @@ export const previewProjectImport = (
       : { projectId: options.replaceProject.projectId, backup: exportProjectBackup(options.replaceProject) },
     schemaVersion: migrated.schemaVersion,
     migratedFrom: migrated.migratedFrom,
-    project: relinkedProject,
+    project: validatedRelinkedProject,
     mediaRelink: relink,
     canImport: relink.status === "verified",
   };

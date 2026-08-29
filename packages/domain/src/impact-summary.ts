@@ -1,5 +1,5 @@
 import type { CaptionProject, DomainEvent } from "./model";
-import type { QualityFinding } from "./quality/validate";
+import { findingIdentityFor, type QualityFinding } from "./quality/validate";
 
 export interface FindingSummary {
   readonly total: number;
@@ -83,8 +83,8 @@ export const buildImpactSummary = (
   const history = project.validationHistory;
   const initial = history[0]?.findings ?? [];
   const current = project.validationRun?.findings ?? currentCertification(project)?.validationRun?.findings ?? [];
-  const currentIds = new Set(current.map((finding) => finding.findingId));
-  const resolved = initial.filter((finding) => !currentIds.has(finding.findingId));
+  const currentIdentities = new Set(current.map(findingIdentityFor));
+  const resolved = initial.filter((finding) => !currentIdentities.has(findingIdentityFor(finding)));
   const humanEvents = project.courtRecord.filter((event) => event.actor.type === "Human");
   const certification = currentCertification(project);
   const createdAt = timestamp(project.createdAtMs);

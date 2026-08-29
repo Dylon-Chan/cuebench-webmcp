@@ -1,5 +1,6 @@
 import type { CaptionProject } from "../model";
 import { canonicalHash } from "../quality/hash";
+import type { RoundTripResult } from "../export/round-trip";
 
 export const PROJECT_BACKUP_SCHEMA_VERSION = 1 as const;
 export const PROJECT_BACKUP_KIND = "CueBenchProjectBackup" as const;
@@ -27,6 +28,9 @@ export interface ProjectBackupExportMetadata {
   readonly excludedArtifactPaths: readonly string[];
   readonly exportedAtMs?: number;
   readonly projectCreatedAtMs?: number;
+  /** Legacy b8 v1 metadata retained only for authenticated compatibility reads. */
+  readonly roundTripResult?: RoundTripResult;
+  /** Legacy arbitrary metadata is read-only compatible; new exports never add it. */
   readonly additional?: Readonly<Record<string, BackupJsonValue>>;
 }
 
@@ -42,7 +46,6 @@ export interface ProjectBackupV1 {
 export interface ExportProjectBackupOptions {
   /** A caller-provided real export time; no clock is consulted in the domain layer. */
   readonly exportedAtMs?: number;
-  readonly additionalExportMetadata?: Readonly<Record<string, unknown>>;
 }
 
 export class ProjectBackupManifestError extends Error {
@@ -93,6 +96,12 @@ const isTrackMetadata = (value: unknown): value is BackupTrackMetadata =>
   && value.itemCount >= 0
   && isCanonicalHash(value.hash);
 
+const isRoundTripResult = (value: unknown): value is RoundTripResult => {
+  if (!isRecord(value) || typeof value.ok !== "boolean") return false;
+  if (value.ok === true) return hasExactKeys(value, ["ok"]);
+  return isRecord(value.error) && isRecord(value.firstDifference);
+};
+
 const isExportMetadata = (value: unknown): value is ProjectBackupExportMetadata => {
   if (!isRecord(value)) return false;
   const allowed = new Set([
@@ -102,6 +111,7 @@ const isExportMetadata = (value: unknown): value is ProjectBackupExportMetadata 
     "excludedArtifactPaths",
     "exportedAtMs",
     "projectCreatedAtMs",
+    "roundTripResult",
     "additional",
   ]);
   if (Object.keys(value).some((key) => !allowed.has(key))) return false;
@@ -116,6 +126,7 @@ const isExportMetadata = (value: unknown): value is ProjectBackupExportMetadata 
     || value.excludedArtifactPaths.some((path) => typeof path !== "string")) return false;
   if (value.exportedAtMs !== undefined && !isSafeTimestamp(value.exportedAtMs)) return false;
   if (value.projectCreatedAtMs !== undefined && !isSafeTimestamp(value.projectCreatedAtMs)) return false;
+  if (value.roundTripResult !== undefined && !isRoundTripResult(value.roundTripResult)) return false;
   return value.additional === undefined || isRecord(value.additional);
 };
 
@@ -133,6 +144,14 @@ const artifactKey = (key: string): boolean => {
     || /^narration(?:audio|blob|preview|url|objecturl)?$/.test(normalized);
 };
 
+const isMediaDataUri = (value: string): boolean => /^data:(?:video|audio)\//i.test(value);
+
+/** Byte arrays are source/narration payloads, not portable project metadata. */
+const isBinaryLikeNumericArray = (value: unknown): boolean =>
+  Array.isArray(value)
+  && value.length >= 4
+  && value.every((entry) => typeof entry === "number" && Number.isInteger(entry) && entry >= 0 && entry <= 255);
+
 const assertPortableManifestValue = (
   value: unknown,
   path: string,
@@ -144,7 +163,9 @@ const assertPortableManifestValue = (
     return;
   }
   if (typeof value === "string") {
-    if (value.startsWith("blob:")) throw new ProjectBackupManifestError(`Portable backup cannot retain an object URL at ${path}.`);
+    if (value.startsWith("blob:") || isMediaDataUri(value)) {
+      throw new ProjectBackupManifestError(`Portable backup cannot retain media URL data at ${path}.`);
+    }
     return;
   }
   if (isBlob(value)) throw new ProjectBackupManifestError(`Portable backup cannot retain Blob data at ${path}.`);
@@ -154,6 +175,9 @@ const assertPortableManifestValue = (
   if (ancestors.has(value)) throw new ProjectBackupManifestError(`Portable backup cannot contain a cyclic value at ${path}.`);
   ancestors.add(value);
   if (Array.isArray(value)) {
+    if (isBinaryLikeNumericArray(value)) {
+      throw new ProjectBackupManifestError(`Portable backup cannot retain binary-like numeric data at ${path}.`);
+    }
     value.forEach((entry, index) => assertPortableManifestValue(entry, `${path}[${index}]`, ancestors));
   } else {
     const prototype = Object.getPrototypeOf(value);
@@ -181,7 +205,7 @@ const timestamp = (value: number | undefined, label: string): number | undefined
 const sanitizeForBackup = (value: unknown, path: string, excluded: string[]): Sanitized => {
   if (value === null || typeof value === "boolean" || typeof value === "number" || typeof value === "string") {
     if (typeof value === "number" && !Number.isFinite(value)) throw new TypeError(`Backup cannot serialize non-finite number at ${path}.`);
-    if (typeof value === "string" && value.startsWith("blob:")) {
+    if (typeof value === "string" && (value.startsWith("blob:") || isMediaDataUri(value))) {
       excluded.push(path);
       return OMIT;
     }
@@ -196,6 +220,10 @@ const sanitizeForBackup = (value: unknown, path: string, excluded: string[]): Sa
     return OMIT;
   }
   if (Array.isArray(value)) {
+    if (isBinaryLikeNumericArray(value)) {
+      excluded.push(path);
+      return OMIT;
+    }
     const result: BackupJsonValue[] = [];
     for (let index = 0; index < value.length; index += 1) {
       const child = sanitizeForBackup(value[index], `${path}[${index}]`, excluded);
@@ -259,9 +287,6 @@ export const exportProjectBackup = (
 ): ProjectBackupV1 => {
   const excluded: string[] = [];
   const portableProject = sanitizedRecord(project, "project", excluded) as unknown as CaptionProject;
-  const additional = options.additionalExportMetadata === undefined
-    ? undefined
-    : sanitizedRecord(options.additionalExportMetadata, "exportMetadata.additional", excluded);
   const projectCreatedAtMs = timestamp(project.createdAtMs, "Project creation timestamp");
   const exportedAtMs = timestamp(options.exportedAtMs, "Export timestamp");
   const metadata: ProjectBackupExportMetadata = {
@@ -280,7 +305,6 @@ export const exportProjectBackup = (
     excludedArtifactPaths: [...new Set(excluded)].sort(),
     ...(exportedAtMs === undefined ? {} : { exportedAtMs }),
     ...(projectCreatedAtMs === undefined ? {} : { projectCreatedAtMs }),
-    ...(additional === undefined ? {} : { additional }),
   };
   const payload: Omit<ProjectBackupV1, "manifestHash"> = {
     schemaVersion: PROJECT_BACKUP_SCHEMA_VERSION,
@@ -319,6 +343,16 @@ export const verifyProjectBackupManifest = (value: unknown): ProjectBackupV1 => 
   const backup = value as unknown as ProjectBackupV1;
   assertPortableManifestValue(backup.project, "project");
   assertPortableManifestValue(backup.exportMetadata, "exportMetadata");
+  if (
+    backup.exportMetadata.projectHash !== canonicalHash("cuebench.project-backup.project.v1", backup.project)
+    || backup.exportMetadata.sourceMediaSha256 !== backup.project.media.sha256
+    || backup.exportMetadata.tracks.captions.itemCount !== backup.project.captions.order.length
+    || backup.exportMetadata.tracks.captions.hash !== canonicalHash("cuebench.project-backup.captions.v1", backup.project.captions)
+    || backup.exportMetadata.tracks.audioDescriptions.itemCount !== backup.project.audioDescriptions.order.length
+    || backup.exportMetadata.tracks.audioDescriptions.hash !== canonicalHash("cuebench.project-backup.audio-descriptions.v1", backup.project.audioDescriptions)
+  ) {
+    throw new ProjectBackupManifestError("Project backup manifest export metadata does not bind its portable project payload.");
+  }
   const expected = projectBackupManifestHash({
     schemaVersion: backup.schemaVersion,
     backupKind: backup.backupKind,

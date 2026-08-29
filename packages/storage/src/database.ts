@@ -1147,7 +1147,17 @@ const assertProjectRelationships = (project: CaptionProject): void => {
 };
 
 export const validateCaptionProject = (value: unknown): CaptionProject => {
-  const project = parseStored<CaptionProject>(CaptionProjectSchema, value, "project");
+  const legacy = typeof value === "object" && value !== null && !Array.isArray(value)
+    ? value as Readonly<Record<string, unknown>>
+    : undefined;
+  /** Old v1 rows/backups retained one current run but predate append-only history. */
+  const withBackfilledHistory = legacy !== undefined
+    && !Object.hasOwn(legacy, "validationHistory")
+    && legacy.validationRun !== null
+    && legacy.validationRun !== undefined
+    ? { ...legacy, validationHistory: [legacy.validationRun] }
+    : value;
+  const project = parseStored<CaptionProject>(CaptionProjectSchema, withBackfilledHistory, "project");
   assertProjectRelationships(project);
   return clone(project);
 };
@@ -1378,7 +1388,10 @@ export const rehydrateProject = (rows: NormalizedProjectRows): CaptionProject =>
     return scoped;
   };
   const currentRun = header.validationRun === null ? null : rehydrateValidationRun(header.validationRun, findingsForRun(header.validationRun));
-  const validationHistory = header.validationHistory.map((run) => rehydrateValidationRun(run, findingsForRun(run)));
+  /** Physical v1 headers predating the history field retain their current run. */
+  const validationHistory = header.validationHistory.length === 0 && currentRun !== null
+    ? [currentRun]
+    : header.validationHistory.map((run) => rehydrateValidationRun(run, findingsForRun(run)));
   const rehydratedCertifications = [...certifications]
     .sort((left, right) => left.sequence - right.sequence)
     .map((row) => rehydrateCertification(row.certification, findingsForRun(row.certification.validationRun)));

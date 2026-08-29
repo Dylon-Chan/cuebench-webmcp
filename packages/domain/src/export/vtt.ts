@@ -61,6 +61,13 @@ export const serializeVttTrack = (
   options: SerializeTrackOptions = {},
 ): string => {
   const track = normalizeExportTrack(source, options.trackKind);
+  let previousStartMs = -1;
+  for (const item of track.items) {
+    if (item.startMs < previousStartMs) {
+      throw new TrackSerializationError("VTT cue starts must be nondecreasing in exported track order.");
+    }
+    previousStartMs = item.startMs;
+  }
   const cues = track.items.map((item, index) => [
     cueId(item, index),
     `${formatVttTimestamp(item.startMs)} --> ${formatVttTimestamp(item.endMs)}`,
@@ -113,6 +120,7 @@ export const parseVttTrack = (source: string, options: ParseTrackOptions = {}): 
   let cursor = header.cursor;
   const identities = new Set<string>();
   const items: ExportTrackItem[] = [];
+  let previousStartMs = -1;
   while (cursor < lines.length) {
     while (cursor < lines.length && lines[cursor] === "") cursor += 1;
     if (cursor >= lines.length) break;
@@ -145,10 +153,15 @@ export const parseVttTrack = (source: string, options: ParseTrackOptions = {}): 
       cursor += 1;
     }
     if (payload.length === 0) throw new TrackParseError("VTT cues must contain text.");
+    if (payload.some((line) => line.includes("-->"))) {
+      throw new TrackParseError("VTT cue payloads must escape a literal timing arrow as --&gt;.");
+    }
     const text = parseVttCueText(header.kind, payload.join("\n"));
     const startMs = parseVttTimestamp(timingMatch[1] ?? "");
     const endMs = parseVttTimestamp(timingMatch[2] ?? "");
     if (endMs <= startMs) throw new TrackParseError("VTT cue end time must be after its start time.");
+    if (startMs < previousStartMs) throw new TrackParseError("VTT cue starts must be nondecreasing.");
+    previousStartMs = startMs;
     if (header.kind === "Captions") {
       items.push({
         kind: "CaptionCue",
