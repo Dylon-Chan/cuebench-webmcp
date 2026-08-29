@@ -2,6 +2,8 @@ import { describe, expect, it } from "vitest";
 import {
   buildImpactSummary,
   exportProjectBackup,
+  applyCommand,
+  prepareTrackExport,
   previewProjectImport,
   type CaptionProject,
 } from "../index";
@@ -19,7 +21,6 @@ describe("project backups", () => {
     } as CaptionProject & Record<string, unknown>;
     const backup = exportProjectBackup(project, {
       exportedAtMs: 1_700_000_000_000,
-      projectCreatedAtMs: 1_600_000_000_000,
     });
     const json = JSON.stringify(backup);
 
@@ -57,7 +58,70 @@ describe("project backups", () => {
       requiresSafetyBackup: true,
       mediaRelink: { status: "required", expectedSha256: project.media.sha256 },
     });
-    if (preview.mode === "preview") expect(preview.safetyBackup?.projectId).toBe(project.projectId);
+    if (preview.mode === "preview") {
+      expect(preview.safetyBackup.projectId).toBeNull();
+      expect(preview.safetyBackup.originalEnvelope).toEqual(backup);
+      expect(preview.replacementSafetyBackup?.projectId).toBe(project.projectId);
+    }
+  });
+
+  it("fails closed when a v1 manifest is incomplete or altered", () => {
+    const backup = exportProjectBackup(fixtureProject());
+    const missingKind = { ...backup };
+    Reflect.deleteProperty(missingKind, "backupKind");
+    const missingMetadata = { ...backup };
+    Reflect.deleteProperty(missingMetadata, "exportMetadata");
+    const missingManifest = { ...backup };
+    Reflect.deleteProperty(missingManifest, "manifestHash");
+    const fixtures: readonly unknown[] = [
+      missingKind,
+      { ...backup, backupKind: "SomethingElse" },
+      missingMetadata,
+      missingManifest,
+      { ...backup, exportMetadata: { ...backup.exportMetadata, sourceMediaSha256: "b".repeat(64) } },
+    ];
+
+    for (const malformed of fixtures) {
+      expect(() => previewProjectImport(malformed, { actor: human })).toThrow();
+    }
+  });
+
+  it("requires explicit human provenance for every public import preview", () => {
+    expect(() => {
+      // @ts-expect-error The public preview boundary has no anonymous form.
+      previewProjectImport(exportProjectBackup(fixtureProject()));
+    }).toThrow();
+    expect(() => previewProjectImport(exportProjectBackup(fixtureProject()), {
+      actor: { type: "System", id: "migration" },
+    })).toThrow();
+  });
+
+  it("preserves the original legacy envelope before migration even without a replacement project", () => {
+    const legacyEnvelope = {
+      schemaVersion: 0,
+      project: {
+        projectId: "legacy-project",
+        revision: 1,
+        name: "Legacy project",
+        sourceMedia: { id: "legacy-media", hash: "a".repeat(64), durationMs: 10_000, linked: true },
+      },
+    };
+    const preview = previewProjectImport(legacyEnvelope, {
+      actor: human,
+      migration: () => ({
+        mode: "preview" as const,
+        requiresHumanConfirmation: true as const,
+        schemaVersion: 1 as const,
+        migratedFrom: 0,
+        project: fixtureProject(),
+      }),
+    });
+
+    if (preview.mode === "preview") {
+      expect(preview.safetyBackup.required).toBe(true);
+      expect(preview.safetyBackup.originalEnvelope).toEqual(legacyEnvelope);
+      expect(preview.replacementSafetyBackup).toBeNull();
+    }
   });
 
   it("opens newer backup schemas read-only without migration", () => {
@@ -80,7 +144,7 @@ describe("project backups", () => {
     });
   });
 
-  it("reports only local findings, human interventions, certification state, and supplied round-trip data", () => {
+  it("reports only durable local history, human interventions, certification state, and recorded round-trip data", () => {
     const project = fixtureProject();
     const withHistory: CaptionProject = {
       ...project,
@@ -114,10 +178,40 @@ describe("project backups", () => {
         itemId: "c05",
       }],
     };
-    const summary = buildImpactSummary(withHistory, {
-      projectCreatedAtMs: 1_000,
-      roundTripResult: { ok: true },
+    const durableHistory: CaptionProject = {
+      ...withHistory,
+      validationHistory: [withHistory.validationRun!],
+    };
+    const exported = prepareTrackExport({
+      project: durableHistory,
+      trackKind: "Captions",
+      format: "vtt",
+      disposition: "draft",
     });
+    expect(applyCommand(durableHistory, {
+      type: "RecordExportRoundTrip",
+      actor: { type: "System", id: "exporter" },
+      expectedProjectRevision: durableHistory.projectRevision,
+      exportId: "forged-export",
+      trackKind: "Captions",
+      format: "vtt",
+      disposition: "draft",
+      verifiedAtMs: 2_000,
+      text: "not the verified export",
+    }).error?.code).toBe("INVALID_ARGUMENT");
+    const recorded = applyCommand(durableHistory, {
+      type: "RecordExportRoundTrip",
+      actor: { type: "System", id: "exporter" },
+      expectedProjectRevision: durableHistory.projectRevision,
+      exportId: "export-1",
+      trackKind: "Captions",
+      format: "vtt",
+      disposition: "draft",
+      verifiedAtMs: 2_000,
+      text: exported.text,
+    });
+    expect(recorded.error).toBeUndefined();
+    const summary = buildImpactSummary(recorded.project);
 
     expect(summary).toMatchObject({
       initialFindings: { total: 0 },
@@ -135,14 +229,15 @@ describe("project backups", () => {
     const project = fixtureProject();
     const current: CaptionProject = {
       ...project,
+      /** Simulates the durable value returned by local IndexedDB storage. */
       createdAtMs: 1_000,
       certification: { status: "Current", certificationId: "cert-1" },
       certifications: [{ certificationId: "cert-1", certifiedAtMs: 2_750 } as CaptionProject["certifications"][number]],
     };
 
     expect(buildImpactSummary(current).timeToCertificationMs).toBe(1_750);
-    const { createdAtMs, ...withoutCreationTime } = current;
-    void createdAtMs;
+    const { createdAtMs: persistedCreationTime, ...withoutCreationTime } = current;
+    void persistedCreationTime;
     expect(buildImpactSummary(withoutCreationTime)).not.toHaveProperty("timeToCertificationMs");
   });
 });

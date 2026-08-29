@@ -668,6 +668,7 @@ const projectFromValidationInput = (input: ValidationInputSnapshot): CaptionProj
     selectedItem: null,
     validation: { status: "NotRun", blockerCount: 0, warningCount: 0 },
     validationRun: null,
+    validationHistory: [],
     certification: { status: "NotCertified" },
     certifications: [],
     qualityProfile: {
@@ -679,6 +680,7 @@ const projectFromValidationInput = (input: ValidationInputSnapshot): CaptionProj
     warningWaivers: {},
     activeGenerationRun: null,
     courtRecord: [],
+    exportHistory: [],
   };
 };
 

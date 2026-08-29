@@ -106,6 +106,17 @@ export type DomainCommand =
       readonly type: "ValidateProject";
     })
   | (CommandBase & {
+      /** Records a successful parser round trip for one exact exported payload. */
+      readonly type: "RecordExportRoundTrip";
+      readonly exportId: string;
+      readonly trackKind: "Captions" | "AudioDescriptions";
+      readonly format: "vtt" | "srt" | "ad-txt";
+      readonly disposition: "draft" | "certified";
+      readonly verifiedAtMs: number;
+      /** Exact text is independently re-parsed and compared by the reducer. */
+      readonly text: string;
+    })
+  | (CommandBase & {
       readonly type: "WaiveWarning";
       readonly findingId: string;
       readonly reason: string;

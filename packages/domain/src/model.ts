@@ -153,15 +153,27 @@ export interface DomainEvent {
   readonly detail?: string;
 }
 
+/**
+ * Immutable proof that an exact exported text payload parsed back to the
+ * selected source track. This is persisted project history, not UI-supplied
+ * Impact Summary input.
+ */
+export interface ExportRoundTripEvidence {
+  readonly exportId: string;
+  readonly projectRevision: number;
+  readonly trackKind: "Captions" | "AudioDescriptions";
+  readonly format: "vtt" | "srt" | "ad-txt";
+  readonly disposition: "draft" | "certified";
+  readonly verifiedAtMs: number;
+  readonly serializedTextHash: string;
+  readonly roundTrip: { readonly ok: true };
+}
+
 export interface CaptionProject {
   readonly contractVersion: 1;
   readonly projectId: string;
   readonly projectRevision: number;
-  /**
-   * Optional because pre-timestamp project records remain importable. When it
-   * exists it is a caller-supplied, real local creation timestamp; domain code
-   * never invents one from a revision or current clock.
-   */
+  /** Optional only for legacy backups made before local creation timestamps. */
   readonly createdAtMs?: number;
   readonly title: string;
   readonly media: MediaSourceSnapshot;
@@ -178,17 +190,20 @@ export interface CaptionProject {
   readonly validation: ValidationSnapshot;
   /** Full deterministic run retained for readiness and immutable certification. */
   readonly validationRun: ValidationRun | null;
+  /** Append-only validation history, including the initial run. */
+  readonly validationHistory: readonly ValidationRun[];
   readonly certification: CertificationSnapshot;
   readonly certifications: readonly ProjectCertification[];
   readonly qualityProfile: QualityProfile;
   readonly warningWaivers: Readonly<Record<string, WarningWaiver>>;
   readonly activeGenerationRun: GenerationLease | null;
   readonly courtRecord: readonly DomainEvent[];
+  /** Append-only successful export verification evidence. */
+  readonly exportHistory: readonly ExportRoundTripEvidence[];
 }
 
 export interface CreateProjectInput {
   readonly projectId: string;
-  readonly createdAtMs?: number;
   readonly title: string;
   readonly media: MediaSourceSnapshot;
   readonly profile?: Omit<QualityProfile, "revision"> & { readonly revision?: number };
@@ -219,9 +234,6 @@ const hasValidInitialTiming = (durationMs: number, startMs: number, endMs: numbe
   && endMs <= durationMs;
 
 const assertInitialProjectInvariant = (input: CreateProjectInput) => {
-  if (input.createdAtMs !== undefined && (!Number.isSafeInteger(input.createdAtMs) || input.createdAtMs < 0)) {
-    throw new RangeError("Project creation time must be a non-negative integer timestamp.");
-  }
   if (!Number.isSafeInteger(input.media.durationMs) || input.media.durationMs < 0) {
     throw new RangeError("Media duration must be a non-negative integer.");
   }
@@ -333,7 +345,6 @@ export const createProject = (input: CreateProjectInput): CaptionProject => {
     contractVersion: 1,
     projectId: input.projectId,
     projectRevision: 1,
-    ...(input.createdAtMs === undefined ? {} : { createdAtMs: input.createdAtMs }),
     title: input.title,
     media: clone(input.media),
     evidence: clone(input.evidence ?? []),
@@ -355,8 +366,10 @@ export const createProject = (input: CreateProjectInput): CaptionProject => {
     },
     warningWaivers: {},
     validationRun: null,
+    validationHistory: [],
     activeGenerationRun: null,
     certifications: [],
     courtRecord: [],
+    exportHistory: [],
   };
 };

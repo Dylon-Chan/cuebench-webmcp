@@ -35,7 +35,7 @@ export const serializeAdTextTrack = (
     ].join("\n");
   });
   const header = ["CUEBENCH-AD-TEXT", "X-CUEBENCH-TRACK: AudioDescriptions"].join("\n");
-  return cues.length === 0 ? `${header}\n` : `${header}\n\n${cues.join("\n\n")}`;
+  return cues.length === 0 ? `${header}\n\n` : `${header}\n\n${cues.join("\n\n")}\n`;
 };
 
 export const parseAdTextTrack = (source: string): ParsedTrack => {

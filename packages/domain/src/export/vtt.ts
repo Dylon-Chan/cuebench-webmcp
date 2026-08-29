@@ -5,8 +5,8 @@ import {
   normalizeExportTrack,
   parsedTrack,
   type ExportTrackItem,
-  type NormalizedTrack,
   type ParsedTrack,
+  type ParseTrackOptions,
   type TrackExportSource,
   type SerializeTrackOptions,
   TrackParseError,
@@ -42,8 +42,6 @@ export const parseVttTimestamp = (value: string): number => {
   return total;
 };
 
-const vttTrackHeader = (track: NormalizedTrack): string => `X-CUEBENCH-TRACK: ${track.kind}`;
-
 const cueText = (item: ExportTrackItem): string => {
   const text = escapeTimedText(item.text);
   if (item.kind === "CaptionCue" && item.speaker !== null) {
@@ -68,8 +66,8 @@ export const serializeVttTrack = (
     `${formatVttTimestamp(item.startMs)} --> ${formatVttTimestamp(item.endMs)}`,
     cueText(item),
   ].join("\n"));
-  const header = ["WEBVTT", vttTrackHeader(track)].join("\n");
-  return cues.length === 0 ? `${header}\n` : `${header}\n\n${cues.join("\n\n")}`;
+  /** The required blank line after WEBVTT is deliberately literal. */
+  return cues.length === 0 ? "WEBVTT\n\n" : `WEBVTT\n\n${cues.join("\n\n")}\n`;
 };
 
 interface ParsedVttCueText {
@@ -94,34 +92,24 @@ const parseVttCueText = (kind: "Captions" | "AudioDescriptions", payload: string
   return { text: unescapeTimedText(payload), speaker: null };
 };
 
-const parseHeader = (lines: readonly string[]): { readonly kind: "Captions" | "AudioDescriptions"; readonly cursor: number } => {
-  if (lines[0]?.replace(/^\uFEFF/, "") !== "WEBVTT") {
-    throw new TrackParseError("A strict VTT export must begin with WEBVTT.");
+const parseHeader = (
+  source: string,
+  options: ParseTrackOptions,
+): { readonly lines: readonly string[]; readonly kind: "Captions" | "AudioDescriptions"; readonly cursor: number } => {
+  const normalized = source.replace(/\r\n?/g, "\n").replace(/^\uFEFF/, "");
+  if (!normalized.startsWith("WEBVTT\n\n")) {
+    throw new TrackParseError("A strict CueBench VTT must begin with WEBVTT followed immediately by one blank line.");
   }
-  let cursor = 1;
-  let kind: "Captions" | "AudioDescriptions" = "Captions";
-  let sawIdentity = false;
-  while (cursor < lines.length && lines[cursor] !== "") {
-    const line = lines[cursor]!;
-    const track = /^X-CUEBENCH-TRACK: (Captions|AudioDescriptions)$/.exec(line);
-    if (track !== null) {
-      if (sawIdentity) throw new UnsupportedTrackMetadataError("VTT contains more than one CueBench track identity header.");
-      kind = track[1] as "Captions" | "AudioDescriptions";
-      sawIdentity = true;
-    } else if (/^(NOTE|STYLE|REGION)(?:\s|$)/.test(line)) {
-      throw new UnsupportedTrackMetadataError(`Unsupported VTT metadata block ${line.split(/\s/, 1)[0] ?? ""}.`);
-    } else {
-      throw new UnsupportedTrackMetadataError("Unsupported VTT header metadata.");
-    }
-    cursor += 1;
+  const kind = options.trackKind ?? "Captions";
+  if (kind !== "Captions" && kind !== "AudioDescriptions") {
+    throw new TrackParseError("VTT track identity must be Captions or AudioDescriptions when supplied by the caller.");
   }
-  if (cursor >= lines.length) return { kind, cursor };
-  return { kind, cursor: cursor + 1 };
+  return { lines: normalized.split("\n"), kind, cursor: 2 };
 };
 
-export const parseVttTrack = (source: string): ParsedTrack => {
-  const lines = source.replace(/\r\n?/g, "\n").split("\n");
-  const header = parseHeader(lines);
+export const parseVttTrack = (source: string, options: ParseTrackOptions = {}): ParsedTrack => {
+  const header = parseHeader(source, options);
+  const lines = header.lines;
   let cursor = header.cursor;
   const identities = new Set<string>();
   const items: ExportTrackItem[] = [];
@@ -175,7 +163,7 @@ export const parseVttTrack = (source: string): ParsedTrack => {
     }
   }
   return parsedTrack(header.kind, items, "vtt", {
-    trackIdentity: true,
+    trackIdentity: options.trackKind !== undefined,
     itemIdentity: true,
     speaker: header.kind === "Captions",
   });

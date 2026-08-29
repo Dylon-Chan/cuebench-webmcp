@@ -1,6 +1,5 @@
 import type { CaptionProject } from "../model";
 import { canonicalHash } from "../quality/hash";
-import type { RoundTripResult } from "../export/round-trip";
 
 export const PROJECT_BACKUP_SCHEMA_VERSION = 1 as const;
 export const PROJECT_BACKUP_KIND = "CueBenchProjectBackup" as const;
@@ -28,7 +27,6 @@ export interface ProjectBackupExportMetadata {
   readonly excludedArtifactPaths: readonly string[];
   readonly exportedAtMs?: number;
   readonly projectCreatedAtMs?: number;
-  readonly roundTripResult?: RoundTripResult;
   readonly additional?: Readonly<Record<string, BackupJsonValue>>;
 }
 
@@ -44,17 +42,82 @@ export interface ProjectBackupV1 {
 export interface ExportProjectBackupOptions {
   /** A caller-provided real export time; no clock is consulted in the domain layer. */
   readonly exportedAtMs?: number;
-  /** Project-creation time retained by the browser persistence layer, when available. */
-  readonly projectCreatedAtMs?: number;
-  readonly roundTripResult?: RoundTripResult;
   readonly additionalExportMetadata?: Readonly<Record<string, unknown>>;
 }
+
+export class ProjectBackupManifestError extends Error {
+  public constructor(message: string) {
+    super(message);
+    this.name = "ProjectBackupManifestError";
+  }
+}
+
+export interface LegacyProjectBackupEnvelopeV0 {
+  readonly schemaVersion: 0;
+  readonly project: unknown;
+}
+
+export interface NewerProjectBackupEnvelope {
+  readonly schemaVersion: number;
+  readonly project: unknown;
+}
+
+export type ClassifiedProjectBackupEnvelope =
+  | { readonly kind: "current"; readonly backup: ProjectBackupV1 }
+  | { readonly kind: "legacy"; readonly backup: LegacyProjectBackupEnvelopeV0 }
+  | { readonly kind: "newer"; readonly backup: NewerProjectBackupEnvelope };
 
 const OMIT = Symbol("cuebench-backup-omit");
 type Sanitized = BackupJsonValue | typeof OMIT;
 
 const isRecord = (value: unknown): value is Readonly<Record<string, unknown>> =>
   typeof value === "object" && value !== null && !Array.isArray(value);
+
+const hasExactKeys = (value: Readonly<Record<string, unknown>>, keys: readonly string[]): boolean => {
+  const actual = Object.keys(value).sort();
+  const expected = [...keys].sort();
+  return actual.length === expected.length && actual.every((key, index) => key === expected[index]);
+};
+
+const isSafeTimestamp = (value: unknown): value is number =>
+  typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
+
+const isCanonicalHash = (value: unknown): value is string =>
+  typeof value === "string" && /^sha256:[0-9a-f]{64}$/.test(value);
+
+const isTrackMetadata = (value: unknown): value is BackupTrackMetadata =>
+  isRecord(value)
+  && hasExactKeys(value, ["itemCount", "hash"])
+  && typeof value.itemCount === "number"
+  && Number.isSafeInteger(value.itemCount)
+  && value.itemCount >= 0
+  && isCanonicalHash(value.hash);
+
+const isExportMetadata = (value: unknown): value is ProjectBackupExportMetadata => {
+  if (!isRecord(value)) return false;
+  const allowed = new Set([
+    "projectHash",
+    "sourceMediaSha256",
+    "tracks",
+    "excludedArtifactPaths",
+    "exportedAtMs",
+    "projectCreatedAtMs",
+    "additional",
+  ]);
+  if (Object.keys(value).some((key) => !allowed.has(key))) return false;
+  if (!isCanonicalHash(value.projectHash) || typeof value.sourceMediaSha256 !== "string" || !/^[0-9a-f]{64}$/i.test(value.sourceMediaSha256)) {
+    return false;
+  }
+  if (!isRecord(value.tracks)
+    || !hasExactKeys(value.tracks, ["captions", "audioDescriptions"])
+    || !isTrackMetadata(value.tracks.captions)
+    || !isTrackMetadata(value.tracks.audioDescriptions)
+    || !Array.isArray(value.excludedArtifactPaths)
+    || value.excludedArtifactPaths.some((path) => typeof path !== "string")) return false;
+  if (value.exportedAtMs !== undefined && !isSafeTimestamp(value.exportedAtMs)) return false;
+  if (value.projectCreatedAtMs !== undefined && !isSafeTimestamp(value.projectCreatedAtMs)) return false;
+  return value.additional === undefined || isRecord(value.additional);
+};
 
 const isBlob = (value: unknown): boolean => typeof Blob !== "undefined" && value instanceof Blob;
 
@@ -68,6 +131,41 @@ const artifactKey = (key: string): boolean => {
     || normalized === "blob"
     || normalized.endsWith("blob")
     || /^narration(?:audio|blob|preview|url|objecturl)?$/.test(normalized);
+};
+
+const assertPortableManifestValue = (
+  value: unknown,
+  path: string,
+  ancestors = new WeakSet<object>(),
+): void => {
+  if (value === null || typeof value === "boolean") return;
+  if (typeof value === "number") {
+    if (!Number.isFinite(value)) throw new ProjectBackupManifestError(`Portable backup value at ${path} is not finite.`);
+    return;
+  }
+  if (typeof value === "string") {
+    if (value.startsWith("blob:")) throw new ProjectBackupManifestError(`Portable backup cannot retain an object URL at ${path}.`);
+    return;
+  }
+  if (isBlob(value)) throw new ProjectBackupManifestError(`Portable backup cannot retain Blob data at ${path}.`);
+  if (typeof value !== "object" || value === undefined) {
+    throw new ProjectBackupManifestError(`Portable backup value at ${path} is not JSON-compatible.`);
+  }
+  if (ancestors.has(value)) throw new ProjectBackupManifestError(`Portable backup cannot contain a cyclic value at ${path}.`);
+  ancestors.add(value);
+  if (Array.isArray(value)) {
+    value.forEach((entry, index) => assertPortableManifestValue(entry, `${path}[${index}]`, ancestors));
+  } else {
+    const prototype = Object.getPrototypeOf(value);
+    if (prototype !== Object.prototype && prototype !== null) {
+      throw new ProjectBackupManifestError(`Portable backup value at ${path} must be a plain object.`);
+    }
+    for (const [key, entry] of Object.entries(value)) {
+      if (artifactKey(key)) throw new ProjectBackupManifestError(`Portable backup cannot retain ${key} at ${path}.`);
+      assertPortableManifestValue(entry, path.length === 0 ? key : `${path}.${key}`, ancestors);
+    }
+  }
+  ancestors.delete(value);
 };
 
 const timestamp = (value: number | undefined, label: string): number | undefined => {
@@ -164,10 +262,7 @@ export const exportProjectBackup = (
   const additional = options.additionalExportMetadata === undefined
     ? undefined
     : sanitizedRecord(options.additionalExportMetadata, "exportMetadata.additional", excluded);
-  const projectCreatedAtMs = timestamp(
-    options.projectCreatedAtMs ?? project.createdAtMs,
-    "Project creation timestamp",
-  );
+  const projectCreatedAtMs = timestamp(project.createdAtMs, "Project creation timestamp");
   const exportedAtMs = timestamp(options.exportedAtMs, "Export timestamp");
   const metadata: ProjectBackupExportMetadata = {
     projectHash: canonicalHash("cuebench.project-backup.project.v1", portableProject),
@@ -185,7 +280,6 @@ export const exportProjectBackup = (
     excludedArtifactPaths: [...new Set(excluded)].sort(),
     ...(exportedAtMs === undefined ? {} : { exportedAtMs }),
     ...(projectCreatedAtMs === undefined ? {} : { projectCreatedAtMs }),
-    ...(options.roundTripResult === undefined ? {} : { roundTripResult: structuredClone(options.roundTripResult) }),
     ...(additional === undefined ? {} : { additional }),
   };
   const payload: Omit<ProjectBackupV1, "manifestHash"> = {
@@ -197,7 +291,64 @@ export const exportProjectBackup = (
   return { ...payload, manifestHash: projectBackupManifestHash(payload) };
 };
 
+/** Returns true only for the complete, integrity-checked v1 portable manifest. */
 export const isProjectBackupV1 = (value: unknown): value is ProjectBackupV1 => {
-  if (!isRecord(value) || value.schemaVersion !== PROJECT_BACKUP_SCHEMA_VERSION || value.backupKind !== PROJECT_BACKUP_KIND) return false;
-  return isRecord(value.project) && isRecord(value.exportMetadata) && typeof value.manifestHash === "string";
+  try {
+    verifyProjectBackupManifest(value);
+    return true;
+  } catch {
+    return false;
+  }
+};
+
+/**
+ * Validates every required v1 manifest field before any project migration can
+ * inspect it. A v1-shaped object missing a field is never reclassified as a
+ * legacy input: legacy migration is explicitly schemaVersion 0 only.
+ */
+export const verifyProjectBackupManifest = (value: unknown): ProjectBackupV1 => {
+  if (!isRecord(value)
+    || !hasExactKeys(value, ["schemaVersion", "backupKind", "project", "exportMetadata", "manifestHash"])
+    || value.schemaVersion !== PROJECT_BACKUP_SCHEMA_VERSION
+    || value.backupKind !== PROJECT_BACKUP_KIND
+    || !isRecord(value.project)
+    || !isExportMetadata(value.exportMetadata)
+    || !isCanonicalHash(value.manifestHash)) {
+    throw new ProjectBackupManifestError("CueBenchProjectBackup v1 requires a complete, strict manifest.");
+  }
+  const backup = value as unknown as ProjectBackupV1;
+  assertPortableManifestValue(backup.project, "project");
+  assertPortableManifestValue(backup.exportMetadata, "exportMetadata");
+  const expected = projectBackupManifestHash({
+    schemaVersion: backup.schemaVersion,
+    backupKind: backup.backupKind,
+    project: backup.project,
+    exportMetadata: backup.exportMetadata,
+  });
+  if (backup.manifestHash !== expected) {
+    throw new ProjectBackupManifestError("Project backup manifest hash does not match its portable contents.");
+  }
+  return structuredClone(backup);
+};
+
+export const classifyProjectBackupEnvelope = (value: unknown): ClassifiedProjectBackupEnvelope => {
+  if (!isRecord(value) || !Object.hasOwn(value, "schemaVersion") || !Number.isSafeInteger(value.schemaVersion) || typeof value.schemaVersion !== "number") {
+    throw new ProjectBackupManifestError("A project backup requires an integer schemaVersion.");
+  }
+  if (value.schemaVersion === PROJECT_BACKUP_SCHEMA_VERSION) {
+    return { kind: "current", backup: verifyProjectBackupManifest(value) };
+  }
+  if (value.schemaVersion === 0) {
+    if (!hasExactKeys(value, ["schemaVersion", "project"])) {
+      throw new ProjectBackupManifestError("Legacy project migration inputs must be explicit schemaVersion 0 envelopes.");
+    }
+    return { kind: "legacy", backup: structuredClone(value as unknown as LegacyProjectBackupEnvelopeV0) };
+  }
+  if (value.schemaVersion > PROJECT_BACKUP_SCHEMA_VERSION) {
+    if (!Object.hasOwn(value, "project")) {
+      throw new ProjectBackupManifestError("A newer project backup requires a project payload for read-only preview.");
+    }
+    return { kind: "newer", backup: structuredClone(value as unknown as NewerProjectBackupEnvelope) };
+  }
+  throw new ProjectBackupManifestError(`Unsupported project backup schema v${value.schemaVersion}.`);
 };

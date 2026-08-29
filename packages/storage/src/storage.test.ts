@@ -3,11 +3,13 @@ import "fake-indexeddb/auto";
 import Dexie from "dexie";
 import {
   applyCommand,
+  buildImpactSummary,
   canonicalHash,
   createProject,
   intermediateCertificationSnapshotHashFor,
   legacyCertificationSnapshotHashFor,
   prepareCertificationReview,
+  prepareTrackExport,
   type CaptionProject,
 } from "@cuebench/domain";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -135,6 +137,42 @@ const certifiedFixtureProject = (
 };
 
 describe("CueBenchDatabase", () => {
+  it("persists append-only validation and actual export round-trip history for the Impact Summary", async () => {
+    const db = testDatabase();
+    const initial = fixtureProject();
+    await initializeProject(db, initial);
+    const validated = await executePersistentCommand(db, initial.projectId, {
+      type: "ValidateProject",
+      actor: { type: "System", id: "validator" },
+      expectedProjectRevision: initial.projectRevision,
+    });
+    expect(validated.error).toBeUndefined();
+    const exported = prepareTrackExport({
+      project: validated.project,
+      trackKind: "Captions",
+      format: "vtt",
+      disposition: "draft",
+    });
+    if (!exported.roundTrip.ok) throw new Error("expected verified export");
+    const recorded = await executePersistentCommand(db, initial.projectId, {
+      type: "RecordExportRoundTrip",
+      actor: { type: "System", id: "exporter" },
+      expectedProjectRevision: validated.project.projectRevision,
+      exportId: "export-1",
+      trackKind: "Captions",
+      format: "vtt",
+      disposition: "draft",
+      verifiedAtMs: validated.project.createdAtMs! + 1,
+      text: exported.text,
+    });
+    expect(recorded.error).toBeUndefined();
+
+    const persisted = await loadProject(db, initial.projectId);
+    expect(persisted?.validationHistory).toEqual([validated.project.validationRun]);
+    expect(persisted?.exportHistory).toEqual(recorded.project.exportHistory);
+    expect(persisted === undefined ? null : buildImpactSummary(persisted).roundTripResult).toEqual({ ok: true });
+  });
+
   it("persists project revision and Court Record atomically", async () => {
     const db = testDatabase();
     await initializeProject(db, fixtureProject());
@@ -591,7 +629,9 @@ describe("CueBenchDatabase", () => {
 
     await initializeProject(db, exactProject);
     const restored = await loadProject(db, "project-1");
-    expect(restored).toEqual(exactProject);
+    const { createdAtMs, ...restoredWithoutCreationTime } = restored ?? {};
+    expect(createdAtMs).toEqual(expect.any(Number));
+    expect(restoredWithoutCreationTime).toEqual(exactProject);
 
     await expect(initializeProject(testDatabase(), {
       ...fixtureProject(),
@@ -744,7 +784,7 @@ describe("CueBenchDatabase", () => {
     expect(await db.findings.where("projectId").equals("certification-project").count()).toBe(
       certified.project.validationRun?.findings.length ?? 0,
     );
-    expect(saved).toEqual(certified.project);
+    expect(saved).toEqual({ ...certified.project, createdAtMs: saved?.createdAtMs });
 
     await db.projectHeaders.update("certification-project", { warningWaivers: {} } as never);
     await expect(loadProject(db, "certification-project")).rejects.toBeInstanceOf(StorageReadValidationError);

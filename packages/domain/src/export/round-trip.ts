@@ -1,5 +1,6 @@
 import type { CaptionProject, ProjectCertification } from "../model";
 import { domainError, type DomainError } from "../errors";
+import { canonicalHash } from "../quality/hash";
 import { parseAdTextTrack, serializeAdTextTrack } from "./ad-text";
 import { parseSrtTrack, serializeSrtTrack } from "./srt";
 import {
@@ -9,6 +10,7 @@ import {
   type ExportTrackKind,
   type ExportTrackItem,
   type NormalizedTrack,
+  type ParseTrackOptions,
   type ParsedTrack,
   type SerializeTrackOptions,
   type TrackExportSource,
@@ -135,9 +137,13 @@ export const serializeTrack = (
   options: SerializeTrackOptions = {},
 ): string => serializeCanonicalTrack(source, canonicalTrackFormat(format), options);
 
-export const parseTrack = (source: string, format: TrackFormat): ParsedTrack => {
+export const parseTrack = (
+  source: string,
+  format: TrackFormat,
+  options: ParseTrackOptions = {},
+): ParsedTrack => {
   const canonical = canonicalTrackFormat(format);
-  if (canonical === "vtt") return parseVttTrack(source);
+  if (canonical === "vtt") return parseVttTrack(source, options);
   if (canonical === "srt") return parseSrtTrack(source);
   return parseAdTextTrack(source);
 };
@@ -152,6 +158,8 @@ export interface ProjectTrackExportRequest {
 export interface ProjectTrackExport {
   readonly filename: string;
   readonly text: string;
+  /** Durable-record input tying a successful verification to exact bytes. */
+  readonly serializedTextHash: string;
   readonly source: NormalizedTrack;
   readonly parsed: ParsedTrack;
   readonly roundTrip: RoundTripResult;
@@ -180,7 +188,7 @@ export const prepareTrackExport = (request: ProjectTrackExportRequest): ProjectT
     : certifiedSnapshot(request.project);
   const options: SerializeTrackOptions = { trackKind: request.trackKind };
   const text = serializeTrack(source, request.format, options);
-  const parsed = parseTrack(text, request.format);
+  const parsed = parseTrack(text, request.format, options);
   const roundTrip = verifyRoundTrip(source, parsed, options);
   if (!roundTrip.ok) {
     throw new TrackSerializationError(roundTrip.error.message);
@@ -188,6 +196,7 @@ export const prepareTrackExport = (request: ProjectTrackExportRequest): ProjectT
   return {
     filename: buildTrackFilename(request.project.title, request.format, request.disposition),
     text,
+    serializedTextHash: canonicalHash("cuebench.track-export.text.v1", text),
     source: normalizeExportTrack(source, request.trackKind),
     parsed,
     roundTrip,

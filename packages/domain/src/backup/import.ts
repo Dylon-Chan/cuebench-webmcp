@@ -1,11 +1,11 @@
 import type { Actor } from "@cuebench/contracts";
 import { domainError, type DomainError } from "../errors";
 import type { CaptionProject } from "../model";
+import { canonicalHash } from "../quality/hash";
 import {
+  classifyProjectBackupEnvelope,
   exportProjectBackup,
-  isProjectBackupV1,
-  PROJECT_BACKUP_SCHEMA_VERSION,
-  projectBackupManifestHash,
+  ProjectBackupManifestError,
   type ProjectBackupV1,
 } from "./schema";
 
@@ -36,10 +36,18 @@ export type ImportPreviewMigration = (value: unknown) => ImportMigrationPreview;
 
 export interface ImportSafetyBackup {
   readonly required: true;
-  readonly projectId: string | null;
-  /** Present only when an existing selected project can be backed up now. */
-  readonly backup: ProjectBackupV1 | null;
-  readonly reason: "REPLACE_PROJECT" | "MIGRATION" | "IMPORT";
+  /** The input envelope is cloned before migration so recovery is exact. */
+  readonly projectId: null;
+  readonly originalEnvelope: unknown;
+  readonly originalEnvelopeHash: string;
+  readonly actor: Actor;
+  readonly reason: "MIGRATION" | "IMPORT";
+}
+
+/** A replacement target is protected independently from the incoming envelope. */
+export interface ReplacementProjectSafetyBackup {
+  readonly projectId: string;
+  readonly backup: ProjectBackupV1;
 }
 
 export interface MediaRelinkRequired {
@@ -68,6 +76,7 @@ export interface ProjectImportPreview {
   readonly requiresHumanConfirmation: true;
   readonly requiresSafetyBackup: true;
   readonly safetyBackup: ImportSafetyBackup;
+  readonly replacementSafetyBackup: ReplacementProjectSafetyBackup | null;
   readonly schemaVersion: number;
   readonly migratedFrom: number | null;
   readonly project: CaptionProject;
@@ -81,6 +90,7 @@ export interface ReadOnlyProjectImportPreview {
   readonly requiresHumanConfirmation: true;
   readonly requiresSafetyBackup: false;
   readonly safetyBackup: null;
+  readonly replacementSafetyBackup: null;
   readonly schemaVersion: number;
   readonly reason: "NEWER_SCHEMA";
   readonly project: unknown;
@@ -90,8 +100,8 @@ export interface ReadOnlyProjectImportPreview {
 export type ProjectImportDescriptor = ProjectImportPreview | ReadOnlyProjectImportPreview;
 
 export interface PreviewProjectImportOptions {
-  /** When supplied, import previews enforce the same human-only boundary as the UI. */
-  readonly actor?: Actor;
+  /** Explicit provenance is required at the public import boundary. */
+  readonly actor: Actor;
   /** Existing project selected for replacement. Its portable safety backup is returned, never written here. */
   readonly replaceProject?: CaptionProject;
   readonly relinkedMedia?: MediaRelinkCandidate;
@@ -134,45 +144,47 @@ const staleDerivedArtifacts = (project: CaptionProject): CaptionProject => ({
 });
 
 const basicPreview = (value: unknown): ImportMigrationPreview => {
-  if (!isRecord(value) || !Number.isSafeInteger(value.schemaVersion) || typeof value.schemaVersion !== "number") {
-    throw new BackupImportError("INVALID_ARGUMENT", "A project backup requires an integer schemaVersion.");
-  }
-  if (value.schemaVersion > PROJECT_BACKUP_SCHEMA_VERSION) {
+  const envelope = classifyProjectBackupEnvelope(value);
+  if (envelope.kind === "newer") {
     return {
       mode: "read-only",
       readOnly: true,
-      schemaVersion: value.schemaVersion,
+      schemaVersion: envelope.backup.schemaVersion,
       reason: "NEWER_SCHEMA",
-      project: value.project,
+      project: envelope.backup.project,
     };
   }
-  if (value.schemaVersion !== PROJECT_BACKUP_SCHEMA_VERSION || !isRecord(value.project)) {
-    throw new BackupImportError("BACKUP_SCHEMA_UNSUPPORTED", `No domain preview migration exists for backup schema v${value.schemaVersion}.`);
+  if (envelope.kind === "legacy") {
+    throw new BackupImportError("BACKUP_SCHEMA_UNSUPPORTED", "A legacy project backup requires the explicit storage migration preview.");
   }
-  const project = value.project as unknown as CaptionProject;
+  const project = envelope.backup.project;
   if (!isRecord(project.media) || typeof project.media.sha256 !== "string" || !isSha256(project.media.sha256)) {
     throw new BackupImportError("INVALID_ARGUMENT", "Backup project media must record a SHA-256 hash for Media Relink.");
   }
   return {
     mode: "preview",
     requiresHumanConfirmation: true,
-    schemaVersion: value.schemaVersion,
+    schemaVersion: envelope.backup.schemaVersion,
     migratedFrom: null,
     project: staleDerivedArtifacts(project),
   };
 };
 
-const assertManifest = (value: unknown): void => {
-  if (!isProjectBackupV1(value)) return;
-  const expected = projectBackupManifestHash({
-    schemaVersion: value.schemaVersion,
-    backupKind: value.backupKind,
-    project: value.project,
-    exportMetadata: value.exportMetadata,
-  });
-  if (value.manifestHash !== expected) {
-    throw new BackupImportError("INVALID_ARGUMENT", "Project backup manifest hash does not match its portable contents.");
+const cloneIncomingEnvelope = (value: unknown, actor: Actor, reason: ImportSafetyBackup["reason"]): ImportSafetyBackup => {
+  let originalEnvelope: unknown;
+  try {
+    originalEnvelope = structuredClone(value);
+  } catch {
+    throw new BackupImportError("INVALID_ARGUMENT", "A project import envelope must be safely cloneable before migration.");
   }
+  return {
+    required: true,
+    projectId: null,
+    originalEnvelope,
+    originalEnvelopeHash: canonicalHash("cuebench.import.original-envelope.v1", originalEnvelope),
+    actor: structuredClone(actor),
+    reason,
+  };
 };
 
 export const verifyMediaRelink = (
@@ -195,9 +207,13 @@ export const verifyMediaRelink = (
   return { status: "verified", expectedSha256: expected, actualSha256: actual };
 };
 
-const optionsFor = (
-  options: PreviewProjectImportOptions | ImportPreviewMigration | undefined,
-): PreviewProjectImportOptions => typeof options === "function" ? { migration: options } : options ?? {};
+const requireHumanProvenance = (options: PreviewProjectImportOptions | undefined): Actor => {
+  const actor = options?.actor;
+  if (actor === undefined || actor.type !== "Human" || typeof actor.id !== "string" || actor.id.trim().length === 0 || actor.id.trim() !== actor.id) {
+    throw new BackupImportError("HUMAN_AUTHORITY_REQUIRED", "A named Human actor is required to preview a project import.");
+  }
+  return actor;
+};
 
 /**
  * Pure import preflight. It never writes Dexie, never performs a relink
@@ -207,14 +223,39 @@ const optionsFor = (
  */
 export const previewProjectImport = (
   value: unknown,
-  options?: PreviewProjectImportOptions | ImportPreviewMigration,
+  options: PreviewProjectImportOptions,
 ): ProjectImportDescriptor => {
-  const resolved = optionsFor(options);
-  if (resolved.actor !== undefined && resolved.actor.type !== "Human") {
-    throw new BackupImportError("HUMAN_AUTHORITY_REQUIRED", "Only a human may import a project backup.");
+  const actor = requireHumanProvenance(options);
+  let envelope;
+  try {
+    envelope = classifyProjectBackupEnvelope(value);
+  } catch (error) {
+    if (error instanceof ProjectBackupManifestError) {
+      throw new BackupImportError("BACKUP_SCHEMA_UNSUPPORTED", error.message);
+    }
+    throw error;
   }
-  assertManifest(value);
-  const migration = resolved.migration ?? resolved.migrate ?? basicPreview;
+  if (envelope.kind === "newer") {
+    return {
+      mode: "read-only",
+      readOnly: true,
+      requiresHumanConfirmation: true,
+      requiresSafetyBackup: false,
+      safetyBackup: null,
+      replacementSafetyBackup: null,
+      schemaVersion: envelope.backup.schemaVersion,
+      reason: "NEWER_SCHEMA",
+      project: envelope.backup.project,
+      canImport: false,
+    };
+  }
+  /** ADR-0019: capture the exact source before any migration can transform it. */
+  const safetyBackup = cloneIncomingEnvelope(
+    value,
+    actor,
+    envelope.kind === "legacy" ? "MIGRATION" : "IMPORT",
+  );
+  const migration = options.migration ?? options.migrate ?? basicPreview;
   let migrated: ImportMigrationPreview;
   try {
     migrated = migration(value);
@@ -229,6 +270,7 @@ export const previewProjectImport = (
       requiresHumanConfirmation: true,
       requiresSafetyBackup: false,
       safetyBackup: null,
+      replacementSafetyBackup: null,
       schemaVersion: migrated.schemaVersion,
       reason: "NEWER_SCHEMA",
       project: migrated.project,
@@ -238,36 +280,29 @@ export const previewProjectImport = (
 
   const project = staleDerivedArtifacts(migrated.project);
   const expectedSha256 = normalSha256(project.media.sha256);
-  const relink = resolved.relinkedMedia === undefined
+  const relink = options.relinkedMedia === undefined
     ? { status: "required" as const, expectedSha256 }
-    : verifyMediaRelink(expectedSha256, resolved.relinkedMedia);
-  const relinkedProject = relink.status === "verified" && resolved.relinkedMedia !== undefined
+    : verifyMediaRelink(expectedSha256, options.relinkedMedia);
+  const relinkedProject = relink.status === "verified" && options.relinkedMedia !== undefined
     ? {
       ...project,
       media: {
-        sourceId: resolved.relinkedMedia.sourceId,
+        sourceId: options.relinkedMedia.sourceId,
         sha256: relink.actualSha256,
-        durationMs: resolved.relinkedMedia.durationMs,
+        durationMs: options.relinkedMedia.durationMs,
         relinkState: "Linked" as const,
       },
     }
     : project;
-  const reason = resolved.replaceProject !== undefined
-    ? "REPLACE_PROJECT" as const
-    : migrated.migratedFrom !== null
-      ? "MIGRATION" as const
-      : "IMPORT" as const;
   return {
     mode: "preview",
     readOnly: false,
     requiresHumanConfirmation: true,
     requiresSafetyBackup: true,
-    safetyBackup: {
-      required: true,
-      projectId: resolved.replaceProject?.projectId ?? null,
-      backup: resolved.replaceProject === undefined ? null : exportProjectBackup(resolved.replaceProject),
-      reason,
-    },
+    safetyBackup,
+    replacementSafetyBackup: options.replaceProject === undefined
+      ? null
+      : { projectId: options.replaceProject.projectId, backup: exportProjectBackup(options.replaceProject) },
     schemaVersion: migrated.schemaVersion,
     migratedFrom: migrated.migratedFrom,
     project: relinkedProject,

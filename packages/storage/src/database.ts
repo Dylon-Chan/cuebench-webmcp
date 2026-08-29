@@ -20,6 +20,7 @@ import {
   type CaptionProject,
   type DomainEvent,
   type EvidenceProvenance,
+  type ExportRoundTripEvidence,
   type GenerationLease,
   type ProjectCertification,
   type QualityFinding,
@@ -331,6 +332,17 @@ const ValidationRunSchema = StoredValidationRunSchema.extend({
   }
 });
 
+const ExportRoundTripEvidenceSchema = z.object({
+  exportId: identifier,
+  projectRevision: positiveSafeInteger,
+  trackKind: z.enum(["Captions", "AudioDescriptions"]),
+  format: z.enum(["vtt", "srt", "ad-txt"]),
+  disposition: z.enum(["draft", "certified"]),
+  verifiedAtMs: nonNegativeSafeInteger,
+  serializedTextHash: prefixedSha256,
+  roundTrip: z.object({ ok: z.literal(true) }).strict(),
+}).strict();
+
 const CertificationItemRevisionSchema = z.object({
   kind: z.enum(["CaptionCue", "AudioDescriptionBeat"]),
   itemId: identifier,
@@ -377,12 +389,14 @@ const CaptionProjectSchema = z.object({
   selectedItem: ItemSelectionSchema.nullable(),
   validation: ValidationSnapshotStorageSchema,
   validationRun: ValidationRunSchema.nullable(),
+  validationHistory: z.array(ValidationRunSchema).default([]),
   certification: CertificationSnapshotStorageSchema,
   certifications: z.array(ProjectCertificationSchema),
   qualityProfile: QualityProfileSchema,
   warningWaivers: z.record(z.string(), WarningWaiverSchema),
   activeGenerationRun: GenerationLeaseSchema.nullable(),
   courtRecord: z.array(DomainEventSchema),
+  exportHistory: z.array(ExportRoundTripEvidenceSchema).default([]),
 }).strict();
 
 export type StoredValidationRun = Omit<ValidationRun, "findings" | "blockers" | "warnings">;
@@ -406,10 +420,12 @@ export interface ProjectHeaderRow {
   readonly selectedItem: Selection | null;
   readonly validation: ValidationSnapshot;
   readonly validationRun: StoredValidationRun | null;
+  readonly validationHistory: readonly StoredValidationRun[];
   readonly certification: CertificationSnapshot;
   readonly qualityProfile: QualityProfile;
   readonly warningWaivers: Readonly<Record<string, WarningWaiver>>;
   readonly activeGenerationRun: GenerationLease | null;
+  readonly exportHistory: readonly ExportRoundTripEvidence[];
   /** Ordered ids identify the current evidence projection; older versions remain append-only rows. */
   readonly evidenceOrder: readonly string[];
   readonly createdAtMs: number;
@@ -527,10 +543,12 @@ const ProjectHeaderRowSchema = z.object({
   selectedItem: ItemSelectionSchema.nullable(),
   validation: ValidationSnapshotStorageSchema,
   validationRun: StoredValidationRunSchema.nullable(),
+  validationHistory: z.array(StoredValidationRunSchema).default([]),
   certification: CertificationSnapshotStorageSchema,
   qualityProfile: QualityProfileSchema,
   warningWaivers: z.record(z.string(), WarningWaiverSchema),
   activeGenerationRun: GenerationLeaseSchema.nullable(),
+  exportHistory: z.array(ExportRoundTripEvidenceSchema).default([]),
   evidenceOrder: z.array(identifier),
   createdAtMs: nonNegativeSafeInteger,
   updatedAtMs: nonNegativeSafeInteger,
@@ -1097,6 +1115,22 @@ const assertProjectRelationships = (project: CaptionProject): void => {
   if (project.validationRun !== null && (
     project.validationRun.projectId !== project.projectId || project.validationRun.input.projectId !== project.projectId
   )) throw new StorageReadValidationError("findings", "Validation run belongs to another project.");
+  let previousValidationRevision = 0;
+  for (const run of project.validationHistory) {
+    if (run.projectId !== project.projectId || run.input.projectId !== project.projectId) {
+      throw new StorageReadValidationError("findings", "Validation history run belongs to another project.");
+    }
+    if (run.projectRevision <= previousValidationRevision || run.projectRevision > project.projectRevision) {
+      throw new StorageReadValidationError("findings", "Validation history must be ordered and cannot contain future runs.");
+    }
+    previousValidationRevision = run.projectRevision;
+  }
+  assertUnique(project.exportHistory.map((record) => record.exportId), "project headers", "Export verification ids");
+  for (const record of project.exportHistory) {
+    if (record.projectRevision > project.projectRevision) {
+      throw new StorageReadValidationError("project headers", "Export verification belongs to a future project revision.");
+    }
+  }
   if (project.activeGenerationRun !== null && project.activeGenerationRun.actor.type !== "CueBenchAI") {
     throw new StorageReadValidationError("project headers", "Only CueBench AI may hold a generation write lease.");
   }
@@ -1167,10 +1201,12 @@ export const normalizeProject = (
     selectedItem: clone(project.selectedItem),
     validation: clone(project.validation),
     validationRun: project.validationRun === null ? null : storedValidationRun(project.validationRun),
+    validationHistory: project.validationHistory.map((run) => storedValidationRun(run)),
     certification: clone(project.certification),
     qualityProfile: clone(project.qualityProfile),
     warningWaivers: clone(project.warningWaivers),
     activeGenerationRun: clone(project.activeGenerationRun),
+    exportHistory: clone(project.exportHistory),
     evidenceOrder: project.evidence.map((entry) => entry.evidenceId),
     createdAtMs: timestamps.createdAtMs,
     updatedAtMs: timestamps.updatedAtMs,
@@ -1202,6 +1238,7 @@ export const normalizeProject = (
 
   const findings: FindingRow[] = [];
   if (project.validationRun !== null) appendRunFindings(findings, project.projectId, project.validationRun);
+  for (const run of project.validationHistory) appendRunFindings(findings, project.projectId, run);
   const certifications = project.certifications.map((certification, sequence): CertificationRow => {
     appendRunFindings(findings, project.projectId, certification.validationRun);
     return {
@@ -1341,6 +1378,7 @@ export const rehydrateProject = (rows: NormalizedProjectRows): CaptionProject =>
     return scoped;
   };
   const currentRun = header.validationRun === null ? null : rehydrateValidationRun(header.validationRun, findingsForRun(header.validationRun));
+  const validationHistory = header.validationHistory.map((run) => rehydrateValidationRun(run, findingsForRun(run)));
   const rehydratedCertifications = [...certifications]
     .sort((left, right) => left.sequence - right.sequence)
     .map((row) => rehydrateCertification(row.certification, findingsForRun(row.certification.validationRun)));
@@ -1358,12 +1396,14 @@ export const rehydrateProject = (rows: NormalizedProjectRows): CaptionProject =>
     selectedItem: clone(header.selectedItem),
     validation: clone(header.validation),
     validationRun: currentRun,
+    validationHistory,
     certification: clone(header.certification),
     certifications: rehydratedCertifications,
     qualityProfile: clone(header.qualityProfile),
     warningWaivers: clone(header.warningWaivers),
     activeGenerationRun: clone(header.activeGenerationRun),
     courtRecord: [...courtRecord].sort((left, right) => left.sequence - right.sequence).map((row) => clone(row.event)),
+    exportHistory: clone(header.exportHistory),
   };
   return validateCaptionProject(project);
 };
@@ -1528,7 +1568,9 @@ export const initializeProject = async (db: CueBenchDatabase, project: CaptionPr
       throw new StorageImmutableWriteError(`Project ${projectId} is already initialized.`);
     }
     const now = Date.now();
-    const rows = normalizeProject(checked, { createdAtMs: now, updatedAtMs: now });
+    /** Storage, rather than the pure domain factory, records project creation. */
+    const persisted = { ...checked, createdAtMs: now };
+    const rows = normalizeProject(persisted, { createdAtMs: now, updatedAtMs: now });
     await db.projectHeaders.add(rows.header);
     if (rows.items.length > 0) await db.items.bulkAdd([...rows.items]);
     if (rows.revisions.length > 0) await db.revisions.bulkAdd([...rows.revisions]);
@@ -1615,6 +1657,16 @@ export const appendAcceptedProjectInTransaction = async (
     [...existingCertifications].sort((left, right) => left.sequence - right.sequence),
     candidate.certifications,
     "Certification",
+  );
+  assertPrefixHistory(
+    previousHeader.validationHistory,
+    candidate.header.validationHistory,
+    "Validation",
+  );
+  assertPrefixHistory(
+    previousHeader.exportHistory,
+    candidate.header.exportHistory,
+    "Export verification",
   );
 
   const candidateItemMap = maps.items;

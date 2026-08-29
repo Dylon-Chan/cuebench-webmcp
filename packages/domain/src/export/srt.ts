@@ -42,7 +42,7 @@ export const serializeSrtTrack = (
   if (track.kind !== "Captions") {
     throw new TrackSerializationError("SRT is only supported for caption tracks; use VTT or AD TXT for audio descriptions.");
   }
-  return track.items.map((item, index) => {
+  const cues = track.items.map((item, index) => {
     if (item.kind !== "CaptionCue") throw new TrackSerializationError("SRT cannot serialize an audio-description item.");
     return [
       String(index + 1),
@@ -50,6 +50,7 @@ export const serializeSrtTrack = (
       escapeTimedText(item.text),
     ].join("\n");
   }).join("\n\n");
+  return cues.length === 0 ? "" : `${cues}\n`;
 };
 
 export const parseSrtTrack = (source: string): ParsedTrack => {

@@ -59,6 +59,15 @@ export interface SerializeTrackOptions {
   readonly trackKind?: ExportTrackKind;
 }
 
+/**
+ * WebVTT has no portable field for distinguishing a caption track from an
+ * audio-description track. Callers therefore supply that identity out of
+ * band when parsing an AD VTT export.
+ */
+export interface ParseTrackOptions {
+  readonly trackKind?: ExportTrackKind;
+}
+
 export type TrackExportSource =
   | CaptionTrack
   | AudioDescriptionTrack
@@ -282,27 +291,34 @@ const unescapeMarkup = (value: string): string => {
   return value.replace(/&(amp|lt|gt);/g, (_all, entity: string) => ({ amp: "&", lt: "<", gt: ">" })[entity]!);
 };
 
-/** Encodes blank payload lines without allowing them to terminate a timed-text cue. */
-export const escapeTimedText = (value: string): string => normalizedLineEndings(value)
-  .split("\n")
-  .map((line) => {
-    if (line.length === 0) return "\\N";
-    const escapedSlashes = line.replace(/\\/g, "\\\\");
-    return escapeMarkup(escapedSlashes);
-  })
-  .join("\n");
+/**
+ * VTT and SRT use blank lines as cue delimiters. Rather than introduce a
+ * private sentinel (which would alter what standards-compliant players show),
+ * reject an otherwise unrepresentable blank payload line. Every accepted
+ * payload is literal/reversible: backslashes retain their original meaning.
+ */
+export const escapeTimedText = (value: string): string => {
+  const lines = normalizedLineEndings(value).split("\n");
+  if (lines.some((line) => line.length === 0)) {
+    throw new TrackSerializationError("VTT and SRT cannot represent blank lines inside one cue payload.");
+  }
+  return lines.map(escapeMarkup).join("\n");
+};
 
-export const unescapeTimedText = (value: string): string => normalizedLineEndings(value)
-  .split("\n")
+export const unescapeTimedText = (value: string): string => {
+  const lines = normalizedLineEndings(value).split("\n");
+  if (lines.some((line) => line.length === 0)) {
+    throw new TrackParseError("VTT and SRT cue payloads cannot contain blank lines.");
+  }
+  return lines
   .map((line) => {
-    if (line === "\\N") return "";
-    const slashRestored = line.startsWith("\\\\") ? line.slice(1) : line;
-    if (/[<>]/.test(slashRestored)) {
+    if (/[<>]/.test(line)) {
       throw new UnsupportedTrackMetadataError("Raw timed-text markup is unsupported; literal markup must be escaped.");
     }
-    return unescapeMarkup(slashRestored);
+    return unescapeMarkup(line);
   })
   .join("\n");
+};
 
 export const escapeVoiceAnnotation = (speaker: string): string => {
   if (speaker.trim().length === 0 || /[\r\n]/.test(speaker)) {

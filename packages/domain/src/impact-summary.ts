@@ -1,6 +1,5 @@
 import type { CaptionProject, DomainEvent } from "./model";
-import type { QualityFinding, ValidationRun } from "./quality/validate";
-import type { RoundTripResult } from "./export/round-trip";
+import type { QualityFinding } from "./quality/validate";
 
 export interface FindingSummary {
   readonly total: number;
@@ -27,15 +26,8 @@ export interface ImpactSummary {
   readonly reviewStateCounts: ReviewStateCounts;
   readonly humanInterventions: HumanInterventionSummary;
   readonly certificationState: CaptionProject["certification"]["status"];
-  readonly roundTripResult: RoundTripResult | null;
+  readonly roundTripResult: { readonly ok: true } | null;
   readonly timeToCertificationMs?: number;
-}
-
-export interface BuildImpactSummaryOptions {
-  /** A real local persistence timestamp, never an estimate or wall-clock fallback. */
-  readonly projectCreatedAtMs?: number;
-  /** The latest actual export verification result that the caller chose to retain. */
-  readonly roundTripResult?: RoundTripResult;
 }
 
 const emptyFindingSummary = (): FindingSummary => ({ total: 0, blockerCount: 0, warningCount: 0, findings: [] });
@@ -46,28 +38,6 @@ const summaryFor = (findings: readonly QualityFinding[]): FindingSummary => ({
   warningCount: findings.filter((finding) => finding.severity === "warning").length,
   findings: structuredClone(findings),
 });
-
-const isValidationRun = (value: unknown): value is ValidationRun =>
-  typeof value === "object"
-  && value !== null
-  && "inputHash" in value
-  && typeof value.inputHash === "string"
-  && "projectRevision" in value
-  && typeof value.projectRevision === "number";
-
-const validationHistory = (project: CaptionProject): readonly ValidationRun[] => {
-  const candidates: readonly unknown[] = [
-    ...(project.validationRun === null ? [] : [project.validationRun]),
-    ...project.certifications.map((certification) => certification.validationRun),
-  ];
-  const byHash = new Map<string, ValidationRun>();
-  for (const run of candidates) {
-    if (!isValidationRun(run)) continue;
-    const existing = byHash.get(run.inputHash);
-    if (existing === undefined || run.projectRevision < existing.projectRevision) byHash.set(run.inputHash, run);
-  }
-  return [...byHash.values()].sort((left, right) => left.projectRevision - right.projectRevision);
-};
 
 const currentCertification = (project: CaptionProject) => {
   const pointer = project.certification;
@@ -109,16 +79,15 @@ const stateCountsFor = (project: CaptionProject): ReviewStateCounts => {
  */
 export const buildImpactSummary = (
   project: CaptionProject,
-  options: BuildImpactSummaryOptions = {},
 ): ImpactSummary => {
-  const history = validationHistory(project);
+  const history = project.validationHistory;
   const initial = history[0]?.findings ?? [];
   const current = project.validationRun?.findings ?? currentCertification(project)?.validationRun?.findings ?? [];
   const currentIds = new Set(current.map((finding) => finding.findingId));
   const resolved = initial.filter((finding) => !currentIds.has(finding.findingId));
   const humanEvents = project.courtRecord.filter((event) => event.actor.type === "Human");
   const certification = currentCertification(project);
-  const createdAt = timestamp(options.projectCreatedAtMs ?? project.createdAtMs);
+  const createdAt = timestamp(project.createdAtMs);
   const timeToCertificationMs = certification === undefined || createdAt === undefined || certification.certifiedAtMs < createdAt
     ? undefined
     : certification.certifiedAtMs - createdAt;
@@ -128,7 +97,9 @@ export const buildImpactSummary = (
     reviewStateCounts: stateCountsFor(project),
     humanInterventions: { count: humanEvents.length, events: structuredClone(humanEvents) },
     certificationState: project.certification.status,
-    roundTripResult: options.roundTripResult === undefined ? null : structuredClone(options.roundTripResult),
+    roundTripResult: project.exportHistory.at(-1)?.roundTrip === undefined
+      ? null
+      : structuredClone(project.exportHistory.at(-1)!.roundTrip),
     ...(timeToCertificationMs === undefined ? {} : { timeToCertificationMs }),
   };
 };

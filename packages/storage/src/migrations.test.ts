@@ -127,15 +127,30 @@ describe("project schema migrations", () => {
       expectedProjectRevision: 1,
     });
     expect(validated.error).toBeUndefined();
-    const current = describeImportedProject({
-      schemaVersion: 1,
-      project: validated.project,
-    });
+    const current = describeImportedProject(exportProjectBackup(validated.project));
 
     expect(current.mode).toBe("preview");
     if (current.mode !== "preview") throw new Error("Expected preview descriptor.");
     expect(current.project.media.relinkState).toBe("Missing");
     expect(current.project.validation.status).toBe("Stale");
+  });
+
+  it("rejects an unmanifested or tampered v1 envelope instead of treating it as legacy data", () => {
+    const project = createProject({
+      projectId: "strict-manifest-preview",
+      title: "Strict manifest preview",
+      media: { sourceId: "source-1", sha256: "a".repeat(64), durationMs: 60_000, relinkState: "Linked" },
+    });
+    const backup = exportProjectBackup(project);
+    const missingManifest = { ...backup };
+    Reflect.deleteProperty(missingManifest, "manifestHash");
+
+    expect(() => describeImportedProject({ schemaVersion: 1, project })).toThrow(/manifest/i);
+    expect(() => describeImportedProject(missingManifest)).toThrow(/manifest/i);
+    expect(() => describeImportedProject({
+      ...backup,
+      exportMetadata: { ...backup.exportMetadata, sourceMediaSha256: "b".repeat(64) },
+    })).toThrow(/manifest/i);
   });
 
   it("upgrades authenticated legacy and intermediate certifications in a v1 preview before marking it stale", () => {
@@ -193,7 +208,7 @@ describe("project schema migrations", () => {
       }],
     };
 
-    const descriptor = describeImportedProject({ schemaVersion: 1, project: legacyProject });
+    const descriptor = describeImportedProject(exportProjectBackup(legacyProject));
 
     if (descriptor.mode !== "preview") throw new Error("Expected preview descriptor.");
     expect(descriptor.project.media.relinkState).toBe("Missing");
@@ -202,16 +217,13 @@ describe("project schema migrations", () => {
 
     const legacyEvidence = legacyProject.certifications[0]?.evidence[0];
     if (legacyEvidence === undefined) throw new Error("Expected legacy certification evidence.");
-    expect(() => describeImportedProject({
-      schemaVersion: 1,
-      project: {
+    expect(() => describeImportedProject(exportProjectBackup({
         ...legacyProject,
         certifications: [{
           ...legacyProject.certifications[0]!,
           evidence: [{ ...legacyEvidence, mediaSha256: "d".repeat(64) }],
         }],
-      },
-    })).toThrow(/certification/i);
+      }))).toThrow(/certification/i);
 
     const intermediateProject = {
       ...certified,
@@ -224,7 +236,7 @@ describe("project schema migrations", () => {
         })(),
       }],
     };
-    const intermediate = describeImportedProject({ schemaVersion: 1, project: intermediateProject });
+    const intermediate = describeImportedProject(exportProjectBackup(intermediateProject));
     if (intermediate.mode !== "preview") throw new Error("Expected intermediate preview descriptor.");
     expect(intermediateCertificationSnapshotHashFor(snapshot)).toBe(
       intermediateProject.certifications[0]?.certificationSnapshotHash,
@@ -233,18 +245,15 @@ describe("project schema migrations", () => {
 
     const intermediateEvidence = intermediateProject.certifications[0]?.evidence[0];
     if (intermediateEvidence === undefined) throw new Error("Expected intermediate certification evidence.");
-    expect(() => describeImportedProject({
-      schemaVersion: 1,
-      project: {
+    expect(() => describeImportedProject(exportProjectBackup({
         ...intermediateProject,
         certifications: [{
           ...intermediateProject.certifications[0]!,
           evidence: [{ ...intermediateEvidence, mediaSha256: "d".repeat(64) }],
         }],
-      },
-    })).toThrow(/certification/i);
+      }))).toThrow(/certification/i);
 
-    const current = describeImportedProject({ schemaVersion: 1, project: certified });
+    const current = describeImportedProject(exportProjectBackup(certified));
     if (current.mode !== "preview") throw new Error("Expected current preview descriptor.");
     expect(current.project.certifications[0]?.certificationSnapshotHash).toBe(snapshot.certificationSnapshotHash);
   });
@@ -302,7 +311,6 @@ describe("project schema migrations", () => {
   it("lets the domain import preview use the storage migration without a package cycle", () => {
     const project = createProject({
       projectId: "portable-backup",
-      createdAtMs: 1_000,
       title: "Portable backup",
       media: { sourceId: "source-1", sha256: "d".repeat(64), durationMs: 60_000, relinkState: "Linked" },
     });

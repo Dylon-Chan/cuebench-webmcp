@@ -5,6 +5,7 @@ import {
   createCertificationSnapshot,
   prepareCertificationReview,
 } from "./quality/certification";
+import { prepareTrackExport } from "./export/round-trip";
 import { currentValidationRun, validateProject } from "./quality/validate";
 import type {
   AudioDescriptionBeat,
@@ -312,6 +313,49 @@ export const applyCommand = (project: CaptionProject, command: DomainCommand): C
         warningCount: validationRun.warningCount,
       },
       validationRun: clone(validationRun),
+      validationHistory: [...project.validationHistory, clone(validationRun)],
+    });
+  }
+  if (command.type === "RecordExportRoundTrip") {
+    if (command.actor.type !== "System") {
+      return fail(project, "INVALID_ARGUMENT", "Only System may record deterministic export verification.");
+    }
+    if (!command.exportId.trim() || project.exportHistory.some((record) => record.exportId === command.exportId)) {
+      return fail(project, "INVALID_ARGUMENT", "Export verification ids must be unique and non-empty.");
+    }
+    if (
+      (command.trackKind !== "Captions" && command.trackKind !== "AudioDescriptions")
+      || !["vtt", "srt", "ad-txt"].includes(command.format)
+      || (command.disposition !== "draft" && command.disposition !== "certified")
+      || !isFiniteInteger(command.verifiedAtMs)
+      || command.verifiedAtMs < 0
+      || typeof command.text !== "string"
+    ) return fail(project, "INVALID_ARGUMENT", "Export verification must contain an exact exported payload.");
+    let prepared: ReturnType<typeof prepareTrackExport>;
+    try {
+      prepared = prepareTrackExport({
+        project,
+        trackKind: command.trackKind,
+        format: command.format,
+        disposition: command.disposition,
+      });
+    } catch (error) {
+      return fail(project, "INVALID_ARGUMENT", error instanceof Error ? error.message : "Export verification could not be prepared.");
+    }
+    if (!prepared.roundTrip.ok || command.text !== prepared.text) {
+      return fail(project, "INVALID_ARGUMENT", "Export verification text does not match the independently verified project export.");
+    }
+    return commit(project, command, {
+      exportHistory: [...project.exportHistory, {
+        exportId: command.exportId,
+        projectRevision: project.projectRevision,
+        trackKind: command.trackKind,
+        format: command.format,
+        disposition: command.disposition,
+        verifiedAtMs: command.verifiedAtMs,
+        serializedTextHash: prepared.serializedTextHash,
+        roundTrip: { ok: true },
+      }],
     });
   }
   if (command.type === "WaiveWarning") {

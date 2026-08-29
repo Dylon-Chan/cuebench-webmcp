@@ -1,5 +1,7 @@
 import {
+  classifyProjectBackupEnvelope,
   createProject,
+  ProjectBackupManifestError,
   upgradeLegacyCertificationSnapshot,
   type CaptionProject,
 } from "@cuebench/domain";
@@ -51,15 +53,6 @@ export interface ReadOnlyProjectDescriptor {
 }
 
 export type ImportedProjectDescriptor = ProjectPreviewDescriptor | ReadOnlyProjectDescriptor;
-
-const ImportedEnvelopeSchema = z.object({
-  schemaVersion: nonNegativeInteger,
-  project: z.unknown(),
-  /** Task 5's portable envelope fields are intentionally ignored by the structural migration. */
-  backupKind: z.literal("CueBenchProjectBackup").optional(),
-  exportMetadata: z.unknown().optional(),
-  manifestHash: z.string().optional(),
-}).strict();
 
 const LegacyMediaSchema = z.object({
   id: identifier,
@@ -243,22 +236,27 @@ const upgradePreviewCertifications = (project: CaptionProject): CaptionProject =
 });
 
 export const describeImportedProject = (value: unknown): ImportedProjectDescriptor => {
-  const envelope = ImportedEnvelopeSchema.safeParse(value);
-  if (!envelope.success) {
-    throw new StorageMigrationError(`Invalid project envelope: ${envelope.error.issues[0]?.message ?? "unknown shape"}`);
+  let envelope;
+  try {
+    envelope = classifyProjectBackupEnvelope(value);
+  } catch (error) {
+    if (error instanceof ProjectBackupManifestError) {
+      throw new StorageMigrationError(`Invalid project envelope: ${error.message}`);
+    }
+    throw error;
   }
-  if (envelope.data.schemaVersion > STORAGE_SCHEMA_VERSION) {
+  if (envelope.kind === "newer") {
     return {
       mode: "read-only",
       readOnly: true,
-      schemaVersion: envelope.data.schemaVersion,
+      schemaVersion: envelope.backup.schemaVersion,
       reason: "NEWER_SCHEMA",
-      project: envelope.data.project,
+      project: envelope.backup.project,
     };
   }
-  let version = envelope.data.schemaVersion;
-  let project: unknown = envelope.data.project;
-  const migratedFrom = version === STORAGE_SCHEMA_VERSION ? null : version;
+  let version = envelope.kind === "legacy" ? 0 : STORAGE_SCHEMA_VERSION;
+  let project: unknown = envelope.backup.project;
+  const migratedFrom = envelope.kind === "legacy" ? 0 : null;
   while (version < STORAGE_SCHEMA_VERSION) {
     const migration = PROJECT_MIGRATIONS.find((candidate) => candidate.from === version);
     if (migration === undefined) throw new StorageMigrationError(`No project migration exists from schema v${version}.`);
