@@ -1,0 +1,146 @@
+{
+  "title": "Choose CueBench's visual world",
+  "question": "Which operating world should CueBench carry into its evidence-led caption and audio-description workbench?",
+  "options": [
+    {
+      "id": "assigned",
+      "label": "Projection Proof",
+      "kicker": "THE ROLL",
+      "lineage": "annotated classroom transparencies and shared teaching slides",
+      "thesis": "The video is the shared sheet; agents add transparent timed marks and the teacher settles the record.",
+      "palette": ["#F4F5EE", "#1F2A30", "#167A7B", "#6B55C8", "#B36512"],
+      "materials": ["translucent acetate", "projector light", "registration ink"],
+      "viewport": "A luminous video-and-timeline evidence field owns two thirds of the desktop while a numbered review docket anchors the right and the Court Record rests in a lower drawer.",
+      "risk": "Transparency becomes visual noise unless only the selected evidence layer lifts above the sheet.",
+      "raised": [
+        {
+          "from": "Elbow Panel",
+          "raise": "Status banks use unmistakable label, shape, and color changes instead of delicate tint shifts."
+        },
+        {
+          "from": "Gravity Garden",
+          "raise": "Finding focus traces a brief visible path from validation result to its exact moment on the timeline."
+        },
+        {
+          "from": "Depth Queue",
+          "raise": "The selected evidence plane holds completely still while surrounding layers visibly recede."
+        }
+      ],
+      "comp": ".impeccable/mocks/decision/projection-proof.png"
+    },
+    {
+      "id": "model-pick",
+      "label": "Calibration Bench",
+      "kicker": "IMPECCABLE’S PICK",
+      "lineage": "classroom science instruments and oscilloscope calibration",
+      "thesis": "Caption timing becomes a measured signal that a teacher and agent calibrate against visible evidence.",
+      "palette": ["#E9ECE7", "#17242B", "#147A63", "#D08A19", "#6E7D83"],
+      "materials": ["etched instrument grid", "anodized aluminum", "optical glass"],
+      "viewport": "A large specimen bay holds the video, a calibrated signal rail spans beneath it, and the docket reads like precise bench measurements without hiding full caption text.",
+      "risk": "Its familiar professional-tool grammar may feel too technical for a teacher's first captioning session.",
+      "comp": ".impeccable/mocks/decision/calibration-bench.png"
+    },
+    {
+      "id": "challenger-precisionist",
+      "label": "Hard-Plane Review",
+      "verdict": "competitive",
+      "lineage": "Precisionist industrial plates and operator control surfaces",
+      "thesis": "Video, timeline, findings, and docket become interlocking planes; the active plane alone takes the light.",
+      "palette": ["#F2F1EC", "#46515A", "#1E2328", "#C24A2A", "#8D979E"],
+      "materials": ["painted steel", "cast mineral surface", "hard shadow"],
+      "viewport": "The video plane dominates left, the timeline overlaps its lower edge, and a slate docket plane on the right reveals selected evidence through strict geometry.",
+      "case": "It matches CueBench's structural clarity but identifies with industrial operators more than teachers.",
+      "risk": "Stencil typography and hard mass can make careful accessibility review feel severe.",
+      "comp": ".impeccable/mocks/decision/hard-plane-review.png",
+      "hero": "https://impeccable.style/worlds/cards/design-canon-precisionist-industrial-plate-hero.webp",
+      "board": "https://impeccable.style/worlds/cards/design-canon-precisionist-industrial-plate.webp"
+    },
+    {
+      "id": "challenger-orizuru",
+      "label": "Revision Sheet",
+      "verdict": "competitive",
+      "lineage": "one-sheet fold sequences and recoverable crease diagrams",
+      "thesis": "Every immutable cue revision remains a visible crease in one continuous timed sheet.",
+      "palette": ["#F6F1E9", "#D83A2E", "#1A1A1A", "#D4AF37", "#8E8A83"],
+      "materials": ["fibrous paper", "crease lines", "sumi annotation"],
+      "viewport": "The selected video and cue sit on one large working sheet while revision lineage runs as deliberate steps beneath and the review docket forms a narrow margin.",
+      "case": "It makes revision history unusually legible, but the paper ritual is less native to timed media than the assigned world.",
+      "risk": "Cultural specificity and soft paper texture can distract from evidence accuracy if treated decoratively.",
+      "comp": ".impeccable/mocks/decision/revision-sheet.png",
+      "hero": "https://impeccable.style/worlds/cards/paper-folds-pleats-deployable-orizuru-crane-sequence-hero.webp",
+      "board": "https://impeccable.style/worlds/cards/paper-folds-pleats-deployable-orizuru-crane-sequence.webp"
+    },
+    {
+      "id": "challenger-segments",
+      "label": "Time Signal",
+      "verdict": "competitive",
+      "lineage": "seven-segment clocks, scoreboards, and timing instruments",
+      "thesis": "Time, readiness, and validation illuminate in fixed slots while full caption language remains calm and readable.",
+      "palette": ["#0A0A0A", "#FF3B30", "#FFB400", "#00B85A", "#6F777B"],
+      "materials": ["matte instrument face", "ghost segments", "brushed metal"],
+      "viewport": "Large time and validation masks lock the upper rail, with video and waveform beneath and readable caption prose in a separate docket plane.",
+      "case": "It makes time and state immediate, but its native alphabet cannot carry the transcript without breaking its own system.",
+      "risk": "The dark luminous register can resemble the generic neon AI dashboard CueBench explicitly rejects.",
+      "comp": ".impeccable/mocks/decision/time-signal.png",
+      "hero": "https://impeccable.style/worlds/cards/signals-instruments-seven-segment-alarm-clock-hero.webp",
+      "board": "https://impeccable.style/worlds/cards/signals-instruments-seven-segment-alarm-clock.webp"
+    },
+    {
+      "id": "challenger-elbow",
+      "label": "Elbow Panel",
+      "verdict": "declined",
+      "lineage": "flat segmented wall consoles",
+      "thesis": "Workflow states travel through thick color-banked routes around the workbench.",
+      "palette": ["#050505", "#C9B3F5", "#F4B79E", "#E4B941", "#9CAEEA"],
+      "materials": ["black glass", "flat enamel blocks"],
+      "viewport": "A sweeping elbow frame routes video, timeline, and docket through ranked pill segments.",
+      "case": "The active-state grammar is excellent, but teachers do not identify with a fictional console and the frame competes with evidence.",
+      "kept": "Unmistakable active-state banks.",
+      "risk": "It reads as entertainment-interface cosplay."
+    },
+    {
+      "id": "challenger-gravity",
+      "label": "Gravity Garden",
+      "verdict": "declined",
+      "lineage": "directional rain fields and causal paths",
+      "thesis": "Findings visibly flow toward the exact cue, gap, or evidence that caused them.",
+      "palette": ["#59645F", "#4787D9", "#C84D4D", "#111514", "#D8E1DC"],
+      "materials": ["vector rain", "trajectory field"],
+      "viewport": "A timeline field bends findings toward cues while video and docket sit as quiet anchors.",
+      "case": "Cause and effect is memorable, but the garden metaphor weakens task recognition and predictable editing controls.",
+      "kept": "Visible cause-to-evidence motion.",
+      "risk": "Animation would obscure rather than clarify routine review."
+    },
+    {
+      "id": "challenger-depth",
+      "label": "Depth Queue",
+      "verdict": "declined",
+      "lineage": "bitmap scrollers and ranked depth planes",
+      "thesis": "Brightness, spacing, and motion depth rank every unresolved piece of work without enclosing it.",
+      "palette": ["#050608", "#F0EFE8", "#9AA0A6", "#D39428"],
+      "materials": ["emissive void", "bitmap dust field"],
+      "viewport": "The selected cue holds still at the front while findings, timeline, and record occupy receding baseline planes.",
+      "case": "Focus hierarchy is strong, but removing enclosure and dividers damages scanning, accessibility, and teacher familiarity.",
+      "kept": "Complete stillness at the focus plane.",
+      "risk": "Sparse darkness hides the relationship among video, cue, evidence, and ruling."
+    }
+  ],
+  "reroll": {
+    "registers": ["safer", "bolder"]
+  },
+  "buildPath": {
+    "value": "comp",
+    "toggle": true
+  },
+  "canon": true,
+  "canonCard": {
+    "label": "The category standard",
+    "thesis": "A polished dark professional video editor with familiar panels, a blue playhead, and conventional caption cards.",
+    "palette": ["#111318", "#222630", "#E7EAF0", "#3B82F6"],
+    "materials": ["flat dark panels", "standard waveform chrome"],
+    "viewport": "Video and waveform fill the left, a dense caption inspector fills the right, and export controls sit in a top toolbar.",
+    "risk": "Immediately understandable but indistinguishable from existing editors and intimidating to occasional teachers.",
+    "comp": ".impeccable/mocks/decision/category-standard.png"
+  },
+  "steer": true
+}

@@ -1,0 +1,4 @@
+Edit only the most recently generated CueBench dark professional-editor UI comp. Preserve its entire layout, colors, content density, video frame, timeline, cue list, and visual style. Make exactly these factual corrections:
+1. In the bottom “WebMCP State” panel, remove “Model: Claude 3.5 Sonnet” and the session identifier. Replace those two lines with “Project revision 42” and “Selection C05”.
+2. Replace the blue “Share” button in the top-right toolbar with a blue “Validate project” button.
+Keep “Agent connected”. Do not add any model vendor, account, login, share, or collaboration claim. No other changes. No watermark.
