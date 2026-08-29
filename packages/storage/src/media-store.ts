@@ -1,6 +1,8 @@
 import type { MediaSourceSnapshot } from "@cuebench/contracts";
+import { sha256Hex } from "@cuebench/domain";
 import {
   CueBenchDatabase,
+  StorageReadValidationError,
   narrationBlobKey,
   runReceiptKey,
   sourceBlobKey,
@@ -17,7 +19,7 @@ import {
 const now = (): number => Date.now();
 
 const isSha256 = (value: string): boolean => /^[0-9a-f]{64}$/i.test(value);
-const isIdentifier = (value: string): boolean => value.trim().length > 0 && value.length <= 200;
+const isIdentifier = (value: string): boolean => value.length > 0 && value.length <= 200 && value.trim() === value;
 const assertBlob: (value: unknown, label: string) => asserts value is Blob = (value, label) => {
   if (typeof Blob === "undefined" || !(value instanceof Blob)) {
     throw new TypeError(`${label} must be a Blob.`);
@@ -26,11 +28,14 @@ const assertBlob: (value: unknown, label: string) => asserts value is Blob = (va
 
 export interface SourceMediaInput {
   readonly sourceId: string;
-  readonly sha256: string;
+  /** Optional caller claim; persisted media is always hashed from blob bytes. */
+  readonly sha256?: string;
   readonly blob: Blob;
   readonly fileName?: string | null;
   readonly contentType?: string;
 }
+
+type SourceMediaReference = Pick<MediaSourceSnapshot, "sourceId"> & Partial<Pick<MediaSourceSnapshot, "sha256">>;
 
 export interface NarrationBlobInput {
   readonly beatId: string;
@@ -40,12 +45,28 @@ export interface NarrationBlobInput {
 }
 
 const sourceInputFrom = (
-  source: SourceMediaInput | Pick<MediaSourceSnapshot, "sourceId" | "sha256">,
+  source: SourceMediaInput | SourceMediaReference,
   blob: Blob | undefined,
 ): SourceMediaInput => {
   if ("blob" in source) return source;
   if (blob === undefined) throw new TypeError("A source-media Blob is required.");
-  return { ...source, blob };
+  return { sourceId: source.sourceId, ...(source.sha256 === undefined ? {} : { sha256: source.sha256 }), blob };
+};
+
+const sourceBytesHash = async (blob: Blob): Promise<string> => sha256Hex(new Uint8Array(await blob.arrayBuffer()));
+
+const verifySourceBlob = async (row: SourceBlobRow): Promise<SourceBlobRow> => {
+  const checked = validateSourceBlobRow(row);
+  if (checked.key !== sourceBlobKey(checked.projectId, checked.sha256)) {
+    throw new StorageReadValidationError("source blobs", "Row primary key does not match the canonical source hash.");
+  }
+  if (checked.byteLength !== checked.blob.size) {
+    throw new StorageReadValidationError("source blobs", "Stored byte length does not match Blob size.");
+  }
+  if (await sourceBytesHash(checked.blob) !== checked.sha256) {
+    throw new StorageReadValidationError("source blobs", "Stored Blob bytes do not match the canonical source hash.");
+  }
+  return checked;
 };
 
 /**
@@ -61,26 +82,30 @@ export async function saveSourceMedia(
 export async function saveSourceMedia(
   db: CueBenchDatabase,
   projectId: string,
-  source: Pick<MediaSourceSnapshot, "sourceId" | "sha256">,
+  source: SourceMediaReference,
   blob: Blob,
 ): Promise<SourceBlobRow>;
 export async function saveSourceMedia(
   db: CueBenchDatabase,
   projectId: string,
-  source: SourceMediaInput | Pick<MediaSourceSnapshot, "sourceId" | "sha256">,
+  source: SourceMediaInput | SourceMediaReference,
   blob?: Blob,
 ): Promise<SourceBlobRow> {
   const input = sourceInputFrom(source, blob);
-  if (!isIdentifier(projectId) || !isIdentifier(input.sourceId) || !isSha256(input.sha256)) {
-    throw new TypeError("Source media needs non-empty project/source ids and a SHA-256 hash.");
+  if (!isIdentifier(projectId) || !isIdentifier(input.sourceId)) {
+    throw new TypeError("Source media needs canonical non-empty project and source ids.");
   }
   assertBlob(input.blob, "Source media");
-  const key = sourceBlobKey(projectId, input.sha256);
+  const calculatedHash = await sourceBytesHash(input.blob);
+  if (input.sha256 !== undefined && (!isSha256(input.sha256) || input.sha256.toLowerCase() !== calculatedHash)) {
+    throw new TypeError("Claimed source SHA-256 does not match the Blob bytes.");
+  }
+  const key = sourceBlobKey(projectId, calculatedHash);
   const candidate: SourceBlobRow = {
     key,
     projectId,
     sourceId: input.sourceId,
-    sha256: input.sha256,
+    sha256: calculatedHash,
     blob: input.blob,
     byteLength: input.blob.size,
     contentType: input.contentType ?? input.blob.type,
@@ -89,19 +114,20 @@ export async function saveSourceMedia(
   };
   const validatedCandidate = validateSourceBlobRow(candidate);
   try {
-    return await db.transaction("rw", db.sourceBlobs, async () => {
+    const stored = await db.transaction("rw", db.sourceBlobs, async () => {
       const existing = await db.sourceBlobs.get(key);
-      if (existing !== undefined) return validateSourceBlobRow(existing);
+      if (existing !== undefined) return existing;
       await db.sourceBlobs.add(validatedCandidate);
       return validatedCandidate;
     });
+    return verifySourceBlob(stored);
   } catch (error) {
     // A second database connection may win after this transaction read but
     // before its add. Re-read the deterministic key rather than writing a
     // second blob under a different source id.
     if (error instanceof Error && error.name === "ConstraintError") {
       const existing = await db.sourceBlobs.get(key);
-      if (existing !== undefined) return validateSourceBlobRow(existing);
+      if (existing !== undefined) return verifySourceBlob(existing);
     }
     throw error;
   }
@@ -111,14 +137,16 @@ export const loadSourceMedia = async (
   db: CueBenchDatabase,
   projectId: string,
   sourceIdOrSha256: string,
-): Promise<SourceBlobRow | undefined> => db.transaction("r", db.sourceBlobs, async () => {
-  const byHash = isSha256(sourceIdOrSha256)
-    ? await db.sourceBlobs.get(sourceBlobKey(projectId, sourceIdOrSha256))
-    : undefined;
-  if (byHash !== undefined) return validateSourceBlobRow(byHash);
-  const bySourceId = await db.sourceBlobs.where("[projectId+sourceId]").equals([projectId, sourceIdOrSha256]).first();
-  return bySourceId === undefined ? undefined : validateSourceBlobRow(bySourceId);
-});
+): Promise<SourceBlobRow | undefined> => {
+  const stored = await db.transaction("r", db.sourceBlobs, async () => {
+    const byHash = isSha256(sourceIdOrSha256)
+      ? await db.sourceBlobs.get(sourceBlobKey(projectId, sourceIdOrSha256.toLowerCase()))
+      : undefined;
+    if (byHash !== undefined) return byHash;
+    return db.sourceBlobs.where("[projectId+sourceId]").equals([projectId, sourceIdOrSha256]).first();
+  });
+  return stored === undefined ? undefined : verifySourceBlob(stored);
+};
 
 export const saveNarrationBlob = async (
   db: CueBenchDatabase,
@@ -209,7 +237,19 @@ export interface ProjectStorageEstimate {
   readonly browserAvailableBytes: number | null;
 }
 
-const byteLengthOf = (value: unknown): number => new TextEncoder().encode(JSON.stringify(value) ?? "").byteLength;
+const byteLengthOf = (value: unknown): number => {
+  const seen = new WeakSet<object>();
+  const serialized = JSON.stringify(value, (_key, entry: unknown) => {
+    if (typeof entry === "bigint") return `bigint:${entry.toString()}`;
+    if (typeof entry === "number" && !Number.isFinite(entry)) return `number:${String(entry)}`;
+    if (typeof entry === "object" && entry !== null) {
+      if (seen.has(entry)) return "[Circular]";
+      seen.add(entry);
+    }
+    return entry;
+  }) ?? "";
+  return new TextEncoder().encode(serialized).byteLength;
+};
 
 /**
  * Reports the exact retained blob sizes plus a conservative JSON metadata
@@ -250,6 +290,7 @@ export const estimateProjectStorage = async (
   const [header, items, revisions, findings, evidence, courtRecord, certifications, sourceBlobs, narrationBlobs, receipts] = rows;
   const validSources = sourceBlobs.map(validateSourceBlobRow);
   const validNarration = narrationBlobs.map(validateNarrationBlobRow);
+  const validReceipts = receipts.map(validateRunReceiptRow);
   const sourceBlobBytes = validSources.reduce((total, row) => total + row.byteLength, 0);
   const narrationBlobBytes = validNarration.reduce((total, row) => total + row.byteLength, 0);
   const metadataBytes = byteLengthOf(header)
@@ -259,7 +300,7 @@ export const estimateProjectStorage = async (
     + byteLengthOf(evidence)
     + byteLengthOf(courtRecord)
     + byteLengthOf(certifications)
-    + byteLengthOf(receipts);
+    + byteLengthOf(validReceipts);
   let browserUsageBytes: number | null = null;
   let browserQuotaBytes: number | null = null;
   try {

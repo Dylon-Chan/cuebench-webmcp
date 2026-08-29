@@ -1,73 +1,106 @@
 import Dexie, { type Table } from "dexie";
-import {
-  ActorSchema,
-  CertificationSnapshotSchema,
-  IdentifierSchema,
-  MediaSourceSnapshotSchema,
-  ReviewStateSchema,
-  ValidationSnapshotSchema,
+import type {
+  CertificationSnapshot,
+  MediaSourceSnapshot,
+  ValidationSnapshot,
 } from "@cuebench/contracts";
-import type {
-  AudioDescriptionBeat,
-  AudioDescriptionBeatRevision,
-  AudioDescriptionGap,
-  CaptionCue,
-  CaptionCueRevision,
-  CaptionProject,
-  DomainEvent,
-  EvidenceProvenance,
-  GenerationLease,
-  ProjectCertification,
-  QualityProfile,
-  Selection,
-  WarningWaiver,
-} from "@cuebench/domain";
-import type {
-  QualityFinding,
-  ValidationRun,
+import {
+  canonicalSerialize,
+  currentValidationRun,
+  currentProjectItems,
+  verifyCertificationSnapshot,
+  type AudioDescriptionBeat,
+  type AudioDescriptionBeatRevision,
+  type CaptionCue,
+  type CaptionCueRevision,
+  type CaptionProject,
+  type DomainEvent,
+  type EvidenceProvenance,
+  type GenerationLease,
+  type ProjectCertification,
+  type QualityFinding,
+  type QualityProfile,
+  type Selection,
+  type ValidationRun,
+  type WarningWaiver,
 } from "@cuebench/domain";
 import { z } from "zod";
 
+/** The durable project-envelope schema, independent of Dexie's internal schema number. */
 export const STORAGE_SCHEMA_VERSION = 1 as const;
 
 const clone = <Value>(value: Value): Value => structuredClone(value);
+const sameValue = (left: unknown, right: unknown): boolean => canonicalSerialize(left) === canonicalSerialize(right);
 
 const positiveSafeInteger = z.number().int().refine(Number.isSafeInteger).positive();
 const nonNegativeSafeInteger = z.number().int().refine(Number.isSafeInteger).nonnegative();
-const nonEmptyText = z.string().trim().min(1);
-const sha256 = z.string().trim().regex(/^[0-9a-f]{64}$/i);
+/** Stored identifiers are canonical; validation must not trim them on read. */
+const identifier = z.string().min(1).max(200).refine((value) => value.trim() === value, {
+  message: "Identifier must not have leading or trailing whitespace.",
+});
+/** Human-facing text is retained byte-for-byte, while all-whitespace values remain invalid. */
+const nonBlankText = z.string().min(1).refine((value) => value.trim().length > 0, {
+  message: "Text must contain a non-whitespace character.",
+});
+const boundedText = (maximum: number) => nonBlankText.max(maximum);
+const lowercaseSha256 = z.string().regex(/^[0-9a-f]{64}$/, "Expected a canonical lowercase SHA-256 hash.");
+const prefixedSha256 = z.string().regex(/^sha256:[0-9a-f]{64}$/, "Expected a SHA-256 hash.");
 const unknownRecord = z.record(z.string(), z.unknown());
 
-const ReviewStateStorageSchema = ReviewStateSchema;
+const ActorStorageSchema = z.object({
+  type: z.enum(["Human", "BrowserAgent", "CueBenchAI", "System"]),
+  id: identifier,
+}).strict();
+
+const ReviewStateStorageSchema = z.enum(["Proposed", "AgentReady", "Objected", "Sustained"]);
+
+const MediaSourceStorageSchema = z.object({
+  sourceId: identifier,
+  sha256: lowercaseSha256,
+  durationMs: nonNegativeSafeInteger,
+  relinkState: z.enum(["Linked", "Missing", "TemporarySession"]),
+}).strict();
+
+const ValidationSnapshotStorageSchema = z.object({
+  status: z.enum(["NotRun", "Current", "Stale"]),
+  blockerCount: nonNegativeSafeInteger,
+  warningCount: nonNegativeSafeInteger,
+}).strict();
+
+const CertificationSnapshotStorageSchema = z.discriminatedUnion("status", [
+  z.object({ status: z.literal("NotCertified") }).strict(),
+  z.object({ status: z.literal("Current"), certificationId: identifier }).strict(),
+  z.object({ status: z.literal("Stale"), certificationId: identifier }).strict(),
+]);
 
 const CaptionCueRevisionSchema = z.object({
-  itemId: IdentifierSchema,
+  itemId: identifier,
   itemRevision: positiveSafeInteger,
   state: ReviewStateStorageSchema,
   startMs: nonNegativeSafeInteger,
   endMs: nonNegativeSafeInteger,
-  actor: ActorSchema,
-  cause: nonEmptyText,
+  actor: ActorStorageSchema,
+  cause: boundedText(1_000),
   parentItemRevision: positiveSafeInteger.nullable(),
   kind: z.literal("CaptionCue"),
-  text: z.string().min(1).max(1_000).refine((value) => value.trim().length > 0),
-  speaker: z.string().min(1).max(200).refine((value) => value.trim().length > 0).nullable(),
+  text: boundedText(1_000),
+  speaker: boundedText(200).nullable(),
 }).strict().refine((revision) => revision.endMs > revision.startMs, {
   message: "A revision must end after it starts.",
   path: ["endMs"],
 });
 
 const AudioDescriptionBeatRevisionSchema = z.object({
-  itemId: IdentifierSchema,
+  itemId: identifier,
   itemRevision: positiveSafeInteger,
   state: ReviewStateStorageSchema,
   startMs: nonNegativeSafeInteger,
   endMs: nonNegativeSafeInteger,
-  actor: ActorSchema,
-  cause: nonEmptyText,
+  actor: ActorStorageSchema,
+  cause: boundedText(1_000),
   parentItemRevision: positiveSafeInteger.nullable(),
   kind: z.literal("AudioDescriptionBeat"),
-  description: z.string().min(1).max(1_000).refine((value) => value.trim().length > 0),
+  description: boundedText(1_000),
 }).strict().refine((revision) => revision.endMs > revision.startMs, {
   message: "A revision must end after it starts.",
   path: ["endMs"],
@@ -79,22 +112,22 @@ const RevisionSchema = z.discriminatedUnion("kind", [
 ]);
 
 const CaptionCueSchema = z.object({
-  itemId: IdentifierSchema,
+  itemId: identifier,
   kind: z.literal("CaptionCue"),
   revisions: z.array(CaptionCueRevisionSchema).min(1),
   current: CaptionCueRevisionSchema,
-  mergedIntoItemId: IdentifierSchema.nullable(),
+  mergedIntoItemId: identifier.nullable(),
 }).strict();
 
 const AudioDescriptionBeatSchema = z.object({
-  itemId: IdentifierSchema,
+  itemId: identifier,
   kind: z.literal("AudioDescriptionBeat"),
   revisions: z.array(AudioDescriptionBeatRevisionSchema).min(1),
   current: AudioDescriptionBeatRevisionSchema,
 }).strict();
 
 const AudioDescriptionGapSchema = z.object({
-  gapId: IdentifierSchema,
+  gapId: identifier,
   gapRevision: positiveSafeInteger,
   state: z.enum(["Available", "Consumed"]),
   startMs: nonNegativeSafeInteger,
@@ -105,18 +138,10 @@ const AudioDescriptionGapSchema = z.object({
 });
 
 const ItemSelectionSchema = z.discriminatedUnion("kind", [
+  z.object({ itemId: identifier, itemRevision: positiveSafeInteger, kind: z.literal("CaptionCue") }).strict(),
+  z.object({ itemId: identifier, itemRevision: positiveSafeInteger, kind: z.literal("AudioDescriptionBeat") }).strict(),
   z.object({
-    itemId: IdentifierSchema,
-    itemRevision: positiveSafeInteger,
-    kind: z.literal("CaptionCue"),
-  }).strict(),
-  z.object({
-    itemId: IdentifierSchema,
-    itemRevision: positiveSafeInteger,
-    kind: z.literal("AudioDescriptionBeat"),
-  }).strict(),
-  z.object({
-    itemId: IdentifierSchema,
+    itemId: identifier,
     itemRevision: positiveSafeInteger,
     kind: z.literal("AudioDescriptionGap"),
     state: z.literal("Available"),
@@ -124,71 +149,71 @@ const ItemSelectionSchema = z.discriminatedUnion("kind", [
 ]);
 
 const QualityProfileSchema = z.object({
-  profileId: IdentifierSchema,
+  profileId: identifier,
   revision: positiveSafeInteger,
-  name: nonEmptyText,
+  name: boundedText(1_000),
   rules: unknownRecord,
 }).strict();
 
 const WarningWaiverSchema = z.object({
-  findingId: IdentifierSchema,
-  reason: nonEmptyText,
-  actor: ActorSchema,
+  findingId: identifier,
+  reason: boundedText(4_000),
+  actor: ActorStorageSchema,
   projectRevision: positiveSafeInteger,
 }).strict();
 
 const EvidenceProvenanceSchema = z.object({
-  evidenceId: IdentifierSchema,
-  projectId: IdentifierSchema,
-  mediaSha256: sha256,
-  itemId: IdentifierSchema.nullable(),
+  evidenceId: identifier,
+  projectId: identifier,
+  mediaSha256: lowercaseSha256,
+  itemId: identifier.nullable(),
   itemRevision: positiveSafeInteger.nullable(),
 }).strict().refine((evidence) => (evidence.itemId === null) === (evidence.itemRevision === null), {
   message: "Evidence item id and revision must be present together.",
 });
 
 const GenerationLeaseSchema = z.object({
-  runId: IdentifierSchema,
+  runId: identifier,
   targetTrack: z.enum(["Captions", "AudioDescriptions"]),
-  actor: ActorSchema,
+  actor: ActorStorageSchema,
 }).strict();
 
 const DomainEventSchema = z.object({
-  eventId: IdentifierSchema,
+  eventId: identifier,
   projectRevision: positiveSafeInteger,
-  type: nonEmptyText,
-  actor: ActorSchema,
-  itemId: IdentifierSchema.optional(),
+  type: boundedText(200),
+  actor: ActorStorageSchema,
+  itemId: identifier.optional(),
   detail: z.string().optional(),
 }).strict();
 
 const ValidationInputItemSchema = z.object({
   kind: z.enum(["CaptionCue", "AudioDescriptionBeat"]),
-  itemId: IdentifierSchema,
+  itemId: identifier,
   itemRevision: positiveSafeInteger,
-  state: nonEmptyText,
+  state: ReviewStateStorageSchema,
   startMs: nonNegativeSafeInteger,
   endMs: nonNegativeSafeInteger,
   text: z.string(),
   speaker: z.string().nullable(),
-  mergedIntoItemId: IdentifierSchema.nullable().optional(),
+  mergedIntoItemId: identifier.nullable().optional(),
 }).strict().refine((item) => item.endMs > item.startMs, {
   message: "Validation input items must end after they start.",
   path: ["endMs"],
 });
 
 const ValidationInputSchema = z.object({
-  projectId: IdentifierSchema,
+  projectId: identifier,
   projectRevision: positiveSafeInteger,
-  media: MediaSourceSnapshotSchema,
+  media: MediaSourceStorageSchema,
   evidence: z.array(EvidenceProvenanceSchema),
   qualityProfile: QualityProfileSchema,
   captions: z.object({
-    order: z.array(IdentifierSchema),
+    order: z.array(identifier),
     items: z.array(ValidationInputItemSchema),
   }).strict(),
   audioDescriptions: z.object({
-    order: z.array(IdentifierSchema),
+    order: z.array(identifier),
     items: z.array(ValidationInputItemSchema),
   }).strict(),
   audioDescriptionGaps: z.array(AudioDescriptionGapSchema),
@@ -197,48 +222,48 @@ const ValidationInputSchema = z.object({
 const FindingTargetSchema = z.discriminatedUnion("type", [
   z.object({
     type: z.literal("project"),
-    projectId: IdentifierSchema,
+    projectId: identifier,
     projectRevision: positiveSafeInteger,
   }).strict(),
   z.object({
     type: z.literal("item"),
     kind: z.enum(["CaptionCue", "AudioDescriptionBeat"]),
-    itemId: IdentifierSchema,
+    itemId: identifier,
     itemRevision: positiveSafeInteger,
   }).strict(),
   z.object({
     type: z.literal("pair"),
     first: z.object({
       kind: z.enum(["CaptionCue", "AudioDescriptionBeat"]),
-      itemId: IdentifierSchema,
+      itemId: identifier,
       itemRevision: positiveSafeInteger,
     }).strict(),
     second: z.object({
       kind: z.enum(["CaptionCue", "AudioDescriptionBeat"]),
-      itemId: IdentifierSchema,
+      itemId: identifier,
       itemRevision: positiveSafeInteger,
     }).strict(),
   }).strict(),
 ]);
 
 const QualityFindingSchema = z.object({
-  id: IdentifierSchema,
-  findingId: IdentifierSchema,
-  ruleId: nonEmptyText,
+  id: identifier,
+  findingId: identifier,
+  ruleId: boundedText(200),
   severity: z.enum(["blocker", "warning"]),
-  message: nonEmptyText,
+  message: boundedText(4_000),
   target: FindingTargetSchema,
 }).strict().refine((finding) => finding.id === finding.findingId, {
   message: "Finding id aliases must agree.",
 });
 
 const StoredValidationRunSchema = z.object({
-  projectId: IdentifierSchema,
+  projectId: identifier,
   projectRevision: positiveSafeInteger,
-  profileId: IdentifierSchema,
+  profileId: identifier,
   profileRevision: positiveSafeInteger,
   input: ValidationInputSchema,
-  inputHash: nonEmptyText,
+  inputHash: prefixedSha256,
   blockerCount: nonNegativeSafeInteger,
   warningCount: nonNegativeSafeInteger,
 }).strict();
@@ -250,7 +275,7 @@ const ValidationRunSchema = StoredValidationRunSchema.extend({
 }).strict().superRefine((run, context) => {
   const blockers = run.findings.filter((finding) => finding.severity === "blocker");
   const warnings = run.findings.filter((finding) => finding.severity === "warning");
-  const sameIds = (left: readonly { findingId: string }[], right: readonly { findingId: string }[]) =>
+  const sameIds = (left: readonly { readonly findingId: string }[], right: readonly { readonly findingId: string }[]) =>
     left.length === right.length && left.every((value, index) => value.findingId === right[index]?.findingId);
   if (run.blockerCount !== blockers.length || run.warningCount !== warnings.length) {
     context.addIssue({ code: "custom", message: "Validation counts do not match findings." });
@@ -262,17 +287,17 @@ const ValidationRunSchema = StoredValidationRunSchema.extend({
 
 const CertificationItemRevisionSchema = z.object({
   kind: z.enum(["CaptionCue", "AudioDescriptionBeat"]),
-  itemId: IdentifierSchema,
+  itemId: identifier,
   itemRevision: positiveSafeInteger,
 }).strict();
 
 const StoredProjectCertificationSchema = z.object({
-  certificationId: IdentifierSchema,
-  certificationSnapshotHash: nonEmptyText,
-  readinessHash: nonEmptyText,
+  certificationId: identifier,
+  certificationSnapshotHash: prefixedSha256,
+  readinessHash: prefixedSha256,
   certifiedAtMs: positiveSafeInteger,
-  actor: ActorSchema,
-  media: MediaSourceSnapshotSchema,
+  actor: ActorStorageSchema,
+  media: MediaSourceStorageSchema,
   evidence: z.array(EvidenceProvenanceSchema),
   itemRevisions: z.array(CertificationItemRevisionSchema),
   qualityProfile: QualityProfileSchema,
@@ -286,26 +311,26 @@ const ProjectCertificationSchema = StoredProjectCertificationSchema.extend({
 
 const CaptionProjectSchema = z.object({
   contractVersion: z.literal(1),
-  projectId: IdentifierSchema,
+  projectId: identifier,
   projectRevision: positiveSafeInteger,
-  title: nonEmptyText,
-  media: MediaSourceSnapshotSchema,
+  title: boundedText(1_000),
+  media: MediaSourceStorageSchema,
   evidence: z.array(EvidenceProvenanceSchema),
   captions: z.object({
     kind: z.literal("Captions"),
-    order: z.array(IdentifierSchema),
+    order: z.array(identifier),
     items: z.record(z.string(), CaptionCueSchema),
   }).strict(),
   audioDescriptions: z.object({
     kind: z.literal("AudioDescriptions"),
-    order: z.array(IdentifierSchema),
+    order: z.array(identifier),
     items: z.record(z.string(), AudioDescriptionBeatSchema),
   }).strict(),
   audioDescriptionGaps: z.record(z.string(), AudioDescriptionGapSchema),
   selectedItem: ItemSelectionSchema.nullable(),
-  validation: ValidationSnapshotSchema,
+  validation: ValidationSnapshotStorageSchema,
   validationRun: ValidationRunSchema.nullable(),
-  certification: CertificationSnapshotSchema,
+  certification: CertificationSnapshotStorageSchema,
   certifications: z.array(ProjectCertificationSchema),
   qualityProfile: QualityProfileSchema,
   warningWaivers: z.record(z.string(), WarningWaiverSchema),
@@ -325,17 +350,19 @@ export interface ProjectHeaderRow {
   readonly contractVersion: 1;
   readonly projectRevision: number;
   readonly title: string;
-  readonly media: CaptionProject["media"];
+  readonly media: MediaSourceSnapshot;
   readonly captionOrder: readonly string[];
   readonly audioDescriptionOrder: readonly string[];
-  readonly audioDescriptionGaps: Readonly<Record<string, AudioDescriptionGap>>;
+  readonly audioDescriptionGaps: Readonly<Record<string, import("@cuebench/domain").AudioDescriptionGap>>;
   readonly selectedItem: Selection | null;
-  readonly validation: CaptionProject["validation"];
+  readonly validation: ValidationSnapshot;
   readonly validationRun: StoredValidationRun | null;
-  readonly certification: CaptionProject["certification"];
+  readonly certification: CertificationSnapshot;
   readonly qualityProfile: QualityProfile;
   readonly warningWaivers: Readonly<Record<string, WarningWaiver>>;
   readonly activeGenerationRun: GenerationLease | null;
+  /** Ordered ids identify the current evidence projection; older versions remain append-only rows. */
+  readonly evidenceOrder: readonly string[];
   readonly createdAtMs: number;
   readonly updatedAtMs: number;
 }
@@ -366,10 +393,12 @@ export interface FindingRow {
   readonly finding: QualityFinding;
 }
 
+/** Evidence is immutable by version; the header chooses the current version of each id. */
 export interface EvidenceRow {
   readonly key: string;
   readonly projectId: string;
   readonly evidenceId: string;
+  readonly version: number;
   readonly sequence: number;
   readonly evidence: EvidenceProvenance;
 }
@@ -413,12 +442,19 @@ export interface NarrationBlobRow {
   readonly savedAtMs: number;
 }
 
+export type JsonValue = null | boolean | number | string | readonly JsonValue[] | { readonly [key: string]: JsonValue };
+
+export interface VersionedRunReceipt {
+  readonly version: 1;
+  readonly payload: JsonValue;
+}
+
 export interface RunReceiptRow {
   readonly key: string;
   readonly projectId: string;
   readonly runId: string;
-  /** Opaque signed recovery data. Project content never belongs in this row. */
-  readonly receipt: unknown;
+  /** Versioned JSON only: receipts must be durable and safely estimable. */
+  readonly receipt: VersionedRunReceipt;
   readonly savedAtMs: number;
 }
 
@@ -429,72 +465,74 @@ export interface SettingRow {
 }
 
 const ProjectHeaderRowSchema = z.object({
-  projectId: IdentifierSchema,
+  projectId: identifier,
   schemaVersion: z.literal(STORAGE_SCHEMA_VERSION),
   contractVersion: z.literal(1),
   projectRevision: positiveSafeInteger,
-  title: nonEmptyText,
-  media: MediaSourceSnapshotSchema,
-  captionOrder: z.array(IdentifierSchema),
-  audioDescriptionOrder: z.array(IdentifierSchema),
+  title: boundedText(1_000),
+  media: MediaSourceStorageSchema,
+  captionOrder: z.array(identifier),
+  audioDescriptionOrder: z.array(identifier),
   audioDescriptionGaps: z.record(z.string(), AudioDescriptionGapSchema),
   selectedItem: ItemSelectionSchema.nullable(),
-  validation: ValidationSnapshotSchema,
+  validation: ValidationSnapshotStorageSchema,
   validationRun: StoredValidationRunSchema.nullable(),
-  certification: CertificationSnapshotSchema,
+  certification: CertificationSnapshotStorageSchema,
   qualityProfile: QualityProfileSchema,
   warningWaivers: z.record(z.string(), WarningWaiverSchema),
   activeGenerationRun: GenerationLeaseSchema.nullable(),
+  evidenceOrder: z.array(identifier),
   createdAtMs: nonNegativeSafeInteger,
   updatedAtMs: nonNegativeSafeInteger,
 }).strict();
 
 const ItemRowSchema = z.object({
-  key: nonEmptyText,
-  projectId: IdentifierSchema,
-  itemId: IdentifierSchema,
+  key: nonBlankText,
+  projectId: identifier,
+  itemId: identifier,
   kind: z.enum(["CaptionCue", "AudioDescriptionBeat"]),
   currentItemRevision: positiveSafeInteger,
-  mergedIntoItemId: IdentifierSchema.nullable(),
+  mergedIntoItemId: identifier.nullable(),
 }).strict();
 
 const RevisionRowSchema = z.object({
-  key: nonEmptyText,
-  projectId: IdentifierSchema,
-  itemId: IdentifierSchema,
+  key: nonBlankText,
+  projectId: identifier,
+  itemId: identifier,
   itemRevision: positiveSafeInteger,
   kind: z.enum(["CaptionCue", "AudioDescriptionBeat"]),
   revision: RevisionSchema,
 }).strict();
 
 const FindingRowSchema = z.object({
-  key: nonEmptyText,
-  projectId: IdentifierSchema,
-  scope: nonEmptyText,
-  findingId: IdentifierSchema,
+  key: nonBlankText,
+  projectId: identifier,
+  scope: nonBlankText,
+  findingId: identifier,
   finding: QualityFindingSchema,
 }).strict();
 
 const EvidenceRowSchema = z.object({
-  key: nonEmptyText,
-  projectId: IdentifierSchema,
-  evidenceId: IdentifierSchema,
+  key: nonBlankText,
+  projectId: identifier,
+  evidenceId: identifier,
+  version: positiveSafeInteger,
   sequence: nonNegativeSafeInteger,
   evidence: EvidenceProvenanceSchema,
 }).strict();
 
 const CourtRecordRowSchema = z.object({
-  key: nonEmptyText,
-  projectId: IdentifierSchema,
-  eventId: IdentifierSchema,
+  key: nonBlankText,
+  projectId: identifier,
+  eventId: identifier,
   sequence: nonNegativeSafeInteger,
   event: DomainEventSchema,
 }).strict();
 
 const CertificationRowSchema = z.object({
-  key: nonEmptyText,
-  projectId: IdentifierSchema,
-  certificationId: IdentifierSchema,
+  key: nonBlankText,
+  projectId: identifier,
+  certificationId: identifier,
   sequence: nonNegativeSafeInteger,
   certification: StoredProjectCertificationSchema,
 }).strict();
@@ -504,10 +542,10 @@ const blobSchema = z.custom<Blob>((value) => typeof Blob !== "undefined" && valu
 });
 
 const SourceBlobRowSchema = z.object({
-  key: nonEmptyText,
-  projectId: IdentifierSchema,
-  sourceId: IdentifierSchema,
-  sha256,
+  key: nonBlankText,
+  projectId: identifier,
+  sourceId: identifier,
+  sha256: lowercaseSha256,
   blob: blobSchema,
   byteLength: nonNegativeSafeInteger,
   contentType: z.string(),
@@ -516,9 +554,9 @@ const SourceBlobRowSchema = z.object({
 }).strict();
 
 const NarrationBlobRowSchema = z.object({
-  key: nonEmptyText,
-  projectId: IdentifierSchema,
-  beatId: IdentifierSchema,
+  key: nonBlankText,
+  projectId: identifier,
+  beatId: identifier,
   itemRevision: positiveSafeInteger,
   blob: blobSchema,
   byteLength: nonNegativeSafeInteger,
@@ -526,16 +564,34 @@ const NarrationBlobRowSchema = z.object({
   savedAtMs: nonNegativeSafeInteger,
 }).strict();
 
+const isJsonValue = (value: unknown, seen = new WeakSet<object>()): value is JsonValue => {
+  if (value === null || typeof value === "string" || typeof value === "boolean") return true;
+  if (typeof value === "number") return Number.isFinite(value);
+  if (typeof value !== "object") return false;
+  if (seen.has(value)) return false;
+  seen.add(value);
+  if (Array.isArray(value)) return value.every((entry) => isJsonValue(entry, seen));
+  if (Object.getPrototypeOf(value) !== Object.prototype && Object.getPrototypeOf(value) !== null) return false;
+  return Object.values(value as Record<string, unknown>).every((entry) => isJsonValue(entry, seen));
+};
+
+const VersionedRunReceiptSchema = z.object({
+  version: z.literal(1),
+  payload: z.custom<JsonValue>((value) => isJsonValue(value), {
+    message: "Receipt payload must be finite, JSON-compatible, and acyclic.",
+  }),
+}).strict();
+
 const RunReceiptRowSchema = z.object({
-  key: nonEmptyText,
-  projectId: IdentifierSchema,
-  runId: IdentifierSchema,
-  receipt: z.unknown(),
+  key: nonBlankText,
+  projectId: identifier,
+  runId: identifier,
+  receipt: VersionedRunReceiptSchema,
   savedAtMs: nonNegativeSafeInteger,
 }).strict();
 
 const SettingRowSchema = z.object({
-  key: nonEmptyText,
+  key: identifier,
   value: z.unknown(),
   updatedAtMs: nonNegativeSafeInteger,
 }).strict();
@@ -550,6 +606,22 @@ export class StorageReadValidationError extends Error {
   }
 }
 
+/** Raised when a caller attempts to alter an immutable normalized history row. */
+export class StorageImmutableWriteError extends Error {
+  public constructor(message: string) {
+    super(`CueBench immutable storage write rejected: ${message}`);
+    this.name = "StorageImmutableWriteError";
+  }
+}
+
+/** Raised after a different Dexie connection advanced the persisted header. */
+export class StorageStaleWriteError extends Error {
+  public constructor(projectId: string) {
+    super(`CueBench project ${projectId} changed in another browser context.`);
+    this.name = "StorageStaleWriteError";
+  }
+}
+
 const parseStored = <Value>(schema: z.ZodType, value: unknown, table: string): Value => {
   const parsed = schema.safeParse(value);
   if (parsed.success) return parsed.data as Value;
@@ -559,12 +631,12 @@ const parseStored = <Value>(schema: z.ZodType, value: unknown, table: string): V
 };
 
 const recordKey = (...parts: readonly string[]): string => JSON.stringify(parts);
-
 const itemKey = (projectId: string, itemId: string) => recordKey(projectId, itemId);
 const revisionKey = (projectId: string, itemId: string, itemRevision: number) =>
   recordKey(projectId, itemId, String(itemRevision));
 const findingKey = (projectId: string, scope: string, findingId: string) => recordKey(projectId, scope, findingId);
-const evidenceKey = (projectId: string, evidenceId: string) => recordKey(projectId, evidenceId);
+const evidenceKey = (projectId: string, evidenceId: string, version: number) =>
+  recordKey(projectId, evidenceId, String(version));
 const courtRecordKey = (projectId: string, eventId: string) => recordKey(projectId, eventId);
 const certificationKey = (projectId: string, certificationId: string) => recordKey(projectId, certificationId);
 export const sourceBlobKey = (projectId: string, sourceSha256: string) => recordKey(projectId, sourceSha256);
@@ -572,43 +644,36 @@ export const narrationBlobKey = (projectId: string, beatId: string, itemRevision
   recordKey(projectId, beatId, String(itemRevision));
 export const runReceiptKey = (projectId: string, runId: string) => recordKey(projectId, runId);
 
-const currentValidationScope = (run: StoredValidationRun) => `current:${run.inputHash}`;
-const certificationValidationScope = (certification: StoredProjectCertification) =>
-  `certification:${certification.certificationId}:${certification.validationRun.inputHash}`;
+/** A validation run is immutable at its post-command project revision. */
+const validationScope = (run: StoredValidationRun) => `validation:${run.projectRevision}:${run.inputHash}`;
 
-const storedValidationRun = (run: ValidationRun): StoredValidationRun => {
-  return {
-    projectId: run.projectId,
-    projectRevision: run.projectRevision,
-    profileId: run.profileId,
-    profileRevision: run.profileRevision,
-    input: clone(run.input),
-    inputHash: run.inputHash,
-    blockerCount: run.blockerCount,
-    warningCount: run.warningCount,
-  };
-};
+const storedValidationRun = (run: ValidationRun): StoredValidationRun => ({
+  projectId: run.projectId,
+  projectRevision: run.projectRevision,
+  profileId: run.profileId,
+  profileRevision: run.profileRevision,
+  input: clone(run.input),
+  inputHash: run.inputHash,
+  blockerCount: run.blockerCount,
+  warningCount: run.warningCount,
+});
 
 const rehydrateValidationRun = (
   stored: StoredValidationRun,
   findings: readonly QualityFinding[],
 ): ValidationRun => {
   const orderedFindings = [...findings].sort((left, right) => left.findingId.localeCompare(right.findingId));
-  const run: ValidationRun = {
+  return parseStored<ValidationRun>(ValidationRunSchema, {
     ...clone(stored),
     findings: orderedFindings,
     blockers: orderedFindings.filter((finding) => finding.severity === "blocker"),
     warnings: orderedFindings.filter((finding) => finding.severity === "warning"),
-  };
-  return parseStored<ValidationRun>(ValidationRunSchema, run, "validation runs");
+  }, "validation runs");
 };
 
 const storedCertification = (certification: ProjectCertification): StoredProjectCertification => {
   const { validationRun, ...rest } = certification;
-  return {
-    ...clone(rest),
-    validationRun: storedValidationRun(validationRun),
-  };
+  return { ...clone(rest), validationRun: storedValidationRun(validationRun) };
 };
 
 const rehydrateCertification = (
@@ -619,12 +684,13 @@ const rehydrateCertification = (
   validationRun: rehydrateValidationRun(stored.validationRun, findings),
 }, "certifications");
 
-const sameJson = (left: unknown, right: unknown): boolean => JSON.stringify(left) === JSON.stringify(right);
+const assertUnique = (values: readonly string[], table: string, label: string): void => {
+  if (new Set(values).size !== values.length) {
+    throw new StorageReadValidationError(table, `${label} must be unique.`);
+  }
+};
 
-const assertRevisionHistory = (
-  item: CaptionCue | AudioDescriptionBeat,
-  project: CaptionProject,
-): void => {
+const assertRevisionHistory = (item: CaptionCue | AudioDescriptionBeat, project: CaptionProject): void => {
   const revisions = item.revisions;
   for (let index = 0; index < revisions.length; index += 1) {
     const revision = revisions[index]!;
@@ -638,17 +704,12 @@ const assertRevisionHistory = (
       throw new StorageReadValidationError("revisions", "Revision timing falls outside the linked media.");
     }
   }
-  const latest = revisions.at(-1);
-  if (latest === undefined || !sameJson(latest, item.current)) {
+  if (!sameValue(revisions.at(-1), item.current)) {
     throw new StorageReadValidationError("items", "Item current revision does not equal its immutable history tail.");
   }
 };
 
-const assertTrackOrder = (
-  order: readonly string[],
-  expectedIds: readonly string[],
-  table: string,
-): void => {
+const assertTrackOrder = (order: readonly string[], expectedIds: readonly string[], table: string): void => {
   const actual = new Set(order);
   if (actual.size !== order.length || actual.size !== expectedIds.length || expectedIds.some((itemId) => !actual.has(itemId))) {
     throw new StorageReadValidationError(table, "Track order must contain every live item exactly once.");
@@ -665,9 +726,57 @@ const assertContiguousSequences = (
   }
 };
 
+const canonicalEvidence = (evidence: readonly EvidenceProvenance[]): readonly EvidenceProvenance[] =>
+  [...evidence].sort((left, right) => left.evidenceId.localeCompare(right.evidenceId));
+
+const currentItemBindings = (project: CaptionProject) => currentProjectItems(project).map((item) => ({
+  kind: item.kind,
+  itemId: item.itemId,
+  itemRevision: item.current.itemRevision,
+}));
+
+const assertCertificationPointer = (project: CaptionProject): void => {
+  const certificationIds = project.certifications.map((certification) => certification.certificationId);
+  assertUnique(certificationIds, "certifications", "Certification ids");
+  for (const certification of project.certifications) {
+    if (!verifyCertificationSnapshot(certification)) {
+      throw new StorageReadValidationError("certifications", "Certification snapshot signature or structure is invalid.");
+    }
+    if (certification.validationRun.projectId !== project.projectId) {
+      throw new StorageReadValidationError("certifications", "Certification validation run belongs to another project.");
+    }
+  }
+  const pointer = project.certification;
+  if (pointer.status === "NotCertified") return;
+  const snapshot = project.certifications.find(
+    (candidate) => candidate.certificationId === pointer.certificationId,
+  );
+  if (snapshot === undefined) {
+    throw new StorageReadValidationError("project headers", "Certification pointer has no immutable snapshot.");
+  }
+  if (pointer.status === "Stale") return;
+  if (
+    project.validation.status !== "Current"
+    || project.validationRun === null
+    || !sameValue(snapshot.media, project.media)
+    || !sameValue(snapshot.evidence, canonicalEvidence(project.evidence))
+    || !sameValue(snapshot.itemRevisions, currentItemBindings(project))
+    || !sameValue(snapshot.qualityProfile, project.qualityProfile)
+    || !sameValue(snapshot.validationRun, project.validationRun)
+  ) {
+    throw new StorageReadValidationError("project headers", "Current certification does not bind the current project projection.");
+  }
+};
+
 const assertProjectRelationships = (project: CaptionProject): void => {
+  const globalIds = new Set<string>();
+  const claimGlobalId = (id: string, table: string) => {
+    if (globalIds.has(id)) throw new StorageReadValidationError(table, "Caption, audio-description, and gap ids must be globally unique.");
+    globalIds.add(id);
+  };
   for (const [itemId, item] of Object.entries(project.captions.items)) {
     if (item.itemId !== itemId) throw new StorageReadValidationError("items", "Caption item map key does not match item id.");
+    claimGlobalId(itemId, "items");
     assertRevisionHistory(item, project);
     if (item.mergedIntoItemId !== null && (
       item.mergedIntoItemId === item.itemId || project.captions.items[item.mergedIntoItemId] === undefined
@@ -675,6 +784,7 @@ const assertProjectRelationships = (project: CaptionProject): void => {
   }
   for (const [itemId, item] of Object.entries(project.audioDescriptions.items)) {
     if (item.itemId !== itemId) throw new StorageReadValidationError("items", "Audio-description item map key does not match item id.");
+    claimGlobalId(itemId, "items");
     assertRevisionHistory(item, project);
   }
   assertTrackOrder(
@@ -688,13 +798,15 @@ const assertProjectRelationships = (project: CaptionProject): void => {
     "project headers",
   );
   for (const [gapId, gap] of Object.entries(project.audioDescriptionGaps)) {
+    claimGlobalId(gapId, "project headers");
     if (gap.gapId !== gapId || gap.endMs > project.media.durationMs) {
       throw new StorageReadValidationError("project headers", "Audio-description gap is invalid.");
     }
   }
+  assertUnique(project.evidence.map((entry) => entry.evidenceId), "evidence", "Evidence ids");
   for (const evidence of project.evidence) {
-    if (evidence.projectId !== project.projectId || evidence.mediaSha256 !== project.media.sha256) {
-      throw new StorageReadValidationError("evidence", "Evidence does not bind to this project and media.");
+    if (evidence.projectId !== project.projectId) {
+      throw new StorageReadValidationError("evidence", "Evidence belongs to another project.");
     }
     if (evidence.itemId !== null) {
       const item = project.captions.items[evidence.itemId] ?? project.audioDescriptions.items[evidence.itemId];
@@ -717,44 +829,32 @@ const assertProjectRelationships = (project: CaptionProject): void => {
       }
     }
   }
-  const certificationIds = new Set<string>();
-  for (const certification of project.certifications) {
-    if (certificationIds.has(certification.certificationId)) {
-      throw new StorageReadValidationError("certifications", "Certification ids must be unique.");
-    }
-    certificationIds.add(certification.certificationId);
-  }
-  if (project.certification.status !== "NotCertified" && !certificationIds.has(project.certification.certificationId)) {
-    throw new StorageReadValidationError("project headers", "Current certification pointer has no snapshot.");
-  }
   if (project.validation.status === "Current" && project.validationRun === null) {
     throw new StorageReadValidationError("project headers", "Current validation has no persisted validation run.");
   }
-  const assertValidationRunProject = (run: ValidationRun, table: string) => {
-    if (run.projectId !== project.projectId || run.input.projectId !== project.projectId) {
-      throw new StorageReadValidationError(table, "Validation run belongs to another project.");
-    }
-  };
-  if (project.validationRun !== null) assertValidationRunProject(project.validationRun, "findings");
-  for (const certification of project.certifications) {
-    assertValidationRunProject(certification.validationRun, "certifications");
-    if (certification.evidence.some((entry) => entry.projectId !== project.projectId)) {
-      throw new StorageReadValidationError("certifications", "Certification evidence belongs to another project.");
-    }
+  if (project.validation.status === "Current" && (
+    currentValidationRun(project) === undefined
+    || project.validation.blockerCount !== project.validationRun!.blockerCount
+    || project.validation.warningCount !== project.validationRun!.warningCount
+  )) {
+    throw new StorageReadValidationError("project headers", "Current validation does not bind the current project projection.");
   }
+  if (project.validationRun !== null && (
+    project.validationRun.projectId !== project.projectId || project.validationRun.input.projectId !== project.projectId
+  )) throw new StorageReadValidationError("findings", "Validation run belongs to another project.");
   if (project.activeGenerationRun !== null && project.activeGenerationRun.actor.type !== "CueBenchAI") {
     throw new StorageReadValidationError("project headers", "Only CueBench AI may hold a generation write lease.");
   }
-  const eventIds = new Set<string>();
+  assertUnique(project.courtRecord.map((event) => event.eventId), "court record", "Court Record event ids");
   for (const event of project.courtRecord) {
-    if (eventIds.has(event.eventId) || event.projectRevision > project.projectRevision) {
-      throw new StorageReadValidationError("court record", "Court Record events are not valid for this project revision.");
+    if (event.projectRevision > project.projectRevision) {
+      throw new StorageReadValidationError("court record", "Court Record event is from a future project revision.");
     }
-    eventIds.add(event.eventId);
   }
   for (const [findingId, waiver] of Object.entries(project.warningWaivers)) {
     if (findingId !== waiver.findingId) throw new StorageReadValidationError("project headers", "Warning waiver key does not match finding id.");
   }
+  assertCertificationPointer(project);
 };
 
 export const validateCaptionProject = (value: unknown): CaptionProject => {
@@ -772,6 +872,25 @@ export interface NormalizedProjectRows {
   readonly courtRecord: readonly CourtRecordRow[];
   readonly certifications: readonly CertificationRow[];
 }
+
+const appendRunFindings = (target: FindingRow[], projectId: string, run: ValidationRun): void => {
+  const stored = storedValidationRun(run);
+  const scope = validationScope(stored);
+  for (const finding of run.findings) {
+    const row: FindingRow = {
+      key: findingKey(projectId, scope, finding.findingId),
+      projectId,
+      scope,
+      findingId: finding.findingId,
+      finding: clone(finding),
+    };
+    const existing = target.find((candidate) => candidate.key === row.key);
+    if (existing === undefined) target.push(row);
+    else if (!sameValue(existing, row)) {
+      throw new StorageReadValidationError("findings", "One validation scope contains conflicting duplicate finding ids.");
+    }
+  }
+};
 
 export const normalizeProject = (
   value: CaptionProject,
@@ -795,6 +914,7 @@ export const normalizeProject = (
     qualityProfile: clone(project.qualityProfile),
     warningWaivers: clone(project.warningWaivers),
     activeGenerationRun: clone(project.activeGenerationRun),
+    evidenceOrder: project.evidence.map((entry) => entry.evidenceId),
     createdAtMs: timestamps.createdAtMs,
     updatedAtMs: timestamps.updatedAtMs,
   };
@@ -824,35 +944,22 @@ export const normalizeProject = (
   for (const item of Object.values(project.audioDescriptions.items)) appendItem(item, null);
 
   const findings: FindingRow[] = [];
-  const appendRunFindings = (scope: string, run: ValidationRun) => {
-    for (const finding of run.findings) {
-      findings.push({
-        key: findingKey(project.projectId, scope, finding.findingId),
-        projectId: project.projectId,
-        scope,
-        findingId: finding.findingId,
-        finding: clone(finding),
-      });
-    }
-  };
-  if (project.validationRun !== null) appendRunFindings(currentValidationScope(storedValidationRun(project.validationRun)), project.validationRun);
-
+  if (project.validationRun !== null) appendRunFindings(findings, project.projectId, project.validationRun);
   const certifications = project.certifications.map((certification, sequence): CertificationRow => {
-    const stored = storedCertification(certification);
-    appendRunFindings(certificationValidationScope(stored), certification.validationRun);
+    appendRunFindings(findings, project.projectId, certification.validationRun);
     return {
       key: certificationKey(project.projectId, certification.certificationId),
       projectId: project.projectId,
       certificationId: certification.certificationId,
       sequence,
-      certification: stored,
+      certification: storedCertification(certification),
     };
   });
-
   const evidence = project.evidence.map((entry, sequence): EvidenceRow => ({
-    key: evidenceKey(project.projectId, entry.evidenceId),
+    key: evidenceKey(project.projectId, entry.evidenceId, 1),
     projectId: project.projectId,
     evidenceId: entry.evidenceId,
+    version: 1,
     sequence,
     evidence: clone(entry),
   }));
@@ -870,6 +977,18 @@ const assertRowKey = (actual: string, expected: string, table: string): void => 
   if (actual !== expected) throw new StorageReadValidationError(table, "Row primary key does not match its normalized fields.");
 };
 
+const latestEvidenceRows = (rows: readonly EvidenceRow[]): Map<string, EvidenceRow> => {
+  const latest = new Map<string, EvidenceRow>();
+  for (const row of rows) {
+    const previous = latest.get(row.evidenceId);
+    if (previous === undefined || row.version > previous.version) latest.set(row.evidenceId, row);
+    else if (row.version === previous.version) {
+      throw new StorageReadValidationError("evidence", "Evidence has duplicate immutable versions.");
+    }
+  }
+  return latest;
+};
+
 export const rehydrateProject = (rows: NormalizedProjectRows): CaptionProject => {
   const header = parseStored<ProjectHeaderRow>(ProjectHeaderRowSchema, rows.header, "project headers");
   const items = rows.items.map((row) => parseStored<ItemRow>(ItemRowSchema, row, "items"));
@@ -879,26 +998,28 @@ export const rehydrateProject = (rows: NormalizedProjectRows): CaptionProject =>
   const courtRecord = rows.courtRecord.map((row) => parseStored<CourtRecordRow>(CourtRecordRowSchema, row, "court record"));
   const certifications = rows.certifications.map((row) => parseStored<CertificationRow>(CertificationRowSchema, row, "certifications"));
   const projectId = header.projectId;
-  const allRows = [
-    ...items, ...revisions, ...findings, ...evidence, ...courtRecord, ...certifications,
-  ] as readonly { projectId: string }[];
+  const allRows = [...items, ...revisions, ...findings, ...evidence, ...courtRecord, ...certifications] as readonly { readonly projectId: string }[];
   if (allRows.some((row) => row.projectId !== projectId)) {
     throw new StorageReadValidationError("normalized tables", "A child row belongs to another project.");
   }
   for (const row of items) assertRowKey(row.key, itemKey(projectId, row.itemId), "items");
   for (const row of revisions) assertRowKey(row.key, revisionKey(projectId, row.itemId, row.itemRevision), "revisions");
   for (const row of findings) assertRowKey(row.key, findingKey(projectId, row.scope, row.findingId), "findings");
-  for (const row of evidence) assertRowKey(row.key, evidenceKey(projectId, row.evidenceId), "evidence");
+  for (const row of evidence) assertRowKey(row.key, evidenceKey(projectId, row.evidenceId, row.version), "evidence");
   for (const row of courtRecord) assertRowKey(row.key, courtRecordKey(projectId, row.eventId), "court record");
   for (const row of certifications) assertRowKey(row.key, certificationKey(projectId, row.certificationId), "certifications");
+  assertUnique(items.map((row) => row.itemId), "items", "Item ids");
+  assertUnique(revisions.map((row) => row.key), "revisions", "Revision keys");
+  assertUnique(findings.map((row) => row.key), "findings", "Finding keys");
+  assertUnique(courtRecord.map((row) => row.eventId), "court record", "Court Record event ids");
+  assertUnique(certifications.map((row) => row.certificationId), "certifications", "Certification ids");
+  assertContiguousSequences(courtRecord, "court record");
+  assertContiguousSequences(certifications, "certifications");
   for (const row of findings) {
     if (row.findingId !== row.finding.findingId) {
       throw new StorageReadValidationError("findings", "Finding key does not match its finding payload.");
     }
   }
-  assertContiguousSequences(evidence, "evidence");
-  assertContiguousSequences(courtRecord, "court record");
-  assertContiguousSequences(certifications, "certifications");
 
   const revisionsByItem = new Map<string, RevisionRow[]>();
   for (const row of revisions) {
@@ -948,31 +1069,31 @@ export const rehydrateProject = (rows: NormalizedProjectRows): CaptionProject =>
   if (revisionsByItem.size !== items.length) {
     throw new StorageReadValidationError("revisions", "A revision references an item that does not exist.");
   }
-  const recognizedFindingScopes = new Set<string>();
-  if (header.validationRun !== null) recognizedFindingScopes.add(currentValidationScope(header.validationRun));
-  for (const row of certifications) recognizedFindingScopes.add(certificationValidationScope(row.certification));
-  if (findings.some((row) => !recognizedFindingScopes.has(row.scope))) {
-    throw new StorageReadValidationError("findings", "Finding row is not attached to a persisted validation run.");
+
+  const evidenceById = latestEvidenceRows(evidence);
+  assertUnique(header.evidenceOrder, "project headers", "Current evidence ids");
+  if (evidenceById.size !== header.evidenceOrder.length || header.evidenceOrder.some((id) => !evidenceById.has(id))) {
+    throw new StorageReadValidationError("evidence", "Current evidence projection does not bind every persisted evidence id.");
   }
-  const findingsForScope = (scope: string): readonly QualityFinding[] => findings
-    .filter((row) => row.scope === scope)
-    .map((row) => clone(row.finding));
-  const currentRun = header.validationRun === null
-    ? null
-    : rehydrateValidationRun(header.validationRun, findingsForScope(currentValidationScope(header.validationRun)));
+  const projectEvidence = header.evidenceOrder.map((id) => clone(evidenceById.get(id)!.evidence));
+
+  const findingsForRun = (run: StoredValidationRun): readonly QualityFinding[] => {
+    const scope = validationScope(run);
+    const scoped = findings.filter((row) => row.scope === scope).map((row) => clone(row.finding));
+    assertUnique(scoped.map((finding) => finding.findingId), "findings", "Finding ids in validation scope");
+    return scoped;
+  };
+  const currentRun = header.validationRun === null ? null : rehydrateValidationRun(header.validationRun, findingsForRun(header.validationRun));
   const rehydratedCertifications = [...certifications]
     .sort((left, right) => left.sequence - right.sequence)
-    .map((row) => rehydrateCertification(
-      row.certification,
-      findingsForScope(certificationValidationScope(row.certification)),
-    ));
+    .map((row) => rehydrateCertification(row.certification, findingsForRun(row.certification.validationRun)));
   const project: CaptionProject = {
     contractVersion: header.contractVersion,
     projectId,
     projectRevision: header.projectRevision,
     title: header.title,
     media: clone(header.media),
-    evidence: [...evidence].sort((left, right) => left.sequence - right.sequence).map((row) => clone(row.evidence)),
+    evidence: projectEvidence,
     captions: { kind: "Captions", order: clone(header.captionOrder), items: captionItems },
     audioDescriptions: { kind: "AudioDescriptions", order: clone(header.audioDescriptionOrder), items: audioDescriptionItems },
     audioDescriptionGaps: clone(header.audioDescriptionGaps),
@@ -996,7 +1117,7 @@ export class CueBenchDatabase extends Dexie {
   public readonly findings!: Table<FindingRow, string>;
   public readonly evidence!: Table<EvidenceRow, string>;
   public readonly courtRecord!: Table<CourtRecordRow, string>;
-  /** Compatibility alias that still refers to the singular Court Record table. */
+  /** Compatibility alias for callers that use the plural table spelling. */
   public readonly courtRecords!: Table<CourtRecordRow, string>;
   public readonly certifications!: Table<CertificationRow, string>;
   public readonly sourceBlobs!: Table<SourceBlobRow, string>;
@@ -1007,11 +1128,11 @@ export class CueBenchDatabase extends Dexie {
   public constructor(name = "cuebench") {
     super(name);
     this.version(STORAGE_SCHEMA_VERSION).stores({
-      projectHeaders: "&projectId, projectRevision, updatedAtMs",
+      projectHeaders: "&projectId, projectRevision, [projectId+projectRevision], updatedAtMs",
       items: "&key, projectId, itemId, [projectId+itemId], kind, currentItemRevision",
       revisions: "&key, projectId, itemId, itemRevision, [projectId+itemId], [projectId+itemId+itemRevision], kind",
       findings: "&key, projectId, scope, findingId, [projectId+scope], [projectId+scope+findingId]",
-      evidence: "&key, projectId, evidenceId, [projectId+evidenceId]",
+      evidence: "&key, projectId, evidenceId, version, [projectId+evidenceId], [projectId+evidenceId+version]",
       courtRecord: "&key, projectId, eventId, projectRevision, [projectId+eventId]",
       certifications: "&key, projectId, certificationId, [projectId+certificationId]",
       sourceBlobs: "&key, projectId, sourceId, sha256, [projectId+sha256], [projectId+sourceId]",
@@ -1034,46 +1155,140 @@ export class CueBenchDatabase extends Dexie {
   }
 }
 
+const projectTables = (db: CueBenchDatabase) => [
+  db.projectHeaders,
+  db.items,
+  db.revisions,
+  db.findings,
+  db.evidence,
+  db.courtRecord,
+  db.certifications,
+] as const;
+
 export interface WriteProjectOptions {
-  /** Test-only synchronous fault seam; an exception aborts the Dexie transaction. */
+  /** Test-only fault seam. Throwing aborts the whole IndexedDB transaction. */
   readonly beforeCourtRecordWrite?: (event: DomainEvent) => void;
 }
 
-const deleteProjectChildren = async (db: CueBenchDatabase, projectId: string): Promise<void> => {
-  await db.items.where("projectId").equals(projectId).delete();
-  await db.revisions.where("projectId").equals(projectId).delete();
-  await db.findings.where("projectId").equals(projectId).delete();
-  await db.evidence.where("projectId").equals(projectId).delete();
-  await db.courtRecord.where("projectId").equals(projectId).delete();
-  await db.certifications.where("projectId").equals(projectId).delete();
+const rowMaps = (rows: NormalizedProjectRows) => ({
+  items: new Map(rows.items.map((row) => [row.key, row])),
+  revisions: new Map(rows.revisions.map((row) => [row.key, row])),
+  findings: new Map(rows.findings.map((row) => [row.key, row])),
+  courtRecord: new Map(rows.courtRecord.map((row) => [row.key, row])),
+  certifications: new Map(rows.certifications.map((row) => [row.key, row])),
+});
+
+const assertExistingImmutableRows = <Row extends { readonly key: string }>(
+  existing: readonly Row[],
+  candidate: ReadonlyMap<string, Row>,
+  table: string,
+): void => {
+  for (const row of existing) {
+    const replacement = candidate.get(row.key);
+    if (replacement === undefined) {
+      throw new StorageImmutableWriteError(`${table} row ${row.key} would be deleted.`);
+    }
+    if (!sameValue(row, replacement)) {
+      throw new StorageImmutableWriteError(`${table} row ${row.key} would be rewritten.`);
+    }
+  }
 };
 
-export const writeProjectInTransaction = async (
-  db: CueBenchDatabase,
-  project: CaptionProject,
-  options: WriteProjectOptions = {},
-): Promise<void> => {
-  const checkedProject = validateCaptionProject(project);
-  const existing = await db.projectHeaders.get(checkedProject.projectId);
-  const existingHeader = existing === undefined
-    ? undefined
-    : parseStored<ProjectHeaderRow>(ProjectHeaderRowSchema, existing, "project headers");
-  const now = Date.now();
-  const rows = normalizeProject(checkedProject, {
-    createdAtMs: existingHeader?.createdAtMs ?? now,
-    updatedAtMs: now,
-  });
-  await db.projectHeaders.put(rows.header);
-  await deleteProjectChildren(db, checkedProject.projectId);
-  await db.items.bulkPut([...rows.items]);
-  await db.revisions.bulkPut([...rows.revisions]);
-  await db.findings.bulkPut([...rows.findings]);
-  await db.evidence.bulkPut([...rows.evidence]);
-  await db.certifications.bulkPut([...rows.certifications]);
-  if (options.beforeCourtRecordWrite !== undefined) {
-    for (const row of rows.courtRecord) options.beforeCourtRecordWrite(row.event);
+const assertPrefixHistory = <Row>(
+  previous: readonly Row[],
+  candidate: readonly Row[],
+  table: string,
+): void => {
+  if (candidate.length < previous.length || previous.some((row, index) => !sameValue(row, candidate[index]))) {
+    throw new StorageImmutableWriteError(`${table} history must append without rewriting prior rows.`);
   }
-  await db.courtRecord.bulkPut([...rows.courtRecord]);
+};
+
+const addOnly = async <Row extends { readonly key: string }>(
+  table: Table<Row, string>,
+  existing: readonly Row[],
+  candidates: readonly Row[],
+  tableName: string,
+): Promise<void> => {
+  const existingByKey = new Map(existing.map((row) => [row.key, row]));
+  const candidateByKey = new Map<string, Row>();
+  for (const candidate of candidates) {
+    const duplicate = candidateByKey.get(candidate.key);
+    if (duplicate !== undefined && !sameValue(duplicate, candidate)) {
+      throw new StorageImmutableWriteError(`${tableName} has duplicate keys with different payloads.`);
+    }
+    candidateByKey.set(candidate.key, candidate);
+    const prior = existingByKey.get(candidate.key);
+    if (prior !== undefined && !sameValue(prior, candidate)) {
+      throw new StorageImmutableWriteError(`${tableName} row ${candidate.key} would be rewritten.`);
+    }
+  }
+  const additions = [...candidateByKey.values()].filter((candidate) => !existingByKey.has(candidate.key));
+  if (additions.length > 0) await table.bulkAdd([...additions]);
+};
+
+const evidenceCandidatesForAppend = (
+  previousHeader: ProjectHeaderRow,
+  previousRows: readonly EvidenceRow[],
+  candidate: NormalizedProjectRows,
+): readonly EvidenceRow[] => {
+  const previousLatest = latestEvidenceRows(previousRows);
+  const candidateById = new Map(candidate.evidence.map((row) => [row.evidenceId, row]));
+  if (candidateById.size !== candidate.evidence.length) {
+    throw new StorageImmutableWriteError("Evidence ids must be unique.");
+  }
+  for (const id of previousHeader.evidenceOrder) {
+    if (!candidateById.has(id)) throw new StorageImmutableWriteError(`Evidence ${id} would be removed.`);
+  }
+  const additions: EvidenceRow[] = [];
+  for (const candidateRow of candidate.evidence) {
+    const previous = previousLatest.get(candidateRow.evidenceId);
+    if (previous === undefined) {
+      additions.push(candidateRow);
+      continue;
+    }
+    if (!sameValue(previous.evidence, candidateRow.evidence)) {
+      const nextVersion = previous.version + 1;
+      additions.push({
+        ...candidateRow,
+        version: nextVersion,
+        key: evidenceKey(candidateRow.projectId, candidateRow.evidenceId, nextVersion),
+      });
+    }
+  }
+  return additions;
+};
+
+/**
+ * One-time aggregate initialization. It deliberately refuses to touch any
+ * pre-existing project namespace so callers cannot use it as a rewrite API.
+ */
+export const initializeProject = async (db: CueBenchDatabase, project: CaptionProject): Promise<void> => {
+  const checked = validateCaptionProject(project);
+  await db.transaction("rw", projectTables(db), async () => {
+    const projectId = checked.projectId;
+    const [header, itemCount, revisionCount, findingCount, evidenceCount, courtCount, certificationCount] = await Promise.all([
+      db.projectHeaders.get(projectId),
+      db.items.where("projectId").equals(projectId).count(),
+      db.revisions.where("projectId").equals(projectId).count(),
+      db.findings.where("projectId").equals(projectId).count(),
+      db.evidence.where("projectId").equals(projectId).count(),
+      db.courtRecord.where("projectId").equals(projectId).count(),
+      db.certifications.where("projectId").equals(projectId).count(),
+    ]);
+    if (header !== undefined || itemCount + revisionCount + findingCount + evidenceCount + courtCount + certificationCount > 0) {
+      throw new StorageImmutableWriteError(`Project ${projectId} is already initialized.`);
+    }
+    const now = Date.now();
+    const rows = normalizeProject(checked, { createdAtMs: now, updatedAtMs: now });
+    await db.projectHeaders.add(rows.header);
+    if (rows.items.length > 0) await db.items.bulkAdd([...rows.items]);
+    if (rows.revisions.length > 0) await db.revisions.bulkAdd([...rows.revisions]);
+    if (rows.findings.length > 0) await db.findings.bulkAdd([...rows.findings]);
+    if (rows.evidence.length > 0) await db.evidence.bulkAdd([...rows.evidence]);
+    if (rows.courtRecord.length > 0) await db.courtRecord.bulkAdd([...rows.courtRecord]);
+    if (rows.certifications.length > 0) await db.certifications.bulkAdd([...rows.certifications]);
+  });
 };
 
 export const loadProjectInTransaction = async (
@@ -1093,33 +1308,124 @@ export const loadProjectInTransaction = async (
   return rehydrateProject({ header, items, revisions, findings, evidence, courtRecord, certifications });
 };
 
-const projectTables = (db: CueBenchDatabase) => [
-  db.projectHeaders,
-  db.items,
-  db.revisions,
-  db.findings,
-  db.evidence,
-  db.courtRecord,
-  db.certifications,
-] as const;
-
-export const saveProject = async (db: CueBenchDatabase, project: CaptionProject): Promise<void> => {
-  await db.transaction("rw", projectTables(db), async () => {
-    await writeProjectInTransaction(db, project);
-  });
-};
-
 export const loadProject = async (db: CueBenchDatabase, projectId: string): Promise<CaptionProject | undefined> =>
   db.transaction("r", projectTables(db), async () => loadProjectInTransaction(db, projectId));
 
-export const validateSourceBlobRow = (value: unknown): SourceBlobRow =>
-  parseStored<SourceBlobRow>(SourceBlobRowSchema, value, "source blobs");
+/**
+ * Internal command persistence primitive. The caller supplies the exact
+ * aggregate it read in the same transaction; this routine appends histories,
+ * updates projections, and advances the header through a persisted CAS.
+ */
+export const appendAcceptedProjectInTransaction = async (
+  db: CueBenchDatabase,
+  previous: CaptionProject,
+  accepted: CaptionProject,
+  options: WriteProjectOptions = {},
+): Promise<void> => {
+  const before = validateCaptionProject(previous);
+  const after = validateCaptionProject(accepted);
+  if (after.projectId !== before.projectId || after.projectRevision !== before.projectRevision + 1) {
+    throw new StorageImmutableWriteError("Accepted command must advance exactly one project revision.");
+  }
+  const header = await db.projectHeaders.get(before.projectId);
+  if (header === undefined) throw new StorageStaleWriteError(before.projectId);
+  const previousHeader = parseStored<ProjectHeaderRow>(ProjectHeaderRowSchema, header, "project headers");
+  if (previousHeader.projectRevision !== before.projectRevision) throw new StorageStaleWriteError(before.projectId);
 
-export const validateNarrationBlobRow = (value: unknown): NarrationBlobRow =>
-  parseStored<NarrationBlobRow>(NarrationBlobRowSchema, value, "narration blobs");
+  const [existingItems, existingRevisions, existingFindings, existingEvidence, existingCourt, existingCertifications] = await Promise.all([
+    db.items.where("projectId").equals(before.projectId).toArray(),
+    db.revisions.where("projectId").equals(before.projectId).toArray(),
+    db.findings.where("projectId").equals(before.projectId).toArray(),
+    db.evidence.where("projectId").equals(before.projectId).toArray(),
+    db.courtRecord.where("projectId").equals(before.projectId).toArray(),
+    db.certifications.where("projectId").equals(before.projectId).toArray(),
+  ]);
+  const previousRows: NormalizedProjectRows = {
+    header: previousHeader,
+    items: existingItems,
+    revisions: existingRevisions,
+    findings: existingFindings,
+    evidence: existingEvidence,
+    courtRecord: existingCourt,
+    certifications: existingCertifications,
+  };
+  /** Rehydration confirms caller did not provide a stale or fabricated base aggregate. */
+  if (!sameValue(rehydrateProject(previousRows), before)) throw new StorageStaleWriteError(before.projectId);
 
-export const validateRunReceiptRow = (value: unknown): RunReceiptRow =>
-  parseStored<RunReceiptRow>(RunReceiptRowSchema, value, "run receipts");
+  const candidate = normalizeProject(after, {
+    createdAtMs: previousHeader.createdAtMs,
+    updatedAtMs: Date.now(),
+  });
+  const maps = rowMaps(candidate);
+  assertExistingImmutableRows(existingRevisions, maps.revisions, "Revision");
+  assertPrefixHistory(
+    [...existingCourt].sort((left, right) => left.sequence - right.sequence),
+    candidate.courtRecord,
+    "Court Record",
+  );
+  assertPrefixHistory(
+    [...existingCertifications].sort((left, right) => left.sequence - right.sequence),
+    candidate.certifications,
+    "Certification",
+  );
+
+  const candidateItemMap = maps.items;
+  for (const existing of existingItems) {
+    const replacement = candidateItemMap.get(existing.key);
+    if (replacement === undefined || replacement.kind !== existing.kind) {
+      throw new StorageImmutableWriteError(`Item ${existing.itemId} would be removed or change kind.`);
+    }
+  }
+  await addOnly(db.revisions, existingRevisions, candidate.revisions, "Revision");
+  await addOnly(db.findings, existingFindings, candidate.findings, "Finding");
+  const newEvidence = evidenceCandidatesForAppend(previousHeader, existingEvidence, candidate);
+  if (newEvidence.length > 0) await db.evidence.bulkAdd([...newEvidence]);
+  await addOnly(db.certifications, existingCertifications, candidate.certifications, "Certification");
+  if (options.beforeCourtRecordWrite !== undefined) {
+    for (const event of candidate.courtRecord.slice(existingCourt.length)) options.beforeCourtRecordWrite(event.event);
+  }
+  await addOnly(db.courtRecord, existingCourt, candidate.courtRecord, "Court Record");
+
+  const existingItemsByKey = new Map(existingItems.map((row) => [row.key, row]));
+  const changedItems = candidate.items.filter((row) => !sameValue(existingItemsByKey.get(row.key), row));
+  if (changedItems.length > 0) await db.items.bulkPut([...changedItems]);
+
+  const changed = await db.projectHeaders
+    .where("[projectId+projectRevision]")
+    .equals([before.projectId, before.projectRevision])
+    .modify((row) => Object.assign(row, candidate.header));
+  if (changed !== 1) throw new StorageStaleWriteError(before.projectId);
+};
+
+export const validateSourceBlobRow = (value: unknown): SourceBlobRow => {
+  const row = parseStored<SourceBlobRow>(SourceBlobRowSchema, value, "source blobs");
+  if (row.key !== sourceBlobKey(row.projectId, row.sha256)) {
+    throw new StorageReadValidationError("source blobs", "Row primary key does not match the canonical source hash.");
+  }
+  if (row.byteLength !== row.blob.size) {
+    throw new StorageReadValidationError("source blobs", "Stored byte length does not match Blob size.");
+  }
+  return row;
+};
+
+export const validateNarrationBlobRow = (value: unknown): NarrationBlobRow => {
+  const row = parseStored<NarrationBlobRow>(NarrationBlobRowSchema, value, "narration blobs");
+  if (row.key !== narrationBlobKey(row.projectId, row.beatId, row.itemRevision)) {
+    throw new StorageReadValidationError("narration blobs", "Row primary key does not match narration fields.");
+  }
+  if (row.byteLength !== row.blob.size) {
+    throw new StorageReadValidationError("narration blobs", "Stored byte length does not match Blob size.");
+  }
+  return row;
+};
+
+export const validateRunReceiptRow = (value: unknown): RunReceiptRow => {
+  const row = parseStored<RunReceiptRow>(RunReceiptRowSchema, value, "run receipts");
+  if (row.key !== runReceiptKey(row.projectId, row.runId)) {
+    throw new StorageReadValidationError("run receipts", "Row primary key does not match run receipt fields.");
+  }
+  return row;
+};
 
 export const validateSettingRow = (value: unknown): SettingRow =>
   parseStored<SettingRow>(SettingRowSchema, value, "settings");

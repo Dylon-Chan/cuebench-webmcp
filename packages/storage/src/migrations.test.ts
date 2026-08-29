@@ -4,8 +4,8 @@ import { afterEach, describe, expect, it } from "vitest";
 import {
   CueBenchDatabase,
   describeImportedProject,
-  importProject,
 } from "./index";
+import * as storage from "./index";
 
 let databaseNumber = 0;
 const databases: CueBenchDatabase[] = [];
@@ -58,13 +58,21 @@ describe("project schema migrations", () => {
       },
     });
 
-    expect(descriptor.mode).toBe("read-write");
-    if (descriptor.mode !== "read-write") throw new Error("expected writable descriptor");
+    expect(descriptor.mode).toBe("preview");
+    if (descriptor.mode !== "preview") throw new Error("expected preview descriptor");
     expect(descriptor.migratedFrom).toBe(0);
+    expect(descriptor.requiresHumanConfirmation).toBe(true);
     expect(descriptor.project.contractVersion).toBe(1);
-    expect(descriptor.project.media).toMatchObject({ sourceId: "media-1", relinkState: "Linked" });
-    expect(descriptor.project.captions.items.c05?.current.itemRevision).toBe(2);
-    expect(descriptor.project.courtRecord).toHaveLength(1);
+    expect(descriptor.project.media).toMatchObject({ sourceId: "media-1", relinkState: "Missing" });
+    expect(descriptor.project.captions.items.c05?.revisions).toHaveLength(1);
+    expect(descriptor.project.captions.items.c05?.current.itemRevision).toBe(1);
+    expect(descriptor.project.courtRecord).toEqual([
+      expect.objectContaining({
+        type: "LegacyHistoryUnavailable",
+        actor: { type: "System", id: "cuebench-migration" },
+      }),
+    ]);
+    expect(storage).not.toHaveProperty("importProject");
   });
 
   it("describes newer imports as read-only and never writes them", async () => {
@@ -72,10 +80,8 @@ describe("project schema migrations", () => {
     const incoming = { schemaVersion: 2, project: { projectId: "future-project" } };
 
     const descriptor = describeImportedProject(incoming);
-    const imported = await importProject(db, incoming);
 
     expect(descriptor).toMatchObject({ mode: "read-only", readOnly: true, schemaVersion: 2 });
-    expect(imported).toMatchObject({ mode: "read-only", readOnly: true });
     expect(await db.projectHeaders.count()).toBe(0);
   });
 });

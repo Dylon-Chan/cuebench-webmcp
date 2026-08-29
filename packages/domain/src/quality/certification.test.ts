@@ -3,6 +3,7 @@ import {
   applyCommand,
   createProject,
   prepareCertificationReview,
+  verifyCertificationSnapshot,
   type CaptionProject,
   type DomainCommand,
 } from "../index";
@@ -52,6 +53,30 @@ const certificationCommand = (
 });
 
 describe("human certification", () => {
+  it("verifies persisted certification hashes, human authority, and immutable item bindings", () => {
+    const validated = validate(sustainedProject());
+    const readiness = prepareCertificationReview(validated.project);
+    const snapshot = applyCommand(
+      validated.project,
+      certificationCommand(validated.project, readiness.readinessHash),
+    ).project.certifications[0];
+    if (snapshot === undefined) throw new Error("Expected certification snapshot.");
+
+    expect(verifyCertificationSnapshot(snapshot)).toBe(true);
+    expect(verifyCertificationSnapshot({
+      ...snapshot,
+      actor: { type: "BrowserAgent", id: "browser-agent" },
+    })).toBe(false);
+    expect(verifyCertificationSnapshot({
+      ...snapshot,
+      certificationSnapshotHash: `sha256:${"0".repeat(64)}`,
+    })).toBe(false);
+    expect(verifyCertificationSnapshot({
+      ...snapshot,
+      itemRevisions: [...snapshot.itemRevisions, snapshot.itemRevisions[0]!],
+    })).toBe(false);
+  });
+
   it("does not allow blockers to be waived and requires a Human and reason for warnings", () => {
     const preparedWarning = validate(fixtureProject());
     const warning = preparedWarning.project.validationRun?.findings.find(

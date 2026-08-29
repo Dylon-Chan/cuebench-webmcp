@@ -1,25 +1,19 @@
-import { ActorSchema, ReviewStateSchema } from "@cuebench/contracts";
-import {
-  createProject,
-  type AudioDescriptionBeat,
-  type AudioDescriptionBeatRevision,
-  type CaptionCue,
-  type CaptionCueRevision,
-  type CaptionProject,
-  type DomainEvent,
-} from "@cuebench/domain";
+import { createProject, type CaptionProject } from "@cuebench/domain";
 import { z } from "zod";
-import {
-  CueBenchDatabase,
-  STORAGE_SCHEMA_VERSION,
-  saveProject,
-  validateCaptionProject,
-} from "./database";
+import { STORAGE_SCHEMA_VERSION, validateCaptionProject } from "./database";
 
-const identifier = z.string().trim().min(1).max(200);
+const identifier = z.string().min(1).max(200).refine((value) => value.trim() === value, {
+  message: "Identifier must not have leading or trailing whitespace.",
+});
 const positiveInteger = z.number().int().refine(Number.isSafeInteger).positive();
 const nonNegativeInteger = z.number().int().refine(Number.isSafeInteger).nonnegative();
-const sha256 = z.string().trim().regex(/^[0-9a-f]{64}$/i);
+const nonBlankText = z.string().min(1).refine((value) => value.trim().length > 0);
+const sha256 = z.string().regex(/^[0-9a-f]{64}$/i);
+const actor = z.object({
+  type: z.enum(["Human", "BrowserAgent", "CueBenchAI", "System"]),
+  id: identifier,
+}).strict();
+const reviewState = z.enum(["Proposed", "AgentReady", "Objected", "Sustained"]);
 
 export class StorageMigrationError extends Error {
   public constructor(message: string) {
@@ -28,15 +22,16 @@ export class StorageMigrationError extends Error {
   }
 }
 
-/** The browser backup envelope intentionally does not include source blobs. */
+/** The browser backup envelope intentionally excludes source-media blobs. */
 export interface ProjectEnvelopeV1 {
   readonly schemaVersion: 1;
   readonly project: CaptionProject;
 }
 
-export interface WritableProjectDescriptor {
-  readonly mode: "read-write";
-  readonly readOnly: false;
+/** A migrated aggregate is only a preview until Task 5 obtains human import consent. */
+export interface ProjectPreviewDescriptor {
+  readonly mode: "preview";
+  readonly requiresHumanConfirmation: true;
   readonly schemaVersion: 1;
   readonly migratedFrom: number | null;
   readonly project: CaptionProject;
@@ -47,11 +42,11 @@ export interface ReadOnlyProjectDescriptor {
   readonly readOnly: true;
   readonly schemaVersion: number;
   readonly reason: "NEWER_SCHEMA";
-  /** Keep the original envelope for preview/export without writing it locally. */
+  /** Original data is retained for preview/export and is never written by this module. */
   readonly project: unknown;
 }
 
-export type ImportedProjectDescriptor = WritableProjectDescriptor | ReadOnlyProjectDescriptor;
+export type ImportedProjectDescriptor = ProjectPreviewDescriptor | ReadOnlyProjectDescriptor;
 
 const ImportedEnvelopeSchema = z.object({
   schemaVersion: nonNegativeInteger,
@@ -69,30 +64,37 @@ const LegacyCueSchema = z.object({
   id: identifier,
   startMs: nonNegativeInteger,
   endMs: nonNegativeInteger,
-  text: z.string().min(1).max(1_000).refine((value) => value.trim().length > 0),
-  speaker: z.string().min(1).max(200).refine((value) => value.trim().length > 0).nullable(),
+  text: nonBlankText.max(1_000),
+  speaker: nonBlankText.max(200).nullable(),
+  /** Retained only to explain unavailable historical revisions; never fabricated. */
   revision: positiveInteger.default(1),
-  state: ReviewStateSchema,
-  actor: ActorSchema,
-  cause: z.string().trim().min(1).default("Migrated from schema v0"),
-}).strict().refine((cue) => cue.endMs > cue.startMs, { path: ["endMs"], message: "Cue must end after it starts." });
+  state: reviewState,
+  actor,
+  cause: nonBlankText.max(1_000).default("Migrated from schema v0"),
+}).strict().refine((cue) => cue.endMs > cue.startMs, {
+  path: ["endMs"],
+  message: "Cue must end after it starts.",
+});
 
 const LegacyAudioDescriptionSchema = z.object({
   id: identifier,
   startMs: nonNegativeInteger,
   endMs: nonNegativeInteger,
-  description: z.string().min(1).max(1_000).refine((value) => value.trim().length > 0),
+  description: nonBlankText.max(1_000),
   revision: positiveInteger.default(1),
-  state: ReviewStateSchema,
-  actor: ActorSchema,
-  cause: z.string().trim().min(1).default("Migrated from schema v0"),
-}).strict().refine((beat) => beat.endMs > beat.startMs, { path: ["endMs"], message: "Beat must end after it starts." });
+  state: reviewState,
+  actor,
+  cause: nonBlankText.max(1_000).default("Migrated from schema v0"),
+}).strict().refine((beat) => beat.endMs > beat.startMs, {
+  path: ["endMs"],
+  message: "Beat must end after it starts.",
+});
 
 const LegacyHistoryEventSchema = z.object({
   id: identifier,
-  kind: z.string().trim().min(1),
+  kind: nonBlankText.max(200),
   revision: positiveInteger,
-  actor: ActorSchema,
+  actor,
   itemId: identifier.optional(),
   detail: z.string().optional(),
 }).strict();
@@ -100,7 +102,7 @@ const LegacyHistoryEventSchema = z.object({
 const LegacyProjectV0Schema = z.object({
   projectId: identifier,
   revision: positiveInteger,
-  name: z.string().trim().min(1).max(1_000),
+  name: nonBlankText.max(1_000),
   sourceMedia: LegacyMediaSchema,
   captionCues: z.array(LegacyCueSchema).default([]),
   audioDescriptionBeats: z.array(LegacyAudioDescriptionSchema).default([]),
@@ -109,48 +111,29 @@ const LegacyProjectV0Schema = z.object({
 
 export type LegacyProjectV0 = z.infer<typeof LegacyProjectV0Schema>;
 
-const previousCaptionRevisions = (
-  item: CaptionCue,
-  count: number,
-): readonly CaptionCueRevision[] => Array.from({ length: count }, (_, index) => ({
-  ...item.current,
-  itemRevision: index + 1,
-  state: index + 1 === count ? item.current.state : "Proposed",
-  parentItemRevision: index === 0 ? null : index,
-}));
-
-const previousAudioDescriptionRevisions = (
-  item: AudioDescriptionBeat,
-  count: number,
-): readonly AudioDescriptionBeatRevision[] => Array.from({ length: count }, (_, index) => ({
-  ...item.current,
-  itemRevision: index + 1,
-  state: index + 1 === count ? item.current.state : "Proposed",
-  parentItemRevision: index === 0 ? null : index,
-}));
-
 /**
- * v0 was a practical monolithic local draft: it named media `id`/`hash`,
- * kept a single current item revision, and recorded event names as `kind`.
- * v1 expands those records into immutable histories and the current domain
- * aggregate without inventing additional authoring changes.
+ * v0 held a single mutable item state and counters claiming past revisions.
+ * It did not retain the earlier revision payloads, so fabricating proposed
+ * predecessors would create false audit history. v1 therefore starts every
+ * migrated item at one explicit `migrated-current` revision and records one
+ * deterministic System event that legacy history is unavailable. Source blobs
+ * are not part of backups, so even a formerly linked source must be relinked.
  */
 export const migrateV0ToV1 = (value: unknown): ProjectEnvelopeV1 => {
-  const legacy = LegacyProjectV0Schema.safeParse(value);
-  if (!legacy.success) {
-    throw new StorageMigrationError(`Invalid v0 project: ${legacy.error.issues[0]?.message ?? "unknown shape"}`);
+  const parsed = LegacyProjectV0Schema.safeParse(value);
+  if (!parsed.success) {
+    throw new StorageMigrationError(`Invalid v0 project: ${parsed.error.issues[0]?.message ?? "unknown shape"}`);
   }
-  const source = legacy.data;
-  let project: CaptionProject;
+  const source = parsed.data;
   try {
-    project = createProject({
+    const project = createProject({
       projectId: source.projectId,
       title: source.name,
       media: {
         sourceId: source.sourceMedia.id,
-        sha256: source.sourceMedia.hash,
+        sha256: source.sourceMedia.hash.toLowerCase(),
         durationMs: source.sourceMedia.durationMs,
-        relinkState: source.sourceMedia.linked ? "Linked" : "Missing",
+        relinkState: "Missing",
       },
       captions: source.captionCues.map((cue) => ({
         kind: "CaptionCue" as const,
@@ -174,48 +157,32 @@ export const migrateV0ToV1 = (value: unknown): ProjectEnvelopeV1 => {
         cause: beat.cause,
       })),
     });
+    const unavailableDetail = `Legacy v0 history (${source.history.length} event(s), revision ${source.revision}) is unavailable; migrated current state is the only retained audit point.`;
+    return {
+      schemaVersion: STORAGE_SCHEMA_VERSION,
+      project: validateCaptionProject({
+        ...project,
+        courtRecord: [{
+          eventId: "legacy-history-unavailable",
+          projectRevision: 1,
+          type: "LegacyHistoryUnavailable",
+          actor: { type: "System", id: "cuebench-migration" },
+          detail: unavailableDetail,
+        }],
+      }),
+    };
   } catch (error) {
     throw new StorageMigrationError(error instanceof Error ? error.message : "Invalid v0 project data.");
   }
-  const captions: Record<string, CaptionCue> = {};
-  for (const cue of source.captionCues) {
-    const item = project.captions.items[cue.id];
-    if (item === undefined) throw new StorageMigrationError("Migrated cue is missing.");
-    const revisions = previousCaptionRevisions(item, cue.revision);
-    captions[cue.id] = { ...item, revisions, current: revisions.at(-1)! };
-  }
-  const audioDescriptions: Record<string, AudioDescriptionBeat> = {};
-  for (const beat of source.audioDescriptionBeats) {
-    const item = project.audioDescriptions.items[beat.id];
-    if (item === undefined) throw new StorageMigrationError("Migrated audio-description beat is missing.");
-    const revisions = previousAudioDescriptionRevisions(item, beat.revision);
-    audioDescriptions[beat.id] = { ...item, revisions, current: revisions.at(-1)! };
-  }
-  const courtRecord: DomainEvent[] = source.history.map((event) => ({
-    eventId: event.id,
-    projectRevision: event.revision,
-    type: event.kind,
-    actor: event.actor,
-    ...(event.itemId === undefined ? {} : { itemId: event.itemId }),
-    ...(event.detail === undefined ? {} : { detail: event.detail }),
-  }));
-  const migrated = validateCaptionProject({
-    ...project,
-    projectRevision: source.revision,
-    captions: { ...project.captions, items: captions },
-    audioDescriptions: { ...project.audioDescriptions, items: audioDescriptions },
-    courtRecord,
-  });
-  return { schemaVersion: STORAGE_SCHEMA_VERSION, project: migrated };
 };
 
 export interface ProjectMigration {
   readonly from: number;
-  readonly to: number;
+  readonly to: 1;
   readonly migrate: (project: unknown) => ProjectEnvelopeV1;
 }
 
-/** Ordered, one-way migrations for serialized project structure. */
+/** Ordered, pure migrations. They preview data only and have no Dexie dependency. */
 export const PROJECT_MIGRATIONS: readonly ProjectMigration[] = [
   { from: 0, to: 1, migrate: migrateV0ToV1 },
 ];
@@ -235,37 +202,23 @@ export const describeImportedProject = (value: unknown): ImportedProjectDescript
     };
   }
   let version = envelope.data.schemaVersion;
-  let project = envelope.data.project;
+  let project: unknown = envelope.data.project;
   const migratedFrom = version === STORAGE_SCHEMA_VERSION ? null : version;
   while (version < STORAGE_SCHEMA_VERSION) {
     const migration = PROJECT_MIGRATIONS.find((candidate) => candidate.from === version);
-    if (migration === undefined) {
-      throw new StorageMigrationError(`No project migration exists from schema v${version}.`);
-    }
+    if (migration === undefined) throw new StorageMigrationError(`No project migration exists from schema v${version}.`);
     const migrated = migration.migrate(project);
     version = migration.to;
     project = migrated.project;
   }
   return {
-    mode: "read-write",
-    readOnly: false,
+    mode: "preview",
+    requiresHumanConfirmation: true,
     schemaVersion: STORAGE_SCHEMA_VERSION,
     migratedFrom,
     project: validateCaptionProject(project),
   };
 };
 
+/** Alias emphasizes that this operation is pure and never writes browser storage. */
 export const migrateImportedProject = describeImportedProject;
-
-/**
- * Persists only a supported, validated descriptor. A future schema remains a
- * read-only preview and cannot alter the browser-canonical database.
- */
-export const importProject = async (
-  db: CueBenchDatabase,
-  value: unknown,
-): Promise<ImportedProjectDescriptor> => {
-  const descriptor = describeImportedProject(value);
-  if (descriptor.mode === "read-write") await saveProject(db, descriptor.project);
-  return descriptor;
-};

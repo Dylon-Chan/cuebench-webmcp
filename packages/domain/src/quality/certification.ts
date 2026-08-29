@@ -17,6 +17,18 @@ import {
 
 const compareText = (left: string, right: string): number => left < right ? -1 : left > right ? 1 : 0;
 
+const SHA256_HASH = /^sha256:[0-9a-f]{64}$/;
+
+const semanticValidationInput = (input: ValidationRun["input"]) => ({
+  projectId: input.projectId,
+  media: input.media,
+  evidence: input.evidence,
+  qualityProfile: input.qualityProfile,
+  captions: input.captions,
+  audioDescriptions: input.audioDescriptions,
+  audioDescriptionGaps: input.audioDescriptionGaps,
+});
+
 export type ValidationStaleCauseCode =
   | "NOT_RUN"
   | "STATUS_STALE"
@@ -188,18 +200,12 @@ export const createCertificationSnapshot = (
   const actor = clone(input.actor);
   const evidence = canonicalEvidence(project);
   const warnings = validationRun.findings.filter((finding) => finding.severity === "warning");
-  const certificationSnapshotHash = tupleHash("cuebench.certification-snapshot.v1", [
-    "readinessHash",
-    readiness.readinessHash,
-    "certificationId",
-    input.certificationId,
-    "actorType",
-    actor.type,
-    "actorId",
-    actor.id,
-    "certifiedAtMs",
-    String(input.certifiedAtMs),
-  ]);
+  const certificationSnapshotHash = certificationSnapshotHashFor({
+    readinessHash: readiness.readinessHash,
+    certificationId: input.certificationId,
+    actor,
+    certifiedAtMs: input.certifiedAtMs,
+  });
   return {
     certificationId: input.certificationId,
     certificationSnapshotHash,
@@ -217,4 +223,125 @@ export const createCertificationSnapshot = (
     validationRun: clone(validationRun),
     warningWaivers: clone(applicableWarningWaivers(project, warnings)),
   };
+};
+
+export const certificationSnapshotHashFor = (input: {
+  readonly readinessHash: string;
+  readonly certificationId: string;
+  readonly actor: ProjectCertification["actor"];
+  readonly certifiedAtMs: number;
+}): string => tupleHash("cuebench.certification-snapshot.v1", [
+    "readinessHash",
+    input.readinessHash,
+    "certificationId",
+    input.certificationId,
+    "actorType",
+    input.actor.type,
+    "actorId",
+    input.actor.id,
+    "certifiedAtMs",
+    String(input.certifiedAtMs),
+  ]);
+
+/**
+ * Verifies only the immutable record itself. Currentness is deliberately a
+ * project concern, so callers additionally bind the verified id to the
+ * project certification pointer.
+ */
+export const verifyCertificationSnapshot = (snapshot: ProjectCertification): boolean => {
+  if (snapshot.actor.type !== "Human" || !snapshot.actor.id.trim() || snapshot.actor.id.trim() !== snapshot.actor.id) return false;
+  if (!SHA256_HASH.test(snapshot.readinessHash) || !SHA256_HASH.test(snapshot.certificationSnapshotHash)) return false;
+  if (!Number.isSafeInteger(snapshot.certifiedAtMs) || snapshot.certifiedAtMs <= 0) return false;
+  if (
+    !snapshot.certificationId.trim()
+    || snapshot.certificationId.trim() !== snapshot.certificationId
+    || !snapshot.media.sourceId.trim()
+    || snapshot.media.sourceId.trim() !== snapshot.media.sourceId
+    || !/^[0-9a-f]{64}$/.test(snapshot.media.sha256)
+    || snapshot.media.relinkState !== "Linked"
+  ) return false;
+  const itemKeys = new Set<string>();
+  const itemIds = new Set<string>();
+  for (const item of snapshot.itemRevisions) {
+    const key = `${item.kind}\u0000${item.itemId}`;
+    if (
+      !item.itemId.trim()
+      || item.itemId.trim() !== item.itemId
+      || !Number.isSafeInteger(item.itemRevision)
+      || item.itemRevision <= 0
+      || itemKeys.has(key)
+      || itemIds.has(item.itemId)
+    ) {
+      return false;
+    }
+    itemKeys.add(key);
+    itemIds.add(item.itemId);
+  }
+  const evidenceIds = new Set<string>();
+  for (const evidence of snapshot.evidence) {
+    if (
+      !evidence.evidenceId.trim()
+      || evidence.evidenceId.trim() !== evidence.evidenceId
+      || evidenceIds.has(evidence.evidenceId)
+      || evidence.projectId !== snapshot.validationRun.projectId
+      || evidence.mediaSha256 !== snapshot.media.sha256
+      || !/^[0-9a-f]{64}$/.test(evidence.mediaSha256)
+      || (evidence.itemId === null) !== (evidence.itemRevision === null)
+    ) return false;
+    evidenceIds.add(evidence.evidenceId);
+    if (evidence.itemId !== null && !itemIds.has(evidence.itemId)) return false;
+  }
+  const run = snapshot.validationRun;
+  if (
+    run.projectId !== run.input.projectId
+    || run.profileId !== snapshot.qualityProfile.profileId
+    || run.profileRevision !== snapshot.qualityProfile.revision
+    || !SHA256_HASH.test(run.inputHash)
+    || run.inputHash !== stableHash(semanticValidationInput(run.input))
+    || !sameValue(run.input.media, snapshot.media)
+    || !sameValue(run.input.evidence, snapshot.evidence)
+    || !sameValue(run.input.qualityProfile, snapshot.qualityProfile)
+  ) return false;
+  const inputItemEntries = [
+    ...run.input.captions.items,
+    ...run.input.audioDescriptions.items,
+  ].map((item) => [`${item.kind}\u0000${item.itemId}`, item] as const);
+  const inputItems = new Map(inputItemEntries);
+  if (inputItems.size !== inputItemEntries.length) return false;
+  if (snapshot.itemRevisions.some((item) => inputItems.get(`${item.kind}\u0000${item.itemId}`)?.itemRevision !== item.itemRevision)) {
+    return false;
+  }
+  const findingIds = new Set<string>();
+  for (const finding of run.findings) {
+    if (finding.id !== finding.findingId || !finding.findingId.trim() || findingIds.has(finding.findingId)) return false;
+    findingIds.add(finding.findingId);
+  }
+  const blockers = run.findings.filter((finding) => finding.severity === "blocker");
+  const warnings = run.findings.filter((finding) => finding.severity === "warning");
+  if (
+    blockers.length !== run.blockerCount
+    || warnings.length !== run.warningCount
+    || blockers.length !== run.blockers.length
+    || warnings.length !== run.warnings.length
+    || !sameValue(blockers, run.blockers)
+    || !sameValue(warnings, run.warnings)
+  ) return false;
+  const waiverIds = new Set<string>();
+  for (const waiver of snapshot.warningWaivers) {
+    if (
+      !waiver.findingId.trim()
+      || waiver.findingId.trim() !== waiver.findingId
+      || !waiver.reason.trim()
+      || waiver.actor.type !== "Human"
+      || !waiver.actor.id.trim()
+      || waiver.actor.id.trim() !== waiver.actor.id
+      || waiverIds.has(waiver.findingId)
+      || !warnings.some((finding) => finding.findingId === waiver.findingId)
+    ) {
+      return false;
+    }
+    waiverIds.add(waiver.findingId);
+  }
+  if (blockers.length > 0 || warnings.some((warning) => !waiverIds.has(warning.findingId))) return false;
+  return snapshot.certificationSnapshotHash === certificationSnapshotHashFor(snapshot);
 };
