@@ -123,6 +123,25 @@ describe("domain reducer properties", () => {
     );
   });
 
+  it("never shortens a merged cue below either source end", () => {
+    fc.assert(
+      fc.property(fc.integer({ min: 1_001, max: 2_999 }), (containedEnd) => {
+        const project = fixtureProject();
+        const c06 = project.captions.items.c06!;
+        const contained = {
+          ...project,
+          captions: { ...project.captions, items: { ...project.captions.items, c06: { ...c06, current: { ...c06.current, startMs: 1_000, endMs: containedEnd } } } },
+        };
+        const result = applyCommand(contained, {
+          type: "MergeCue", actor: { type: "Human", id: "teacher" }, cueId: "c05", adjacentCueId: "c06",
+          expectedItemRevision: 1, expectedAdjacentItemRevision: 1, expectedProjectRevision: 1,
+        });
+        expect(result.error).toBeUndefined();
+        expect(result.project.captions.items.c05?.current.endMs).toBe(3_000);
+      }),
+    );
+  });
+
   it("rejects authority and target-lease violations without state changes", () => {
     fc.assert(
       fc.property(fc.constantFrom("Captions" as const, "AudioDescriptions" as const), (targetTrack) => {

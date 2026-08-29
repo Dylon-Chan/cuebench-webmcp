@@ -119,8 +119,6 @@ export type DomainCommand =
   | (CommandBase & {
       readonly type: "AppendCourtRecord";
       readonly eventType: SystemCourtRecordEventType;
-      readonly detail?: string;
-      readonly payload?: Readonly<Record<string, unknown>>;
       readonly itemId?: string;
       readonly deterministic?: boolean;
     })

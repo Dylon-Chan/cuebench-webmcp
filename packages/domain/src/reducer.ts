@@ -50,14 +50,9 @@ const eventFor = (project: CaptionProject, command: DomainCommand, itemId?: stri
   type: command.type === "AppendCourtRecord" ? command.eventType : command.type,
   actor: clone(command.actor),
   ...(itemId === undefined ? {} : { itemId }),
-  ...(command.type === "AppendCourtRecord" && command.detail !== undefined
-    ? { detail: command.detail }
-    : command.type === "ObjectItem"
+  ...(command.type === "ObjectItem"
       ? { detail: command.reason }
       : {}),
-  ...(command.type === "AppendCourtRecord" && command.payload !== undefined
-    ? { payload: clone(command.payload) }
-    : {}),
 });
 
 const commit = (
@@ -195,7 +190,8 @@ const resolvedItemId = (command: DomainCommand): string | DomainError => {
 
 const allCurrentTimesFit = (project: CaptionProject, durationMs: number) =>
   Object.values(project.captions.items).every((item) => hasValidTime({ ...project, media: { ...project.media, durationMs } }, item.current.startMs, item.current.endMs))
-  && Object.values(project.audioDescriptions.items).every((item) => hasValidTime({ ...project, media: { ...project.media, durationMs } }, item.current.startMs, item.current.endMs));
+  && Object.values(project.audioDescriptions.items).every((item) => hasValidTime({ ...project, media: { ...project.media, durationMs } }, item.current.startMs, item.current.endMs))
+  && Object.values(project.audioDescriptionGaps).every((gap) => hasValidTime({ ...project, media: { ...project.media, durationMs } }, gap.startMs, gap.endMs));
 
 const systemCourtRecordEventTypes = new Set([
   "ExportRoundTripVerified",
@@ -298,6 +294,7 @@ export const applyCommand = (project: CaptionProject, command: DomainCommand): C
     ) return fail(project, "STALE_SELECTION", "The selected gap is no longer current.");
     if (itemAt(project, command.beatId) !== undefined || project.audioDescriptionGaps[command.beatId] !== undefined) return fail(project, "INVALID_ARGUMENT", "The proposed beat id already exists.");
     if (!hasValidTime(project, command.startMs, command.endMs) || !command.description.trim()) return fail(project, "INVALID_ARGUMENT", "The proposed beat needs valid timing and description.");
+    if (command.startMs < gap.startMs || command.endMs > gap.endMs) return fail(project, "INVALID_ARGUMENT", "The proposed beat must fit inside the selected gap.");
     if (command.actor.type === "System") return fail(project, "INVALID_ARGUMENT", "System cannot author semantic work.");
     const current: AudioDescriptionBeatRevision = { kind: "AudioDescriptionBeat", itemId: command.beatId, itemRevision: 1, state: "Proposed", startMs: command.startMs, endMs: command.endMs, description: command.description, actor: clone(command.actor), cause: "ProposeAudioDescriptionInGap", parentItemRevision: null };
     const item: AudioDescriptionBeat = { itemId: command.beatId, kind: "AudioDescriptionBeat", revisions: [current], current };
@@ -346,7 +343,7 @@ export const applyCommand = (project: CaptionProject, command: DomainCommand): C
     if (command.type === "SplitCue") {
       if (command.cueId !== item.itemId || itemAt(project, command.newCueId) !== undefined || project.audioDescriptionGaps[command.newCueId] !== undefined || !isFiniteInteger(command.splitMs) || command.splitMs <= item.current.startMs || command.splitMs >= item.current.endMs) return fail(project, "INVALID_ARGUMENT", "A split must create a new id inside the current cue.");
       const left = appendCaptionRevision(item, command.actor, "Proposed", command.type, { endMs: command.splitMs });
-      const rightCurrent: CaptionCueRevision = { ...item.current, itemId: command.newCueId, itemRevision: 1, state: "Proposed", startMs: command.splitMs, actor: command.actor, cause: command.type, parentItemRevision: null };
+      const rightCurrent: CaptionCueRevision = { ...item.current, itemId: command.newCueId, itemRevision: 1, state: "Proposed", startMs: command.splitMs, actor: clone(command.actor), cause: command.type, parentItemRevision: null };
       const right: CaptionCue = { itemId: command.newCueId, kind: "CaptionCue", revisions: [rightCurrent], current: rightCurrent, mergedIntoItemId: null };
       const index = project.captions.order.indexOf(item.itemId);
       const order = [...project.captions.order]; order.splice(index + 1, 0, right.itemId);
@@ -363,8 +360,10 @@ export const applyCommand = (project: CaptionProject, command: DomainCommand): C
         || right.current.itemRevision !== command.expectedAdjacentItemRevision
       ) return fail(project, right !== undefined && right.current.itemRevision !== command.expectedAdjacentItemRevision ? "STALE_ITEM" : "INVALID_ARGUMENT", "Cues may merge only with their current adjacent successor.");
       if (right.current.state === "Sustained" && !hasHumanAuthority(command.actor)) return fail(project, "HUMAN_AUTHORITY_REQUIRED", "Only a human may alter Sustained work.");
-      if (!hasValidTime(project, item.current.startMs, right.current.endMs)) return fail(project, "INVALID_ARGUMENT", "Merged cue timing must remain within media bounds.");
-      const merged = appendCaptionRevision(item, command.actor, "Proposed", command.type, { endMs: right.current.endMs, text: `${item.current.text} ${right.current.text}`.trim() });
+      if (right.current.startMs < item.current.startMs) return fail(project, "INVALID_ARGUMENT", "Merged cues must remain in chronological order.");
+      const mergedEndMs = Math.max(item.current.endMs, right.current.endMs);
+      if (!hasValidTime(project, item.current.startMs, mergedEndMs)) return fail(project, "INVALID_ARGUMENT", "Merged cue timing must remain within media bounds.");
+      const merged = appendCaptionRevision(item, command.actor, "Proposed", command.type, { endMs: mergedEndMs, text: `${item.current.text} ${right.current.text}`.trim() });
       const mergedRight: CaptionCue = {
         ...appendCaptionRevision(right, command.actor, "Proposed", `MergedInto:${item.itemId}`),
         mergedIntoItemId: item.itemId,

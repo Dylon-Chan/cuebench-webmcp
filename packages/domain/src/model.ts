@@ -111,7 +111,6 @@ export interface DomainEvent {
   readonly actor: Actor;
   readonly itemId?: string;
   readonly detail?: string;
-  readonly payload?: Readonly<Record<string, unknown>>;
 }
 
 export interface CaptionProject {

@@ -229,11 +229,10 @@ describe("domain reducer", () => {
       type: "AppendCourtRecord",
       actor: { type: "System", id: "system" },
       eventType: "ValidationMigrated",
-      detail: "Schema version 1",
       deterministic: true,
       expectedProjectRevision: 3,
     });
-    expect(record.events[0]).toMatchObject({ type: "ValidationMigrated", detail: "Schema version 1" });
+    expect(record.events[0]).toMatchObject({ type: "ValidationMigrated", actor: { type: "System", id: "system" } });
   });
 
   it("stale-guards both merge revisions and preserves the rejected project byte-for-byte", () => {
@@ -392,6 +391,72 @@ describe("domain reducer", () => {
     }).error?.code).toBe("INVALID_ARGUMENT");
   });
 
+  it("merges to an interval containing both source cues when the right cue ends inside the left", () => {
+    const project = fixtureProject();
+    const c06 = project.captions.items.c06!;
+    const contained: CaptionProject = {
+      ...project,
+      captions: { ...project.captions, items: { ...project.captions.items, c06: { ...c06, current: { ...c06.current, startMs: 1_500, endMs: 2_500 } } } },
+    };
+    const result = applyCommand(contained, {
+      type: "MergeCue", actor: { type: "Human", id: "teacher" }, cueId: "c05", adjacentCueId: "c06",
+      expectedItemRevision: 1, expectedAdjacentItemRevision: 1, expectedProjectRevision: 1,
+    });
+    expect(result.error).toBeUndefined();
+    expect(result.project.captions.items.c05?.current).toMatchObject({ startMs: 1_000, endMs: 3_000 });
+  });
+
+  it("does not store forged semantic payloads on deterministic System events", () => {
+    const forged = {
+      type: "AppendCourtRecord", actor: { type: "System", id: "system" }, eventType: "ValidationMigrated",
+      deterministic: true, expectedProjectRevision: 1,
+      detail: "Human sustained every cue", payload: { certificationId: "forged", ruling: "Sustained" },
+    } as unknown as DomainCommand;
+    const result = applyCommand(fixtureProject(), forged);
+    expect(result.error).toBeUndefined();
+    expect(result.events[0]).toMatchObject({ type: "ValidationMigrated" });
+    expect("detail" in (result.events[0] ?? {})).toBe(false);
+    expect("payload" in (result.events[0] ?? {})).toBe(false);
+  });
+
+  it("clones split actor identity before storing the successor revision", () => {
+    const actor = { type: "BrowserAgent" as const, id: "browser-agent" };
+    const result = applyCommand(fixtureProject(), {
+      type: "SplitCue", actor, cueId: "c05", newCueId: "c05b", splitMs: 2_000,
+      expectedItemRevision: 1, expectedProjectRevision: 1,
+    });
+    actor.id = "mutated-agent";
+    expect(result.project.captions.items.c05b?.current.actor.id).toBe("browser-agent");
+    expect(result.project.captions.items.c05b?.revisions[0]?.actor.id).toBe("browser-agent");
+  });
+
+  it("rejects media relinks that would place consumed historical gaps out of bounds", () => {
+    const project = fixtureProject();
+    const historical: CaptionProject = {
+      ...project,
+      audioDescriptionGaps: { ...project.audioDescriptionGaps, "gap-1": { ...project.audioDescriptionGaps["gap-1"]!, state: "Consumed", startMs: 12_000, endMs: 13_000 } },
+    };
+    const result = applyCommand(historical, {
+      type: "RelinkMedia", actor: { type: "Human", id: "teacher" }, expectedProjectRevision: 1,
+      media: { sourceId: "short", sha256: "b".repeat(64), durationMs: 10_000 },
+    });
+    expect(result.error?.code).toBe("INVALID_ARGUMENT");
+  });
+
+  it("requires proposed AD timing to fit inside the selected gap without consuming it on rejection", () => {
+    const focused = applyCommand(fixtureProject(), {
+      type: "FocusGap", actor: { type: "Human", id: "teacher" }, gapId: "gap-1", expectedGapRevision: 1, expectedProjectRevision: 1,
+    }).project;
+    const before = JSON.stringify(focused);
+    const result = applyCommand(focused, {
+      type: "ProposeAudioDescriptionInGap", actor: { type: "Human", id: "teacher" }, gapId: "gap-1", expectedSelectionId: "gap-1", expectedGapRevision: 1,
+      beatId: "ad02", startMs: 8_000, endMs: 10_000, description: "Too early for this gap.", expectedProjectRevision: 2,
+    });
+    expect(result.error?.code).toBe("INVALID_ARGUMENT");
+    expect(result.project.audioDescriptionGaps["gap-1"]?.state).toBe("Available");
+    expect(JSON.stringify(result.project)).toBe(before);
+  });
+
   it("enforces initial actor/state authority and global IDs for split and AD additions", () => {
     expect(() => createProject({
       projectId: "bad-actor", title: "Bad actor", media: { sourceId: "m", sha256: "c".repeat(64), durationMs: 1_000, relinkState: "Linked" },
@@ -431,14 +496,11 @@ describe("domain reducer", () => {
     expect((project.qualityProfile.rules.nested as { maxLines: number }).maxLines).toBe(2);
     expect(project.captions.items.c1?.current.actor.id).toBe("teacher");
     const recordActor = { type: "System" as const, id: "system" };
-    const payload: Record<string, unknown> = { nested: { stage: "before" } };
     const recorded = applyCommand(project, {
-      type: "AppendCourtRecord", actor: recordActor, eventType: "ValidationMigrated", detail: "v1", payload, deterministic: true, expectedProjectRevision: 1,
+      type: "AppendCourtRecord", actor: recordActor, eventType: "ValidationMigrated", deterministic: true, expectedProjectRevision: 1,
     });
     recordActor.id = "mutated-system";
-    ((payload.nested as { stage: string }).stage) = "after";
     expect(recorded.events[0]?.actor.id).toBe("system");
-    expect((recorded.events[0]?.payload?.nested as { stage: string }).stage).toBe("before");
 
     const revisedActor = { type: "BrowserAgent" as const, id: "browser-agent" };
     const revised = applyCommand(project, {
