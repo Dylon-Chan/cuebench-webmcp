@@ -1,0 +1,117 @@
+import type { Actor, GenerationTargetTrack } from "@cuebench/contracts";
+import type { AudioDescriptionBeatRevision, CaptionCueRevision } from "./model";
+
+interface CommandBase {
+  readonly actor: Actor;
+  readonly expectedProjectRevision: number;
+}
+
+interface ItemCommandBase extends CommandBase {
+  /** Stable item identity; cueId/beatId aliases are accepted by track-specific commands. */
+  readonly itemId?: string;
+  readonly expectedItemRevision: number;
+  /** Optional for direct UI commands; WebMCP supplies it for scoped mutations. */
+  readonly expectedSelectionId?: string;
+}
+
+interface ExpectedItemCommandBase extends CommandBase {
+  /** Accepted for adapters that use a common item-id envelope. */
+  readonly itemId?: string;
+  readonly expectedItemRevision: number;
+  /** Optional for direct UI commands; WebMCP supplies it for scoped mutations. */
+  readonly expectedSelectionId?: string;
+}
+
+export type CuePatch = Partial<
+  Pick<CaptionCueRevision, "text" | "speaker" | "startMs" | "endMs">
+>;
+export type AudioDescriptionPatch = Partial<
+  Pick<AudioDescriptionBeatRevision, "description" | "startMs" | "endMs">
+>;
+
+export type DomainCommand =
+  | (CommandBase & {
+      readonly type: "SelectItem" | "FocusItem";
+      readonly itemId: string;
+      readonly expectedItemRevision?: number;
+    })
+  | (ExpectedItemCommandBase & {
+      readonly type: "AdjustCueTiming";
+      readonly cueId?: string;
+      readonly startMs?: number;
+      readonly endMs?: number;
+      readonly startDeltaMs?: number;
+      readonly endDeltaMs?: number;
+    })
+  | (ExpectedItemCommandBase & {
+      readonly type: "SplitCue";
+      readonly cueId: string;
+      readonly splitMs: number;
+      readonly newCueId: string;
+    })
+  | (ExpectedItemCommandBase & {
+      readonly type: "MergeCue";
+      readonly cueId: string;
+      readonly adjacentCueId: string;
+    })
+  | (ExpectedItemCommandBase & {
+      readonly type: "ReviseCue";
+      readonly cueId: string;
+      readonly patch: CuePatch;
+    })
+  | (ExpectedItemCommandBase & {
+      readonly type: "AdjustAudioDescriptionTiming";
+      readonly beatId?: string;
+      readonly startMs?: number;
+      readonly endMs?: number;
+      readonly startDeltaMs?: number;
+      readonly endDeltaMs?: number;
+    })
+  | (ItemCommandBase & {
+      readonly type: "ReviseAudioDescription";
+      readonly beatId?: string;
+      readonly patch: AudioDescriptionPatch;
+    })
+  | (CommandBase & {
+      readonly type: "ProposeAudioDescriptionInGap";
+      readonly gapId: string;
+      readonly expectedSelectionId?: string;
+      readonly beatId: string;
+      readonly startMs: number;
+      readonly endMs: number;
+      readonly description: string;
+    })
+  | (ItemCommandBase & { readonly type: "MarkItemAgentReady" })
+  | (ItemCommandBase & {
+      readonly type: "ObjectItem";
+      readonly reason: string;
+    })
+  | (ItemCommandBase & { readonly type: "SustainItem" })
+  | (CommandBase & {
+      readonly type: "WaiveWarning";
+      readonly findingId: string;
+      readonly reason: string;
+    })
+  | (CommandBase & {
+      readonly type: "ApplyProfile";
+      readonly profileId: string;
+      readonly name: string;
+      readonly rules: Readonly<Record<string, unknown>>;
+    })
+  | (CommandBase & {
+      readonly type: "RelinkMedia";
+      readonly media: { readonly sourceId: string; readonly sha256: string; readonly durationMs: number };
+    })
+  | (CommandBase & {
+      readonly type: "AppendCourtRecord";
+      readonly eventType: string;
+      readonly detail?: string;
+      readonly itemId?: string;
+      readonly deterministic?: boolean;
+    })
+  | (CommandBase & {
+      readonly type: "StartGenerationRun";
+      readonly runId: string;
+      readonly targetTrack: GenerationTargetTrack;
+    })
+  | (CommandBase & { readonly type: "ReleaseGenerationRun"; readonly runId: string });

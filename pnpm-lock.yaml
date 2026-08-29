@@ -33,6 +33,16 @@ importers:
         specifier: 4.4.3
         version: 4.4.3
 
+  packages/domain:
+    dependencies:
+      '@cuebench/contracts':
+        specifier: workspace:*
+        version: link:../contracts
+    devDependencies:
+      fast-check:
+        specifier: 4.9.0
+        version: 4.9.0
+
 packages:
 
   '@eslint-community/eslint-utils@4.10.1':
