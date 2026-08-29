@@ -75,6 +75,28 @@ const verifySourceBlob = async (row: SourceBlobRow): Promise<SourceBlobRow> => {
 };
 
 /**
+ * A duplicate save has already hashed the incoming bytes. Validate the
+ * existing row's structural binding, then trust that matching immutable hash
+ * identity without reading and hashing an arbitrarily large stored Blob.
+ * `loadSourceMedia` remains the explicit byte-integrity verification path.
+ */
+const validateSourceBlobDedupe = (
+  row: SourceBlobRow,
+  projectId: string,
+  sha256: string,
+): SourceBlobRow => {
+  const checked = validateSourceBlobRow(row);
+  if (
+    checked.projectId !== projectId
+    || checked.sha256 !== sha256
+    || checked.key !== sourceBlobKey(projectId, sha256)
+  ) {
+    throw new StorageReadValidationError("source blobs", "Existing source Blob does not bind the requested immutable hash.");
+  }
+  return checked;
+};
+
+/**
  * Stores source media by project and immutable media hash. The primary key is
  * hash-derived, so repeated imports (including racing browser tabs) cannot
  * create duplicate copies of the same source blob.
@@ -125,15 +147,17 @@ export async function saveSourceMedia(
       await db.sourceBlobs.add(validatedCandidate);
       return { row: validatedCandidate, inserted: true };
     });
-    /** A fresh candidate was already schema-validated and byte-hashed above. Do not hash it twice. */
-    return stored.inserted ? stored.row : verifySourceBlob(stored.row);
+    /** A fresh candidate was already schema-validated and byte-hashed above. */
+    return stored.inserted
+      ? stored.row
+      : validateSourceBlobDedupe(stored.row, projectId, calculatedHash);
   } catch (error) {
     // A second database connection may win after this transaction read but
     // before its add. Re-read the deterministic key rather than writing a
     // second blob under a different source id.
     if (error instanceof Error && error.name === "ConstraintError") {
       const existing = await db.sourceBlobs.get(key);
-      if (existing !== undefined) return verifySourceBlob(existing);
+      if (existing !== undefined) return validateSourceBlobDedupe(existing, projectId, calculatedHash);
     }
     throw error;
   }

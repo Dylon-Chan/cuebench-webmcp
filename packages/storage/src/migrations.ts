@@ -1,4 +1,8 @@
-import { createProject, type CaptionProject } from "@cuebench/domain";
+import {
+  createProject,
+  upgradeLegacyCertificationSnapshot,
+  type CaptionProject,
+} from "@cuebench/domain";
 import { z } from "zod";
 import { STORAGE_SCHEMA_VERSION, validateCaptionProject } from "./database";
 
@@ -167,8 +171,7 @@ export const migrateV0ToV1 = (value: unknown): ProjectEnvelopeV1 => {
       ...(event.detail === undefined ? {} : { detail: event.detail }),
     }));
     const unavailableItemPayloadCount = [...source.captionCues, ...source.audioDescriptionBeats]
-      .filter((item) => item.revision > 1)
-      .length;
+      .reduce((count, item) => count + Math.max(0, item.revision - 1), 0);
     const historyMarker = unavailableItemPayloadCount === 0 ? [] : [{
       eventId: "legacy-item-revision-payload-history-unavailable",
       projectRevision: source.revision,
@@ -218,6 +221,23 @@ const previewV1Project = (project: CaptionProject): CaptionProject => validateCa
     : { ...project.certification, status: "Stale" },
 });
 
+/**
+ * v1 backup envelopes can contain the former shallow certification hash.
+ * Upgrade only after the domain verifier authenticates both that legacy hash
+ * and all full snapshot/readiness contents; this function never mutates the
+ * imported envelope and is used solely for the human-confirmation preview.
+ */
+const upgradePreviewCertifications = (project: CaptionProject): CaptionProject => ({
+  ...project,
+  certifications: project.certifications.map((certification) => {
+    const upgraded = upgradeLegacyCertificationSnapshot(certification);
+    if (upgraded === undefined) {
+      throw new StorageMigrationError("Legacy certification snapshot cannot be verified for migration.");
+    }
+    return upgraded;
+  }),
+});
+
 export const describeImportedProject = (value: unknown): ImportedProjectDescriptor => {
   const envelope = ImportedEnvelopeSchema.safeParse(value);
   if (!envelope.success) {
@@ -242,13 +262,20 @@ export const describeImportedProject = (value: unknown): ImportedProjectDescript
     version = migration.to;
     project = migrated.project;
   }
-  return {
-    mode: "preview",
-    requiresHumanConfirmation: true,
-    schemaVersion: STORAGE_SCHEMA_VERSION,
-    migratedFrom,
-    project: previewV1Project(validateCaptionProject(project)),
-  };
+  try {
+    /** Validate after, not before, the authenticated legacy-hash upgrade. */
+    const checked = validateCaptionProject(upgradePreviewCertifications(project as CaptionProject));
+    return {
+      mode: "preview",
+      requiresHumanConfirmation: true,
+      schemaVersion: STORAGE_SCHEMA_VERSION,
+      migratedFrom,
+      project: previewV1Project(checked),
+    };
+  } catch (error) {
+    if (error instanceof StorageMigrationError) throw error;
+    throw new StorageMigrationError(error instanceof Error ? error.message : "Invalid v1 project data.");
+  }
 };
 
 /** Alias emphasizes that this operation is pure and never writes browser storage. */

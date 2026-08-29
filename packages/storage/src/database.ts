@@ -5,10 +5,12 @@ import type {
   ValidationSnapshot,
 } from "@cuebench/contracts";
 import {
+  applicableWarningWaivers,
   buildValidationInput,
   canonicalSerialize,
   currentValidationRun,
   semanticValidationInput,
+  upgradeLegacyCertificationSnapshot,
   validationInputHash,
   verifyCertificationSnapshot,
   type AudioDescriptionBeat,
@@ -82,6 +84,7 @@ const nonBlankText = z.string().min(1).refine((value) => value.trim().length > 0
 const boundedText = (maximum: number) => nonBlankText.max(maximum);
 const lowercaseSha256 = z.string().regex(/^[0-9a-f]{64}$/, "Expected a canonical lowercase SHA-256 hash.");
 const prefixedSha256 = z.string().regex(/^sha256:[0-9a-f]{64}$/, "Expected a SHA-256 hash.");
+const versionedCertificationSha256 = z.string().regex(/^sha256:v2:[0-9a-f]{64}$/, "Expected a v2 certification snapshot hash.");
 const unknownRecord = z.record(z.string(), z.unknown());
 
 const ActorStorageSchema = z.object({
@@ -333,7 +336,7 @@ const CertificationItemRevisionSchema = z.object({
 
 const StoredProjectCertificationSchema = z.object({
   certificationId: identifier,
-  certificationSnapshotHash: prefixedSha256,
+  certificationSnapshotHash: versionedCertificationSha256,
   readinessHash: prefixedSha256,
   certifiedAtMs: positiveSafeInteger,
   actor: ActorStorageSchema,
@@ -684,72 +687,183 @@ export const narrationBlobKey = (projectId: string, beatId: string, itemRevision
   recordKey(projectId, beatId, String(itemRevision));
 export const runReceiptKey = (projectId: string, runId: string) => recordKey(projectId, runId);
 
-/** Physical v1 header rows predate the explicit evidence projection. */
-type PhysicalV1ProjectHeaderRow = Omit<ProjectHeaderRow, "evidenceOrder">;
-/** Physical v1 evidence rows were mutable/current rows without a version column. */
-type PhysicalV1EvidenceRow = Omit<EvidenceRow, "version">;
+/**
+ * A brief pre-v2 build wrote the new row shapes into the old physical schema.
+ * Versionchange therefore normalizes each row independently rather than
+ * assuming that the whole database is either entirely legacy or entirely new.
+ */
+type PhysicalV1ProjectHeaderRow = Omit<ProjectHeaderRow, "evidenceOrder"> & {
+  readonly evidenceOrder?: unknown;
+};
+type PhysicalV1EvidenceRow = Omit<EvidenceRow, "version"> & {
+  readonly version?: unknown;
+};
 
-const physicalV1EvidenceKey = (projectId: string, evidenceId: string): string => recordKey(projectId, evidenceId);
+interface PhysicalEvidenceCandidate {
+  readonly row: EvidenceRow;
+  readonly sourceKey: string;
+  readonly canonicalSource: boolean;
+}
+
+const parsedRecordKey = (key: string): readonly string[] | undefined => {
+  try {
+    const parsed: unknown = JSON.parse(key);
+    return Array.isArray(parsed) && parsed.every((part) => typeof part === "string") ? parsed : undefined;
+  } catch {
+    return undefined;
+  }
+};
+
+const physicalEvidenceCandidate = (row: PhysicalV1EvidenceRow): PhysicalEvidenceCandidate => {
+  if (
+    typeof row.projectId !== "string"
+    || typeof row.evidenceId !== "string"
+    || typeof row.key !== "string"
+    || !Number.isSafeInteger(row.sequence)
+    || row.sequence < 0
+  ) throw new Error("Cannot upgrade malformed physical evidence row.");
+  const parts = parsedRecordKey(row.key);
+  if (parts === undefined || parts[0] !== row.projectId || parts[1] !== row.evidenceId) {
+    throw new Error("Cannot upgrade physical evidence row with a mismatched primary key.");
+  }
+  let keyVersion: number | undefined;
+  if (parts.length === 2) {
+    if (row.key !== recordKey(row.projectId, row.evidenceId)) {
+      throw new Error("Cannot upgrade noncanonical legacy physical evidence key.");
+    }
+  } else if (parts.length === 3) {
+    const parsedVersion = Number(parts[2]);
+    if (!Number.isSafeInteger(parsedVersion) || parsedVersion <= 0 || String(parsedVersion) !== parts[2]) {
+      throw new Error("Cannot upgrade physical evidence row with an invalid version key.");
+    }
+    if (row.key !== evidenceKey(row.projectId, row.evidenceId, parsedVersion)) {
+      throw new Error("Cannot upgrade noncanonical physical evidence key.");
+    }
+    keyVersion = parsedVersion;
+  } else {
+    throw new Error("Cannot upgrade physical evidence row with an invalid primary key shape.");
+  }
+  const rowVersion = row.version;
+  if (rowVersion !== undefined && (typeof rowVersion !== "number" || !Number.isSafeInteger(rowVersion) || rowVersion <= 0)) {
+    throw new Error("Cannot upgrade physical evidence row with an invalid version field.");
+  }
+  if (keyVersion !== undefined && rowVersion !== undefined && keyVersion !== rowVersion) {
+    throw new Error("Cannot upgrade physical evidence row whose key and version disagree.");
+  }
+  const version = rowVersion ?? keyVersion ?? 1;
+  const normalized: EvidenceRow = { ...row, key: evidenceKey(row.projectId, row.evidenceId, version), version };
+  return {
+    row: normalized,
+    sourceKey: row.key,
+    canonicalSource: row.key === normalized.key && row.version === version,
+  };
+};
+
+const samePhysicalEvidence = (left: EvidenceRow, right: EvidenceRow): boolean =>
+  left.projectId === right.projectId
+  && left.evidenceId === right.evidenceId
+  && left.version === right.version
+  && left.sequence === right.sequence
+  && sameValue(left.evidence, right.evidence);
+
+const sameStringSet = (left: readonly string[], right: readonly string[]): boolean =>
+  left.length === right.length && left.every((value) => right.includes(value));
 
 /**
- * Dexie v1 stored one mutable evidence row per id. v2 makes it append-only,
- * adds the header's current projection, and installs the CAS compound index.
- * This migration runs entirely inside Dexie's versionchange transaction.
+ * Dexie v1 stored mutable evidence rows and omitted the header projection.
+ * It may also contain row-by-row v2-shaped data from bb49027. This upgrade
+ * derives only absent fields, leaves already-canonical records untouched, and
+ * rejects just genuine normalized-key collisions.
  */
 const upgradePhysicalV1ToV2 = async (transaction: Transaction): Promise<void> => {
   const headers = transaction.table("projectHeaders") as Table<PhysicalV1ProjectHeaderRow, string>;
   const evidence = transaction.table("evidence") as Table<PhysicalV1EvidenceRow, string>;
-  const [legacyHeaders, legacyEvidence] = await Promise.all([headers.toArray(), evidence.toArray()]);
-  const headerHasCurrentProjection = (header: PhysicalV1ProjectHeaderRow): boolean =>
-    Array.isArray((header as unknown as { readonly evidenceOrder?: unknown }).evidenceOrder);
-  const evidenceHasCurrentVersion = (row: PhysicalV1EvidenceRow): boolean =>
-    typeof (row as unknown as { readonly version?: unknown }).version === "number";
-  const currentHeaderCount = legacyHeaders.filter(headerHasCurrentProjection).length;
-  const currentEvidenceCount = legacyEvidence.filter(evidenceHasCurrentVersion).length;
-  /** A short-lived v1 build wrote v2-shaped rows without a physical version bump. Keep it lossless. */
-  if (currentHeaderCount === legacyHeaders.length && currentEvidenceCount === legacyEvidence.length) return;
-  if (currentHeaderCount !== 0 || currentEvidenceCount !== 0) {
-    throw new Error("Cannot upgrade a mixed physical v1/v2 evidence layout.");
-  }
-  const evidenceByProject = new Map<string, PhysicalV1EvidenceRow[]>();
-  const oldEvidenceKeys: string[] = [];
-  const upgradedEvidence: EvidenceRow[] = [];
-  const seenNewEvidenceKeys = new Set<string>();
+  const findings = transaction.table("findings") as Table<FindingRow, string>;
+  const certifications = transaction.table("certifications") as Table<CertificationRow, string>;
+  const [physicalHeaders, physicalEvidence, findingRows, certificationRows] = await Promise.all([
+    headers.toArray(),
+    evidence.toArray(),
+    findings.toArray(),
+    certifications.toArray(),
+  ]);
 
-  for (const row of legacyEvidence) {
-    if (
-      typeof row.projectId !== "string"
-      || typeof row.evidenceId !== "string"
-      || !Number.isSafeInteger(row.sequence)
-      || row.sequence < 0
-      || row.key !== physicalV1EvidenceKey(row.projectId, row.evidenceId)
-    ) throw new Error("Cannot upgrade malformed physical v1 evidence row.");
-    const rows = evidenceByProject.get(row.projectId) ?? [];
-    rows.push(row);
-    evidenceByProject.set(row.projectId, rows);
-    oldEvidenceKeys.push(row.key);
-    const key = evidenceKey(row.projectId, row.evidenceId, 1);
-    if (seenNewEvidenceKeys.has(key)) throw new Error("Cannot upgrade duplicate physical v1 evidence rows.");
-    seenNewEvidenceKeys.add(key);
-    upgradedEvidence.push({ ...row, key, version: 1 });
-  }
-
-  const upgradedHeaders = legacyHeaders.map((header): ProjectHeaderRow => {
-    if (typeof header.projectId !== "string") throw new Error("Cannot upgrade malformed physical v1 project header.");
-    const rows = [...(evidenceByProject.get(header.projectId) ?? [])]
-      .sort((left, right) => left.sequence - right.sequence || compareText(left.evidenceId, right.evidenceId));
-    const evidenceIds = rows.map((row) => row.evidenceId);
-    if (new Set(evidenceIds).size !== evidenceIds.length || rows.some((row, index) => row.sequence !== index)) {
-      throw new Error("Cannot upgrade noncanonical physical v1 evidence projection.");
+  const rawEvidenceByKey = new Map(physicalEvidence.map((row) => [row.key, row]));
+  const candidates = new Map<string, PhysicalEvidenceCandidate>();
+  const obsoleteEvidenceKeys = new Set<string>();
+  for (const physicalRow of physicalEvidence) {
+    const candidate = physicalEvidenceCandidate(physicalRow);
+    const existing = candidates.get(candidate.row.key);
+    if (existing !== undefined) {
+      if (!samePhysicalEvidence(existing.row, candidate.row)) {
+        throw new Error("Cannot upgrade conflicting physical evidence rows with the same normalized key.");
+      }
+      if (candidate.canonicalSource && !existing.canonicalSource) candidates.set(candidate.row.key, candidate);
+      if (candidate.sourceKey !== candidate.row.key) obsoleteEvidenceKeys.add(candidate.sourceKey);
+      continue;
     }
-    return { ...header, evidenceOrder: evidenceIds };
-  });
-
-  if (upgradedHeaders.length > 0) await headers.bulkPut(upgradedHeaders as unknown as PhysicalV1ProjectHeaderRow[]);
-  if (upgradedEvidence.length > 0) {
-    await evidence.bulkAdd(upgradedEvidence as unknown as PhysicalV1EvidenceRow[]);
-    await evidence.bulkDelete(oldEvidenceKeys);
+    candidates.set(candidate.row.key, candidate);
+    if (candidate.sourceKey !== candidate.row.key) obsoleteEvidenceKeys.add(candidate.sourceKey);
   }
+
+  const normalizedEvidence = [...candidates.values()].map((candidate) => candidate.row);
+  const evidenceToPut = normalizedEvidence.filter((row) => {
+    const original = rawEvidenceByKey.get(row.key);
+    return original === undefined || !sameValue(original, row);
+  });
+  if (evidenceToPut.length > 0) {
+    await evidence.bulkPut(evidenceToPut as unknown as PhysicalV1EvidenceRow[]);
+  }
+  if (obsoleteEvidenceKeys.size > 0) await evidence.bulkDelete([...obsoleteEvidenceKeys]);
+
+  const latestByProject = new Map<string, EvidenceRow[]>();
+  for (const row of normalizedEvidence) {
+    const projectRows = latestByProject.get(row.projectId) ?? [];
+    projectRows.push(row);
+    latestByProject.set(row.projectId, projectRows);
+  }
+  const headersToPut: ProjectHeaderRow[] = [];
+  for (const header of physicalHeaders) {
+    if (typeof header.projectId !== "string") throw new Error("Cannot upgrade malformed physical project header.");
+    const latestById = latestEvidenceRows(latestByProject.get(header.projectId) ?? []);
+    const currentEvidence = [...latestById.values()].sort(
+      (left, right) => left.sequence - right.sequence || compareText(left.evidenceId, right.evidenceId),
+    );
+    const derivedOrder = currentEvidence.map((row) => row.evidenceId);
+    const existingOrder = header.evidenceOrder;
+    if (existingOrder !== undefined) {
+      if (!Array.isArray(existingOrder) || existingOrder.some((id) => typeof id !== "string")) {
+        throw new Error("Cannot upgrade malformed physical header evidence projection.");
+      }
+      if (new Set(existingOrder).size !== existingOrder.length || !sameStringSet(existingOrder, derivedOrder)) {
+        throw new Error("Cannot upgrade physical header with an inconsistent evidence projection.");
+      }
+      continue;
+    }
+    headersToPut.push({ ...header, evidenceOrder: derivedOrder } as ProjectHeaderRow);
+  }
+  if (headersToPut.length > 0) await headers.bulkPut(headersToPut as unknown as PhysicalV1ProjectHeaderRow[]);
+
+  const findingsByScope = new Map<string, QualityFinding[]>();
+  for (const row of findingRows) {
+    const grouped = findingsByScope.get(row.scope) ?? [];
+    grouped.push(row.finding);
+    findingsByScope.set(row.scope, grouped);
+  }
+  const certificationsToPut: CertificationRow[] = [];
+  for (const row of certificationRows) {
+    const run = rehydrateValidationRun(
+      row.certification.validationRun,
+      findingsByScope.get(validationScope(row.certification.validationRun)) ?? [],
+    );
+    const upgraded = upgradeLegacyCertificationSnapshot({
+      ...clone(row.certification),
+      validationRun: run,
+    });
+    if (upgraded === undefined) throw new Error("Cannot upgrade invalid legacy certification snapshot.");
+    const next: CertificationRow = { ...row, certification: storedCertification(upgraded) };
+    if (!sameValue(row, next)) certificationsToPut.push(next);
+  }
+  if (certificationsToPut.length > 0) await certifications.bulkPut(certificationsToPut);
 };
 
 /** A validation run is immutable at its post-command project revision. */
@@ -847,7 +961,7 @@ const currentItemBindings = (project: CaptionProject) => {
 };
 
 const currentWarningWaivers = (project: CaptionProject): readonly WarningWaiver[] =>
-  Object.values(project.warningWaivers).sort((left, right) => compareText(left.findingId, right.findingId));
+  applicableWarningWaivers(project, currentValidationRun(project)?.warnings ?? []);
 
 const assertCertificationPointer = (project: CaptionProject): void => {
   const certificationIds = project.certifications.map((certification) => certification.certificationId);

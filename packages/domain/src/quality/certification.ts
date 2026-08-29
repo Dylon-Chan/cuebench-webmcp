@@ -3,7 +3,7 @@ import type {
   ProjectCertification,
   WarningWaiver,
 } from "../model";
-import { canonicalHash } from "./hash";
+import { canonicalHash, tupleHash } from "./hash";
 import {
   buildValidationInput,
   currentValidationRun,
@@ -21,6 +21,17 @@ const compareText = (left: string, right: string): number => left < right ? -1 :
 
 const SHA256_HASH = /^sha256:[0-9a-f]{64}$/;
 const SHA256 = /^[0-9a-f]{64}$/;
+const CERTIFICATION_SNAPSHOT_HASH_V2 = /^sha256:v2:[0-9a-f]{64}$/;
+
+export type CertificationSnapshotHashVersion = 1 | 2;
+
+/** v1 was an unversioned shallow tuple hash; v2 is explicitly content-versioned. */
+export const detectCertificationSnapshotHashVersion = (
+  hash: string,
+): CertificationSnapshotHashVersion | null => {
+  if (CERTIFICATION_SNAPSHOT_HASH_V2.test(hash)) return 2;
+  return SHA256_HASH.test(hash) ? 1 : null;
+};
 
 export type ValidationStaleCauseCode =
   | "NOT_RUN"
@@ -244,17 +255,73 @@ export const createCertificationSnapshot = (
 /** Hashes every immutable certification field except the hash itself. */
 export const certificationSnapshotHashFor = (
   content: Omit<ProjectCertification, "certificationSnapshotHash">,
-): string => canonicalHash("cuebench.certification-snapshot.v2", content);
+): string => canonicalHash("cuebench.certification-snapshot.v2", content).replace("sha256:", "sha256:v2:");
+
+/**
+ * The historic v1 tuple is intentionally retained only to authenticate an
+ * upgrade source before the full v2 verifier normalizes it.
+ */
+export const legacyCertificationSnapshotHashFor = (input: Pick<
+  ProjectCertification,
+  "readinessHash" | "certificationId" | "actor" | "certifiedAtMs"
+>): string => tupleHash("cuebench.certification-snapshot.v1", [
+  "readinessHash",
+  input.readinessHash,
+  "certificationId",
+  input.certificationId,
+  "actorType",
+  input.actor.type,
+  "actorId",
+  input.actor.id,
+  "certifiedAtMs",
+  String(input.certifiedAtMs),
+]);
 
 const canonicalWaivers = (waivers: readonly WarningWaiver[]): readonly WarningWaiver[] =>
   [...waivers].sort((left, right) => compareText(left.findingId, right.findingId));
 
-/**
- * Recomputes the readiness content from the immutable snapshot. It is useful
- * to storage readers as well as the verifier, which must not trust a stored
- * readiness hash merely because it has the right digest shape.
- */
-export const certificationReadinessHashForSnapshot = (snapshot: ProjectCertification): string => {
+type ValidationInputItem = ValidationInputSnapshot["captions"]["items"][number];
+type CertificationItemRevision = ProjectCertification["itemRevisions"][number];
+
+const allInputItems = (input: ValidationInputSnapshot): readonly ValidationInputItem[] => [
+  ...input.captions.items,
+  ...input.audioDescriptions.items,
+];
+
+/** v1 certification snapshots bound only live cues, matching currentProjectItems(). */
+const legacyInputItems = (input: ValidationInputSnapshot): readonly ValidationInputItem[] => [
+  ...input.captions.items.filter((item) => item.mergedIntoItemId === null || item.mergedIntoItemId === undefined),
+  ...input.audioDescriptions.items,
+];
+
+const itemRevisionsFor = (
+  items: readonly ValidationInputItem[],
+): readonly CertificationItemRevision[] => items.map((item) => ({
+  kind: item.kind,
+  itemId: item.itemId,
+  itemRevision: item.itemRevision,
+}));
+
+const countItemStatesFor = (items: readonly ValidationInputItem[]): ItemStateCounts => {
+  const counts: { Proposed: number; AgentReady: number; Objected: number; Sustained: number } = {
+    Proposed: 0,
+    AgentReady: 0,
+    Objected: 0,
+    Sustained: 0,
+  };
+  for (const item of items) {
+    if (item.state === "Proposed" || item.state === "AgentReady" || item.state === "Objected" || item.state === "Sustained") {
+      counts[item.state] += 1;
+    }
+  }
+  return counts;
+};
+
+const readinessHashForSnapshotContent = (
+  snapshot: ProjectCertification,
+  itemRevisions: readonly CertificationItemRevision[],
+  itemStateCounts: ItemStateCounts,
+): string => {
   const run = snapshot.validationRun;
   const blockers = run.findings.filter((finding) => finding.severity === "blocker");
   const warnings = run.findings.filter((finding) => finding.severity === "warning");
@@ -262,7 +329,7 @@ export const certificationReadinessHashForSnapshot = (snapshot: ProjectCertifica
   return readinessHashFor({
     media: snapshot.media,
     evidence: snapshot.evidence,
-    itemRevisions: snapshot.itemRevisions,
+    itemRevisions,
     qualityProfile: snapshot.qualityProfile,
     validationRun: run,
     applicableWarningWaivers: canonicalWaivers(snapshot.warningWaivers),
@@ -271,14 +338,167 @@ export const certificationReadinessHashForSnapshot = (snapshot: ProjectCertifica
       .filter((warning) => !waiverIds.has(warning.findingId))
       .map((warning) => warning.findingId),
     staleValidationCauseCodes: [],
-    itemStateCounts: countInputItemStates(run.input),
+    itemStateCounts,
   });
+};
+
+/**
+ * Recomputes the readiness content from the immutable snapshot. It is useful
+ * to storage readers as well as the verifier, which must not trust a stored
+ * readiness hash merely because it has the right digest shape.
+ */
+export const certificationReadinessHashForSnapshot = (snapshot: ProjectCertification): string => {
+  return readinessHashForSnapshotContent(
+    snapshot,
+    snapshot.itemRevisions,
+    countInputItemStates(snapshot.validationRun.input),
+  );
 };
 
 const validIdentifier = (value: string): boolean => value.trim().length > 0 && value.trim() === value;
 
 const validActor = (actor: ProjectCertification["actor"], type?: "Human"): boolean =>
   (type === undefined || actor.type === type) && validIdentifier(actor.id);
+
+/** Validates the snapshot contents independently of its outer hash format. */
+const hasValidCertificationContents = (
+  snapshot: ProjectCertification,
+  expectedItems: readonly CertificationItemRevision[],
+  expectedInputItems: readonly ValidationInputItem[],
+): boolean => {
+  if (!validActor(snapshot.actor, "Human") || !validIdentifier(snapshot.certificationId)) return false;
+  if (!SHA256_HASH.test(snapshot.readinessHash)) return false;
+  if (!Number.isSafeInteger(snapshot.certifiedAtMs) || snapshot.certifiedAtMs <= 0) return false;
+  if (
+    !validIdentifier(snapshot.media.sourceId)
+    || !SHA256.test(snapshot.media.sha256)
+    || snapshot.media.relinkState !== "Linked"
+    || !Number.isSafeInteger(snapshot.media.durationMs)
+    || snapshot.media.durationMs < 0
+  ) return false;
+
+  const run = snapshot.validationRun;
+  if (
+    run.projectId !== run.input.projectId
+    || run.projectRevision !== run.input.projectRevision
+    || run.profileId !== run.input.qualityProfile.profileId
+    || run.profileRevision !== run.input.qualityProfile.revision
+    || !SHA256_HASH.test(run.inputHash)
+    || run.inputHash !== validationInputHashFor(run.input)
+    || !sameValue(validateValidationInput(run.input), run)
+    || !sameValue(snapshot.media, run.input.media)
+    || !sameValue(snapshot.evidence, run.input.evidence)
+    || !sameValue(snapshot.qualityProfile, run.input.qualityProfile)
+  ) return false;
+
+  if (!sameValue(snapshot.itemRevisions, expectedItems)) return false;
+  const itemIds = new Set<string>();
+  for (const item of expectedItems) {
+    if (!validIdentifier(item.itemId) || !Number.isSafeInteger(item.itemRevision) || item.itemRevision <= 0 || itemIds.has(item.itemId)) {
+      return false;
+    }
+    itemIds.add(item.itemId);
+  }
+  if (!expectedInputItems.some((item) => item.state === "Sustained")) return false;
+
+  const evidenceIds = new Set<string>();
+  for (const evidence of snapshot.evidence) {
+    if (
+      !validIdentifier(evidence.evidenceId)
+      || evidenceIds.has(evidence.evidenceId)
+      || evidence.projectId !== run.projectId
+      || evidence.mediaSha256 !== snapshot.media.sha256
+      || !SHA256.test(evidence.mediaSha256)
+      || (evidence.itemId === null) !== (evidence.itemRevision === null)
+      || (evidence.itemId !== null && (!itemIds.has(evidence.itemId)
+        || evidence.itemRevision === null
+        || !Number.isSafeInteger(evidence.itemRevision)
+        || evidence.itemRevision <= 0))
+    ) return false;
+    evidenceIds.add(evidence.evidenceId);
+  }
+
+  const recomputed = validateValidationInput(run.input);
+  const blockers = recomputed.blockers;
+  const warnings = recomputed.warnings;
+  if (blockers.length > 0) return false;
+  if (!sameValue(snapshot.warningWaivers, canonicalWaivers(snapshot.warningWaivers))) return false;
+  const waiverIds = new Set<string>();
+  for (const waiver of snapshot.warningWaivers) {
+    if (
+      !validIdentifier(waiver.findingId)
+      || !waiver.reason.trim()
+      || !validActor(waiver.actor, "Human")
+      || !Number.isSafeInteger(waiver.projectRevision)
+      || waiver.projectRevision <= 0
+      || waiverIds.has(waiver.findingId)
+      || !warnings.some((warning) => warning.findingId === waiver.findingId)
+    ) return false;
+    waiverIds.add(waiver.findingId);
+  }
+  return waiverIds.size === warnings.length && warnings.every((warning) => waiverIds.has(warning.findingId));
+};
+
+const certificationContent = (
+  snapshot: ProjectCertification,
+): Omit<ProjectCertification, "certificationSnapshotHash"> => ({
+  certificationId: snapshot.certificationId,
+  readinessHash: snapshot.readinessHash,
+  certifiedAtMs: snapshot.certifiedAtMs,
+  actor: snapshot.actor,
+  media: snapshot.media,
+  evidence: snapshot.evidence,
+  itemRevisions: snapshot.itemRevisions,
+  qualityProfile: snapshot.qualityProfile,
+  validationRun: snapshot.validationRun,
+  warningWaivers: snapshot.warningWaivers,
+});
+
+/** Validates the old shallow tuple plus all semantic snapshot content before migration. */
+export const verifyLegacyCertificationSnapshot = (snapshot: ProjectCertification): boolean => {
+  try {
+    if (detectCertificationSnapshotHashVersion(snapshot.certificationSnapshotHash) !== 1) return false;
+    if (snapshot.certificationSnapshotHash !== legacyCertificationSnapshotHashFor(snapshot)) return false;
+    const input = snapshot.validationRun.input;
+    const legacyItems = legacyInputItems(input);
+    const expectedItems = itemRevisionsFor(legacyItems);
+    return hasValidCertificationContents(snapshot, expectedItems, legacyItems)
+      && snapshot.readinessHash === readinessHashForSnapshotContent(
+        snapshot,
+        expectedItems,
+        countItemStatesFor(legacyItems),
+      );
+  } catch {
+    return false;
+  }
+};
+
+/**
+ * Converts only an authenticated, semantically revalidated v1 snapshot into
+ * the full v2 representation. Invalid legacy data is never merely rehashed.
+ */
+export const upgradeLegacyCertificationSnapshot = (
+  snapshot: ProjectCertification,
+): ProjectCertification | undefined => {
+  const version = detectCertificationSnapshotHashVersion(snapshot.certificationSnapshotHash);
+  if (version === 2) return verifyCertificationSnapshot(snapshot) ? clone(snapshot) : undefined;
+  if (version !== 1 || !verifyLegacyCertificationSnapshot(snapshot)) return undefined;
+  const upgradedWithoutHash: Omit<ProjectCertification, "certificationSnapshotHash"> = {
+    ...certificationContent(snapshot),
+    itemRevisions: clone(inputItemRevisions(snapshot.validationRun.input)),
+    readinessHash: "",
+  };
+  const readinessHash = certificationReadinessHashForSnapshot({
+    ...upgradedWithoutHash,
+    certificationSnapshotHash: "sha256:v2:" + "0".repeat(64),
+  });
+  const content = { ...upgradedWithoutHash, readinessHash };
+  const upgraded: ProjectCertification = {
+    ...content,
+    certificationSnapshotHash: certificationSnapshotHashFor(content),
+  };
+  return verifyCertificationSnapshot(upgraded) ? upgraded : undefined;
+};
 
 /**
  * Recomputes every deterministic validation fact from the immutable input.
@@ -287,83 +507,11 @@ const validActor = (actor: ProjectCertification["actor"], type?: "Human"): boole
  */
 export const verifyCertificationSnapshot = (snapshot: ProjectCertification): boolean => {
   try {
-    if (!validActor(snapshot.actor, "Human") || !validIdentifier(snapshot.certificationId)) return false;
-    if (!SHA256_HASH.test(snapshot.readinessHash) || !SHA256_HASH.test(snapshot.certificationSnapshotHash)) return false;
-    if (!Number.isSafeInteger(snapshot.certifiedAtMs) || snapshot.certifiedAtMs <= 0) return false;
-    if (
-      !validIdentifier(snapshot.media.sourceId)
-      || !SHA256.test(snapshot.media.sha256)
-      || snapshot.media.relinkState !== "Linked"
-      || !Number.isSafeInteger(snapshot.media.durationMs)
-      || snapshot.media.durationMs < 0
-    ) return false;
-
-    const run = snapshot.validationRun;
-    if (
-      run.projectId !== run.input.projectId
-      || run.projectRevision !== run.input.projectRevision
-      || run.profileId !== run.input.qualityProfile.profileId
-      || run.profileRevision !== run.input.qualityProfile.revision
-      || !SHA256_HASH.test(run.inputHash)
-      || run.inputHash !== validationInputHashFor(run.input)
-      || !sameValue(validateValidationInput(run.input), run)
-      || !sameValue(snapshot.media, run.input.media)
-      || !sameValue(snapshot.evidence, run.input.evidence)
-      || !sameValue(snapshot.qualityProfile, run.input.qualityProfile)
-    ) return false;
-
-    const expectedItems = inputItemRevisions(run.input);
-    if (!sameValue(snapshot.itemRevisions, expectedItems)) return false;
-    const itemIds = new Set<string>();
-    for (const item of expectedItems) {
-      if (!validIdentifier(item.itemId) || !Number.isSafeInteger(item.itemRevision) || item.itemRevision <= 0 || itemIds.has(item.itemId)) {
-        return false;
-      }
-      itemIds.add(item.itemId);
-    }
-    if (![...run.input.captions.items, ...run.input.audioDescriptions.items].some((item) => item.state === "Sustained")) {
-      return false;
-    }
-
-    const evidenceIds = new Set<string>();
-    for (const evidence of snapshot.evidence) {
-      if (
-        !validIdentifier(evidence.evidenceId)
-        || evidenceIds.has(evidence.evidenceId)
-        || evidence.projectId !== run.projectId
-        || evidence.mediaSha256 !== snapshot.media.sha256
-        || !SHA256.test(evidence.mediaSha256)
-        || (evidence.itemId === null) !== (evidence.itemRevision === null)
-        || (evidence.itemId !== null && (!itemIds.has(evidence.itemId)
-          || evidence.itemRevision === null
-          || !Number.isSafeInteger(evidence.itemRevision)
-          || evidence.itemRevision <= 0))
-      ) return false;
-      evidenceIds.add(evidence.evidenceId);
-    }
-
-    const recomputed = validateValidationInput(run.input);
-    const blockers = recomputed.blockers;
-    const warnings = recomputed.warnings;
-    if (blockers.length > 0) return false;
-    if (!sameValue(snapshot.warningWaivers, canonicalWaivers(snapshot.warningWaivers))) return false;
-    const waiverIds = new Set<string>();
-    for (const waiver of snapshot.warningWaivers) {
-      if (
-        !validIdentifier(waiver.findingId)
-        || !waiver.reason.trim()
-        || !validActor(waiver.actor, "Human")
-        || !Number.isSafeInteger(waiver.projectRevision)
-        || waiver.projectRevision <= 0
-        || waiverIds.has(waiver.findingId)
-        || !warnings.some((warning) => warning.findingId === waiver.findingId)
-      ) return false;
-      waiverIds.add(waiver.findingId);
-    }
-    if (waiverIds.size !== warnings.length || warnings.some((warning) => !waiverIds.has(warning.findingId))) return false;
+    if (detectCertificationSnapshotHashVersion(snapshot.certificationSnapshotHash) !== 2) return false;
+    const input = snapshot.validationRun.input;
+    if (!hasValidCertificationContents(snapshot, itemRevisionsFor(allInputItems(input)), allInputItems(input))) return false;
     if (snapshot.readinessHash !== certificationReadinessHashForSnapshot(snapshot)) return false;
-    const { certificationSnapshotHash: hash, ...content } = snapshot;
-    return hash === certificationSnapshotHashFor(content);
+    return snapshot.certificationSnapshotHash === certificationSnapshotHashFor(certificationContent(snapshot));
   } catch {
     return false;
   }

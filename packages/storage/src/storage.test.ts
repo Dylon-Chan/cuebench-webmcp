@@ -4,6 +4,7 @@ import Dexie from "dexie";
 import {
   applyCommand,
   createProject,
+  legacyCertificationSnapshotHashFor,
   prepareCertificationReview,
   type CaptionProject,
 } from "@cuebench/domain";
@@ -78,6 +79,58 @@ const humanSustainCommand = () => ({
   expectedItemRevision: 1,
   expectedProjectRevision: 1,
 });
+
+const certifiedFixtureProject = (
+  projectId = "certified-storage-project",
+  includeEvidence = true,
+): CaptionProject => {
+  let project = applyCommand(createProject({
+    projectId,
+    title: "Certified storage lesson",
+    media: { sourceId: "media-certified", sha256: "c".repeat(64), durationMs: 60_000, relinkState: "Linked" },
+    captions: [{
+      kind: "CaptionCue",
+      itemId: "c01",
+      state: "Sustained",
+      startMs: 1_000,
+      endMs: 3_000,
+      text: "x".repeat(80),
+      speaker: null,
+      actor: { type: "Human", id: "teacher" },
+      cause: "fixture",
+    }],
+    evidence: includeEvidence ? [{
+      evidenceId: "evidence-1",
+      projectId,
+      mediaSha256: "c".repeat(64),
+      itemId: "c01",
+      itemRevision: 1,
+    }] : [],
+  }), {
+    type: "ValidateProject",
+    actor: { type: "System", id: "validator" },
+    expectedProjectRevision: 1,
+  }).project;
+  for (const warning of project.validationRun?.warnings ?? []) {
+    project = applyCommand(project, {
+      type: "WaiveWarning",
+      actor: { type: "Human", id: "teacher" },
+      expectedProjectRevision: project.projectRevision,
+      findingId: warning.findingId,
+      reason: "The teacher explicitly reviewed this bounded exception.",
+    }).project;
+  }
+  const certified = applyCommand(project, {
+    type: "CertifyProject",
+    actor: { type: "Human", id: "teacher" },
+    expectedProjectRevision: project.projectRevision,
+    expectedReadinessHash: prepareCertificationReview(project).readinessHash,
+    certificationId: "certification-1",
+    certifiedAtMs: 1_700_000_000_000,
+  });
+  if (certified.error !== undefined) throw new Error(`Could not build certified fixture: ${certified.error.code}`);
+  return certified.project;
+};
 
 describe("CueBenchDatabase", () => {
   it("persists project revision and Court Record atomically", async () => {
@@ -274,6 +327,147 @@ describe("CueBenchDatabase", () => {
     expect(result.error).toBeUndefined();
     expect((await upgraded.evidence.where("projectId").equals("project-1").toArray()).map((row) => row.version).sort()).toEqual([1, 2]);
     expect(await loadProject(upgraded, "project-1")).toEqual(result.project);
+  });
+
+  it("migrates every valid mixed v1 header and evidence row without rewriting v2-shaped rows", async () => {
+    const databaseName = `cuebench-storage-physical-v1-mixed-${databaseNumber += 1}`;
+    const legacy = new Dexie(databaseName);
+    legacy.version(1).stores({
+      projectHeaders: "&projectId, projectRevision, updatedAtMs",
+      items: "&key, projectId, itemId, [projectId+itemId], kind, currentItemRevision",
+      revisions: "&key, projectId, itemId, itemRevision, [projectId+itemId], [projectId+itemId+itemRevision], kind",
+      findings: "&key, projectId, scope, findingId, [projectId+scope], [projectId+scope+findingId]",
+      evidence: "&key, projectId, evidenceId, [projectId+evidenceId]",
+      courtRecord: "&key, projectId, eventId, projectRevision, [projectId+eventId]",
+      certifications: "&key, projectId, certificationId, [projectId+certificationId]",
+      sourceBlobs: "&key, projectId, sourceId, sha256, [projectId+sha256], [projectId+sourceId]",
+      narrationBlobs: "&key, projectId, beatId, itemRevision, [projectId+beatId+itemRevision]",
+      runReceipts: "&key, projectId, runId, [projectId+runId]",
+      settings: "&key, updatedAtMs",
+    });
+    await legacy.open();
+    const currentHeaderLegacyEvidence = {
+      ...fixtureProject(),
+      projectId: "mixed-current-header",
+      evidence: [{
+        evidenceId: "evidence-current-header",
+        projectId: "mixed-current-header",
+        mediaSha256: "a".repeat(64),
+        itemId: "c05",
+        itemRevision: 1,
+      }],
+    } as CaptionProject;
+    const legacyHeaderCurrentEvidence = {
+      ...fixtureProject(),
+      projectId: "mixed-legacy-header",
+      evidence: [{
+        evidenceId: "evidence-legacy-header",
+        projectId: "mixed-legacy-header",
+        mediaSha256: "a".repeat(64),
+        itemId: "c05",
+        itemRevision: 1,
+      }],
+    } as CaptionProject;
+    const currentRows = normalizeProject(currentHeaderLegacyEvidence, { createdAtMs: 1, updatedAtMs: 1 });
+    const legacyRows = normalizeProject(legacyHeaderCurrentEvidence, { createdAtMs: 2, updatedAtMs: 2 });
+    const legacyHeader = { ...legacyRows.header } as Record<string, unknown>;
+    Reflect.deleteProperty(legacyHeader, "evidenceOrder");
+    const legacyEvidence = currentRows.evidence.map((row) => ({
+      key: JSON.stringify([row.projectId, row.evidenceId]),
+      projectId: row.projectId,
+      evidenceId: row.evidenceId,
+      sequence: row.sequence,
+      evidence: row.evidence,
+    }));
+    await legacy.table("projectHeaders").bulkAdd([currentRows.header, legacyHeader]);
+    await legacy.table("items").bulkAdd([...currentRows.items, ...legacyRows.items]);
+    await legacy.table("revisions").bulkAdd([...currentRows.revisions, ...legacyRows.revisions]);
+    await legacy.table("findings").bulkAdd([...currentRows.findings, ...legacyRows.findings]);
+    await legacy.table("evidence").bulkAdd([...legacyEvidence, ...legacyRows.evidence]);
+    await legacy.table("courtRecord").bulkAdd([...currentRows.courtRecord, ...legacyRows.courtRecord]);
+    await legacy.table("certifications").bulkAdd([...currentRows.certifications, ...legacyRows.certifications]);
+    legacy.close();
+
+    const upgraded = new CueBenchDatabase(databaseName);
+    databases.push(upgraded);
+    await upgraded.open();
+    expect(await upgraded.projectHeaders.get(currentHeaderLegacyEvidence.projectId)).toEqual(currentRows.header);
+    expect(await upgraded.evidence.get(legacyRows.evidence[0]!.key)).toEqual(legacyRows.evidence[0]);
+    expect(await loadProject(upgraded, currentHeaderLegacyEvidence.projectId)).toEqual(currentHeaderLegacyEvidence);
+    expect(await loadProject(upgraded, legacyHeaderCurrentEvidence.projectId)).toEqual(legacyHeaderCurrentEvidence);
+    const result = await executePersistentCommand(upgraded, legacyHeaderCurrentEvidence.projectId, humanSustainCommand());
+    expect(result.error).toBeUndefined();
+    expect(await loadProject(upgraded, legacyHeaderCurrentEvidence.projectId)).toEqual(result.project);
+  });
+
+  it("upgrades only verified legacy certification rows from a physical v1 database", async () => {
+    const aggregate = certifiedFixtureProject("legacy-certified-storage");
+    const snapshot = aggregate.certifications[0];
+    if (snapshot === undefined) throw new Error("Certified fixture is missing its snapshot.");
+    const normalized = normalizeProject(aggregate, { createdAtMs: 1, updatedAtMs: 1 });
+    const legacyHeader = { ...normalized.header } as Record<string, unknown>;
+    Reflect.deleteProperty(legacyHeader, "evidenceOrder");
+    const legacyEvidence = normalized.evidence.map((row) => ({
+      key: JSON.stringify([row.projectId, row.evidenceId]),
+      projectId: row.projectId,
+      evidenceId: row.evidenceId,
+      sequence: row.sequence,
+      evidence: row.evidence,
+    }));
+    const legacyCertificationRows = normalized.certifications.map((row) => ({
+      ...row,
+      certification: {
+        ...row.certification,
+        certificationSnapshotHash: legacyCertificationSnapshotHashFor(snapshot),
+      },
+    }));
+    const seed = async (databaseName: string, certifications = legacyCertificationRows) => {
+      const raw = new Dexie(databaseName);
+      raw.version(1).stores({
+        projectHeaders: "&projectId, projectRevision, updatedAtMs",
+        items: "&key, projectId, itemId, [projectId+itemId], kind, currentItemRevision",
+        revisions: "&key, projectId, itemId, itemRevision, [projectId+itemId], [projectId+itemId+itemRevision], kind",
+        findings: "&key, projectId, scope, findingId, [projectId+scope], [projectId+scope+findingId]",
+        evidence: "&key, projectId, evidenceId, [projectId+evidenceId]",
+        courtRecord: "&key, projectId, eventId, projectRevision, [projectId+eventId]",
+        certifications: "&key, projectId, certificationId, [projectId+certificationId]",
+        sourceBlobs: "&key, projectId, sourceId, sha256, [projectId+sha256], [projectId+sourceId]",
+        narrationBlobs: "&key, projectId, beatId, itemRevision, [projectId+beatId+itemRevision]",
+        runReceipts: "&key, projectId, runId, [projectId+runId]",
+        settings: "&key, updatedAtMs",
+      });
+      await raw.open();
+      await raw.table("projectHeaders").add(legacyHeader);
+      await raw.table("items").bulkAdd([...normalized.items]);
+      await raw.table("revisions").bulkAdd([...normalized.revisions]);
+      await raw.table("findings").bulkAdd([...normalized.findings]);
+      await raw.table("evidence").bulkAdd(legacyEvidence);
+      await raw.table("courtRecord").bulkAdd([...normalized.courtRecord]);
+      await raw.table("certifications").bulkAdd(certifications);
+      raw.close();
+    };
+
+    const validName = `cuebench-storage-legacy-certified-${databaseNumber += 1}`;
+    await seed(validName);
+    const upgraded = new CueBenchDatabase(validName);
+    databases.push(upgraded);
+    await upgraded.open();
+    expect(await loadProject(upgraded, aggregate.projectId)).toEqual(aggregate);
+
+    const evidence = legacyCertificationRows[0]?.certification.evidence[0];
+    if (evidence === undefined) throw new Error("Legacy fixture is missing certification evidence.");
+    const tamperedRows = legacyCertificationRows.map((row) => ({
+      ...row,
+      certification: {
+        ...row.certification,
+        evidence: [{ ...evidence, mediaSha256: "d".repeat(64) }],
+      },
+    }));
+    const tamperedName = `cuebench-storage-legacy-certified-tampered-${databaseNumber += 1}`;
+    await seed(tamperedName, tamperedRows);
+    const tampered = new CueBenchDatabase(tamperedName);
+    databases.push(tampered);
+    await expect(tampered.open()).rejects.toThrow(/certification/i);
   });
 
   it("rejects malformed normalized records at the read boundary", async () => {
@@ -543,6 +737,61 @@ describe("CueBenchDatabase", () => {
     expect((await loadProject(db, reviewed.projectId))).toEqual(certified.project);
   });
 
+  it("binds a current certification only to waivers applicable to its current warning ids", async () => {
+    const db = testDatabase();
+    const initial = certifiedFixtureProject("historical-waiver-project", false);
+    const initialWaiverIds = Object.keys(initial.warningWaivers);
+    expect(initialWaiverIds.length).toBeGreaterThan(0);
+    await initializeProject(db, initial);
+
+    let current = (await executePersistentCommand(db, initial.projectId, {
+      type: "ReviseCue",
+      actor: { type: "Human", id: "teacher" },
+      cueId: "c01",
+      expectedItemRevision: 1,
+      expectedProjectRevision: initial.projectRevision,
+      patch: { text: "y".repeat(80) },
+    })).project;
+    current = (await executePersistentCommand(db, initial.projectId, {
+      type: "SustainItem",
+      actor: { type: "Human", id: "teacher" },
+      itemId: "c01",
+      expectedItemRevision: 2,
+      expectedProjectRevision: current.projectRevision,
+    })).project;
+    current = (await executePersistentCommand(db, initial.projectId, {
+      type: "ValidateProject",
+      actor: { type: "System", id: "validator" },
+      expectedProjectRevision: current.projectRevision,
+    })).project;
+    const currentWarningIds = current.validationRun?.warnings.map((warning) => warning.findingId) ?? [];
+    expect(currentWarningIds.some((id) => !initialWaiverIds.includes(id))).toBe(true);
+    for (const findingId of currentWarningIds) {
+      current = (await executePersistentCommand(db, initial.projectId, {
+        type: "WaiveWarning",
+        actor: { type: "Human", id: "teacher" },
+        expectedProjectRevision: current.projectRevision,
+        findingId,
+        reason: "The current warning was reviewed after the edit.",
+      })).project;
+    }
+    const certified = await executePersistentCommand(db, initial.projectId, {
+      type: "CertifyProject",
+      actor: { type: "Human", id: "teacher" },
+      expectedProjectRevision: current.projectRevision,
+      expectedReadinessHash: prepareCertificationReview(current).readinessHash,
+      certificationId: "certification-after-edit",
+      certifiedAtMs: 1_700_000_000_001,
+    });
+
+    expect(certified.error).toBeUndefined();
+    expect(Object.keys(certified.project.warningWaivers)).toEqual(expect.arrayContaining(initialWaiverIds));
+    expect(certified.project.certifications.at(-1)?.warningWaivers.map((waiver) => waiver.findingId)).toEqual(
+      [...currentWarningIds].sort(),
+    );
+    expect(await loadProject(db, initial.projectId)).toEqual(certified.project);
+  });
+
   it("deduplicates source blobs by project and source hash and estimates bytes", async () => {
     const db = testDatabase();
     const bytes = new TextEncoder().encode("source-video");
@@ -578,12 +827,14 @@ describe("CueBenchDatabase", () => {
     try {
       const first = await saveSourceMedia(db, "project-1", { sourceId: "media-1", blob: new Blob([bytes]) });
       expect(digest).toHaveBeenCalledTimes(1);
+      const digestCallsBeforeDuplicate = digest.mock.calls.length;
       const duplicate = await saveSourceMedia(db, "project-1", {
         sourceId: "media-alias",
         blob: new Blob([bytes]),
         sha256: actualHash.toUpperCase(),
       });
       expect(duplicate.key).toBe(first.key);
+      expect(digest).toHaveBeenCalledTimes(digestCallsBeforeDuplicate + 1);
       await expect(saveSourceMedia(db, "project-1", {
         sourceId: "media-bad",
         blob: new Blob([bytes]),

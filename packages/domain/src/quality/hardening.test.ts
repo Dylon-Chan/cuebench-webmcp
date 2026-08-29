@@ -426,7 +426,7 @@ describe("quality hardening regressions", () => {
     });
 
     expect(first.readinessHash).toBe(readiness.readinessHash);
-    expect(first.certificationSnapshotHash).toMatch(/^sha256:[0-9a-f]{64}$/);
+    expect(first.certificationSnapshotHash).toMatch(/^sha256:v2:[0-9a-f]{64}$/);
     expect(first.actor).toEqual({ type: "Human", id: "teacher" });
     expect(changedActor.certificationSnapshotHash).not.toBe(first.certificationSnapshotHash);
     expect(changedTime.certificationSnapshotHash).not.toBe(first.certificationSnapshotHash);

@@ -3,7 +3,10 @@ import {
   applyCommand,
   certificationSnapshotHashFor,
   createProject,
+  detectCertificationSnapshotHashVersion,
+  legacyCertificationSnapshotHashFor,
   prepareCertificationReview,
+  upgradeLegacyCertificationSnapshot,
   verifyCertificationSnapshot,
   type CaptionProject,
   type DomainCommand,
@@ -71,6 +74,8 @@ describe("human certification", () => {
     if (snapshot === undefined) throw new Error("Expected certification snapshot.");
 
     expect(verifyCertificationSnapshot(snapshot)).toBe(true);
+    expect(snapshot.certificationSnapshotHash).toMatch(/^sha256:v2:[0-9a-f]{64}$/);
+    expect(detectCertificationSnapshotHashVersion(snapshot.certificationSnapshotHash)).toBe(2);
     expect(verifyCertificationSnapshot({
       ...snapshot,
       actor: { type: "BrowserAgent", id: "browser-agent" },
@@ -83,6 +88,34 @@ describe("human certification", () => {
       ...snapshot,
       itemRevisions: [...snapshot.itemRevisions, snapshot.itemRevisions[0]!],
     })).toBe(false);
+  });
+
+  it("upgrades only a fully verified legacy certification snapshot to the versioned full hash", () => {
+    const validated = validate(sustainedProject());
+    const readiness = prepareCertificationReview(validated.project);
+    const snapshot = applyCommand(
+      validated.project,
+      certificationCommand(validated.project, readiness.readinessHash),
+    ).project.certifications[0];
+    if (snapshot === undefined) throw new Error("Expected certification snapshot.");
+    const legacy = {
+      ...snapshot,
+      certificationSnapshotHash: legacyCertificationSnapshotHashFor(snapshot),
+    };
+
+    expect(detectCertificationSnapshotHashVersion(legacy.certificationSnapshotHash)).toBe(1);
+    expect(verifyCertificationSnapshot(legacy)).toBe(false);
+    const upgraded = upgradeLegacyCertificationSnapshot(legacy);
+    expect(upgraded).toBeDefined();
+    expect(upgraded?.certificationSnapshotHash).toMatch(/^sha256:v2:[0-9a-f]{64}$/);
+    expect(verifyCertificationSnapshot(upgraded!)).toBe(true);
+
+    const evidence = legacy.evidence[0];
+    if (evidence === undefined) throw new Error("Expected legacy evidence.");
+    expect(upgradeLegacyCertificationSnapshot({
+      ...legacy,
+      evidence: [{ ...evidence, mediaSha256: "d".repeat(64) }],
+    })).toBeUndefined();
   });
 
   it("recomputes the complete certified validation input and binds every immutable snapshot field", () => {
@@ -350,7 +383,7 @@ describe("human certification", () => {
       actor: human,
       certifiedAtMs: 1_700_000_000_000,
     });
-    expect(snapshot.certificationSnapshotHash).toMatch(/^sha256:[0-9a-f]{64}$/);
+    expect(snapshot.certificationSnapshotHash).toMatch(/^sha256:v2:[0-9a-f]{64}$/);
     expect(snapshot.validationRun.findings).toEqual(validated.project.validationRun?.findings);
     const frozen = JSON.stringify(snapshot);
 
