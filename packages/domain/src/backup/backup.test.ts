@@ -465,6 +465,108 @@ describe("project backups", () => {
     }
   });
 
+  it("round-trips a split cue that is subsequently merged into its left identity", () => {
+    const split = applyCommand(fixtureProject(), {
+      type: "SplitCue",
+      actor: human,
+      cueId: "c05",
+      newCueId: "c05-split",
+      splitMs: 2_000,
+      expectedItemRevision: 1,
+      expectedProjectRevision: 1,
+    });
+    expect(split.error).toBeUndefined();
+    const merged = applyCommand(split.project, {
+      type: "MergeCue",
+      actor: human,
+      cueId: "c05",
+      adjacentCueId: "c05-split",
+      expectedItemRevision: 2,
+      expectedAdjacentItemRevision: 1,
+      expectedProjectRevision: 2,
+    });
+    expect(merged.error).toBeUndefined();
+    expect(merged.project.captions.items["c05-split"]?.mergedIntoItemId).toBe("c05");
+
+    expect(previewProjectImport(exportProjectBackup(merged.project), { actor: human })).toMatchObject({
+      mode: "preview",
+      project: {
+        captions: { items: { "c05-split": { mergedIntoItemId: "c05" } } },
+      },
+    });
+  });
+
+  it("retains repeated historical warning waivers while reconciling the current waiver projection", () => {
+    const validated = applyCommand(fixtureProject(), {
+      type: "ValidateProject",
+      actor: { type: "System", id: "validator" },
+      expectedProjectRevision: 1,
+    }).project;
+    const warning = validated.validationRun?.warnings[0];
+    if (warning === undefined) throw new Error("Expected fixture validation warning.");
+    const first = applyCommand(validated, {
+      type: "WaiveWarning",
+      actor: human,
+      findingId: warning.findingId,
+      reason: "Reviewed in the first pass.",
+      expectedProjectRevision: validated.projectRevision,
+    });
+    expect(first.error).toBeUndefined();
+    const second = applyCommand(first.project, {
+      type: "WaiveWarning",
+      actor: human,
+      findingId: warning.findingId,
+      reason: "Reviewed again after a follow-up.",
+      expectedProjectRevision: first.project.projectRevision,
+    });
+    expect(second.error).toBeUndefined();
+    expect(second.project.courtRecord.filter((event) => event.type === "WaiveWarning")).toHaveLength(2);
+    expect(second.project.warningWaivers[warning.findingId]?.projectRevision).toBe(second.project.projectRevision);
+
+    expect(previewProjectImport(exportProjectBackup(second.project), { actor: human })).toMatchObject({ mode: "preview" });
+  });
+
+  it("accepts only the authenticated pre-history v1 ValidateProject replay shape", () => {
+    const first = applyCommand(fixtureProject(), {
+      type: "ValidateProject",
+      actor: { type: "System", id: "validator" },
+      expectedProjectRevision: 1,
+    }).project;
+    const second = applyCommand(first, {
+      type: "ValidateProject",
+      actor: { type: "System", id: "validator" },
+      expectedProjectRevision: first.projectRevision,
+    }).project;
+    expect(second.validationHistory).toHaveLength(2);
+    const { validationHistory: _history, exportHistory: _exports, ...preHistoryProject } = second;
+    void _history;
+    void _exports;
+
+    const preview = previewProjectImport(exportProjectBackup(preHistoryProject as CaptionProject), { actor: human });
+    if (preview.mode !== "preview") throw new Error("Expected preview.");
+    expect(preview.project.validationHistory).toEqual([second.validationRun]);
+    expect(preview.project.courtRecord.filter((event) => event.type === "ValidateProject")).toHaveLength(2);
+
+    const firstValidationEvent = preHistoryProject.courtRecord[0];
+    if (firstValidationEvent === undefined) throw new Error("Expected first validation event.");
+    const retaggedOlderValidation = {
+      ...preHistoryProject,
+      courtRecord: [{
+        ...firstValidationEvent,
+        type: "SelectItem",
+        actor: human,
+        itemId: "c05",
+      }, ...preHistoryProject.courtRecord.slice(1)],
+    };
+    expect(() => previewProjectImport(exportProjectBackup(retaggedOlderValidation as unknown as CaptionProject), { actor: human })).toThrow(/selection|court|validation/i);
+
+    const currentWithTruncatedHistory = {
+      ...second,
+      validationHistory: [second.validationRun!],
+    };
+    expect(() => previewProjectImport(exportProjectBackup(currentWithTruncatedHistory), { actor: human })).toThrow(/validation history|court record/i);
+  });
+
   it("backfills old validation history and keeps persistent project findings unresolved across revisions", () => {
     const validated = applyCommand(fixtureProject(), {
       type: "ValidateProject",

@@ -41,6 +41,12 @@ export class CaptionProjectAggregateError extends Error {
  */
 export interface CaptionProjectAggregateValidationOptions {
   readonly allowLegacyCourtRecord?: boolean;
+  /**
+   * Set only after a current-v1 manifest has authenticated an original
+   * aggregate that predates durable `validationHistory`. The compatibility
+   * marker must be captured before the missing field is backfilled.
+   */
+  readonly allowPreHistoryValidationReplay?: boolean;
 }
 
 const clone = <Value>(value: Value): Value => structuredClone(value);
@@ -60,6 +66,20 @@ const record = (value: unknown): Readonly<Record<string, unknown>> | undefined =
     : undefined;
 
 /**
+ * b8/current-v1 backups persisted only their latest `validationRun`. Import
+ * callers use this *before* backfill, after authenticating the v1 manifest,
+ * to distinguish that exact wire shape from a current aggregate with an
+ * intentionally truncated history.
+ */
+export const hasPreHistoryValidationReplay = (value: unknown): boolean => {
+  const aggregate = record(value);
+  return aggregate !== undefined
+    && !Object.hasOwn(aggregate, "validationHistory")
+    && aggregate.validationRun !== undefined
+    && aggregate.validationRun !== null;
+};
+
+/**
  * v1 exports made before durable history fields existed are explicitly
  * normalized here. A present-but-empty history is not rewritten: only an
  * absent field represents that older wire shape.
@@ -70,7 +90,7 @@ const normalizeLegacyHistories = (value: unknown): unknown => {
   const validationRun = aggregate.validationRun;
   return {
     ...aggregate,
-    ...(aggregate.validationHistory === undefined
+    ...(!Object.hasOwn(aggregate, "validationHistory")
       ? { validationHistory: validationRun === undefined || validationRun === null ? [] : [validationRun] }
       : {}),
     ...(aggregate.exportHistory === undefined ? { exportHistory: [] } : {}),
@@ -422,7 +442,6 @@ const assertCurrentRevisionEvent = (
     const rightCandidates = Object.values(project.captions.items).filter((candidate) => {
       const initial = candidate.revisions[0]!;
       return candidate.itemId !== item.itemId
-        && candidate.mergedIntoItemId === null
         && !claimed.has(revisionClaim(candidate, initial.itemRevision))
         && initial.itemRevision === 1
         && initial.parentItemRevision === null
@@ -489,16 +508,40 @@ const assertLegacyCourtRecord = (project: CaptionProject, events: readonly Domai
   }
 };
 
-const assertSideHistoryEvents = (project: CaptionProject, events: readonly DomainEvent[]): void => {
+const assertSideHistoryEvents = (
+  project: CaptionProject,
+  events: readonly DomainEvent[],
+  options: CaptionProjectAggregateValidationOptions,
+): void => {
   const eventsOf = (type: string) => events.filter((event) => event.type === type);
 
   const validations = eventsOf("ValidateProject");
-  requireAggregate(validations.length === project.validationHistory.length, "Validation history and Court Record ValidateProject events must agree.");
-  for (const run of project.validationHistory) {
+  if (options.allowPreHistoryValidationReplay === true) {
     requireAggregate(
-      validations.filter((event) => event.projectRevision === run.projectRevision).length === 1,
+      validations.length >= project.validationHistory.length,
+      "Pre-history validation replay cannot omit the retained durable validation run.",
+    );
+  } else {
+    requireAggregate(validations.length === project.validationHistory.length, "Validation history and Court Record ValidateProject events must agree.");
+  }
+  const retainedValidationEventIds = new Set<string>();
+  for (const run of project.validationHistory) {
+    const matching = validations.filter((event) => event.projectRevision === run.projectRevision);
+    requireAggregate(
+      matching.length === 1,
       "Each durable validation run requires one matching Court Record ValidateProject event.",
     );
+    retainedValidationEventIds.add(matching[0]!.eventId);
+  }
+  if (options.allowPreHistoryValidationReplay === true) {
+    const oldestRetainedRevision = project.validationHistory[0]?.projectRevision;
+    for (const event of validations) {
+      if (retainedValidationEventIds.has(event.eventId)) continue;
+      requireAggregate(
+        oldestRetainedRevision !== undefined && event.projectRevision < oldestRetainedRevision,
+        "Pre-history validation replay may contain only older unmatched System ValidateProject events.",
+      );
+    }
   }
 
   const exports = eventsOf("RecordExportRoundTrip");
@@ -512,11 +555,26 @@ const assertSideHistoryEvents = (project: CaptionProject, events: readonly Domai
 
   const waivers = Object.values(project.warningWaivers);
   const waiverEvents = eventsOf("WaiveWarning");
-  requireAggregate(waiverEvents.length === waivers.length, "Warning waiver history and Court Record events must agree.");
+  const currentWaiverEventIds = new Set<string>();
   for (const waiver of waivers) {
+    const matching = waiverEvents.filter((event) => event.projectRevision === waiver.projectRevision && sameActor(event.actor, waiver.actor));
     requireAggregate(
-      waiverEvents.filter((event) => event.projectRevision === waiver.projectRevision && sameActor(event.actor, waiver.actor)).length === 1,
-      "Each warning waiver requires one matching Court Record event.",
+      matching.length === 1 && !currentWaiverEventIds.has(matching[0]!.eventId),
+      "Each current warning waiver requires its latest matching Court Record event.",
+    );
+    currentWaiverEventIds.add(matching[0]!.eventId);
+  }
+  /**
+   * A finding id is intentionally not embedded in a DomainEvent. Repeated
+   * waivers therefore leave historical Human events after the map projects
+   * only the latest waiver for that finding. Each unmatched event still needs
+   * a durable earlier validation containing at least one warning.
+   */
+  for (const event of waiverEvents) {
+    if (currentWaiverEventIds.has(event.eventId)) continue;
+    requireAggregate(
+      project.validationHistory.some((run) => run.projectRevision < event.projectRevision && run.warnings.length > 0),
+      "Historical warning waiver has no durable warning validation predecessor.",
     );
   }
 
@@ -534,7 +592,11 @@ const assertSideHistoryEvents = (project: CaptionProject, events: readonly Domai
   }
 };
 
-const assertCurrentCourtRecord = (project: CaptionProject, events: readonly DomainEvent[]): void => {
+const assertCurrentCourtRecord = (
+  project: CaptionProject,
+  events: readonly DomainEvent[],
+  options: CaptionProjectAggregateValidationOptions,
+): void => {
   requireAggregate(
     events.length === project.projectRevision - 1,
     "Current v1 Court Record must contain one event for every post-creation project revision.",
@@ -542,6 +604,7 @@ const assertCurrentCourtRecord = (project: CaptionProject, events: readonly Doma
   if (events.length === 0) return;
 
   const claimed = new Set<string>();
+  let projectedSelection: { readonly kind: "CaptionCue" | "AudioDescriptionBeat" | "AudioDescriptionGap"; readonly itemId: string } | null = null;
   for (let index = 0; index < events.length; index += 1) {
     const event = events[index]!;
     requireAggregate(
@@ -556,14 +619,23 @@ const assertCurrentCourtRecord = (project: CaptionProject, events: readonly Doma
       requireAggregate(event.detail === undefined, `Court Record ${event.type} cannot carry arbitrary detail.`);
     }
 
+    let eventItem: ProjectItem | undefined;
     if (event.type === "FocusGap") {
       requireAggregate(event.itemId !== undefined && project.audioDescriptionGaps[event.itemId] !== undefined, "Court Record FocusGap references an unknown gap.");
+      projectedSelection = { kind: "AudioDescriptionGap", itemId: event.itemId };
     } else if (itemCourtEventTypes.has(event.type)) {
-      itemForCourtEvent(project, event);
+      eventItem = itemForCourtEvent(project, event);
     } else if (["ValidateProject", "RecordExportRoundTrip", "WaiveWarning", "CertifyProject", "ApplyProfile", "RelinkMedia", "StartGenerationRun", "ReleaseGenerationRun"].includes(event.type)) {
       requireAggregate(event.itemId === undefined, `Court Record ${event.type} cannot target an item.`);
     }
     assertCurrentRevisionEvent(project, event, claimed);
+    if (eventItem !== undefined && (
+      event.type === "SelectItem"
+      || event.type === "FocusItem"
+      || revisionChangingCourtEventTypes.has(event.type)
+    )) {
+      projectedSelection = { kind: eventItem.kind, itemId: eventItem.itemId };
+    }
   }
 
   for (const item of allItems(project)) {
@@ -581,24 +653,18 @@ const assertCurrentCourtRecord = (project: CaptionProject, events: readonly Doma
     }
   }
 
-  assertSideHistoryEvents(project, events);
-  const last = events.at(-1)!;
-  if (last.type === "FocusGap") {
+  assertSideHistoryEvents(project, events, options);
+  if (projectedSelection === null) {
     requireAggregate(
-      last.itemId !== undefined
-        && project.selectedItem !== null
-        && project.selectedItem.kind === "AudioDescriptionGap"
-        && project.selectedItem.itemId === last.itemId,
-      "Final Court Record gap focus does not match the current selection.",
+      project.selectedItem === null,
+      "Court Record selection history does not match the current project selection.",
     );
-  } else if (last.type === "SelectItem" || last.type === "FocusItem" || revisionChangingCourtEventTypes.has(last.type)) {
-    const item = itemForCourtEvent(project, last);
+  } else {
     requireAggregate(
       project.selectedItem !== null
-        && project.selectedItem.kind === item.kind
-        && project.selectedItem.itemId === item.itemId
-        && project.selectedItem.itemRevision === item.current.itemRevision,
-      "Final Court Record item transition does not match the current selection.",
+        && project.selectedItem.kind === projectedSelection.kind
+        && project.selectedItem.itemId === projectedSelection.itemId,
+      "Court Record selection history does not match the current project selection.",
     );
   }
 };
@@ -615,7 +681,7 @@ const assertCourtRecord = (
     return;
   }
   /** Current-v1 count is checked before an empty record can be accepted. */
-  assertCurrentCourtRecord(project, events);
+  assertCurrentCourtRecord(project, events, options);
 };
 
 const normalizedMedia = <Media extends { readonly sha256: string }>(media: Media): Media => ({

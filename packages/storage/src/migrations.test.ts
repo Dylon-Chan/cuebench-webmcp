@@ -170,7 +170,7 @@ describe("project schema migrations", () => {
   });
 
   it("backfills validation history when reading a pre-history v1 backup", () => {
-    const validated = applyCommand(createProject({
+    const firstValidation = applyCommand(createProject({
       projectId: "history-backfill-preview",
       title: "History backfill preview",
       media: { sourceId: "source-1", sha256: "a".repeat(64), durationMs: 60_000, relinkState: "Linked" },
@@ -179,6 +179,12 @@ describe("project schema migrations", () => {
       actor: { type: "System", id: "validator" },
       expectedProjectRevision: 1,
     }).project;
+    const validated = applyCommand(firstValidation, {
+      type: "ValidateProject",
+      actor: { type: "System", id: "validator" },
+      expectedProjectRevision: firstValidation.projectRevision,
+    }).project;
+    expect(validated.validationHistory).toHaveLength(2);
     const { validationHistory: _history, exportHistory: _exports, ...preHistoryProject } = validated;
     void _history;
     void _exports;
@@ -186,6 +192,7 @@ describe("project schema migrations", () => {
 
     if (descriptor.mode !== "preview") throw new Error("Expected preview descriptor.");
     expect(descriptor.project.validationHistory).toEqual([validated.validationRun]);
+    expect(descriptor.project.courtRecord.filter((event) => event.type === "ValidateProject")).toHaveLength(2);
   });
 
   it("rejects an unmanifested or tampered v1 envelope instead of treating it as legacy data", () => {

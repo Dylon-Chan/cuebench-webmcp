@@ -1,6 +1,7 @@
 import {
   classifyProjectBackupEnvelope,
   createProject,
+  hasPreHistoryValidationReplay,
   ProjectBackupManifestError,
   validateCaptionProjectAggregate,
   type CaptionProject,
@@ -252,6 +253,9 @@ export const describeImportedProject = (value: unknown): ImportedProjectDescript
     const checked = validateCaptionProject(validateCaptionProjectAggregate(project, {
       /** Only an already-parsed v0 envelope may retain its incomplete Court Record. */
       allowLegacyCourtRecord: migratedFrom === 0,
+      /** Captured from the authenticated source before storage backfills history. */
+      allowPreHistoryValidationReplay: envelope.kind === "current"
+        && hasPreHistoryValidationReplay(envelope.backup.project),
     }));
     return {
       mode: "preview",

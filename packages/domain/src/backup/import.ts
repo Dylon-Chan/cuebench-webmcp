@@ -2,7 +2,11 @@ import type { Actor } from "@cuebench/contracts";
 import { domainError, type DomainError } from "../errors";
 import type { CaptionProject } from "../model";
 import { canonicalHash } from "../quality/hash";
-import { CaptionProjectAggregateError, validateCaptionProjectAggregate } from "./aggregate";
+import {
+  CaptionProjectAggregateError,
+  hasPreHistoryValidationReplay,
+  validateCaptionProjectAggregate,
+} from "./aggregate";
 import {
   classifyProjectBackupEnvelope,
   exportProjectBackup,
@@ -158,7 +162,10 @@ const basicPreview = (value: unknown): ImportMigrationPreview => {
   if (envelope.kind === "legacy") {
     throw new BackupImportError("BACKUP_SCHEMA_UNSUPPORTED", "A legacy project backup requires the explicit storage migration preview.");
   }
-  const project = validateCaptionProjectAggregate(envelope.backup.project);
+  const project = validateCaptionProjectAggregate(envelope.backup.project, {
+    /** The manifest was verified by `classifyProjectBackupEnvelope` above. */
+    allowPreHistoryValidationReplay: hasPreHistoryValidationReplay(envelope.backup.project),
+  });
   if (!isRecord(project.media) || typeof project.media.sha256 !== "string" || !isSha256(project.media.sha256)) {
     throw new BackupImportError("INVALID_ARGUMENT", "Backup project media must record a SHA-256 hash for Media Relink.");
   }
@@ -286,6 +293,9 @@ export const previewProjectImport = (
   /** A current v1 input cannot claim legacy Court Record leniency through a custom adapter. */
   const aggregateOptions = {
     allowLegacyCourtRecord: envelope.kind === "legacy" && migrated.migratedFrom === 0,
+    /** Capture the authenticated original shape before migration/backfill changes it. */
+    allowPreHistoryValidationReplay: envelope.kind === "current"
+      && hasPreHistoryValidationReplay(envelope.backup.project),
   };
   try {
     /** A custom storage migration is never a substitute for the public aggregate proof. */
