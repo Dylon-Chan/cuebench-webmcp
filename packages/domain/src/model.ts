@@ -100,6 +100,19 @@ export interface WarningWaiver {
   readonly projectRevision: number;
 }
 
+/**
+ * A durable binding between a piece of review evidence and the exact media
+ * and optional item revision it supports.  Evidence is intentionally small:
+ * its content can live elsewhere while this provenance remains auditable.
+ */
+export interface EvidenceProvenance {
+  readonly evidenceId: string;
+  readonly projectId: string;
+  readonly mediaSha256: string;
+  readonly itemId: ItemId | null;
+  readonly itemRevision: number | null;
+}
+
 export interface CertificationItemRevision {
   readonly kind: "CaptionCue" | "AudioDescriptionBeat";
   readonly itemId: ItemId;
@@ -112,11 +125,13 @@ export interface CertificationItemRevision {
  */
 export interface ProjectCertification {
   readonly certificationId: string;
-  readonly snapshotHash: string;
+  /** SHA-256 hash of this immutable human certification record. */
+  readonly certificationSnapshotHash: string;
   readonly readinessHash: string;
   readonly certifiedAtMs: number;
   readonly actor: Actor;
   readonly media: MediaSourceSnapshot;
+  readonly evidence: readonly EvidenceProvenance[];
   readonly itemRevisions: readonly CertificationItemRevision[];
   readonly qualityProfile: QualityProfile;
   readonly validationRun: ValidationRun;
@@ -144,6 +159,7 @@ export interface CaptionProject {
   readonly projectRevision: number;
   readonly title: string;
   readonly media: MediaSourceSnapshot;
+  readonly evidence: readonly EvidenceProvenance[];
   readonly captions: CaptionTrack;
   readonly audioDescriptions: AudioDescriptionTrack;
   readonly audioDescriptionGaps: Readonly<Record<string, AudioDescriptionGap>>;
@@ -170,6 +186,7 @@ export interface CreateProjectInput {
     "itemRevision" | "parentItemRevision"
   >[];
   readonly audioDescriptionGaps?: readonly AudioDescriptionGap[];
+  readonly evidence?: readonly EvidenceProvenance[];
 }
 
 const initialValidation = (): ValidationSnapshot => ({
@@ -194,9 +211,11 @@ const assertInitialProjectInvariant = (input: CreateProjectInput) => {
     throw new RangeError("Media duration must be a non-negative integer.");
   }
   const knownIds = new Set<string>();
+  const itemIds = new Set<string>();
   for (const item of [...(input.captions ?? []), ...(input.audioDescriptions ?? [])]) {
     if (knownIds.has(item.itemId)) throw new RangeError("Project item ids must be unique.");
     knownIds.add(item.itemId);
+    itemIds.add(item.itemId);
     if (!hasValidInitialTiming(input.media.durationMs, item.startMs, item.endMs)) {
       throw new RangeError("Project item timing must be integer milliseconds within media bounds.");
     }
@@ -212,6 +231,33 @@ const assertInitialProjectInvariant = (input: CreateProjectInput) => {
       || gap.gapRevision <= 0
       || !hasValidInitialTiming(input.media.durationMs, gap.startMs, gap.endMs)
     ) throw new RangeError("Audio-description gaps must have valid integer timing and revision.");
+  }
+  const evidenceIds = new Set<string>();
+  for (const evidence of input.evidence ?? []) {
+    if (!evidence.evidenceId.trim() || evidenceIds.has(evidence.evidenceId)) {
+      throw new RangeError("Evidence ids must be unique and non-empty.");
+    }
+    evidenceIds.add(evidence.evidenceId);
+    if (evidence.projectId !== input.projectId) {
+      throw new RangeError("Evidence must bind to its project.");
+    }
+    if (!/^[0-9a-f]{64}$/i.test(evidence.mediaSha256)) {
+      throw new RangeError("Evidence media hashes must be SHA-256 values.");
+    }
+    if ((evidence.itemId === null) !== (evidence.itemRevision === null)) {
+      throw new RangeError("Evidence item id and revision must be present together.");
+    }
+    if (evidence.itemId !== null) {
+      const itemRevision = evidence.itemRevision;
+      if (
+        !itemIds.has(evidence.itemId)
+        || itemRevision === null
+        || !Number.isSafeInteger(itemRevision)
+        || itemRevision <= 0
+      ) {
+        throw new RangeError("Evidence item bindings must identify a project item revision.");
+      }
+    }
   }
 };
 
@@ -274,6 +320,7 @@ export const createProject = (input: CreateProjectInput): CaptionProject => {
     projectRevision: 1,
     title: input.title,
     media: clone(input.media),
+    evidence: clone(input.evidence ?? []),
     captions: { kind: "Captions", order: captionOrder, items: captions },
     audioDescriptions: {
       kind: "AudioDescriptions",

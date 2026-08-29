@@ -4,6 +4,7 @@ import type {
   CaptionProject,
   QualityProfile,
 } from "../model";
+import { canonicalHash, tupleHash } from "./hash";
 import { resolveEducationProfileRules } from "./profile";
 
 export type FindingSeverity = "blocker" | "warning";
@@ -12,6 +13,8 @@ export type QualityFindingTarget =
   | {
       readonly type: "project";
       readonly projectId: string;
+      /** Project-wide rules bind the project revision that was evaluated. */
+      readonly projectRevision: number;
     }
   | {
       readonly type: "item";
@@ -55,6 +58,14 @@ export interface ValidationInputItem {
   readonly mergedIntoItemId?: string | null;
 }
 
+export interface ValidationInputEvidence {
+  readonly evidenceId: string;
+  readonly projectId: string;
+  readonly mediaSha256: string;
+  readonly itemId: string | null;
+  readonly itemRevision: number | null;
+}
+
 export interface ValidationInputSnapshot {
   readonly projectId: string;
   /** Retained for audit; it is deliberately excluded from the semantic input hash. */
@@ -65,6 +76,7 @@ export interface ValidationInputSnapshot {
     readonly durationMs: number;
     readonly relinkState: string;
   };
+  readonly evidence: readonly ValidationInputEvidence[];
   readonly qualityProfile: {
     readonly profileId: string;
     readonly revision: number;
@@ -102,53 +114,59 @@ export interface ValidationRun {
   readonly warningCount: number;
 }
 
-const stableSerialize = (value: unknown): string => {
-  if (value === null) return "null";
-  switch (typeof value) {
-    case "boolean":
-      return value ? "true" : "false";
-    case "bigint":
-      return `bigint:${value.toString()}`;
-    case "number":
-      return Number.isFinite(value) ? `number:${String(value)}` : `number:${String(value)}`;
-    case "string":
-      return JSON.stringify(value);
-    case "undefined":
-      return "undefined";
-    case "object": {
-      if (Array.isArray(value)) return `[${value.map(stableSerialize).join(",")}]`;
-      const object = value as Readonly<Record<string, unknown>>;
-      return `{${Object.keys(object).sort().map((key) => `${JSON.stringify(key)}:${stableSerialize(object[key])}`).join(",")}}`;
-    }
-    default:
-      return `${typeof value}:${String(value)}`;
-  }
-};
+/** A synchronous deterministic hash for equality checks and input snapshots. */
+export const stableHash = (value: unknown): string => canonicalHash("cuebench.validation-value.v1", value);
 
-/** A synchronous, runtime-independent hash for stable local snapshot identifiers. */
-export const stableHash = (value: unknown): string => {
-  const serialized = stableSerialize(value);
-  let hash = 0xcbf29ce484222325n;
-  for (let index = 0; index < serialized.length; index += 1) {
-    hash ^= BigInt(serialized.charCodeAt(index));
-    hash = BigInt.asUintN(64, hash * 0x100000001b3n);
-  }
-  return `fnv1a64:${hash.toString(16).padStart(16, "0")}`;
-};
+const compareText = (left: string, right: string): number => left < right ? -1 : left > right ? 1 : 0;
 
-const compareText = (left: string, right: string) => left < right ? -1 : left > right ? 1 : 0;
+const compareNumber = (left: number, right: number): number => left < right ? -1 : left > right ? 1 : 0;
 
-const currentCaptionItems = (project: CaptionProject): readonly CaptionCue[] =>
-  project.captions.order.flatMap((itemId) => {
+const liveCaptionItems = (project: CaptionProject): readonly CaptionCue[] =>
+  Object.values(project.captions.items)
+    .filter((item) => item.mergedIntoItemId === null)
+    .sort((left, right) => compareText(left.itemId, right.itemId));
+
+const liveAudioDescriptionItems = (project: CaptionProject): readonly AudioDescriptionBeat[] =>
+  Object.values(project.audioDescriptions.items)
+    .sort((left, right) => compareText(left.itemId, right.itemId));
+
+const temporalItems = <Item extends CaptionCue | AudioDescriptionBeat>(items: readonly Item[]): readonly Item[] =>
+  [...items].sort((left, right) => {
+    const start = compareNumber(left.current.startMs, right.current.startMs);
+    if (start !== 0) return start;
+    const end = compareNumber(left.current.endMs, right.current.endMs);
+    return end !== 0 ? end : compareText(left.itemId, right.itemId);
+  });
+
+/**
+ * Relationship checks use all live map entries, not the mutable order list.
+ * The order list still has independent structural and semantic-order checks.
+ */
+const orderedLiveCaptionItems = (project: CaptionProject): readonly CaptionCue[] => {
+  const seen = new Set<string>();
+  const ordered: CaptionCue[] = [];
+  for (const itemId of project.captions.order) {
     const item = project.captions.items[itemId];
-    return item === undefined || item.mergedIntoItemId !== null ? [] : [item];
-  });
+    if (item !== undefined && item.mergedIntoItemId === null && !seen.has(itemId)) {
+      seen.add(itemId);
+      ordered.push(item);
+    }
+  }
+  return ordered;
+};
 
-const currentAudioDescriptionItems = (project: CaptionProject): readonly AudioDescriptionBeat[] =>
-  project.audioDescriptions.order.flatMap((itemId) => {
+const orderedLiveAudioDescriptionItems = (project: CaptionProject): readonly AudioDescriptionBeat[] => {
+  const seen = new Set<string>();
+  const ordered: AudioDescriptionBeat[] = [];
+  for (const itemId of project.audioDescriptions.order) {
     const item = project.audioDescriptions.items[itemId];
-    return item === undefined ? [] : [item];
-  });
+    if (item !== undefined && !seen.has(itemId)) {
+      seen.add(itemId);
+      ordered.push(item);
+    }
+  }
+  return ordered;
+};
 
 const inputCaptionItem = (item: CaptionCue): ValidationInputItem => ({
   kind: "CaptionCue",
@@ -182,6 +200,9 @@ export const buildValidationInput = (project: CaptionProject): ValidationInputSn
     durationMs: project.media.durationMs,
     relinkState: project.media.relinkState,
   },
+  evidence: [...project.evidence]
+    .sort((left, right) => compareText(left.evidenceId, right.evidenceId))
+    .map((evidence) => ({ ...evidence })),
   qualityProfile: {
     profileId: project.qualityProfile.profileId,
     revision: project.qualityProfile.revision,
@@ -208,6 +229,7 @@ export const buildValidationInput = (project: CaptionProject): ValidationInputSn
 const semanticValidationInput = (input: ValidationInputSnapshot) => ({
   projectId: input.projectId,
   media: input.media,
+  evidence: input.evidence,
   qualityProfile: input.qualityProfile,
   captions: input.captions,
   audioDescriptions: input.audioDescriptions,
@@ -217,8 +239,8 @@ const semanticValidationInput = (input: ValidationInputSnapshot) => ({
 export const validationInputHash = (project: CaptionProject): string =>
   stableHash(semanticValidationInput(buildValidationInput(project)));
 
-const isFiniteInteger = (value: number) => Number.isSafeInteger(value);
-const hasBounds = (project: CaptionProject, startMs: number, endMs: number) =>
+const isFiniteInteger = (value: number): boolean => Number.isSafeInteger(value);
+const hasBounds = (project: CaptionProject, startMs: number, endMs: number): boolean =>
   isFiniteInteger(startMs)
   && isFiniteInteger(endMs)
   && startMs >= 0
@@ -249,31 +271,54 @@ const pairTarget = (
   },
 });
 
-const targetRevisionKey = (target: QualityFindingTarget): string => {
-  if (target.type === "project") return `project:${target.projectId}`;
-  if (target.type === "item") return `${target.kind}:${target.itemId}@${target.itemRevision}`;
-  const part = (item: {
-    readonly kind: "CaptionCue" | "AudioDescriptionBeat";
-    readonly itemId: string;
-    readonly itemRevision: number;
-  }) => `${item.kind}:${item.itemId}@${item.itemRevision}`;
-  return `${part(target.first)}|${part(target.second)}`;
+const targetParts = (target: QualityFindingTarget): readonly string[] => {
+  if (target.type === "project") {
+    return ["target", "project", target.projectId, String(target.projectRevision)];
+  }
+  if (target.type === "item") {
+    return ["target", "item", target.kind, target.itemId, String(target.itemRevision)];
+  }
+  return [
+    "target",
+    "pair",
+    "first",
+    target.first.kind,
+    target.first.itemId,
+    String(target.first.itemRevision),
+    "second",
+    target.second.kind,
+    target.second.itemId,
+    String(target.second.itemRevision),
+  ];
 };
 
+/**
+ * Finding IDs bind rule, profile revision, and target revision using a
+ * length-prefixed tuple before SHA-256. Delimiter-like item ids cannot alias
+ * another pair or target.
+ */
 export const findingIdFor = (
   ruleId: string,
   profile: Pick<QualityProfile, "profileId" | "revision">,
   target: QualityFindingTarget,
-): string => `${ruleId}:${profile.profileId}@${profile.revision}:${targetRevisionKey(target)}`;
+): string => tupleHash("cuebench.finding.v1", [
+  "rule",
+  ruleId,
+  "profile",
+  profile.profileId,
+  "profileRevision",
+  String(profile.revision),
+  ...targetParts(target),
+]);
 
-const normalizedText = (text: string) => text.replace(/\s+/g, " ").trim().toLowerCase();
-const textLength = (text: string) => [...text].length;
-const lineLength = (line: string) => [...line].length;
+const normalizedText = (text: string): string => text.replace(/\s+/g, " ").trim().toLowerCase();
+const textLength = (text: string): number => [...text].length;
+const lineLength = (line: string): number => [...line].length;
 
 const isOverlapping = (
   first: { readonly startMs: number; readonly endMs: number },
   second: { readonly startMs: number; readonly endMs: number },
-) => first.startMs < second.endMs && second.startMs < first.endMs;
+): boolean => first.startMs < second.endMs && second.startMs < first.endMs;
 
 export const validateProject = (project: CaptionProject): ValidationRun => {
   const findings: QualityFinding[] = [];
@@ -287,19 +332,18 @@ export const validateProject = (project: CaptionProject): ValidationRun => {
     const findingId = findingIdFor(ruleId, project.qualityProfile, target);
     if (findingIds.has(findingId)) return;
     findingIds.add(findingId);
-    findings.push({
-      id: findingId,
-      findingId,
-      ruleId,
-      severity,
-      message,
-      target,
-    });
+    findings.push({ id: findingId, findingId, ruleId, severity, message, target });
   };
-  const projectTarget: QualityFindingTarget = { type: "project", projectId: project.projectId };
+  const projectTarget: QualityFindingTarget = {
+    type: "project",
+    projectId: project.projectId,
+    projectRevision: project.projectRevision,
+  };
   const rules = resolveEducationProfileRules(project.qualityProfile.rules);
-  const captionItems = currentCaptionItems(project);
-  const audioDescriptionItems = currentAudioDescriptionItems(project);
+  const captionItems = liveCaptionItems(project);
+  const audioDescriptionItems = liveAudioDescriptionItems(project);
+  const temporalCaptionItems = temporalItems(captionItems);
+  const temporalAudioDescriptionItems = temporalItems(audioDescriptionItems);
 
   if (
     project.media.relinkState !== "Linked"
@@ -308,25 +352,68 @@ export const validateProject = (project: CaptionProject): ValidationRun => {
     || !/^[0-9a-f]{64}$/i.test(project.media.sha256)
   ) add("evidence.stale", "blocker", "Current media evidence is unavailable or no longer linked.", projectTarget);
 
+  const currentItemsById = new Map<string, CaptionCue | AudioDescriptionBeat>(
+    currentProjectItems(project).map((item) => [item.itemId, item]),
+  );
+  for (const evidence of project.evidence) {
+    const boundItem = evidence.itemId === null ? undefined : currentItemsById.get(evidence.itemId);
+    const target = boundItem === undefined ? projectTarget : itemTarget(boundItem);
+    const stale = evidence.projectId !== project.projectId
+      || evidence.mediaSha256 !== project.media.sha256
+      || (evidence.itemId === null) !== (evidence.itemRevision === null)
+      || (evidence.itemId !== null && (
+        boundItem === undefined || boundItem.current.itemRevision !== evidence.itemRevision
+      ));
+    if (stale) {
+      add("evidence.stale", "blocker", "Evidence provenance no longer matches the current project, media, or item revision.", target);
+    }
+  }
+
   const checkTrackStructure = (
     kind: "caption" | "audio-description",
     order: readonly string[],
-    ids: readonly string[],
+    resolve: (itemId: string) => CaptionCue | AudioDescriptionBeat | undefined,
+    isLive: (item: CaptionCue | AudioDescriptionBeat) => boolean,
+    liveItems: readonly (CaptionCue | AudioDescriptionBeat)[],
   ) => {
-    const seen = new Set<string>();
+    const seenLiveIds = new Set<string>();
     for (const itemId of order) {
-      if (seen.has(itemId) || !ids.includes(itemId)) {
+      const item = resolve(itemId);
+      if (item === undefined) {
         add(`${kind}.ordering`, "blocker", "Track order contains a duplicate or unresolved item.", projectTarget);
-        break;
+        add(`${kind}.order-missing-item`, "blocker", "Track order references an item absent from its item map.", projectTarget);
+      } else if (!isLive(item)) {
+        add(`${kind}.ordering`, "blocker", "Track order contains a duplicate or unresolved item.", projectTarget);
+        add(`${kind}.order-nonlive-item`, "blocker", "Track order references an item that is no longer live.", projectTarget);
+      } else if (seenLiveIds.has(itemId)) {
+        add(`${kind}.ordering`, "blocker", "Track order contains a duplicate or unresolved item.", projectTarget);
+        add(`${kind}.order-duplicate`, "blocker", "Track order references the same live item more than once.", projectTarget);
+      } else {
+        seenLiveIds.add(itemId);
       }
-      seen.add(itemId);
     }
-    if (ids.some((itemId) => !seen.has(itemId))) {
-      add(`${kind}.ordering`, "blocker", "Track contains a live item that is absent from its order.", projectTarget);
+    for (const item of liveItems) {
+      if (!seenLiveIds.has(item.itemId)) {
+        add(`${kind}.ordering`, "blocker", "Track contains a live item that is absent from its order.", projectTarget);
+        add(`${kind}.order-omitted-item`, "blocker", "A live item is absent from its track order.", projectTarget);
+        add(`${kind}.map-extra-item`, "blocker", "The item map contains a live item not represented by track order.", projectTarget);
+      }
     }
   };
-  checkTrackStructure("caption", project.captions.order, captionItems.map((item) => item.itemId));
-  checkTrackStructure("audio-description", project.audioDescriptions.order, audioDescriptionItems.map((item) => item.itemId));
+  checkTrackStructure(
+    "caption",
+    project.captions.order,
+    (itemId) => project.captions.items[itemId],
+    (item) => item.kind !== "CaptionCue" || item.mergedIntoItemId === null,
+    captionItems,
+  );
+  checkTrackStructure(
+    "audio-description",
+    project.audioDescriptions.order,
+    (itemId) => project.audioDescriptions.items[itemId],
+    () => true,
+    audioDescriptionItems,
+  );
 
   const seenCaptionText = new Map<string, CaptionCue>();
   for (const cue of captionItems) {
@@ -366,17 +453,21 @@ export const validateProject = (project: CaptionProject): ValidationRun => {
     }
   }
 
-  for (let index = 1; index < captionItems.length; index += 1) {
-    const previous = captionItems[index - 1]!;
-    const current = captionItems[index]!;
+  const orderedCaptionItems = orderedLiveCaptionItems(project);
+  for (let index = 1; index < orderedCaptionItems.length; index += 1) {
+    const previous = orderedCaptionItems[index - 1]!;
+    const current = orderedCaptionItems[index]!;
+    if (hasBounds(project, previous.current.startMs, previous.current.endMs)
+      && hasBounds(project, current.current.startMs, current.current.endMs)
+      && current.current.startMs < previous.current.startMs) {
+      add("caption.ordering", "blocker", "Caption order must follow ascending start times.", pairTarget(previous, current));
+    }
+  }
+  for (let index = 1; index < temporalCaptionItems.length; index += 1) {
+    const previous = temporalCaptionItems[index - 1]!;
+    const current = temporalCaptionItems[index]!;
     if (!hasBounds(project, previous.current.startMs, previous.current.endMs) || !hasBounds(project, current.current.startMs, current.current.endMs)) continue;
     const target = pairTarget(previous, current);
-    if (current.current.startMs < previous.current.startMs) {
-      add("caption.ordering", "blocker", "Caption order must follow ascending start times.", target);
-    }
-    if (isOverlapping(previous.current, current.current)) {
-      add("caption.no-overlap", "blocker", "Caption cues may not overlap.", target);
-    }
     const gapMs = current.current.startMs - previous.current.endMs;
     if (gapMs > rules.caption.maxGapMs) {
       add("caption.gap", "warning", "Caption gap exceeds the selected profile limit.", target);
@@ -387,6 +478,18 @@ export const validateProject = (project: CaptionProject): ValidationRun => {
       && previous.current.speaker !== current.current.speaker
       && gapMs < rules.caption.minSpeakerTransitionGapMs
     ) add("caption.speaker-transition", "warning", "Speaker transition does not meet the selected profile spacing.", target);
+  }
+  if (rules.caption.overlapPolicy === "block") {
+    for (let firstIndex = 0; firstIndex < temporalCaptionItems.length; firstIndex += 1) {
+      const first = temporalCaptionItems[firstIndex]!;
+      if (!hasBounds(project, first.current.startMs, first.current.endMs)) continue;
+      for (let secondIndex = firstIndex + 1; secondIndex < temporalCaptionItems.length; secondIndex += 1) {
+        const second = temporalCaptionItems[secondIndex]!;
+        if (hasBounds(project, second.current.startMs, second.current.endMs) && isOverlapping(first.current, second.current)) {
+          add("caption.no-overlap", "blocker", "Caption cues may not overlap under the selected profile.", pairTarget(first, second));
+        }
+      }
+    }
   }
 
   const seenAudioDescriptionText = new Map<string, AudioDescriptionBeat>();
@@ -416,28 +519,42 @@ export const validateProject = (project: CaptionProject): ValidationRun => {
     }
   }
 
-  for (let index = 1; index < audioDescriptionItems.length; index += 1) {
-    const previous = audioDescriptionItems[index - 1]!;
-    const current = audioDescriptionItems[index]!;
+  const orderedAudioDescriptionItems = orderedLiveAudioDescriptionItems(project);
+  for (let index = 1; index < orderedAudioDescriptionItems.length; index += 1) {
+    const previous = orderedAudioDescriptionItems[index - 1]!;
+    const current = orderedAudioDescriptionItems[index]!;
+    if (hasBounds(project, previous.current.startMs, previous.current.endMs)
+      && hasBounds(project, current.current.startMs, current.current.endMs)
+      && current.current.startMs < previous.current.startMs) {
+      add("audio-description.ordering", "blocker", "Audio-description order must follow ascending start times.", pairTarget(previous, current));
+    }
+  }
+  for (let index = 1; index < temporalAudioDescriptionItems.length; index += 1) {
+    const previous = temporalAudioDescriptionItems[index - 1]!;
+    const current = temporalAudioDescriptionItems[index]!;
     if (!hasBounds(project, previous.current.startMs, previous.current.endMs) || !hasBounds(project, current.current.startMs, current.current.endMs)) continue;
-    const target = pairTarget(previous, current);
-    if (current.current.startMs < previous.current.startMs) {
-      add("audio-description.ordering", "blocker", "Audio-description order must follow ascending start times.", target);
-    }
-    if (isOverlapping(previous.current, current.current)) {
-      add("audio-description.no-overlap", "blocker", "Audio-description beats may not overlap.", target);
-    }
     if (current.current.startMs - previous.current.endMs > rules.audioDescription.maxGapMs) {
-      add("audio-description.gap", "warning", "Audio-description gap exceeds the selected profile limit.", target);
+      add("audio-description.gap", "warning", "Audio-description gap exceeds the selected profile limit.", pairTarget(previous, current));
+    }
+  }
+  if (rules.audioDescription.overlapPolicy === "block") {
+    for (let firstIndex = 0; firstIndex < temporalAudioDescriptionItems.length; firstIndex += 1) {
+      const first = temporalAudioDescriptionItems[firstIndex]!;
+      if (!hasBounds(project, first.current.startMs, first.current.endMs)) continue;
+      for (let secondIndex = firstIndex + 1; secondIndex < temporalAudioDescriptionItems.length; secondIndex += 1) {
+        const second = temporalAudioDescriptionItems[secondIndex]!;
+        if (hasBounds(project, second.current.startMs, second.current.endMs) && isOverlapping(first.current, second.current)) {
+          add("audio-description.no-overlap", "blocker", "Audio-description beats may not overlap under the selected profile.", pairTarget(first, second));
+        }
+      }
     }
   }
 
   if (rules.audioDescription.forbidDialogueCollision) {
-    for (const beat of audioDescriptionItems) {
+    for (const beat of temporalAudioDescriptionItems) {
       if (!hasBounds(project, beat.current.startMs, beat.current.endMs)) continue;
-      for (const cue of captionItems) {
-        if (!hasBounds(project, cue.current.startMs, cue.current.endMs)) continue;
-        if (isOverlapping(beat.current, cue.current)) {
+      for (const cue of temporalCaptionItems) {
+        if (hasBounds(project, cue.current.startMs, cue.current.endMs) && isOverlapping(beat.current, cue.current)) {
           add("audio-description.dialogue-collision", "warning", "Audio description overlaps foreground dialogue.", pairTarget(cue, beat));
         }
       }
@@ -469,9 +586,10 @@ export const currentValidationRun = (project: CaptionProject): ValidationRun | u
   return run.inputHash === validationInputHash(project) ? run : undefined;
 };
 
+/** Every live map entry contributes to validation, readiness, and certification. */
 export const currentProjectItems = (
   project: CaptionProject,
 ): readonly (CaptionCue | AudioDescriptionBeat)[] => [
-  ...currentCaptionItems(project),
-  ...currentAudioDescriptionItems(project),
+  ...liveCaptionItems(project),
+  ...liveAudioDescriptionItems(project),
 ];

@@ -107,10 +107,25 @@ const acceptedTask2CommandCases: readonly AcceptedCommandCase[] = [
   },
   {
     type: "WaiveWarning",
-    apply: () => ({
-      project: fixtureProject(),
-      command: { type: "WaiveWarning", actor: { type: "Human", id: "teacher" }, findingId: "w1", reason: "Intentional pacing.", expectedProjectRevision: 1 },
-    }),
+    apply: () => {
+      const project = applyCommand(fixtureProject(), {
+        type: "ValidateProject",
+        actor: { type: "System", id: "validator" },
+        expectedProjectRevision: 1,
+      }).project;
+      const warning = project.validationRun?.warnings[0];
+      if (warning === undefined) throw new Error("Expected fixture validation warning.");
+      return {
+        project,
+        command: {
+          type: "WaiveWarning",
+          actor: { type: "Human", id: "teacher" },
+          findingId: warning.findingId,
+          reason: "Intentional pacing.",
+          expectedProjectRevision: project.projectRevision,
+        },
+      };
+    },
   },
   {
     type: "ApplyProfile",

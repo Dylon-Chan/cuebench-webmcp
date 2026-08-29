@@ -3,6 +3,7 @@ import type {
   ProjectCertification,
   WarningWaiver,
 } from "../model";
+import { canonicalHash, tupleHash } from "./hash";
 import {
   buildValidationInput,
   currentProjectItems,
@@ -14,13 +15,14 @@ import {
   type ValidationRun,
 } from "./validate";
 
-const compareText = (left: string, right: string) => left < right ? -1 : left > right ? 1 : 0;
+const compareText = (left: string, right: string): number => left < right ? -1 : left > right ? 1 : 0;
 
 export type ValidationStaleCauseCode =
   | "NOT_RUN"
   | "STATUS_STALE"
   | "PROFILE_CHANGED"
   | "MEDIA_CHANGED"
+  | "EVIDENCE_CHANGED"
   | "ITEMS_CHANGED"
   | "TRACK_STRUCTURE_CHANGED"
   | "INPUT_CHANGED";
@@ -38,10 +40,8 @@ export interface ItemStateCounts {
 }
 
 export interface CertificationReadiness {
-  /** The exact hash a human certification command must echo back. */
+  /** The deterministic state hash a human certification command must echo back. */
   readonly readinessHash: string;
-  /** Alias retained for callers that present this as the certification snapshot hash. */
-  readonly snapshotHash: string;
   readonly canCertify: boolean;
   readonly currentBlockers: readonly QualityFinding[];
   readonly unwaivedWarnings: readonly QualityFinding[];
@@ -52,7 +52,10 @@ export interface CertificationReadiness {
 
 const clone = <Value>(value: Value): Value => structuredClone(value);
 
-const sameValue = (left: unknown, right: unknown) => stableHash(left) === stableHash(right);
+const sameValue = (left: unknown, right: unknown): boolean => stableHash(left) === stableHash(right);
+
+const canonicalEvidence = (project: CaptionProject) =>
+  [...project.evidence].sort((left, right) => compareText(left.evidenceId, right.evidenceId));
 
 const validationStaleCauses = (project: CaptionProject): readonly ValidationStaleCause[] => {
   const run = project.validationRun;
@@ -72,9 +75,13 @@ const validationStaleCauses = (project: CaptionProject): readonly ValidationStal
   if (!sameValue(run.input.media, currentInput.media)) {
     causes.push({ code: "MEDIA_CHANGED", message: "The linked media changed after validation." });
   }
-  if (!sameValue(run.input.captions.items, currentInput.captions.items) || !sameValue(run.input.audioDescriptions.items, currentInput.audioDescriptions.items)) {
-    causes.push({ code: "ITEMS_CHANGED", message: "Current item revisions changed after validation." });
+  if (!sameValue(run.input.evidence, currentInput.evidence)) {
+    causes.push({ code: "EVIDENCE_CHANGED", message: "Evidence provenance changed after validation." });
   }
+  if (
+    !sameValue(run.input.captions.items, currentInput.captions.items)
+    || !sameValue(run.input.audioDescriptions.items, currentInput.audioDescriptions.items)
+  ) causes.push({ code: "ITEMS_CHANGED", message: "Current item revisions changed after validation." });
   if (
     !sameValue(run.input.captions.order, currentInput.captions.order)
     || !sameValue(run.input.audioDescriptions.order, currentInput.audioDescriptions.order)
@@ -132,8 +139,9 @@ export const prepareCertificationReview = (project: CaptionProject): Certificati
   const unwaivedWarnings = currentWarnings.filter((warning) => !waivedFindingIds.has(warning.findingId));
   const staleValidationCauses = validationStaleCauses(project);
   const itemStateCounts = countItemStates(project);
-  const snapshotContent = {
+  const readinessContent = {
     media: project.media,
+    evidence: canonicalEvidence(project),
     itemRevisions: currentProjectItems(project).map((item) => ({
       kind: item.kind,
       itemId: item.itemId,
@@ -147,10 +155,9 @@ export const prepareCertificationReview = (project: CaptionProject): Certificati
     staleValidationCauses: staleValidationCauses.map((cause) => cause.code),
     itemStateCounts,
   };
-  const snapshotHash = stableHash(snapshotContent);
+  const readinessHash = canonicalHash("cuebench.certification-readiness.v1", readinessContent);
   return {
-    readinessHash: snapshotHash,
-    snapshotHash,
+    readinessHash,
     canCertify: currentBlockers.length === 0
       && unwaivedWarnings.length === 0
       && staleValidationCauses.length === 0
@@ -174,14 +181,33 @@ export const createCertificationSnapshot = (
 ): ProjectCertification => {
   const validationRun = currentValidationRun(project);
   if (validationRun === undefined) throw new Error("Certification requires a current validation run.");
+  if (input.actor.type !== "Human") throw new Error("Certification requires a Human actor.");
+  if (!Number.isSafeInteger(input.certifiedAtMs) || input.certifiedAtMs <= 0) {
+    throw new RangeError("Certification requires a positive integer timestamp.");
+  }
+  const actor = clone(input.actor);
+  const evidence = canonicalEvidence(project);
   const warnings = validationRun.findings.filter((finding) => finding.severity === "warning");
+  const certificationSnapshotHash = tupleHash("cuebench.certification-snapshot.v1", [
+    "readinessHash",
+    readiness.readinessHash,
+    "certificationId",
+    input.certificationId,
+    "actorType",
+    actor.type,
+    "actorId",
+    actor.id,
+    "certifiedAtMs",
+    String(input.certifiedAtMs),
+  ]);
   return {
     certificationId: input.certificationId,
-    snapshotHash: readiness.snapshotHash,
+    certificationSnapshotHash,
     readinessHash: readiness.readinessHash,
     certifiedAtMs: input.certifiedAtMs,
-    actor: clone(input.actor),
+    actor,
     media: clone(project.media),
+    evidence: clone(evidence),
     itemRevisions: currentProjectItems(project).map((item) => ({
       kind: item.kind,
       itemId: item.itemId,

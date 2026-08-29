@@ -668,26 +668,36 @@ describe("domain reducer", () => {
   });
 
   it("stales validation and certification for all review states and waivers", () => {
-    const certified = { ...fixtureProject(), validation: { status: "Current" as const, blockerCount: 0, warningCount: 1 }, certification: { status: "Current" as const, certificationId: "cert-1" } };
-    const mark = applyCommand(certified, { type: "MarkItemAgentReady", actor: { type: "BrowserAgent", id: "browser-agent" }, itemId: "c05", expectedItemRevision: 1, expectedProjectRevision: 1 });
+    const validated = applyCommand(fixtureProject(), {
+      type: "ValidateProject", actor: { type: "System", id: "validator" }, expectedProjectRevision: 1,
+    }).project;
+    const warning = validated.validationRun?.warnings[0];
+    if (warning === undefined) throw new Error("Expected a validation warning.");
+    const certified = { ...validated, certification: { status: "Current" as const, certificationId: "cert-1" } };
+    const mark = applyCommand(certified, { type: "MarkItemAgentReady", actor: { type: "BrowserAgent", id: "browser-agent" }, itemId: "c05", expectedItemRevision: 1, expectedProjectRevision: certified.projectRevision });
     expect(mark.project.validation.status).toBe("Stale");
-    const objected = applyCommand(certified, { type: "ObjectItem", actor: { type: "Human", id: "teacher" }, itemId: "c05", expectedItemRevision: 1, expectedProjectRevision: 1, reason: "Reason" });
+    const objected = applyCommand(certified, { type: "ObjectItem", actor: { type: "Human", id: "teacher" }, itemId: "c05", expectedItemRevision: 1, expectedProjectRevision: certified.projectRevision, reason: "Reason" });
     expect(objected.project.certification.status).toBe("Stale");
-    const sustained = applyCommand(certified, { type: "SustainItem", actor: { type: "Human", id: "teacher" }, itemId: "c05", expectedItemRevision: 1, expectedProjectRevision: 1 });
+    const sustained = applyCommand(certified, { type: "SustainItem", actor: { type: "Human", id: "teacher" }, itemId: "c05", expectedItemRevision: 1, expectedProjectRevision: certified.projectRevision });
     expect(sustained.project.validation.status).toBe("Stale");
-    const waived = applyCommand(certified, { type: "WaiveWarning", actor: { type: "Human", id: "teacher" }, findingId: "w1", reason: "Reason", expectedProjectRevision: 1 });
+    const waived = applyCommand(certified, { type: "WaiveWarning", actor: { type: "Human", id: "teacher" }, findingId: warning.findingId, reason: "Reason", expectedProjectRevision: certified.projectRevision });
+    expect(waived.error).toBeUndefined();
     expect(waived.project.certification.status).toBe("Stale");
   });
 
   it("preserves current validation but stales current certification for a warning waiver", () => {
+    const validated = applyCommand(fixtureProject(), {
+      type: "ValidateProject", actor: { type: "System", id: "validator" }, expectedProjectRevision: 1,
+    }).project;
+    const warning = validated.validationRun?.warnings[0];
+    if (warning === undefined) throw new Error("Expected a validation warning.");
     const project: CaptionProject = {
-      ...fixtureProject(),
-      validation: { status: "Current", blockerCount: 0, warningCount: 1 },
+      ...validated,
       certification: { status: "Current", certificationId: "cert-1" },
     };
     const result = applyCommand(project, {
-      type: "WaiveWarning", actor: { type: "Human", id: "teacher" }, findingId: "w1", reason: "Intentional pacing",
-      expectedProjectRevision: 1,
+      type: "WaiveWarning", actor: { type: "Human", id: "teacher" }, findingId: warning.findingId, reason: "Intentional pacing",
+      expectedProjectRevision: project.projectRevision,
     });
     expect(result.error).toBeUndefined();
     expect(result.project.validation.status).toBe("Current");

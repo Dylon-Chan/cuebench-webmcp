@@ -115,7 +115,8 @@ export type DomainCommand =
       readonly type: "CertifyProject";
       readonly expectedReadinessHash: string;
       readonly certificationId?: string;
-      readonly certifiedAtMs?: number;
+      /** Required real-world certification time; never inferred from a revision. */
+      readonly certifiedAtMs: number;
     })
   | (CommandBase & {
       readonly type: "ApplyProfile";

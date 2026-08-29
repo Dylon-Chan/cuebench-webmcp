@@ -209,13 +209,14 @@ describe("human certification", () => {
     const snapshot = certified.project.certifications[0];
     if (snapshot === undefined) throw new Error("Expected a certification snapshot.");
     expect(snapshot).toMatchObject({
-      snapshotHash: readiness.snapshotHash,
+      readinessHash: readiness.readinessHash,
       media: { sha256: "c".repeat(64) },
       itemRevisions: [{ itemId: "c01", itemRevision: 1 }],
       qualityProfile: { revision: 1 },
       actor: human,
       certifiedAtMs: 1_700_000_000_000,
     });
+    expect(snapshot.certificationSnapshotHash).toMatch(/^sha256:[0-9a-f]{64}$/);
     expect(snapshot.validationRun.findings).toEqual(validated.project.validationRun?.findings);
     const frozen = JSON.stringify(snapshot);
 

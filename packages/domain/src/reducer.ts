@@ -285,7 +285,9 @@ export const applyCommand = (project: CaptionProject, command: DomainCommand): C
   }
   if (command.type === "ValidateProject") {
     if (command.actor.type !== "System") return fail(project, "INVALID_ARGUMENT", "Only System may persist deterministic validation.");
-    const validationRun = validateProject(project);
+    // The command commit itself creates the revision being validated. This
+    // keeps project-target finding IDs bound to the persisted post-run state.
+    const validationRun = validateProject({ ...project, projectRevision: project.projectRevision + 1 });
     return commit(project, command, {
       validation: {
         status: "Current",
@@ -298,13 +300,16 @@ export const applyCommand = (project: CaptionProject, command: DomainCommand): C
   if (command.type === "WaiveWarning") {
     if (!hasHumanAuthority(command.actor)) return fail(project, "HUMAN_AUTHORITY_REQUIRED", "Only a human may waive a warning.");
     if (!command.findingId.trim() || !command.reason.trim()) return fail(project, "INVALID_ARGUMENT", "A warning waiver needs a finding and reason.");
-    const storedFinding = project.validationRun?.findings.find(
+    const validationRun = currentValidationRun(project);
+    if (validationRun === undefined) {
+      return fail(project, "CERTIFICATION_OUT_OF_DATE", "A warning may be waived only from a current validation run.");
+    }
+    const storedFinding = validationRun.findings.find(
       (candidate) => candidate.findingId === command.findingId,
     );
     if (storedFinding?.severity === "blocker") return fail(project, "VALIDATION_BLOCKER", "Blocking violations cannot be waived.");
-    const validationRun = currentValidationRun(project);
-    if (validationRun !== undefined) {
-      if (storedFinding === undefined) return fail(project, "NOT_FOUND", "The warning is not part of the current validation run.");
+    if (storedFinding === undefined || storedFinding.severity !== "warning") {
+      return fail(project, "NOT_FOUND", "The warning is not part of the current validation run.");
     }
     return commit(project, command, { warningWaivers: { ...project.warningWaivers, [command.findingId]: { findingId: command.findingId, reason: command.reason, actor: clone(command.actor), projectRevision: project.projectRevision + 1 } }, ...withStaleCertification(project) });
   }
@@ -323,14 +328,14 @@ export const applyCommand = (project: CaptionProject, command: DomainCommand): C
       return fail(project, "INVALID_ARGUMENT", "Certification id cannot be empty.");
     }
     const certificationId = command.certificationId === undefined
-      ? `certification-${readiness.snapshotHash}`
+      ? `certification-${readiness.readinessHash}`
       : command.certificationId.trim();
     if (project.certifications.some((snapshot) => snapshot.certificationId === certificationId)) {
       return fail(project, "INVALID_ARGUMENT", "Certification id already exists.");
     }
-    const certifiedAtMs = command.certifiedAtMs ?? project.projectRevision;
-    if (!isFiniteInteger(certifiedAtMs) || certifiedAtMs < 0) {
-      return fail(project, "INVALID_ARGUMENT", "Certification timestamp must be a non-negative integer.");
+    const certifiedAtMs = command.certifiedAtMs;
+    if (!isFiniteInteger(certifiedAtMs) || certifiedAtMs <= 0) {
+      return fail(project, "INVALID_ARGUMENT", "Certification timestamp must be a positive integer.");
     }
     const certification = createCertificationSnapshot(project, readiness, {
       certificationId,

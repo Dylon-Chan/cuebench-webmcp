@@ -1,5 +1,7 @@
 import type { QualityProfile } from "../model";
 
+export type OverlapPolicy = "allow" | "block";
+
 export interface CaptionQualityRules {
   readonly minDurationMs: number;
   readonly maxDurationMs: number;
@@ -8,6 +10,8 @@ export interface CaptionQualityRules {
   readonly maxLineCount: number;
   readonly maxGapMs: number;
   readonly minSpeakerTransitionGapMs: number;
+  /** Whether overlapping live captions are a certification blocker. */
+  readonly overlapPolicy: OverlapPolicy;
 }
 
 export interface AudioDescriptionQualityRules {
@@ -15,6 +19,8 @@ export interface AudioDescriptionQualityRules {
   readonly maxDurationMs: number;
   readonly maxGapMs: number;
   readonly forbidDialogueCollision: boolean;
+  /** Whether overlapping live audio-description beats are a certification blocker. */
+  readonly overlapPolicy: OverlapPolicy;
 }
 
 export interface EducationProfileRules {
@@ -31,12 +37,14 @@ const educationRules = {
     maxLineCount: 2,
     maxGapMs: 5_000,
     minSpeakerTransitionGapMs: 0,
+    overlapPolicy: "block",
   },
   audioDescription: {
     minDurationMs: 500,
     maxDurationMs: 10_000,
     maxGapMs: 15_000,
     forbidDialogueCollision: true,
+    overlapPolicy: "block",
   },
 } satisfies EducationProfileRules;
 
@@ -78,6 +86,15 @@ const booleanFrom = (
   return fallback;
 };
 
+const overlapPolicyFrom = (
+  source: Readonly<Record<string, unknown>>,
+  fallback: OverlapPolicy,
+): OverlapPolicy => {
+  const value = source.overlapPolicy;
+  if (value === "allow" || value === "block") return value;
+  return fallback;
+};
+
 /**
  * Profiles are intentionally stored as extensible JSON-like records. Resolve
  * known settings defensively so an incomplete proposal still receives the
@@ -98,12 +115,14 @@ export const resolveEducationProfileRules = (
       maxLineCount: numberFrom(caption, ["maxLineCount", "maximumLineCount"], defaults.caption.maxLineCount, 1),
       maxGapMs: numberFrom(caption, ["maxGapMs", "maximumGapMs"], defaults.caption.maxGapMs, 0),
       minSpeakerTransitionGapMs: numberFrom(caption, ["minSpeakerTransitionGapMs", "minimumSpeakerTransitionGapMs"], defaults.caption.minSpeakerTransitionGapMs, 0),
+      overlapPolicy: overlapPolicyFrom(caption, defaults.caption.overlapPolicy),
     },
     audioDescription: {
       minDurationMs: numberFrom(audioDescription, ["minDurationMs", "minimumDurationMs"], defaults.audioDescription.minDurationMs, 1),
       maxDurationMs: numberFrom(audioDescription, ["maxDurationMs", "maximumDurationMs"], defaults.audioDescription.maxDurationMs, 1),
       maxGapMs: numberFrom(audioDescription, ["maxGapMs", "maximumGapMs"], defaults.audioDescription.maxGapMs, 0),
       forbidDialogueCollision: booleanFrom(audioDescription, ["forbidDialogueCollision", "avoidDialogueCollision"], defaults.audioDescription.forbidDialogueCollision),
+      overlapPolicy: overlapPolicyFrom(audioDescription, defaults.audioDescription.overlapPolicy),
     },
   };
 };
