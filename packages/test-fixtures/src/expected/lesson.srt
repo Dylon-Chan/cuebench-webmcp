@@ -1,0 +1,7 @@
+1
+00:00:01,000 --> 00:00:03,500
+Dr. Nguyen introduces Gibbs free energy.
+
+2
+00:00:03,500 --> 00:00:05,000
+The diagram is silent for a moment.

@@ -55,6 +55,10 @@ export type ImportedProjectDescriptor = ProjectPreviewDescriptor | ReadOnlyProje
 const ImportedEnvelopeSchema = z.object({
   schemaVersion: nonNegativeInteger,
   project: z.unknown(),
+  /** Task 5's portable envelope fields are intentionally ignored by the structural migration. */
+  backupKind: z.literal("CueBenchProjectBackup").optional(),
+  exportMetadata: z.unknown().optional(),
+  manifestHash: z.string().optional(),
 }).strict();
 
 const LegacyMediaSchema = z.object({

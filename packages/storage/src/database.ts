@@ -359,6 +359,7 @@ const CaptionProjectSchema = z.object({
   contractVersion: z.literal(1),
   projectId: identifier,
   projectRevision: positiveSafeInteger,
+  createdAtMs: nonNegativeSafeInteger.optional(),
   title: boundedText(1_000),
   media: MediaSourceStorageSchema,
   evidence: z.array(EvidenceProvenanceSchema),
@@ -395,6 +396,8 @@ export interface ProjectHeaderRow {
   readonly schemaVersion: 1;
   readonly contractVersion: 1;
   readonly projectRevision: number;
+  /** Optional logical creation time supplied by the project aggregate. */
+  readonly projectCreatedAtMs?: number;
   readonly title: string;
   readonly media: MediaSourceSnapshot;
   readonly captionOrder: readonly string[];
@@ -515,6 +518,7 @@ const ProjectHeaderRowSchema = z.object({
   schemaVersion: z.literal(STORAGE_SCHEMA_VERSION),
   contractVersion: z.literal(1),
   projectRevision: positiveSafeInteger,
+  projectCreatedAtMs: nonNegativeSafeInteger.optional(),
   title: boundedText(1_000),
   media: MediaSourceStorageSchema,
   captionOrder: z.array(identifier),
@@ -1154,6 +1158,7 @@ export const normalizeProject = (
     schemaVersion: STORAGE_SCHEMA_VERSION,
     contractVersion: project.contractVersion,
     projectRevision: project.projectRevision,
+    ...(project.createdAtMs === undefined ? {} : { projectCreatedAtMs: project.createdAtMs }),
     title: project.title,
     media: clone(project.media),
     captionOrder: clone(project.captions.order),
@@ -1343,6 +1348,7 @@ export const rehydrateProject = (rows: NormalizedProjectRows): CaptionProject =>
     contractVersion: header.contractVersion,
     projectId,
     projectRevision: header.projectRevision,
+    ...(header.projectCreatedAtMs === undefined ? {} : { createdAtMs: header.projectCreatedAtMs }),
     title: header.title,
     media: clone(header.media),
     evidence: projectEvidence,

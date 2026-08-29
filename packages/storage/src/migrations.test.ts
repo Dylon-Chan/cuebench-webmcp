@@ -4,9 +4,11 @@ import {
   applyCommand,
   canonicalHash,
   createProject,
+  exportProjectBackup,
   intermediateCertificationSnapshotHashFor,
   legacyCertificationSnapshotHashFor,
   prepareCertificationReview,
+  previewProjectImport,
 } from "@cuebench/domain";
 import { afterEach, describe, expect, it } from "vitest";
 import {
@@ -295,5 +297,28 @@ describe("project schema migrations", () => {
 
     expect(descriptor).toMatchObject({ mode: "read-only", readOnly: true, schemaVersion: 2 });
     expect(await db.projectHeaders.count()).toBe(0);
+  });
+
+  it("lets the domain import preview use the storage migration without a package cycle", () => {
+    const project = createProject({
+      projectId: "portable-backup",
+      createdAtMs: 1_000,
+      title: "Portable backup",
+      media: { sourceId: "source-1", sha256: "d".repeat(64), durationMs: 60_000, relinkState: "Linked" },
+    });
+    const backup = exportProjectBackup(project);
+
+    const direct = describeImportedProject(backup);
+    expect(direct.mode).toBe("preview");
+    const preview = previewProjectImport(backup, {
+      actor: { type: "Human", id: "teacher" },
+      migration: describeImportedProject,
+      relinkedMedia: { sourceId: "source-1", sha256: "d".repeat(64), durationMs: 60_000 },
+    });
+    expect(preview).toMatchObject({
+      mode: "preview",
+      canImport: true,
+      mediaRelink: { status: "verified" },
+    });
   });
 });

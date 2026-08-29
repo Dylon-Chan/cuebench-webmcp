@@ -157,6 +157,12 @@ export interface CaptionProject {
   readonly contractVersion: 1;
   readonly projectId: string;
   readonly projectRevision: number;
+  /**
+   * Optional because pre-timestamp project records remain importable. When it
+   * exists it is a caller-supplied, real local creation timestamp; domain code
+   * never invents one from a revision or current clock.
+   */
+  readonly createdAtMs?: number;
   readonly title: string;
   readonly media: MediaSourceSnapshot;
   /**
@@ -182,6 +188,7 @@ export interface CaptionProject {
 
 export interface CreateProjectInput {
   readonly projectId: string;
+  readonly createdAtMs?: number;
   readonly title: string;
   readonly media: MediaSourceSnapshot;
   readonly profile?: Omit<QualityProfile, "revision"> & { readonly revision?: number };
@@ -212,6 +219,9 @@ const hasValidInitialTiming = (durationMs: number, startMs: number, endMs: numbe
   && endMs <= durationMs;
 
 const assertInitialProjectInvariant = (input: CreateProjectInput) => {
+  if (input.createdAtMs !== undefined && (!Number.isSafeInteger(input.createdAtMs) || input.createdAtMs < 0)) {
+    throw new RangeError("Project creation time must be a non-negative integer timestamp.");
+  }
   if (!Number.isSafeInteger(input.media.durationMs) || input.media.durationMs < 0) {
     throw new RangeError("Media duration must be a non-negative integer.");
   }
@@ -323,6 +333,7 @@ export const createProject = (input: CreateProjectInput): CaptionProject => {
     contractVersion: 1,
     projectId: input.projectId,
     projectRevision: 1,
+    ...(input.createdAtMs === undefined ? {} : { createdAtMs: input.createdAtMs }),
     title: input.title,
     media: clone(input.media),
     evidence: clone(input.evidence ?? []),
