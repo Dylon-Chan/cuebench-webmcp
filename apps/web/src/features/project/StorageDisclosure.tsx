@@ -8,8 +8,8 @@ export function StorageDisclosure({ mode }: StorageDisclosureProps) {
   if (mode === "temporary") {
     return (
       <aside className="storage-disclosure storage-disclosure--temporary" aria-label="Temporary session notice">
-        <strong>Temporary session</strong>
-        <span>This project is usable now and is remembered only for this browser session; recovery is not promised after the session ends.</span>
+        <strong>Temporary page memory</strong>
+        <span>This project is usable only in this open page. Reloading or closing this page loses the project.</span>
       </aside>
     );
   }

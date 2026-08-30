@@ -52,6 +52,12 @@ export class ObjectUrlLease {
     this.api.revokeObjectURL(this.currentUrl);
     this.currentUrl = null;
   }
+
+  /** Avoid revoking a newer URL after a stale asynchronous persistence continuation. */
+  public revokeIfCurrent(url: string): void {
+    if (this.currentUrl !== url) return;
+    this.revoke();
+  }
 }
 
 const isVideoFile = (file: File): boolean => file.type.length === 0 || file.type.startsWith("video/");
@@ -126,10 +132,22 @@ export interface IngestLocalMediaInput {
 }
 
 export interface IngestedLocalMedia extends InspectedLocalMedia {
+  readonly projectId: string;
   readonly sourceId: string;
   readonly sha256: string;
+  readonly blob: Blob;
+  readonly byteLength: number;
+  readonly contentType: string;
   readonly objectUrl: string | null;
 }
+
+/** Hashes a temporary in-memory source once, without creating an IndexedDB row. */
+export const hashLocalMedia = async (blob: Blob): Promise<string> => {
+  const crypto = globalThis.crypto;
+  if (crypto?.subtle === undefined) throw new Error("Web Crypto SHA-256 is required for local media.");
+  const digest = await crypto.subtle.digest("SHA-256", await blob.arrayBuffer());
+  return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+};
 
 /** Hashes immutable source bytes, keeps the Blob in IndexedDB, and owns its preview URL. */
 export const ingestLocalMedia = async ({
@@ -149,8 +167,12 @@ export const ingestLocalMedia = async ({
   });
   return {
     ...inspected,
-    sourceId,
+    projectId: saved.projectId,
+    sourceId: saved.sourceId,
     sha256: saved.sha256,
+    blob: saved.blob,
+    byteLength: saved.byteLength,
+    contentType: saved.contentType,
     objectUrl: urlLease === undefined ? null : urlLease.replace(file),
   };
 };

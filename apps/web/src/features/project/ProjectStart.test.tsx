@@ -3,13 +3,22 @@ import "fake-indexeddb/auto";
 import { readFileSync } from "node:fs";
 import { cleanup, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { CueBenchDatabase, loadProject, loadSourceMedia } from "@cuebench/storage";
+import { createProject } from "@cuebench/domain";
+import {
+  CueBenchDatabase,
+  initializeProject,
+  loadProject,
+  loadSetting,
+  loadSourceMedia,
+  saveSetting,
+  saveSourceMedia,
+} from "@cuebench/storage";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { App } from "../../app/App";
-import { createBundledSampleFile } from "./bundled-sample";
 import { LocalMediaError, ObjectUrlLease, ingestLocalMedia } from "./local-media";
 import { ProjectStart } from "./ProjectStart";
 import { ProjectStore } from "./project-store";
+import { formatDuration } from "../../app/routes";
 
 const databaseName = (): string => `cuebench-web-test-${crypto.randomUUID()}`;
 
@@ -23,20 +32,16 @@ const videoFile = (contents = "small lesson", name = "lesson.webm"): File => Obj
   { name },
 ) as File;
 
+const bundledSampleFile = (): File => Object.assign(
+  new Blob([readFileSync(`${process.cwd()}/src/features/project/bundled-sample.mp4`)], { type: "video/mp4" }),
+  { name: "cuebench-bundled-fixture.mp4", lastModified: 0 },
+) as File;
+
 const objectUrlLease = (prefix = "preview") => {
   let count = 0;
   const createObjectURL = vi.fn(() => `blob:cuebench:${prefix}-${++count}`);
   const revokeObjectURL = vi.fn();
   return { lease: new ObjectUrlLease({ createObjectURL, revokeObjectURL }), createObjectURL, revokeObjectURL };
-};
-
-const sessionStore = () => {
-  const values = new Map<string, string>();
-  return {
-    getItem: vi.fn((key: string) => values.get(key) ?? null),
-    setItem: vi.fn((key: string, value: string) => { values.set(key, value); }),
-    removeItem: vi.fn((key: string) => { values.delete(key); }),
-  };
 };
 
 const deferred = <Value,>() => {
@@ -78,6 +83,7 @@ describe("ProjectStart", () => {
       database,
       browserStorage: browserStorage({ quota: 100_000_000, usage: 0, persisted: true }),
       objectUrlLease: urls.lease,
+      bundledSampleLoader: bundledSampleFile,
     });
     const user = userEvent.setup();
 
@@ -87,8 +93,10 @@ describe("ProjectStart", () => {
     await waitFor(() => expect(store.getSnapshot().route).toBe("workbench"));
     expect(store.getSnapshot().project?.title).toBe("CueBench bundled media fixture");
     expect(store.getSnapshot().sourceObjectUrl).toBe("blob:cuebench:preview-1");
-    expect(await loadProject(database, "sample-gibbs-free-energy")).toBeDefined();
     const project = store.getSnapshot().project;
+    expect(project?.projectId).toMatch(/^sample-/);
+    expect(project?.projectId).not.toBe("sample-gibbs-free-energy");
+    expect(await loadProject(database, project?.projectId ?? "")).toBeDefined();
     const saved = project === null ? undefined : await loadSourceMedia(database, project.projectId, project.media.sha256);
     expect(saved?.blob.size).toBe(2_754);
     expect(saved?.contentType).toBe("video/mp4");
@@ -102,6 +110,7 @@ describe("ProjectStart", () => {
       database,
       browserStorage: browserStorage({ quota: 100_000_000, usage: 0, persisted: true }),
       objectUrlLease: objectUrlLease("first").lease,
+      bundledSampleLoader: bundledSampleFile,
     });
     await firstStore.openSample();
     const resumedStore = new ProjectStore({
@@ -113,12 +122,12 @@ describe("ProjectStart", () => {
     await resumedStore.restoreLastDurableProject();
 
     expect(resumedStore.getSnapshot().route).toBe("workbench");
-    expect(resumedStore.getSnapshot().project?.projectId).toBe("sample-gibbs-free-energy");
+    expect(resumedStore.getSnapshot().project?.projectId).toBe(firstStore.getSnapshot().project?.projectId);
     expect(resumedStore.getSnapshot().mode).toBe("durable");
     expect(resumedStore.getSnapshot().sourceObjectUrl).toBe("blob:cuebench:restored-1");
   });
 
-  it("requires an explicit temporary-session choice when durable browser storage is inadequate", async () => {
+  it("requires an explicit current-page temporary choice when durable browser storage is inadequate", async () => {
     const database = new CueBenchDatabase(databaseName());
     databases.push(database);
     const store = new ProjectStore({
@@ -134,7 +143,7 @@ describe("ProjectStart", () => {
     render(<ProjectStart store={store} />);
 
     expect(await screen.findByRole("dialog", { name: "Temporary session required" })).toBeVisible();
-    expect(screen.getByText(/recovery is not promised after the session ends/i)).toBeVisible();
+    expect(screen.getAllByText(/reloading or closing this page loses the project/i)[0]).toBeVisible();
     expect(store.getSnapshot().project).toBeNull();
 
     await user.click(screen.getByRole("button", { name: "Continue temporarily" }));
@@ -142,18 +151,18 @@ describe("ProjectStart", () => {
     await waitFor(() => expect(store.getSnapshot().route).toBe("workbench"));
     expect(store.getSnapshot().mode).toBe("temporary");
     expect(store.getSnapshot().project?.media.relinkState).toBe("TemporarySession");
+    expect(await database.projectHeaders.count()).toBe(0);
+    expect(await database.sourceBlobs.count()).toBe(0);
   });
 
-  it("keeps a temporary project recoverable only through the same-session pointer", async () => {
+  it("keeps a temporary project only in current-page memory and never restores it", async () => {
     const database = new CueBenchDatabase(databaseName());
     databases.push(database);
-    const session = sessionStore();
     const firstStore = new ProjectStore({
       database,
       browserStorage: browserStorage({ quota: 200, usage: 150, persisted: false }),
       mediaDurationProbe: async () => 1_000,
       objectUrlLease: objectUrlLease("temporary-first").lease,
-      sessionStorage: session,
     });
     await firstStore.chooseFile(videoFile("temporary", "temporary.webm"));
     await firstStore.continueTemporarily();
@@ -162,16 +171,12 @@ describe("ProjectStart", () => {
       database,
       browserStorage: browserStorage({ quota: 200, usage: 150, persisted: false }),
       objectUrlLease: objectUrlLease("temporary-restored").lease,
-      sessionStorage: session,
     });
     await resumedStore.restoreLastDurableProject();
 
-    expect(resumedStore.getSnapshot()).toMatchObject({
-      route: "workbench",
-      mode: "temporary",
-      sourceObjectUrl: "blob:cuebench:temporary-restored-1",
-    });
-    expect(session.setItem).toHaveBeenCalled();
+    expect(resumedStore.getSnapshot()).toMatchObject({ route: "start", mode: null, sourceObjectUrl: null });
+    expect(await database.projectHeaders.count()).toBe(0);
+    expect(await database.sourceBlobs.count()).toBe(0);
   });
 
   it("does not let a late hydration replace a newer start operation", async () => {
@@ -181,6 +186,7 @@ describe("ProjectStart", () => {
       database,
       browserStorage: browserStorage({ quota: 100_000_000, usage: 0, persisted: true }),
       objectUrlLease: objectUrlLease("seed").lease,
+      bundledSampleLoader: bundledSampleFile,
     });
     await firstStore.openSample();
     const hydrateGate = deferred<void>();
@@ -189,6 +195,7 @@ describe("ProjectStart", () => {
       browserStorage: browserStorage({ quota: 100_000_000, usage: 0, persisted: true }),
       objectUrlLease: objectUrlLease("newer").lease,
       beforeRestoreLoad: () => hydrateGate.promise,
+      bundledSampleLoader: bundledSampleFile,
     });
 
     const restore = resumedStore.restoreLastDurableProject();
@@ -207,7 +214,7 @@ describe("ProjectStart", () => {
   it("shows a busy, accessible hydration state and rejects double-start clicks", async () => {
     const database = new CueBenchDatabase(databaseName());
     databases.push(database);
-    const sampleGate = deferred<ReturnType<typeof createBundledSampleFile>>();
+    const sampleGate = deferred<File>();
     const sampleLoader = vi.fn(() => sampleGate.promise);
     const store = new ProjectStore({
       database,
@@ -225,7 +232,7 @@ describe("ProjectStart", () => {
     await user.click(screen.getByRole("button", { name: "Open bundled media fixture" }));
     expect(sampleLoader).toHaveBeenCalledTimes(1);
 
-    sampleGate.resolve(createBundledSampleFile());
+    sampleGate.resolve(bundledSampleFile());
     await waitFor(() => expect(store.getSnapshot().route).toBe("workbench"));
   });
 
@@ -236,6 +243,7 @@ describe("ProjectStart", () => {
       database,
       browserStorage: browserStorage({ quota: 100_000_000, usage: 0, persisted: true }),
       objectUrlLease: objectUrlLease().lease,
+      bundledSampleLoader: bundledSampleFile,
     });
     await store.openSample();
 
@@ -243,6 +251,8 @@ describe("ProjectStart", () => {
 
     expect(screen.getByRole("button", { name: "Object selected revision" })).toBeVisible();
     expect(screen.getByRole("button", { name: "Sustain selected revision" })).toBeVisible();
+    expect(screen.getByRole("button", { name: "Object selected revision" })).toBeDisabled();
+    expect(screen.getAllByText(/activate with task 9/i)[0]).toBeVisible();
     expect(screen.getByText("Browser Agent tools unavailable")).toBeVisible();
   });
 
@@ -265,6 +275,8 @@ describe("ProjectStart", () => {
     addSource.mockRestore();
     await store.continueTemporarily();
     expect(store.getSnapshot().mode).toBe("temporary");
+    expect(await database.projectHeaders.count()).toBe(0);
+    expect(await database.sourceBlobs.count()).toBe(0);
   });
 
   it("rolls back project and media rows when a lifecycle pointer cannot be saved", async () => {
@@ -294,6 +306,7 @@ describe("ProjectStart", () => {
       database,
       browserStorage: browserStorage({ quota: 100_000_000, usage: 0, persisted: true }),
       objectUrlLease: urls.lease,
+      bundledSampleLoader: bundledSampleFile,
     });
     await store.openSample();
 
@@ -321,6 +334,138 @@ describe("ProjectStart", () => {
     expect(stylesheet).toContain(".button--object { color: #fff9f5; background: #9b3d00;");
     expect(contrastRatio("#fff9f5", "#9b3d00")).toBeGreaterThanOrEqual(4.5);
     expect(stylesheet).toContain(".transport-control { min-height: 44px; }");
+    expect(stylesheet).toContain(".docket-tabs button { min-height: 44px; }");
+  });
+
+  it("keeps distinct concurrent projects isolated when the losing write rolls back", async () => {
+    const database = new CueBenchDatabase(databaseName());
+    databases.push(database);
+    const nextId = (...ids: string[]) => {
+      let index = 0;
+      return () => ids[index++] ?? crypto.randomUUID();
+    };
+    const originalPut = database.settings.put.bind(database.settings);
+    const settingsPut = vi.spyOn(database.settings, "put").mockImplementation((row) => {
+      if (row.key === "project-mode:local-loser-project") throw new Error("loser mode write failed");
+      return originalPut(row);
+    });
+    const winner = new ProjectStore({
+      database,
+      browserStorage: browserStorage({ quota: 100_000_000, usage: 0, persisted: true }),
+      mediaDurationProbe: async () => 1_000,
+      objectUrlLease: objectUrlLease("winner").lease,
+      createId: nextId("winner-project", "winner-source", "winner-owner"),
+    });
+    const loser = new ProjectStore({
+      database,
+      browserStorage: browserStorage({ quota: 100_000_000, usage: 0, persisted: true }),
+      mediaDurationProbe: async () => 1_000,
+      objectUrlLease: objectUrlLease("loser").lease,
+      createId: nextId("loser-project", "loser-source", "loser-owner"),
+    });
+
+    await Promise.all([
+      winner.chooseFile(videoFile("winner", "winner.webm")),
+      loser.chooseFile(videoFile("loser", "loser.webm")),
+    ]);
+
+    expect(winner.getSnapshot().project?.projectId).toBe("local-winner-project");
+    expect(winner.getSnapshot().route).toBe("workbench");
+    expect(loser.getSnapshot().error).toMatch(/loser mode write failed/i);
+    expect(await loadProject(database, "local-winner-project")).toBeDefined();
+    expect(await database.sourceBlobs.where("projectId").equals("local-winner-project").count()).toBe(1);
+    expect(await loadProject(database, "local-loser-project")).toBeUndefined();
+    expect(await database.sourceBlobs.where("projectId").equals("local-loser-project").count()).toBe(0);
+    settingsPut.mockRestore();
+  });
+
+  it("does not let a colliding two-tab loser roll back the owner project", async () => {
+    const database = new CueBenchDatabase(databaseName());
+    databases.push(database);
+    const nextId = (...ids: string[]) => {
+      let index = 0;
+      return () => ids[index++] ?? crypto.randomUUID();
+    };
+    const first = new ProjectStore({
+      database,
+      browserStorage: browserStorage({ quota: 100_000_000, usage: 0, persisted: true }),
+      mediaDurationProbe: async () => 1_000,
+      objectUrlLease: objectUrlLease("collision-first").lease,
+      createId: nextId("shared-project", "shared-source", "first-owner"),
+    });
+    const second = new ProjectStore({
+      database,
+      browserStorage: browserStorage({ quota: 100_000_000, usage: 0, persisted: true }),
+      mediaDurationProbe: async () => 1_000,
+      objectUrlLease: objectUrlLease("collision-second").lease,
+      createId: nextId("shared-project", "shared-source", "second-owner"),
+    });
+
+    await Promise.all([
+      first.chooseFile(videoFile("first", "first.webm")),
+      second.chooseFile(videoFile("second", "second.webm")),
+    ]);
+
+    const outcomes = [first.getSnapshot(), second.getSnapshot()];
+    expect(outcomes.filter((snapshot) => snapshot.route === "workbench")).toHaveLength(1);
+    expect(outcomes.filter((snapshot) => snapshot.error?.includes("claim a unique local project"))).toHaveLength(1);
+    expect(await loadProject(database, "local-shared-project")).toBeDefined();
+    expect(await database.sourceBlobs.where("projectId").equals("local-shared-project").count()).toBe(1);
+  });
+
+  it("hashes a durable accepted Blob once before creating its local preview", async () => {
+    const database = new CueBenchDatabase(databaseName());
+    databases.push(database);
+    const file = videoFile("hash-once", "hash-once.webm");
+    const arrayBuffer = vi.spyOn(file, "arrayBuffer");
+    const store = new ProjectStore({
+      database,
+      browserStorage: browserStorage({ quota: 100_000_000, usage: 0, persisted: true }),
+      mediaDurationProbe: async () => 1_000,
+      objectUrlLease: objectUrlLease("hash-once").lease,
+    });
+
+    await store.chooseFile(file);
+
+    expect(store.getSnapshot().route).toBe("workbench");
+    expect(arrayBuffer).toHaveBeenCalledTimes(1);
+  });
+
+  it("sweeps unowned legacy temporary rows instead of recovering them", async () => {
+    const database = new CueBenchDatabase(databaseName());
+    databases.push(database);
+    const blob = videoFile("legacy temporary", "legacy.webm");
+    const source = await saveSourceMedia(database, "legacy-temporary", {
+      sourceId: "legacy-source",
+      blob,
+      contentType: blob.type,
+      fileName: blob.name,
+    });
+    await initializeProject(database, createProject({
+      projectId: "legacy-temporary",
+      title: "Legacy temporary",
+      media: {
+        sourceId: source.sourceId,
+        sha256: source.sha256,
+        durationMs: 1_000,
+        relinkState: "TemporarySession",
+      },
+    }));
+    await saveSetting(database, "project-mode:legacy-temporary", { mode: "temporary" });
+    const store = new ProjectStore({ database, objectUrlLease: objectUrlLease("legacy").lease });
+
+    await store.restoreLastDurableProject();
+
+    expect(store.getSnapshot().route).toBe("start");
+    expect(await loadProject(database, "legacy-temporary")).toBeUndefined();
+    expect(await database.sourceBlobs.where("projectId").equals("legacy-temporary").count()).toBe(0);
+    expect(await loadSetting(database, "project-mode:legacy-temporary")).toBeUndefined();
+  });
+});
+
+describe("formatDuration", () => {
+  it("retains integer milliseconds without whole-second rounding", () => {
+    expect(formatDuration(1_500)).toBe("0:01.500");
   });
 });
 

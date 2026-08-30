@@ -11,11 +11,13 @@ export interface AppRoutesProps {
   readonly webMcpAvailable: boolean;
 }
 
-const formatDuration = (durationMs: number): string => {
-  const totalSeconds = Math.round(durationMs / 1_000);
+export const formatDuration = (durationMs: number): string => {
+  const totalMilliseconds = Math.max(0, Math.trunc(durationMs));
+  const totalSeconds = Math.floor(totalMilliseconds / 1_000);
   const minutes = Math.floor(totalSeconds / 60);
   const seconds = totalSeconds % 60;
-  return `${minutes}:${seconds.toString().padStart(2, "0")}`;
+  const milliseconds = totalMilliseconds % 1_000;
+  return `${minutes}:${seconds.toString().padStart(2, "0")}.${milliseconds.toString().padStart(3, "0")}`;
 };
 
 interface WorkbenchShellProps {
@@ -28,7 +30,6 @@ interface WorkbenchShellProps {
 export function WorkbenchShell({ project, mode, sourceObjectUrl, webMcpAvailable }: WorkbenchShellProps) {
   const captionCount = project.captions.order.length;
   const descriptionCount = project.audioDescriptions.order.length;
-  const hasSelection = project.selectedItem !== null;
   const validationLabel = project.validation.status === "NotRun"
     ? "Validation not run"
     : `${project.validation.blockerCount} blockers · ${project.validation.warningCount} warnings`;
@@ -47,11 +48,11 @@ export function WorkbenchShell({ project, mode, sourceObjectUrl, webMcpAvailable
         <dl className="header-reading">
           <div><dt>Project</dt><dd>{project.title}</dd></div>
           <div><dt>Validation</dt><dd>{validationLabel}</dd></div>
-          <div><dt>Storage</dt><dd>{mode === "temporary" ? "Temporary session" : "Browser durable"}</dd></div>
+          <div><dt>Storage</dt><dd>{mode === "temporary" ? "Temporary page" : "Browser durable"}</dd></div>
           <div><dt>WebMCP</dt><dd className={webMcpAvailable ? "state-ok" : "state-muted"}>{webMcpAvailable ? "Page API available" : "Browser Agent tools unavailable"}</dd></div>
         </dl>
         <div className="header-compact-status" aria-label="Storage and Browser Agent status">
-          <span><b>Storage</b>{mode === "temporary" ? "Temporary" : "Browser durable"}</span>
+          <span><b>Storage</b>{mode === "temporary" ? "Temporary page" : "Browser durable"}</span>
           <span><b>WebMCP</b>{webMcpAvailable ? "Page API available" : "Tools unavailable"}</span>
         </div>
         <div className="header-actions">
@@ -78,7 +79,7 @@ export function WorkbenchShell({ project, mode, sourceObjectUrl, webMcpAvailable
           <div className="transport-bar" aria-label="Playback transport">
             <output aria-label="Current media time">00:00.000</output>
             <span aria-hidden="true">/</span>
-            <output aria-label="Source duration">{formatDuration(project.media.durationMs)}.000</output>
+            <output aria-label="Source duration">{formatDuration(project.media.durationMs)}</output>
             <span className="transport-bar__spacer" />
             <span className="transport-note">Playback and caption controls initialize with the authoritative media clock.</span>
           </div>
@@ -119,10 +120,11 @@ export function WorkbenchShell({ project, mode, sourceObjectUrl, webMcpAvailable
           </Tabs.Root>
           <section className="ruling-panel" aria-labelledby="ruling-heading">
             <div><h3 id="ruling-heading">Human rulings</h3><span>Never delegated to a Browser Agent</span></div>
-            <p>{hasSelection ? "The active revision is ready for a human decision." : "Choose a cue or description beat before ruling."}</p>
+            <span id="ruling-unavailable" className="visually-hidden">Rulings activate with Task 9's reviewed item workflow.</span>
+            <p>Rulings activate with Task 9's reviewed item workflow. Human decisions remain unavailable in this shell.</p>
             <div className="ruling-panel__actions">
-              <button className="button button--object" type="button" aria-label="Object selected revision" disabled={!hasSelection}>Object</button>
-              <button className="button button--sustain" type="button" aria-label="Sustain selected revision" disabled={!hasSelection}>Sustain</button>
+              <button className="button button--object" type="button" aria-label="Object selected revision" aria-describedby="ruling-unavailable" title="Rulings activate with Task 9's reviewed item workflow." disabled>Object</button>
+              <button className="button button--sustain" type="button" aria-label="Sustain selected revision" aria-describedby="ruling-unavailable" title="Rulings activate with Task 9's reviewed item workflow." disabled>Sustain</button>
             </div>
           </section>
           <StorageDisclosure mode={mode} />

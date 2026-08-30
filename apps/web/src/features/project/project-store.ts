@@ -12,11 +12,13 @@ import {
   createBundledSampleFile,
 } from "./bundled-sample";
 import {
+  hashLocalMedia,
   LocalMediaError,
   ObjectUrlLease,
   ingestLocalMedia,
   inspectLocalMedia,
   probeVideoDuration,
+  type IngestedLocalMedia,
   type MediaDurationProbe,
 } from "./local-media";
 
@@ -27,12 +29,6 @@ export type ProjectActivity = "hydrating" | "preparing" | "saving" | null;
 export interface BrowserStorageManager {
   estimate: () => Promise<{ readonly quota?: number; readonly usage?: number }>;
   persist: () => Promise<boolean>;
-}
-
-export interface SessionStorageLike {
-  getItem: (key: string) => string | null;
-  setItem: (key: string, value: string) => void;
-  removeItem: (key: string) => void;
 }
 
 export interface PendingUpload {
@@ -47,7 +43,7 @@ export interface ProjectStoreSnapshot {
   readonly route: ProjectRoute;
   readonly project: CaptionProject | null;
   readonly mode: ProjectMode | null;
-  /** Present only after IndexedDB byte verification and a live Object URL allocation. */
+  /** Present only with a live, playable Blob-backed object URL. */
   readonly sourceObjectUrl: string | null;
   readonly pendingUpload: PendingUpload | null;
   readonly activity: ProjectActivity;
@@ -60,19 +56,16 @@ export interface ProjectStoreOptions {
   readonly mediaDurationProbe?: MediaDurationProbe;
   readonly objectUrlLease?: ObjectUrlLease;
   readonly createId?: () => string;
-  readonly sessionStorage?: SessionStorageLike | null;
   readonly bundledSampleLoader?: () => File | Promise<File>;
   /** Test seam for proving that a stale restore cannot replace a newer operation. */
   readonly beforeRestoreLoad?: () => Promise<void>;
 }
 
 const metadataReserveBytes = 16 * 1024 * 1024;
-const sampleProjectId = "sample-gibbs-free-energy";
-const sampleSourceId = "source-bundled-video-fixture";
 const defaultCreateId = (): string => globalThis.crypto.randomUUID();
 const projectModeKey = (projectId: string): string => `project-mode:${projectId}`;
+const projectOwnerKey = (projectId: string): string => `project-owner:${projectId}`;
 const lastDurableProjectKey = "last-durable-project";
-const temporaryProjectSessionKey = "cuebench:temporary-project";
 
 const emptySnapshot = (): ProjectStoreSnapshot => ({
   route: "start",
@@ -93,14 +86,6 @@ const browserStorageManager = (): BrowserStorageManager | null => {
   };
 };
 
-const browserSessionStorage = (): SessionStorageLike | null => {
-  try {
-    return globalThis.sessionStorage;
-  } catch {
-    return null;
-  }
-};
-
 const readMode = (value: unknown): ProjectMode | null => {
   if (typeof value !== "object" || value === null || !("mode" in value)) return null;
   const mode = value.mode;
@@ -112,6 +97,11 @@ const readProjectId = (value: unknown): string | null => {
   return typeof value.projectId === "string" && value.projectId.trim().length > 0 ? value.projectId : null;
 };
 
+const readOwnerToken = (value: unknown, projectId: string): string | null => {
+  if (typeof value !== "object" || value === null || !("projectId" in value) || !("token" in value)) return null;
+  return value.projectId === projectId && typeof value.token === "string" && value.token.length > 0 ? value.token : null;
+};
+
 const userFacingError = (error: unknown, fallback: string): string => error instanceof Error && error.message.length > 0
   ? error.message
   : fallback;
@@ -120,12 +110,11 @@ const isQuotaExceeded = (error: unknown): boolean => error instanceof Error && e
 
 const titleForFile = (file: File): string => file.name.trim().length > 0 ? file.name : "Local video";
 
-/** Browser-canonical project lifecycle, including truthful temporary-session fallback. */
+/** Browser-canonical lifecycle with durable IndexedDB and truthful page-memory fallback. */
 export class ProjectStore {
   private readonly database: CueBenchDatabase;
   private readonly storage: BrowserStorageManager | null;
   private readonly mediaDurationProbe: MediaDurationProbe;
-  private readonly sessionStorage: SessionStorageLike | null;
   private readonly bundledSampleLoader: () => File | Promise<File>;
   private readonly beforeRestoreLoad: (() => Promise<void>) | undefined;
   private objectUrlLease: ObjectUrlLease | null;
@@ -133,13 +122,13 @@ export class ProjectStore {
   private readonly createId: () => string;
   private snapshot: ProjectStoreSnapshot = emptySnapshot();
   private readonly listeners = new Set<() => void>();
+  private readonly ownedProjectTokens = new Map<string, string>();
   private operationEpoch = 0;
 
   public constructor(options: ProjectStoreOptions = {}) {
     this.database = options.database ?? new CueBenchDatabase();
     this.storage = options.browserStorage === undefined ? browserStorageManager() : options.browserStorage;
     this.mediaDurationProbe = options.mediaDurationProbe ?? probeVideoDuration;
-    this.sessionStorage = options.sessionStorage === undefined ? browserSessionStorage() : options.sessionStorage;
     this.objectUrlLease = options.objectUrlLease ?? null;
     this.triedObjectUrlLease = options.objectUrlLease !== undefined;
     this.createId = options.createId ?? defaultCreateId;
@@ -154,15 +143,11 @@ export class ProjectStore {
     return () => this.listeners.delete(listener);
   };
 
-  /** Opens the real bundled Blob through the same inspected persistence path as an upload. */
+  /** Opens a fresh real bundled Blob through the same storage decision as an upload. */
   public async openSample(): Promise<void> {
     const epoch = this.beginUserOperation("preparing");
     if (epoch === null) return;
     try {
-      const durableExisting = await this.activateExistingProject(sampleProjectId, "durable", epoch);
-      if (durableExisting || !this.isCurrent(epoch)) return;
-      const temporaryExisting = await this.activateExistingProject(sampleProjectId, "temporary", epoch);
-      if (temporaryExisting || !this.isCurrent(epoch)) return;
       const file = await this.bundledSampleLoader();
       if (!this.isCurrent(epoch)) return;
       const inspected = await inspectLocalMedia(file, async () => BUNDLED_SAMPLE_DURATION_MS);
@@ -170,8 +155,8 @@ export class ProjectStore {
       await this.chooseStorageMode({
         file,
         durationMs: inspected.durationMs,
-        projectId: sampleProjectId,
-        sourceId: sampleSourceId,
+        projectId: `sample-${this.createId()}`,
+        sourceId: `source-${this.createId()}`,
         title: "CueBench bundled media fixture",
       }, epoch);
     } catch (error) {
@@ -179,44 +164,32 @@ export class ProjectStore {
     }
   }
 
+  /** Restores only verified durable projects. Temporary work is current-page memory by design. */
   public async restoreLastDurableProject(): Promise<void> {
     const epoch = this.beginRestore();
     if (epoch === null) return;
     try {
       await this.beforeRestoreLoad?.();
       if (!this.isCurrent(epoch)) return;
-
-      let mediaWasUnavailable = false;
-      const temporaryProjectId = this.readTemporaryProjectId();
-      if (temporaryProjectId !== null) {
-        const result = await this.activateExistingProject(temporaryProjectId, "temporary", epoch);
-        if (result) return;
-        if (!this.isCurrent(epoch)) return;
-        this.clearTemporaryProject();
-        mediaWasUnavailable = true;
-      }
+      await this.sweepLegacyTemporaryProjects(epoch);
+      if (!this.isCurrent(epoch)) return;
 
       const durableSetting = await loadSetting(this.database, lastDurableProjectKey);
       if (!this.isCurrent(epoch)) return;
       const durableProjectId = durableSetting === undefined ? null : readProjectId(durableSetting.value);
       if (durableProjectId !== null) {
         const result = await this.activateExistingProject(durableProjectId, "durable", epoch);
-        if (result) return;
-        if (!this.isCurrent(epoch)) return;
-        mediaWasUnavailable = true;
+        if (result || !this.isCurrent(epoch)) return;
+        this.failCurrentOperation(epoch, "CueBench could not restore the local media. Choose the video again to start a new project.");
+        return;
       }
 
-      if (mediaWasUnavailable) {
-        this.failCurrentOperation(epoch, "CueBench could not restore the local media. Choose the video again to start a new project.");
-      } else {
-        this.completeToStart(epoch);
-      }
+      this.completeToStart(epoch);
     } catch (error) {
       this.failCurrentOperation(epoch, userFacingError(error, "CueBench could not restore the local media."));
     }
   }
 
-  /** `restoreLastDurableProject` retains this historic name while also recovering a same-session temporary pointer. */
   public restoreLastProject(): Promise<void> {
     return this.restoreLastDurableProject();
   }
@@ -239,12 +212,13 @@ export class ProjectStore {
     }
   }
 
+  /** Continues from an explicit choice without writing the Blob to IndexedDB. */
   public async continueTemporarily(): Promise<void> {
     const pendingUpload = this.snapshot.pendingUpload;
     if (pendingUpload === null) return;
     const epoch = this.beginUserOperation("saving");
     if (epoch === null) return;
-    await this.persistPendingUpload(pendingUpload, "temporary", epoch);
+    await this.persistTemporaryUpload(pendingUpload, epoch);
   }
 
   public cancelPendingUpload(): void {
@@ -267,13 +241,50 @@ export class ProjectStore {
     if (!this.isCurrent(epoch)) return;
     if (durable) {
       this.setSnapshot({ ...this.snapshot, pendingUpload, activity: "saving", error: null });
-      await this.persistPendingUpload(pendingUpload, "durable", epoch);
+      await this.persistDurableUpload(pendingUpload, epoch);
       return;
     }
     this.offerTemporaryChoice(pendingUpload, epoch, null);
   }
 
-  private async persistPendingUpload(pendingUpload: PendingUpload, mode: ProjectMode, epoch: number): Promise<void> {
+  private async persistTemporaryUpload(pendingUpload: PendingUpload, epoch: number): Promise<void> {
+    if (!this.isCurrent(epoch)) return;
+    this.setSnapshot({ ...this.snapshot, pendingUpload, activity: "saving", error: null });
+    const objectUrlLease = this.activeObjectUrlLease();
+    if (objectUrlLease === undefined) {
+      this.failCurrentOperation(epoch, "This browser cannot safely preview local media.");
+      return;
+    }
+
+    try {
+      const sha256 = await hashLocalMedia(pendingUpload.file);
+      if (!this.isCurrent(epoch)) return;
+      const project = createProject({
+        projectId: pendingUpload.projectId,
+        title: pendingUpload.title,
+        media: {
+          sourceId: pendingUpload.sourceId,
+          sha256,
+          durationMs: pendingUpload.durationMs,
+          relinkState: "TemporarySession",
+        },
+      });
+      const sourceObjectUrl = objectUrlLease.replace(pendingUpload.file);
+      this.setSnapshot({
+        route: "workbench",
+        project,
+        mode: "temporary",
+        sourceObjectUrl,
+        pendingUpload: null,
+        activity: null,
+        error: null,
+      });
+    } catch (error) {
+      this.failCurrentOperation(epoch, userFacingError(error, "CueBench could not prepare this temporary project."));
+    }
+  }
+
+  private async persistDurableUpload(pendingUpload: PendingUpload, epoch: number): Promise<void> {
     if (!this.isCurrent(epoch)) return;
     this.setSnapshot({ ...this.snapshot, pendingUpload, activity: "saving", error: null });
     const objectUrlLease = this.activeObjectUrlLease();
@@ -283,9 +294,17 @@ export class ProjectStore {
     }
 
     let objectUrl: string | null = null;
+    let previousDurableProjectId: string | null = null;
+    let ownershipClaimed = false;
     try {
-      const previousDurableProjectId = mode === "durable" ? await this.readLastDurableProjectId() : null;
+      previousDurableProjectId = await this.readLastDurableProjectId();
       if (!this.isCurrent(epoch)) return;
+      await this.claimProjectOwnership(pendingUpload.projectId);
+      ownershipClaimed = true;
+      if (!this.isCurrent(epoch)) {
+        await this.rollbackProjectLifecycle(pendingUpload.projectId);
+        return;
+      }
       const media = await ingestLocalMedia({
         database: this.database,
         projectId: pendingUpload.projectId,
@@ -293,6 +312,7 @@ export class ProjectStore {
         file: pendingUpload.file,
         probeDuration: async () => pendingUpload.durationMs,
       });
+      this.assertPersistedMedia(pendingUpload, media);
       if (!this.isCurrent(epoch)) {
         await this.rollbackProjectLifecycle(pendingUpload.projectId);
         return;
@@ -304,7 +324,7 @@ export class ProjectStore {
           sourceId: media.sourceId,
           sha256: media.sha256,
           durationMs: media.durationMs,
-          relinkState: mode === "temporary" ? "TemporarySession" : "Linked",
+          relinkState: "Linked",
         },
       });
       await initializeProject(this.database, project);
@@ -312,46 +332,40 @@ export class ProjectStore {
         await this.rollbackProjectLifecycle(pendingUpload.projectId);
         return;
       }
-      // `loadSourceMedia` re-hashes the Blob and prevents a ready-looking route without playable local bytes.
-      const verifiedSource = await loadSourceMedia(this.database, pendingUpload.projectId, media.sha256);
-      if (verifiedSource === undefined) throw new Error("CueBench could not verify the saved local media.");
+      // The fresh write was schema-validated and already SHA-256 checked by storage.
+      objectUrl = objectUrlLease.replace(media.blob);
+      await this.persistMode(pendingUpload.projectId, "durable");
       if (!this.isCurrent(epoch)) {
+        objectUrlLease.revokeIfCurrent(objectUrl);
         await this.rollbackProjectLifecycle(pendingUpload.projectId);
+        await this.restoreDurableProjectPointer(previousDurableProjectId, pendingUpload.projectId);
         return;
       }
-      objectUrl = objectUrlLease.replace(verifiedSource.blob);
-      await this.persistMode(pendingUpload.projectId, mode);
+      await this.rememberDurableProject(pendingUpload.projectId);
       if (!this.isCurrent(epoch)) {
-        objectUrlLease.revoke();
+        objectUrlLease.revokeIfCurrent(objectUrl);
         await this.rollbackProjectLifecycle(pendingUpload.projectId);
+        await this.restoreDurableProjectPointer(previousDurableProjectId, pendingUpload.projectId);
         return;
       }
-      if (mode === "durable") {
-        await this.rememberDurableProject(pendingUpload.projectId);
-        if (!this.isCurrent(epoch)) {
-          objectUrlLease.revoke();
-          await this.rollbackProjectLifecycle(pendingUpload.projectId);
-          await this.restoreDurableProjectPointer(previousDurableProjectId, pendingUpload.projectId);
-          return;
-        }
-        this.clearTemporaryProject();
-      } else {
-        this.rememberTemporaryProject(pendingUpload.projectId);
-      }
+      this.ownedProjectTokens.delete(pendingUpload.projectId);
       this.setSnapshot({
         route: "workbench",
         project,
-        mode,
+        mode: "durable",
         sourceObjectUrl: objectUrl,
         pendingUpload: null,
         activity: null,
         error: null,
       });
     } catch (error) {
-      if (objectUrl !== null) objectUrlLease.revoke();
-      await this.rollbackProjectLifecycle(pendingUpload.projectId);
+      if (objectUrl !== null) objectUrlLease.revokeIfCurrent(objectUrl);
+      if (ownershipClaimed) {
+        await this.rollbackProjectLifecycle(pendingUpload.projectId);
+        await this.restoreDurableProjectPointer(previousDurableProjectId, pendingUpload.projectId);
+      }
       if (!this.isCurrent(epoch)) return;
-      if (mode === "durable" && isQuotaExceeded(error)) {
+      if (isQuotaExceeded(error)) {
         this.offerTemporaryChoice(
           pendingUpload,
           epoch,
@@ -360,6 +374,18 @@ export class ProjectStore {
         return;
       }
       this.failCurrentOperation(epoch, userFacingError(error, "CueBench could not save this video."));
+    }
+  }
+
+  private assertPersistedMedia(pendingUpload: PendingUpload, media: IngestedLocalMedia): void {
+    if (
+      media.projectId !== pendingUpload.projectId
+      || media.sourceId !== pendingUpload.sourceId
+      || media.byteLength !== pendingUpload.file.size
+      || media.blob.size !== pendingUpload.file.size
+      || media.contentType !== pendingUpload.file.type
+    ) {
+      throw new Error("CueBench could not verify the saved local media binding.");
     }
   }
 
@@ -378,7 +404,7 @@ export class ProjectStore {
     if (!this.isCurrent(epoch) || media === undefined) return false;
     const objectUrlLease = this.activeObjectUrlLease();
     if (objectUrlLease === undefined) throw new LocalMediaError("object-url-unavailable", "This browser cannot safely preview local media.");
-    // There is no await after this current-epoch check, so a stale restore cannot revoke a newer URL.
+    // No await follows this epoch check, so a stale restore cannot replace a newer object URL.
     const sourceObjectUrl = objectUrlLease.replace(media.blob);
     this.setSnapshot({
       route: "workbench",
@@ -404,8 +430,37 @@ export class ProjectStore {
     }
   }
 
-  /** Guaranteed cleanup compensates for the package-level immutable writes that span separate Dexie transactions. */
+  /** Claims a unique persistent owner before writing media, so a losing tab cannot roll back another tab. */
+  private async claimProjectOwnership(projectId: string): Promise<void> {
+    const token = this.createId();
+    try {
+      await this.database.transaction("rw", [this.database.projectHeaders, this.database.settings], async () => {
+        const [existingProject, existingOwner] = await Promise.all([
+          this.database.projectHeaders.get(projectId),
+          this.database.settings.get(projectOwnerKey(projectId)),
+        ]);
+        if (existingProject !== undefined || existingOwner !== undefined) {
+          throw new Error("CueBench could not claim a unique local project. Try opening the media again.");
+        }
+        await this.database.settings.add({
+          key: projectOwnerKey(projectId),
+          value: { projectId, token },
+          updatedAtMs: Date.now(),
+        });
+      });
+    } catch (error) {
+      if (error instanceof Error && error.name === "ConstraintError") {
+        throw new Error("CueBench could not claim a unique local project. Try opening the media again.", { cause: error });
+      }
+      throw error;
+    }
+    this.ownedProjectTokens.set(projectId, token);
+  }
+
+  /** Compensates immutable writes only after proving this store owns the lifecycle marker. */
   private async rollbackProjectLifecycle(projectId: string): Promise<void> {
+    const token = this.ownedProjectTokens.get(projectId);
+    if (token === undefined) return;
     try {
       await this.database.transaction(
         "rw",
@@ -423,24 +478,86 @@ export class ProjectStore {
           this.database.settings,
         ],
         async () => {
+          const ownership = await this.database.settings.get(projectOwnerKey(projectId));
+          if (readOwnerToken(ownership?.value, projectId) !== token) return;
+          await this.deleteProjectRows(projectId);
           await Promise.all([
-            this.database.projectHeaders.delete(projectId),
-            this.database.items.where("projectId").equals(projectId).delete(),
-            this.database.revisions.where("projectId").equals(projectId).delete(),
-            this.database.findings.where("projectId").equals(projectId).delete(),
-            this.database.evidence.where("projectId").equals(projectId).delete(),
-            this.database.courtRecord.where("projectId").equals(projectId).delete(),
-            this.database.certifications.where("projectId").equals(projectId).delete(),
-            this.database.sourceBlobs.where("projectId").equals(projectId).delete(),
-            this.database.narrationBlobs.where("projectId").equals(projectId).delete(),
-            this.database.runReceipts.where("projectId").equals(projectId).delete(),
             this.database.settings.delete(projectModeKey(projectId)),
+            this.database.settings.delete(projectOwnerKey(projectId)),
           ]);
         },
       );
     } catch {
-      // Preserve the original user-facing failure; a later inspection can identify a browser-level database outage.
+      // Preserve the primary browser/database failure. The owner marker prevents unrelated deletion on a retry.
+    } finally {
+      this.ownedProjectTokens.delete(projectId);
     }
+  }
+
+  /** Removes only old temporary rows that have neither a durable pointer nor a lifecycle owner. */
+  private async sweepLegacyTemporaryProjects(epoch: number): Promise<void> {
+    const settings = await this.database.settings.toArray();
+    const durableProjectId = readProjectId(settings.find((setting) => setting.key === lastDurableProjectKey)?.value);
+    const legacyIds = settings
+      .filter((setting) => setting.key.startsWith("project-mode:") && readMode(setting.value) === "temporary")
+      .map((setting) => setting.key.slice("project-mode:".length))
+      .filter((projectId) => projectId.length > 0 && projectId !== durableProjectId);
+    for (const projectId of legacyIds) {
+      if (!this.isCurrent(epoch)) return;
+      await this.purgeLegacyTemporaryProject(projectId);
+    }
+  }
+
+  private async purgeLegacyTemporaryProject(projectId: string): Promise<void> {
+    try {
+      await this.database.transaction(
+        "rw",
+        [
+          this.database.projectHeaders,
+          this.database.items,
+          this.database.revisions,
+          this.database.findings,
+          this.database.evidence,
+          this.database.courtRecord,
+          this.database.certifications,
+          this.database.sourceBlobs,
+          this.database.narrationBlobs,
+          this.database.runReceipts,
+          this.database.settings,
+        ],
+        async () => {
+          const [mode, owner, durablePointer] = await Promise.all([
+            this.database.settings.get(projectModeKey(projectId)),
+            this.database.settings.get(projectOwnerKey(projectId)),
+            this.database.settings.get(lastDurableProjectKey),
+          ]);
+          if (
+            readMode(mode?.value) !== "temporary"
+            || owner !== undefined
+            || readProjectId(durablePointer?.value) === projectId
+          ) return;
+          await this.deleteProjectRows(projectId);
+          await this.database.settings.delete(projectModeKey(projectId));
+        },
+      );
+    } catch {
+      // A future app start can retry the migration cleanup; never block durable hydration for an orphan.
+    }
+  }
+
+  private async deleteProjectRows(projectId: string): Promise<void> {
+    await Promise.all([
+      this.database.projectHeaders.delete(projectId),
+      this.database.items.where("projectId").equals(projectId).delete(),
+      this.database.revisions.where("projectId").equals(projectId).delete(),
+      this.database.findings.where("projectId").equals(projectId).delete(),
+      this.database.evidence.where("projectId").equals(projectId).delete(),
+      this.database.courtRecord.where("projectId").equals(projectId).delete(),
+      this.database.certifications.where("projectId").equals(projectId).delete(),
+      this.database.sourceBlobs.where("projectId").equals(projectId).delete(),
+      this.database.narrationBlobs.where("projectId").equals(projectId).delete(),
+      this.database.runReceipts.where("projectId").equals(projectId).delete(),
+    ]);
   }
 
   private async persistMode(projectId: string, mode: ProjectMode): Promise<void> {
@@ -466,33 +583,7 @@ export class ProjectStore {
         await this.rememberDurableProject(previousProjectId);
       }
     } catch {
-      // The project rollback remains authoritative even if the browser rejects a compensating pointer write.
-    }
-  }
-
-  private readTemporaryProjectId(): string | null {
-    try {
-      const encoded = this.sessionStorage?.getItem(temporaryProjectSessionKey);
-      if (encoded === null || encoded === undefined) return null;
-      return readProjectId(JSON.parse(encoded));
-    } catch {
-      return null;
-    }
-  }
-
-  private rememberTemporaryProject(projectId: string): void {
-    try {
-      this.sessionStorage?.setItem(temporaryProjectSessionKey, JSON.stringify({ projectId }));
-    } catch {
-      // The current tab stays usable even in restrictive privacy modes; the disclosure does not promise recovery.
-    }
-  }
-
-  private clearTemporaryProject(): void {
-    try {
-      this.sessionStorage?.removeItem(temporaryProjectSessionKey);
-    } catch {
-      // Best-effort cleanup only; browser session storage can be disabled independently of IndexedDB.
+      // The owner-checked project rollback remains authoritative if pointer recovery is rejected.
     }
   }
 

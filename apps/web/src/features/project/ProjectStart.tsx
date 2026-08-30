@@ -68,7 +68,7 @@ export function ProjectStart({ store }: ProjectStartProps) {
           <Dialog.Content className="storage-dialog" aria-describedby="temporary-session-description">
             <Dialog.Title>Temporary session required</Dialog.Title>
             <Dialog.Description id="temporary-session-description">
-              This browser cannot offer enough durable storage for this video. A temporary session is usable now, but is not recoverable after this browser session ends.
+              This browser cannot offer enough durable storage for this video. Continue only if keeping it in current-page memory is acceptable: reloading or closing this page loses the project.
             </Dialog.Description>
             <StorageDisclosure mode="temporary" />
             {snapshot.error === null ? null : <p className="form-error" role="alert">{snapshot.error}</p>}

@@ -269,6 +269,7 @@ button:disabled { cursor: not-allowed; }
   .project-start__actions .button,
   .ruling-panel__actions .button,
   .transport-control { min-height: 44px; }
+  .docket-tabs button { min-height: 44px; }
   .project-start__measurements div { min-height: 4.7rem; }
   .header-actions { gap: 0.2rem; padding: 0.55rem; }
   .header-button { min-width: 0; padding: 0.42rem 0.48rem; }
