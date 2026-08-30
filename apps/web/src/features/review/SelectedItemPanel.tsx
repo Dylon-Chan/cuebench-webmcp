@@ -11,6 +11,7 @@ import {
   itemProse,
   itemTypeLabel,
   reviewDraftForItem,
+  reviewDraftHasContentChanges,
   reviewDraftIsDirty,
   reviewDraftValidity,
   reviewStateLabel,
@@ -32,6 +33,7 @@ export interface SelectedItemPanelProps {
   /** Reads the single native video clock; no parallel review clock exists. */
   readonly onReadNativePlayheadMs?: () => number;
   readonly evidenceContentResolver?: EvidenceContentResolver;
+  readonly focusedRevision?: number;
 }
 
 const updateDraft = <Key extends keyof ReviewDraft>(
@@ -68,6 +70,7 @@ export function SelectedItemPanel({
   onRequestSemanticCommand,
   onReadNativePlayheadMs,
   evidenceContentResolver,
+  focusedRevision,
 }: SelectedItemPanelProps) {
   if (item === null) {
     return (
@@ -85,6 +88,7 @@ export function SelectedItemPanel({
     : reviewDraftForItem(item);
   const validity = reviewDraftValidity(project, item, activeDraft);
   const draftIsDirty = reviewDraftIsDirty(item, activeDraft);
+  const contentDraftIsDirty = reviewDraftHasContentChanges(item, activeDraft);
   const staleDraft = activeDraft.itemRevision !== item.current.itemRevision;
   const startMs = integerValue(activeDraft.startMs);
   const endMs = integerValue(activeDraft.endMs);
@@ -218,7 +222,7 @@ export function SelectedItemPanel({
         </div>
         {validity.timingError === null ? null : <p className="review-field-error" id={timingErrorId} role="alert">{validity.timingError}</p>}
         <p className="selected-item-panel__timing-note">Times are integer milliseconds against the native video clock.</p>
-        {draftIsDirty ? <p className="selected-item-panel__draft-note">Unsaved text or timing is visible. Save or discard it before navigating or ruling.</p> : null}
+        {draftIsDirty ? <p className="selected-item-panel__draft-note">Unsaved text, timing, or caption structure is visible. Save, apply, or discard it before navigating or ruling.</p> : null}
         {item.current.state !== "Sustained" ? null : <p className="selected-item-panel__confirmation-note">Changing Sustained work requires confirmation and creates a new Proposed revision.</p>}
         <div className="selected-item-panel__actions">
           <button
@@ -232,7 +236,7 @@ export function SelectedItemPanel({
           <button
             className="button button--signal"
             type="button"
-            disabled={isCommandPending || !draftIsDirty || semanticCommand === null}
+            disabled={isCommandPending || !contentDraftIsDirty || semanticCommand === null}
             onClick={() => semanticCommand === null ? undefined : onRequestSemanticCommand(semanticCommand, `Created Proposed revision for ${itemAccessibleLabel(item)}.`)}
           >
             {saveLabel}
@@ -263,8 +267,8 @@ export function SelectedItemPanel({
             </label>
             {validity.splitError === null ? null : <p className="review-field-error" id={splitErrorId} role="alert">{validity.splitError}</p>}
             <div className="selected-item-panel__actions">
-              <button className="button button--outline" type="button" disabled={isCommandPending || draftIsDirty || staleDraft || splitCommand === null} onClick={() => splitCommand === null ? undefined : onRequestSemanticCommand(splitCommand, `Split ${itemAccessibleLabel(item)} at ${splitMs} ms.`)}>Split Caption {item.itemId.toUpperCase()}</button>
-              {adjacent === null ? <p className="caption-structure-tools__empty">No adjacent successor is available to merge.</p> : <button className="button button--outline" type="button" disabled={isCommandPending || draftIsDirty || staleDraft || mergeCommand === null} onClick={() => mergeCommand === null ? undefined : onRequestSemanticCommand(mergeCommand, `Merged ${itemAccessibleLabel(item)} with ${itemAccessibleLabel(adjacent)}.`)}>Merge Caption {item.itemId.toUpperCase()} with {adjacent.itemId.toUpperCase()}</button>}
+              <button className="button button--outline" type="button" disabled={isCommandPending || contentDraftIsDirty || staleDraft || splitCommand === null} onClick={() => splitCommand === null ? undefined : onRequestSemanticCommand(splitCommand, `Split ${itemAccessibleLabel(item)} at ${splitMs} ms.`)}>Split Caption {item.itemId.toUpperCase()}</button>
+              {adjacent === null ? <p className="caption-structure-tools__empty">No adjacent successor is available to merge.</p> : <button className="button button--outline" type="button" disabled={isCommandPending || contentDraftIsDirty || staleDraft || mergeCommand === null} onClick={() => mergeCommand === null ? undefined : onRequestSemanticCommand(mergeCommand, `Merged ${itemAccessibleLabel(item)} with ${itemAccessibleLabel(adjacent)}.`)}>Merge Caption {item.itemId.toUpperCase()} with {adjacent.itemId.toUpperCase()}</button>}
             </div>
           </fieldset>
         )}
@@ -277,7 +281,7 @@ export function SelectedItemPanel({
         {...(evidenceContentResolver === undefined ? {} : { contentResolver: evidenceContentResolver })}
         onFocusEvidence={(evidenceId) => onFocusEvidence(item, evidenceId)}
       />
-      <RevisionHistory project={project} item={item} evidence={evidence} onFocusEvidence={(evidenceId) => onFocusEvidence(item, evidenceId)} />
+      <RevisionHistory project={project} item={item} evidence={evidence} {...(focusedRevision === undefined ? {} : { focusedRevision })} onFocusEvidence={(evidenceId) => onFocusEvidence(item, evidenceId)} />
     </section>
   );
 }

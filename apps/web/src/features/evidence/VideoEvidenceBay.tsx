@@ -24,6 +24,8 @@ export interface VideoEvidenceBayProps {
   readonly onRequestItemNavigation?: (itemId: string, sourceLabel: string) => void;
   /** Prevents a different timeline item from replacing a visible dirty review draft. */
   readonly reviewDraftActive?: boolean;
+  /** Canonical timing results let a clean review draft advance to its new revision. */
+  readonly onCanonicalItemRevision?: (itemId: string, previousItemRevision: number, project: CaptionProject) => void;
   /** Kept as one semantic summary, placed between video and timeline on narrow screens. */
   readonly reviewSummary?: ReactNode;
 }
@@ -41,6 +43,7 @@ export function VideoEvidenceBay({
   onPlayheadReady,
   onRequestItemNavigation,
   reviewDraftActive = false,
+  onCanonicalItemRevision,
   reviewSummary,
 }: VideoEvidenceBayProps) {
   const videoRef = useRef<HTMLVideoElement>(null);
@@ -147,6 +150,7 @@ export function VideoEvidenceBay({
         onCommand={onCommand}
         {...(onRequestItemNavigation === undefined ? {} : { onRequestItemNavigation })}
         reviewDraftActive={reviewDraftActive}
+        {...(onCanonicalItemRevision === undefined ? {} : { onCanonicalItemRevision })}
         peakPyramid={evidence.audioState === "ready" ? evidence.peakPyramid : null}
       />
       <p className="timeline-evidence-status" data-testid="media-evidence-status" role="status" aria-live="polite">{peakStatusMessage}</p>

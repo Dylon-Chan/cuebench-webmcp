@@ -50,6 +50,8 @@ export interface TimelineProps {
   readonly onRequestItemNavigation?: (itemId: string, sourceLabel: string) => void;
   /** A visible draft elsewhere owns the review authority boundary. */
   readonly reviewDraftActive?: boolean;
+  /** Lets the review editor rebase a clean draft after this canonical timing edit. */
+  readonly onCanonicalItemRevision?: (itemId: string, previousItemRevision: number, project: CaptionProject) => void;
 }
 
 interface TimelineViewport {
@@ -167,6 +169,7 @@ export function Timeline({
   onSelectionChange,
   onRequestItemNavigation,
   reviewDraftActive = false,
+  onCanonicalItemRevision,
 }: TimelineProps) {
   const surfaceRef = useRef<HTMLDivElement>(null);
   const itemButtonRefs = useRef(new Map<string, HTMLButtonElement>());
@@ -269,7 +272,7 @@ export function Timeline({
   }, [actor, executeTimelineCommand, onRequestItemNavigation, onSelectionChange, project.projectRevision, seekToMediaTime]);
 
   const commitPreview = useCallback(() => {
-    if (commandPendingRef.current) return;
+    if (commandPendingRef.current || reviewDraftActive) return;
     const preview = editPreviewRef.current;
     if (preview === null) return;
     setEditPreview(null);
@@ -302,17 +305,18 @@ export function Timeline({
       if (result === null || result.error !== undefined) return;
       const canonicalItem = itemForProject(result.project, preview.itemId);
       if (canonicalItem === null) return;
+      onCanonicalItemRevision?.(canonicalItem.itemId, preview.expectedItemRevision, result.project);
       const kind = canonicalItem.kind === "CaptionCue" ? "Caption" : "Audio description";
       setAcceptedFeedback(
         `${kind} ${canonicalItem.itemId.toUpperCase()} timing updated to ${formatMediaTime(canonicalItem.current.startMs)} to ${formatMediaTime(canonicalItem.current.endMs)}.`,
       );
     })();
-  }, [actor, executeTimelineCommand, itemForId, setEditPreview]);
+  }, [actor, executeTimelineCommand, itemForId, onCanonicalItemRevision, reviewDraftActive, setEditPreview]);
 
   const localXForPointer = useCallback((clientX: number) => clientX - (surfaceRef.current?.getBoundingClientRect().left ?? 0), []);
 
   const onPointerDown = useCallback((event: PointerEvent<HTMLButtonElement>, item: TimelineLaneItem, edge: TimelineEditEdge) => {
-    if (commandPendingRef.current) return;
+    if (commandPendingRef.current || reviewDraftActive) return;
     event.preventDefault();
     event.stopPropagation();
     event.currentTarget.focus();
@@ -331,11 +335,16 @@ export function Timeline({
       hasMoved: false,
     };
     event.currentTarget.setPointerCapture?.(event.pointerId);
-  }, [localXForPointer, project.projectRevision, transform]);
+  }, [localXForPointer, project.projectRevision, reviewDraftActive, transform]);
 
   const onPointerMove = useCallback((event: PointerEvent<HTMLButtonElement>) => {
     const drag = dragRef.current;
     if (drag === null || drag.pointerId !== event.pointerId || commandPendingRef.current) return;
+    if (reviewDraftActive) {
+      dragRef.current = null;
+      setEditPreview(null);
+      return;
+    }
     if (!drag.hasMoved && Math.abs(event.clientX - drag.originClientX) < dragThresholdPx) return;
     drag.hasMoved = true;
     const item = itemForId(drag.itemId);
@@ -353,7 +362,7 @@ export function Timeline({
       expectedProjectRevision: drag.expectedProjectRevision,
       ...timing,
     });
-  }, [itemForId, localXForPointer, project.media.durationMs, setEditPreview, transform]);
+  }, [itemForId, localXForPointer, project.media.durationMs, reviewDraftActive, setEditPreview, transform]);
 
   const onPointerUp = useCallback((event: PointerEvent<HTMLButtonElement>) => {
     const drag = dragRef.current;
@@ -374,7 +383,7 @@ export function Timeline({
     item: TimelineLaneItem,
     edge: TimelineEditEdge,
   ) => {
-    if (commandPendingRef.current || !isTimingAdjustmentKey(event.key)) return;
+    if (commandPendingRef.current || reviewDraftActive || !isTimingAdjustmentKey(event.key)) return;
     event.preventDefault();
     const currentPreview = editPreviewRef.current;
     const previous = currentPreview?.itemId === item.itemId && currentPreview.edge === edge
@@ -400,7 +409,7 @@ export function Timeline({
           : previous.endMs + (decrement ? -step : increment ? step : 0);
     const timing = clampPreviewTiming(item, edge, candidate, project.media.durationMs);
     setEditPreview({ ...previous, ...timing });
-  }, [project.media.durationMs, project.projectRevision, setEditPreview]);
+  }, [project.media.durationMs, project.projectRevision, reviewDraftActive, setEditPreview]);
 
   const onKeyboardCommit = useCallback((event: KeyboardEvent<HTMLButtonElement>) => {
     if (event.key === "Escape") {

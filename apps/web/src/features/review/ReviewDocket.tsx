@@ -14,7 +14,11 @@ import {
   useState,
   type ReactNode,
 } from "react";
-import { EvidenceInspector, type EvidenceContentResolver } from "../evidence/EvidenceInspector";
+import {
+  EvidenceInspector,
+  resolveValidatedEvidenceWindow,
+  type EvidenceContentResolver,
+} from "../evidence/EvidenceInspector";
 import { QualityFindings } from "../evidence/QualityFindings";
 import { HumanRulingControls } from "./HumanRulingControls";
 import { SelectedItemPanel } from "./SelectedItemPanel";
@@ -29,6 +33,8 @@ import {
   orderedReviewItems,
   primaryFindingItemId,
   reviewDraftForItem,
+  reviewDraftHasContentChanges,
+  reviewDraftIsCleanForRevision,
   reviewDraftIsDirty,
   reviewItemForId,
   reviewStateLabel,
@@ -43,6 +49,11 @@ interface PendingNavigation {
   readonly itemId: string;
   readonly evidenceId?: string;
   readonly label: string;
+  /** Undefined seeks the item's start, null leaves the native clock untouched. */
+  readonly seekMs?: number | null;
+  readonly itemRevision?: number;
+  /** A save was accepted; only retry selection, never save again. */
+  readonly savedProject?: CaptionProject;
 }
 
 interface PendingSustainedCommand {
@@ -54,6 +65,7 @@ interface PendingSustainedCommand {
 interface FocusAfterSelection {
   readonly itemId: string;
   readonly evidenceId?: string;
+  readonly itemRevision?: number;
 }
 
 export interface ReviewDocketProps {
@@ -67,6 +79,10 @@ export interface ReviewDocketProps {
   readonly evidenceContentResolver?: EvidenceContentResolver;
   /** Cross-surface navigation asks the docket before it can replace a draft. */
   readonly onRegisterItemNavigation?: (navigate: (itemId: string, sourceLabel: string) => void) => void;
+  /** Court Record links can target an immutable item revision instead of a generic heading. */
+  readonly onRegisterItemRevisionFocus?: (focus: (itemId: string, itemRevision: number, sourceLabel: string) => void) => void;
+  /** The native timeline reports accepted timing revisions through this review boundary. */
+  readonly onRegisterCanonicalTimelineEdit?: (rebase: (itemId: string, previousItemRevision: number, project: CaptionProject) => void) => void;
   /** Lets the native timeline disable commands while this docket owns a draft. */
   readonly onDraftStateChange?: (isDirty: boolean) => void;
   /** Provided by VideoEvidenceBay for a legal caption split convenience. */
@@ -82,9 +98,49 @@ const filterOptions: readonly { readonly value: DocketFilter; readonly label: st
 ];
 
 const windowThreshold = 80;
-const virtualRowHeight = 184;
+/** First render estimate only; ResizeObserver replaces it per complete row. */
+const virtualRowEstimate = 148;
 const virtualViewportHeight = 552;
 const virtualOverscan = 4;
+const virtualRowGap = 8;
+
+interface DocketWindowLayout {
+  readonly starts: readonly number[];
+  readonly heights: readonly number[];
+  readonly totalHeight: number;
+}
+
+/** O(n) prefix offsets for variable-height semantic docket rows. */
+export const createDocketWindowLayout = (
+  items: readonly ReviewableItem[],
+  measuredHeights: Readonly<Record<string, number>>,
+): DocketWindowLayout => {
+  const starts: number[] = [];
+  const heights: number[] = [];
+  let cursor = 0;
+  for (const item of items) {
+    starts.push(cursor);
+    const measured = measuredHeights[item.itemId];
+    const height = measured === undefined || !Number.isFinite(measured)
+      ? virtualRowEstimate
+      : Math.max(44, Math.ceil(measured));
+    heights.push(height);
+    cursor += height + virtualRowGap;
+  }
+  return { starts, heights, totalHeight: Math.max(0, cursor - virtualRowGap) };
+};
+
+const firstDocketIndexAfter = (layout: DocketWindowLayout, offset: number): number => {
+  let lower = 0;
+  let upper = layout.starts.length;
+  while (lower < upper) {
+    const middle = Math.floor((lower + upper) / 2);
+    const end = layout.starts[middle]! + layout.heights[middle]!;
+    if (end <= offset) lower = middle + 1;
+    else upper = middle;
+  }
+  return lower;
+};
 
 const errorMessage = (error: unknown): string => error instanceof Error && error.message.trim().length > 0
   ? error.message
@@ -128,7 +184,7 @@ export function ReviewSelectionSummary({ project }: { readonly project: CaptionP
  * The docket owns the draft and all review navigation. A visible dirty draft
  * cannot be silently abandoned by selecting a finding, an item, or evidence.
  */
-export function ReviewDocket({ project, onCommand, onSeekToMediaTime, footer, evidenceContentResolver, onRegisterItemNavigation, onDraftStateChange, onReadNativePlayheadMs }: ReviewDocketProps) {
+export function ReviewDocket({ project, onCommand, onSeekToMediaTime, footer, evidenceContentResolver, onRegisterItemNavigation, onRegisterItemRevisionFocus, onRegisterCanonicalTimelineEdit, onDraftStateChange, onReadNativePlayheadMs }: ReviewDocketProps) {
   const [filter, setFilter] = useState<DocketFilter>("all");
   const [isCommandPending, setIsCommandPending] = useState(false);
   const commandPendingRef = useRef(false);
@@ -138,50 +194,93 @@ export function ReviewDocket({ project, onCommand, onSeekToMediaTime, footer, ev
   const [pendingNavigation, setPendingNavigation] = useState<PendingNavigation | null>(null);
   const [pendingSustainedCommand, setPendingSustainedCommand] = useState<PendingSustainedCommand | null>(null);
   const [virtualScrollTop, setVirtualScrollTop] = useState(0);
+  const [measuredRowHeights, setMeasuredRowHeights] = useState<Readonly<Record<string, number>>>({});
+  const [pinnedDocketItemId, setPinnedDocketItemId] = useState<string | null>(null);
   const itemButtonRefs = useRef(new Map<string, HTMLButtonElement>());
   const virtualViewportRef = useRef<HTMLDivElement>(null);
+  const docketRowRefs = useRef(new Map<string, HTMLLIElement>());
+  const docketRowObserverRef = useRef<ResizeObserver | null>(null);
   const selectedItem = currentSelectedItem(project);
-  const initialSelectedItem = useRef(selectedItem);
+  const initialFocusRequested = useRef(false);
   const [draft, setDraft] = useState<ReviewDraft | null>(() => selectedItem === null ? null : reviewDraftForItem(selectedItem));
+  const draftRef = useRef(draft);
+  const pendingTimelineRebaseRef = useRef<{ readonly itemId: string; readonly itemRevision: number; readonly projectRevision: number } | null>(null);
+  draftRef.current = draft;
+  const replaceDraft = useCallback((nextDraft: ReviewDraft | null) => {
+    draftRef.current = nextDraft;
+    setDraft(nextDraft);
+  }, []);
   const items = useMemo(() => orderedReviewItems(project), [project]);
   const indexes = useMemo(() => indexReviewData(project), [project]);
   const filteredItems = useMemo(() => filter === "all"
     ? items
     : items.filter((item) => item.current.state === filter), [filter, items]);
   const draftItem = draft === null ? null : reviewItemForId(project, draft.itemId);
-  const hasUnsavedDraft = reviewDraftIsDirty(draftItem, draft);
+  const timelineRebasePending = draft !== null
+    && selectedItem !== null
+    && pendingTimelineRebaseRef.current?.itemId === draft.itemId
+    && pendingTimelineRebaseRef.current.itemId === selectedItem.itemId
+    && pendingTimelineRebaseRef.current.itemRevision === draft.itemRevision;
+  const hasUnsavedDraft = timelineRebasePending ? false : reviewDraftIsDirty(draftItem, draft);
   const draftForSelectedItem = selectedItem !== null && draft !== null && draft.itemId === selectedItem.itemId && draft.itemRevision === selectedItem.current.itemRevision
     ? draft
     : selectedItem !== null && draft !== null && draft.itemId === selectedItem.itemId
       ? draft
     : selectedItem === null ? null : reviewDraftForItem(selectedItem);
-  const draftSaveCommand = selectedItem === null || draftForSelectedItem === null
+  const draftSaveCommand = selectedItem === null || draftForSelectedItem === null || !reviewDraftHasContentChanges(selectedItem, draftForSelectedItem)
     ? null
     : draftForSelectedItem.itemRevision !== selectedItem.current.itemRevision
       ? null
       : semanticRevisionCommand(project, selectedItem, draftForSelectedItem);
   const windowed = filteredItems.length > windowThreshold;
-  const rowsPerViewport = Math.ceil(virtualViewportHeight / virtualRowHeight);
-  const virtualStart = windowed ? Math.max(0, Math.floor(virtualScrollTop / virtualRowHeight) - virtualOverscan) : 0;
-  const virtualEnd = windowed ? Math.min(filteredItems.length, virtualStart + rowsPerViewport + virtualOverscan * 2) : filteredItems.length;
-  const visibleItems = filteredItems.slice(virtualStart, virtualEnd);
+  const virtualLayout = useMemo(() => createDocketWindowLayout(filteredItems, measuredRowHeights), [filteredItems, measuredRowHeights]);
+  const renderedDocketIndexes = useMemo(() => {
+    if (!windowed) return filteredItems.map((_, index) => index);
+    const first = Math.max(0, firstDocketIndexAfter(virtualLayout, virtualScrollTop) - virtualOverscan);
+    const lastVisible = firstDocketIndexAfter(virtualLayout, virtualScrollTop + virtualViewportHeight);
+    const last = Math.min(filteredItems.length, lastVisible + virtualOverscan + 1);
+    const indexesToRender = new Set<number>();
+    for (let index = first; index < last; index += 1) indexesToRender.add(index);
+    for (const itemId of [focusAfterSelection?.itemId, pinnedDocketItemId]) {
+      if (itemId === undefined || itemId === null) continue;
+      const index = filteredItems.findIndex((item) => item.itemId === itemId);
+      if (index >= 0) indexesToRender.add(index);
+    }
+    return [...indexesToRender].sort((left, right) => left - right);
+  }, [filteredItems, focusAfterSelection?.itemId, pinnedDocketItemId, virtualLayout, virtualScrollTop, windowed]);
+
+  // Do not let a deferred mount effect overwrite a newer finding/evidence
+  // focus request. The first selected item gets focus only if nothing more
+  // specific has already claimed it.
+  useLayoutEffect(() => {
+    if (initialFocusRequested.current) return;
+    initialFocusRequested.current = true;
+    if (selectedItem !== null) {
+      setFocusAfterSelection((current) => current ?? { itemId: selectedItem.itemId });
+    }
+  }, [selectedItem]);
 
   useEffect(() => {
-    const initiallySelected = initialSelectedItem.current;
-    if (initiallySelected !== null) setFocusAfterSelection({ itemId: initiallySelected.itemId });
-  }, []);
-
-  useEffect(() => {
+    if (timelineRebasePending) return;
     if (selectedItem === null) {
-      if (!hasUnsavedDraft) setDraft(null);
+      if (!hasUnsavedDraft) {
+        replaceDraft(null);
+      }
       return;
     }
     if (draft === null || !hasUnsavedDraft) {
       if (draft?.itemId !== selectedItem.itemId || draft.itemRevision !== selectedItem.current.itemRevision) {
-        setDraft(reviewDraftForItem(selectedItem));
+        replaceDraft(reviewDraftForItem(selectedItem));
       }
     }
-  }, [draft, hasUnsavedDraft, selectedItem]);
+  }, [draft, hasUnsavedDraft, replaceDraft, selectedItem, timelineRebasePending]);
+
+  useEffect(() => {
+    const pending = pendingTimelineRebaseRef.current;
+    if (pending !== null && project.projectRevision >= pending.projectRevision) {
+      pendingTimelineRebaseRef.current = null;
+    }
+  }, [project.projectRevision]);
 
   const executeCommand = useCallback(async (
     command: DomainCommand,
@@ -194,7 +293,7 @@ export function ReviewDocket({ project, onCommand, onSeekToMediaTime, footer, ev
     setErrorAnnouncement(null);
     try {
       const result = await onCommand(command);
-      if (result === null || result === undefined || typeof result !== "object" || !("project" in result) || result.project === null) {
+      if (result === null || result === undefined || typeof result !== "object" || !("project" in result) || result.project === null || result.project === undefined || typeof result.project !== "object") {
         setErrorAnnouncement("CueBench did not return an accepted result. The saved project was not changed; retry or discard the draft.");
         return null;
       }
@@ -216,8 +315,9 @@ export function ReviewDocket({ project, onCommand, onSeekToMediaTime, footer, ev
   const syncDraftToCanonical = useCallback((canonicalProject: CaptionProject, itemId: string | null) => {
     if (itemId === null) return;
     const canonicalItem = reviewItemForId(canonicalProject, itemId);
-    setDraft(canonicalItem === null ? null : reviewDraftForItem(canonicalItem));
-  }, []);
+    const nextDraft = canonicalItem === null ? null : reviewDraftForItem(canonicalItem);
+    replaceDraft(nextDraft);
+  }, [replaceDraft]);
 
   const performNavigation = useCallback(async (navigation: PendingNavigation, baseProject: CaptionProject): Promise<boolean> => {
     const target = reviewItemForId(baseProject, navigation.itemId);
@@ -240,9 +340,9 @@ export function ReviewDocket({ project, onCommand, onSeekToMediaTime, footer, ev
       return false;
     }
     syncDraftToCanonical(result.project, canonicalItem.itemId);
-    onSeekToMediaTime(canonicalItem.current.startMs);
+    if (navigation.seekMs !== null) onSeekToMediaTime(navigation.seekMs ?? canonicalItem.current.startMs);
     setFocusAfterSelection(navigation.evidenceId === undefined
-      ? { itemId: canonicalItem.itemId }
+      ? { itemId: canonicalItem.itemId, ...(navigation.itemRevision === undefined ? {} : { itemRevision: navigation.itemRevision }) }
       : { itemId: canonicalItem.itemId, evidenceId: navigation.evidenceId });
     setPendingNavigation(null);
     return true;
@@ -257,7 +357,13 @@ export function ReviewDocket({ project, onCommand, onSeekToMediaTime, footer, ev
     if (result === null || result.error !== undefined) return false;
     const itemId = commandPrimaryItemId(command);
     syncDraftToCanonical(result.project, itemId);
-    if (afterSuccessNavigation !== undefined) return performNavigation(afterSuccessNavigation, result.project);
+    if (afterSuccessNavigation !== undefined) {
+      const retryNavigation = { ...afterSuccessNavigation, savedProject: result.project };
+      // Once an edit has been accepted, a later failed selection must never
+      // offer a second save against the new immutable revision.
+      setPendingNavigation(retryNavigation);
+      return performNavigation(retryNavigation, result.project);
+    }
     return true;
   }, [executeCommand, performNavigation, syncDraftToCanonical]);
 
@@ -294,6 +400,37 @@ export function ReviewDocket({ project, onCommand, onSeekToMediaTime, footer, ev
     });
   }, [onRegisterItemNavigation, project, requestNavigation]);
 
+  useEffect(() => {
+    onRegisterItemRevisionFocus?.((itemId, itemRevision, sourceLabel) => {
+      const item = reviewItemForId(project, itemId);
+      const revisionExists = item?.revisions.some((revision) => revision.itemRevision === itemRevision) ?? false;
+      if (item === null || !revisionExists) {
+        setErrorAnnouncement("The Court Record target revision is not available in the current project state.");
+        return;
+      }
+      requestNavigation({ itemId, itemRevision, label: sourceLabel || `${itemAccessibleLabel(item)} r${itemRevision}` });
+    });
+  }, [onRegisterItemRevisionFocus, project, requestNavigation]);
+
+  useEffect(() => {
+    onRegisterCanonicalTimelineEdit?.((itemId, previousItemRevision, canonicalProject) => {
+      const canonicalItem = reviewItemForId(canonicalProject, itemId);
+      if (canonicalItem === null) return;
+      const previousRevision = canonicalItem.revisions.find((revision) => revision.itemRevision === previousItemRevision);
+      // A timeline mutation is allowed only while the editor reported a clean
+      // draft. Rebase that exact immutable snapshot to its accepted canonical
+      // successor before the route re-renders, avoiding a false stale draft.
+      if (previousRevision !== undefined && reviewDraftIsCleanForRevision(draftRef.current, canonicalItem, previousRevision)) {
+        pendingTimelineRebaseRef.current = {
+          itemId: canonicalItem.itemId,
+          itemRevision: canonicalItem.current.itemRevision,
+          projectRevision: canonicalProject.projectRevision,
+        };
+        replaceDraft(reviewDraftForItem(canonicalItem));
+      }
+    });
+  }, [onRegisterCanonicalTimelineEdit, replaceDraft]);
+
   const selectItem = useCallback((item: ReviewableItem) => {
     requestNavigation({ itemId: item.itemId, label: itemAccessibleLabel(item) });
   }, [requestNavigation]);
@@ -313,21 +450,77 @@ export function ReviewDocket({ project, onCommand, onSeekToMediaTime, footer, ev
   }, [project, requestNavigation]);
 
   const focusEvidence = useCallback((item: ReviewableItem, evidenceId: string) => {
-    requestNavigation({ itemId: item.itemId, evidenceId, label: `evidence ${evidenceId}` });
-  }, [requestNavigation]);
+    const evidence = evidenceForItem(indexes, item.itemId).find((entry) => entry.evidenceId === evidenceId);
+    if (evidence === undefined) {
+      setErrorAnnouncement("The requested evidence provenance is not available for this item.");
+      return;
+    }
+    const resolution = resolveValidatedEvidenceWindow(project, evidence, evidenceContentResolver);
+    if (resolution.status === "invalid") {
+      setErrorAnnouncement(resolution.message);
+      return;
+    }
+    requestNavigation({
+      itemId: item.itemId,
+      evidenceId,
+      label: `evidence ${evidenceId}`,
+      // A missing package can still reveal its provenance, but never invents a
+      // media seek. A validated window seeks its recorded bounded start.
+      seekMs: resolution.status === "available" ? resolution.window.startMs : null,
+    });
+  }, [evidenceContentResolver, indexes, project, requestNavigation]);
 
   const registerItemButton = useCallback((itemId: string, element: HTMLButtonElement | null) => {
     if (element === null) itemButtonRefs.current.delete(itemId);
     else itemButtonRefs.current.set(itemId, element);
   }, []);
 
+  const recordDocketRowHeight = useCallback((itemId: string, height: number) => {
+    if (!Number.isFinite(height) || height <= 0) return;
+    const nextHeight = Math.max(44, Math.ceil(height));
+    setMeasuredRowHeights((current) => {
+      if (Math.abs((current[itemId] ?? 0) - nextHeight) < 1) return current;
+      return { ...current, [itemId]: nextHeight };
+    });
+  }, []);
+
+  const registerDocketRow = useCallback((itemId: string, element: HTMLLIElement | null) => {
+    const previous = docketRowRefs.current.get(itemId);
+    if (previous !== undefined && previous !== element) docketRowObserverRef.current?.unobserve(previous);
+    if (element === null) {
+      docketRowRefs.current.delete(itemId);
+      return;
+    }
+    docketRowRefs.current.set(itemId, element);
+    docketRowObserverRef.current?.observe(element);
+    recordDocketRowHeight(itemId, element.getBoundingClientRect().height);
+  }, [recordDocketRowHeight]);
+
+  useLayoutEffect(() => {
+    if (typeof ResizeObserver === "undefined") return undefined;
+    const observer = new ResizeObserver((entries) => {
+      for (const entry of entries) {
+        const itemId = (entry.target as HTMLElement).dataset.docketItemId;
+        // contentRect excludes the row’s padding and borders; prefix offsets
+        // must use its rendered border box so following prose never overlaps.
+        if (itemId !== undefined) recordDocketRowHeight(itemId, (entry.target as HTMLElement).getBoundingClientRect().height);
+      }
+    });
+    docketRowObserverRef.current = observer;
+    for (const row of docketRowRefs.current.values()) observer.observe(row);
+    return () => {
+      observer.disconnect();
+      if (docketRowObserverRef.current === observer) docketRowObserverRef.current = null;
+    };
+  }, [recordDocketRowHeight]);
+
   useLayoutEffect(() => {
     if (focusAfterSelection === null || isCommandPending) return;
     const index = filteredItems.findIndex((item) => item.itemId === focusAfterSelection.itemId);
     if (index === -1) return;
     if (windowed) {
-      const wantedScrollTop = Math.max(0, index * virtualRowHeight - virtualRowHeight);
-      if (Math.abs(virtualScrollTop - wantedScrollTop) > virtualRowHeight / 2) {
+      const wantedScrollTop = Math.max(0, virtualLayout.starts[index]! - virtualViewportHeight / 3);
+      if (Math.abs(virtualScrollTop - wantedScrollTop) > 1) {
         const viewport = virtualViewportRef.current;
         if (viewport !== null) viewport.scrollTop = wantedScrollTop;
         setVirtualScrollTop(wantedScrollTop);
@@ -335,21 +528,23 @@ export function ReviewDocket({ project, onCommand, onSeekToMediaTime, footer, ev
       }
     }
     const target = focusAfterSelection.evidenceId === undefined
-      ? itemButtonRefs.current.get(focusAfterSelection.itemId)
+      ? focusAfterSelection.itemRevision === undefined
+        ? itemButtonRefs.current.get(focusAfterSelection.itemId)
+        : document.getElementById(`revision-${encodeURIComponent(focusAfterSelection.itemId)}-${focusAfterSelection.itemRevision}`)
       : document.getElementById(evidenceAnchorId(focusAfterSelection.evidenceId));
     if (target instanceof HTMLElement) {
       target.focus();
       setFocusAfterSelection(null);
     }
-  }, [filter, filteredItems, focusAfterSelection, isCommandPending, virtualScrollTop, windowed]);
+  }, [filter, filteredItems, focusAfterSelection, isCommandPending, virtualLayout, virtualScrollTop, windowed]);
 
   const discardDraft = useCallback(() => {
-    setDraft(selectedItem === null ? null : reviewDraftForItem(selectedItem));
-  }, [selectedItem]);
+    replaceDraft(selectedItem === null ? null : reviewDraftForItem(selectedItem));
+  }, [replaceDraft, selectedItem]);
 
   const saveDraftAndContinue = () => {
     if (pendingNavigation === null || selectedItem === null || draftSaveCommand === null) {
-      setErrorAnnouncement("This draft cannot be saved yet. Correct the marked field or discard it before navigating.");
+      setErrorAnnouncement("This draft cannot be saved as one revision. Apply the caption structure operation or discard it before navigating.");
       return;
     }
     if (commandChangesSustainedWork(project, draftSaveCommand)) {
@@ -377,9 +572,14 @@ export function ReviewDocket({ project, onCommand, onSeekToMediaTime, footer, ev
     const findings = findingsForItem(indexes, item.itemId);
     const evidence = evidenceForItem(indexes, item.itemId);
     const selected = selectedItem?.itemId === item.itemId;
-    const itemStyle = windowed ? { position: "absolute" as const, insetInline: 0, top: `${index * virtualRowHeight}px`, minHeight: `${virtualRowHeight}px` } : undefined;
+    const itemStyle = windowed ? {
+      position: "absolute" as const,
+      insetInline: 0,
+      top: `${virtualLayout.starts[index]!}px`,
+      minHeight: `${virtualLayout.heights[index]!}px`,
+    } : undefined;
     return (
-      <li className={`docket-item${windowed ? " docket-item--windowed" : ""}`} key={item.itemId} style={itemStyle} data-selected={selected || undefined} aria-posinset={windowed ? index + 1 : undefined} aria-setsize={windowed ? filteredItems.length : undefined}>
+      <li ref={(element) => registerDocketRow(item.itemId, element)} className={`docket-item${windowed ? " docket-item--windowed" : ""}`} key={item.itemId} style={itemStyle} data-docket-item-id={item.itemId} data-selected={selected || undefined} aria-posinset={windowed ? index + 1 : undefined} aria-setsize={windowed ? filteredItems.length : undefined} onFocusCapture={() => setPinnedDocketItemId(item.itemId)}>
         <button
           ref={(element) => registerItemButton(item.itemId, element)}
           type="button"
@@ -423,12 +623,12 @@ export function ReviewDocket({ project, onCommand, onSeekToMediaTime, footer, ev
           <p className="empty-docket">{items.length === 0 ? "Caption generation will place proposed cues here for human review." : "No items match this review-state filter."}</p>
         ) : windowed ? (
           <div className="docket-list-viewport" ref={virtualViewportRef} onScroll={(event) => setVirtualScrollTop(event.currentTarget.scrollTop)}>
-            <ol className="docket-list docket-list--windowed" aria-label="Review items" style={{ height: `${filteredItems.length * virtualRowHeight}px` }}>
-              {visibleItems.map((item, offset) => renderDocketItem(item, virtualStart + offset))}
+            <ol className="docket-list docket-list--windowed" aria-label="Review items" style={{ height: `${virtualLayout.totalHeight}px` }}>
+              {renderedDocketIndexes.map((index) => renderDocketItem(filteredItems[index]!, index))}
             </ol>
           </div>
         ) : (
-          <ol className="docket-list" aria-label="Review items">{visibleItems.map((item, index) => renderDocketItem(item, index))}</ol>
+          <ol className="docket-list" aria-label="Review items">{renderedDocketIndexes.map((index) => renderDocketItem(filteredItems[index]!, index))}</ol>
         )}
       </div>
       <SelectedItemPanel
@@ -437,12 +637,13 @@ export function ReviewDocket({ project, onCommand, onSeekToMediaTime, footer, ev
         draft={draftForSelectedItem}
         indexes={indexes}
         isCommandPending={isCommandPending}
-        onDraftChange={setDraft}
+        onDraftChange={replaceDraft}
         onDiscardDraft={discardDraft}
         onSeekItem={(item) => requestNavigation({ itemId: item.itemId, label: `source video for ${itemAccessibleLabel(item)}` })}
         onFocusFinding={focusFinding}
         onFocusEvidence={focusEvidence}
         onRequestSemanticCommand={requestSemanticCommand}
+        {...(focusAfterSelection?.itemRevision === undefined ? {} : { focusedRevision: focusAfterSelection.itemRevision })}
         {...(onReadNativePlayheadMs === undefined ? {} : { onReadNativePlayheadMs })}
         {...(evidenceContentResolver === undefined ? {} : { evidenceContentResolver })}
       />
@@ -454,12 +655,16 @@ export function ReviewDocket({ project, onCommand, onSeekToMediaTime, footer, ev
         <Dialog.Portal>
           <Dialog.Overlay className="dialog-overlay" />
           <Dialog.Content className="storage-dialog review-dialog" aria-describedby="unsaved-draft-description">
-            <Dialog.Title>Unsaved review draft</Dialog.Title>
-            <Dialog.Description id="unsaved-draft-description">{pendingNavigation === null ? "" : `Save, discard, or cancel before opening ${pendingNavigation.label}. The current form displays unsaved text or timing.`}</Dialog.Description>
+            <Dialog.Title>{pendingNavigation?.savedProject === undefined ? "Unsaved review draft" : "Navigation still pending"}</Dialog.Title>
+            <Dialog.Description id="unsaved-draft-description">{pendingNavigation === null ? "" : pendingNavigation.savedProject === undefined
+              ? `Save, apply, discard, or cancel before opening ${pendingNavigation.label}. The current form displays an unsaved text, timing, or caption-structure change.`
+              : `Your draft was saved in canonical project revision ${pendingNavigation.savedProject.projectRevision}, but ${pendingNavigation.label} could not be opened. Retry navigation without saving a second revision, or cancel.`}</Dialog.Description>
             <div className="storage-dialog__actions">
               <Dialog.Close className="button button--outline" type="button">Cancel navigation</Dialog.Close>
-              <button className="button button--outline" type="button" disabled={isCommandPending} onClick={() => { const navigation = pendingNavigation; discardDraft(); if (navigation !== null) void performNavigation(navigation, project); }}>Discard draft and continue</button>
-              <button className="button button--signal" type="button" disabled={isCommandPending || draftSaveCommand === null} onClick={saveDraftAndContinue}>Save changes and continue</button>
+              {pendingNavigation?.savedProject === undefined ? <>
+                <button className="button button--outline" type="button" disabled={isCommandPending} onClick={() => { const navigation = pendingNavigation; discardDraft(); if (navigation !== null) void performNavigation(navigation, project); }}>Discard draft and continue</button>
+                <button className="button button--signal" type="button" disabled={isCommandPending || draftSaveCommand === null} onClick={saveDraftAndContinue}>Save changes and continue</button>
+              </> : <button className="button button--signal" type="button" disabled={isCommandPending} onClick={() => void performNavigation(pendingNavigation, pendingNavigation.savedProject!)}>Retry navigation</button>}
             </div>
           </Dialog.Content>
         </Dialog.Portal>

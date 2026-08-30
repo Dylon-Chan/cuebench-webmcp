@@ -3,6 +3,7 @@ import type {
   CaptionCue,
   CaptionProject,
   CommandResult,
+  DomainEvent,
   DomainCommand,
   EvidenceProvenance,
   QualityFinding,
@@ -22,7 +23,7 @@ export interface ReviewDraft {
   readonly speaker: string;
   readonly startMs: string;
   readonly endMs: string;
-  /** Caption-only operation state; it is not an unsaved prose/timing draft. */
+  /** Caption-only operation state. Generated defaults are clean; a visible change is a draft. */
   readonly splitMs: string;
   readonly newCueId: string;
 }
@@ -64,6 +65,15 @@ export const itemProse = (item: ReviewableItem): string => (
   item.kind === "CaptionCue" ? item.current.text : item.current.description
 );
 
+const splitDraftDefaults = (item: ReviewableItem): Pick<ReviewDraft, "splitMs" | "newCueId"> => (
+  item.kind === "CaptionCue"
+    ? {
+        splitMs: String(Math.floor((item.current.startMs + item.current.endMs) / 2)),
+        newCueId: `${item.itemId}-split-r${item.current.itemRevision + 1}`,
+      }
+    : { splitMs: "", newCueId: "" }
+);
+
 export const reviewDraftForItem = (item: ReviewableItem): ReviewDraft => ({
   itemId: item.itemId,
   itemRevision: item.current.itemRevision,
@@ -71,8 +81,7 @@ export const reviewDraftForItem = (item: ReviewableItem): ReviewDraft => ({
   speaker: item.kind === "CaptionCue" ? item.current.speaker ?? "" : "",
   startMs: String(item.current.startMs),
   endMs: String(item.current.endMs),
-  splitMs: String(Math.floor((item.current.startMs + item.current.endMs) / 2)),
-  newCueId: `${item.itemId}-split-r${item.current.itemRevision + 1}`,
+  ...splitDraftDefaults(item),
 });
 
 export const integerValue = (value: string): number | null => {
@@ -81,15 +90,52 @@ export const integerValue = (value: string): number | null => {
   return Number.isSafeInteger(parsed) ? parsed : null;
 };
 
+/** Text, speaker, and timing form fields which can be saved as one revision. */
+export const reviewDraftHasContentChanges = (item: ReviewableItem | null, draft: ReviewDraft | null): boolean => {
+  if (item === null || draft === null || draft.itemId !== item.itemId) return false;
+  return draft.prose !== itemProse(item)
+    || (item.kind === "CaptionCue" && draft.speaker !== (item.current.speaker ?? ""))
+    || draft.startMs !== String(item.current.startMs)
+    || draft.endMs !== String(item.current.endMs);
+};
+
+/**
+ * A split form starts with generated values. They are deliberately not dirty
+ * until a person changes one of the visible operation fields. This keeps a
+ * clean caption editable while still preventing a changed split from being
+ * silently abandoned by navigation or a human ruling.
+ */
+export const reviewDraftHasStructuralChanges = (item: ReviewableItem | null, draft: ReviewDraft | null): boolean => {
+  if (item === null || draft === null || draft.itemId !== item.itemId || item.kind !== "CaptionCue") return false;
+  const defaults = splitDraftDefaults(item);
+  return draft.splitMs !== defaults.splitMs || draft.newCueId !== defaults.newCueId;
+};
+
 export const reviewDraftIsDirty = (item: ReviewableItem | null, draft: ReviewDraft | null): boolean => {
   if (item === null || draft === null || draft.itemId !== item.itemId) return false;
   // A draft whose base revision changed must be resolved explicitly; treating
   // it as clean would silently replace visible, user-authored content.
   if (draft.itemRevision !== item.current.itemRevision) return true;
-  return draft.prose !== itemProse(item)
-    || (item.kind === "CaptionCue" && draft.speaker !== (item.current.speaker ?? ""))
-    || draft.startMs !== String(item.current.startMs)
-    || draft.endMs !== String(item.current.endMs);
+  return reviewDraftHasContentChanges(item, draft) || reviewDraftHasStructuralChanges(item, draft);
+};
+
+/** Checks a draft against an immutable revision, including generated split defaults. */
+export const reviewDraftIsCleanForRevision = (
+  draft: ReviewDraft | null,
+  item: ReviewableItem,
+  revision: ReviewableItem["current"],
+): boolean => {
+  if (draft === null || draft.itemId !== item.itemId || draft.itemRevision !== revision.itemRevision) return false;
+  const revisionItem: ReviewableItem = item.kind === "CaptionCue"
+    ? { ...item, current: revision as typeof item.current }
+    : { ...item, current: revision as typeof item.current };
+  const defaults = splitDraftDefaults(revisionItem);
+  return draft.prose === (revision.kind === "CaptionCue" ? revision.text : revision.description)
+    && (revision.kind !== "CaptionCue" || draft.speaker === (revision.speaker ?? ""))
+    && draft.startMs === String(revision.startMs)
+    && draft.endMs === String(revision.endMs)
+    && draft.splitMs === defaults.splitMs
+    && draft.newCueId === defaults.newCueId;
 };
 
 export const reviewDraftValidity = (project: CaptionProject, item: ReviewableItem, draft: ReviewDraft): ReviewDraftValidity => {
@@ -123,6 +169,7 @@ export const semanticRevisionCommand = (
   item: ReviewableItem,
   draft: ReviewDraft,
 ): DomainCommand | null => {
+  if (!reviewDraftHasContentChanges(item, draft)) return null;
   const validity = reviewDraftValidity(project, item, draft);
   const startMs = integerValue(draft.startMs);
   const endMs = integerValue(draft.endMs);
@@ -168,6 +215,10 @@ export const actorLabel = (actor: Actor): string => {
 };
 
 export const evidenceAnchorId = (evidenceId: string): string => `evidence-${encodeURIComponent(evidenceId)}`;
+
+export const revisionFocusId = (itemId: string, itemRevision: number): string => (
+  `revision-${encodeURIComponent(itemId)}-${itemRevision}`
+);
 
 export const findingTargetsItem = (finding: QualityFinding, item: ReviewableItem): boolean => {
   if (finding.target.type === "item") return finding.target.itemId === item.itemId;
@@ -241,4 +292,34 @@ export const eventLabel = (type: string): string => {
     WaiveWarning: "Waived warning",
   };
   return labels[type] ?? type.replace(/([a-z])([A-Z])/g, "$1 $2");
+};
+
+const sameActor = (left: Actor, right: Actor): boolean => left.type === right.type && left.id === right.id;
+
+const revisionMatchesCourtEvent = (event: DomainEvent, revision: ReviewableItem["current"]): boolean => {
+  if (!sameActor(event.actor, revision.actor)) return false;
+  if (event.type === "ObjectItem") return event.detail !== undefined && revision.cause === event.detail;
+  return revision.cause === event.type;
+};
+
+/**
+ * Events do not persist an item-revision field. Where their immutable actor,
+ * cause, target, and occurrence sequence make a single history entry
+ * derivable, return it; otherwise callers must honestly leave it unresolved.
+ */
+export const courtRecordRevisionForEvent = (project: CaptionProject, event: DomainEvent): number | null => {
+  if (event.itemId === undefined) return null;
+  const item = reviewItemForId(project, event.itemId);
+  if (item === null) return null;
+  const eventIndex = project.courtRecord.findIndex((candidate) => candidate.eventId === event.eventId);
+  if (eventIndex < 0) return null;
+  const occurrences = project.courtRecord.slice(0, eventIndex + 1).filter((candidate) => (
+    candidate.itemId === event.itemId
+    && candidate.type === event.type
+    && sameActor(candidate.actor, event.actor)
+    && candidate.detail === event.detail
+  ));
+  const revisions = item.revisions.filter((revision) => revisionMatchesCourtEvent(event, revision));
+  const revision = revisions[occurrences.length - 1];
+  return revision?.itemRevision ?? null;
 };

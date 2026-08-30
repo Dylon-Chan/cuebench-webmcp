@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import {
   applyCommand,
   createProject,
@@ -11,7 +11,9 @@ import {
 import { useRef, useState } from "react";
 import { describe, expect, it, vi } from "vitest";
 import { CourtRecord } from "./CourtRecord";
-import { ReviewDocket } from "./ReviewDocket";
+import { createDocketWindowLayout, ReviewDocket } from "./ReviewDocket";
+import { orderedReviewItems } from "./review-utils";
+import type { EvidenceContentResolver } from "../evidence/EvidenceInspector";
 
 const human = { type: "Human" as const, id: "human" };
 
@@ -124,10 +126,17 @@ const largeReviewProject = (): CaptionProject => {
       state: "Proposed" as const,
       startMs: index * 200,
       endMs: (index + 1) * 200,
-      text: `Fixture cue ${index + 1}.`,
+      text: `Fixture cue ${index + 1}. ${"Complete retained test prose. ".repeat((index % 5) + 1)}`,
       speaker: null,
       actor: { type: "CueBenchAI" as const, id: "cuebench-ai" },
       cause: "fixture",
+    })),
+    evidence: Array.from({ length: 250 }, (_, index) => ({
+      evidenceId: `fixture-evidence-${index + 1}`,
+      projectId: "large-review-project",
+      mediaSha256: "b".repeat(64),
+      itemId: `c${String(index * 2 + 1).padStart(3, "0")}`,
+      itemRevision: 1,
     })),
   });
   return applyCommand(project, {
@@ -144,14 +153,22 @@ interface ReviewHarnessProps {
   readonly onSeek?: (mediaTimeMs: number) => void;
   readonly onCommand?: (command: DomainCommand, result: CommandResult) => void;
   readonly onReadNativePlayheadMs?: () => number;
+  readonly evidenceContentResolver?: EvidenceContentResolver;
+  readonly onTimelineRebaseReady?: (
+    rebase: (itemId: string, previousItemRevision: number, project: CaptionProject) => void,
+    acceptProject: (project: CaptionProject) => void,
+  ) => void;
+  readonly commandOverride?: (command: DomainCommand, result: CommandResult) => CommandResult;
 }
 
-function ReviewHarness({ initialProject = reviewProject(), onSeek = vi.fn(), onCommand, onReadNativePlayheadMs }: ReviewHarnessProps) {
+function ReviewHarness({ initialProject = reviewProject(), onSeek = vi.fn(), onCommand, onReadNativePlayheadMs, evidenceContentResolver, onTimelineRebaseReady, commandOverride }: ReviewHarnessProps) {
   const [project, setProject] = useState(initialProject);
   const projectRef = useRef(initialProject);
   const reviewNavigationRef = useRef<(itemId: string, sourceLabel: string) => void>(() => undefined);
+  const reviewRevisionFocusRef = useRef<(itemId: string, itemRevision: number, sourceLabel: string) => void>(() => undefined);
   const executeCommand = (command: DomainCommand): CommandResult => {
-    const result = applyCommand(projectRef.current, command);
+    const defaultResult = applyCommand(projectRef.current, command);
+    const result = commandOverride?.(command, defaultResult) ?? defaultResult;
     onCommand?.(command, result);
     if (result.error === undefined) {
       projectRef.current = result.project;
@@ -167,12 +184,29 @@ function ReviewHarness({ initialProject = reviewProject(), onSeek = vi.fn(), onC
         onCommand={executeCommand}
         onSeekToMediaTime={onSeek}
         onRegisterItemNavigation={(navigate) => { reviewNavigationRef.current = navigate; }}
+        onRegisterItemRevisionFocus={(focus) => { reviewRevisionFocusRef.current = focus; }}
+        onRegisterCanonicalTimelineEdit={(rebase) => onTimelineRebaseReady?.(rebase, (nextProject) => { projectRef.current = nextProject; setProject(nextProject); })}
+        {...(evidenceContentResolver === undefined ? {} : { evidenceContentResolver })}
         {...(onReadNativePlayheadMs === undefined ? {} : { onReadNativePlayheadMs })}
       />
-      <CourtRecord project={project} onSelectItem={(itemId) => reviewNavigationRef.current(itemId, `Court Record item ${itemId.toUpperCase()}`)} />
+      <CourtRecord project={project} onSelectItem={(itemId) => reviewNavigationRef.current(itemId, `Court Record item ${itemId.toUpperCase()}`)} onFocusItemRevision={(itemId, itemRevision) => reviewRevisionFocusRef.current(itemId, itemRevision, `Court Record ${itemId.toUpperCase()} r${itemRevision}`)} />
     </>
   );
 }
+
+const retainedFixtureEvidence: EvidenceContentResolver = {
+  resolve: (evidence) => ({
+    evidenceId: evidence.evidenceId,
+    source: "LocalEvidencePackage",
+    label: "Fixture retained evidence window",
+    startMs: 1_200,
+    endMs: 2_100,
+    projectId: evidence.projectId,
+    mediaSha256: evidence.mediaSha256,
+    itemId: evidence.itemId,
+    itemRevision: evidence.itemRevision,
+  }),
+};
 
 describe("Review docket human-authority flow", () => {
   it("focuses a finding by selecting its item, seeking the shared video, and retaining stable focus", async () => {
@@ -391,19 +425,123 @@ describe("Review docket human-authority flow", () => {
     }), expect.anything()));
   });
 
-  it("renders immutable payload details and focuses a retained evidence binding without fabricating its window", async () => {
+  it("treats a changed split field as dirty without blocking the split operation itself", async () => {
+    render(<ReviewHarness initialProject={selectedProject()} />);
+
+    fireEvent.change(screen.getByLabelText("Split point for Caption C01"), { target: { value: "2000" } });
+    expect(screen.getByRole("button", { name: "Split Caption C01" })).toBeEnabled();
+    expect(screen.getByRole("button", { name: "Object selected revision" })).toBeDisabled();
+
+    fireEvent.click(screen.getByRole("button", { name: /select caption c02/i }));
+    const dialog = await screen.findByRole("dialog", { name: /unsaved review draft/i });
+    expect(within(dialog).getByRole("button", { name: /save changes and continue/i })).toBeDisabled();
+    expect(screen.getByLabelText("Split point for Caption C01")).toHaveValue(2000);
+    fireEvent.click(within(dialog).getByRole("button", { name: /cancel navigation/i }));
+    expect(screen.getByLabelText("Split point for Caption C01")).toHaveValue(2000);
+  });
+
+  it("rebases a clean docket draft after an accepted timeline timing revision without a false dirty lock", async () => {
+    let timelineRebase: ((itemId: string, previousItemRevision: number, project: CaptionProject) => void) | null = null;
+    let acceptProject: ((project: CaptionProject) => void) | null = null;
+    const initial = selectedProject();
+    render(<ReviewHarness
+      initialProject={initial}
+      onTimelineRebaseReady={(rebase, accept) => { timelineRebase = rebase; acceptProject = accept; }}
+    />);
+
+    await waitFor(() => expect(timelineRebase).not.toBeNull());
+    const accepted = applyCommand(initial, {
+      type: "AdjustCueTiming",
+      actor: human,
+      itemId: "c01",
+      cueId: "c01",
+      startMs: 1_100,
+      endMs: 3_500,
+      expectedItemRevision: 1,
+      expectedProjectRevision: initial.projectRevision,
+    });
+    if (accepted.error !== undefined || timelineRebase === null || acceptProject === null) throw new Error("Expected accepted timing revision and registered docket callback.");
+    act(() => {
+      timelineRebase!("c01", 1, accepted.project);
+    });
+
+    await waitFor(() => expect(screen.getByLabelText("Start time for Caption C01")).toHaveValue(1100));
+    // The store subscription may render one frame later than the accepted
+    // timeline callback. That bridge must not turn clean timing into a stale
+    // draft that requires manual discard.
+    expect(screen.getByRole("button", { name: "Object selected revision" })).toBeEnabled();
+    act(() => acceptProject!(accepted.project));
+    fireEvent.click(screen.getByRole("button", { name: /select caption c02/i }));
+    await waitFor(() => expect(screen.getByRole("heading", { name: /selected caption c02/i })).toBeVisible());
+    expect(screen.queryByRole("dialog", { name: /unsaved review draft/i })).not.toBeInTheDocument();
+  });
+
+  it("retries only navigation after a save is accepted and the first selection fails", async () => {
+    let selectAttempts = 0;
+    const commands: DomainCommand[] = [];
+    const initial = selectedProject();
+    render(<ReviewHarness
+      initialProject={initial}
+      onCommand={(command) => commands.push(command)}
+      commandOverride={(command, result) => {
+        if (command.type !== "SelectItem" || command.itemId !== "c02") return result;
+        selectAttempts += 1;
+        return selectAttempts === 1
+          ? { project: initial, events: [], error: domainError("STALE_PROJECT", "Selection temporarily unavailable.") }
+          : result;
+      }}
+    />);
+
+    fireEvent.change(screen.getByLabelText("Caption text for C01"), { target: { value: "Saved exactly once." } });
+    fireEvent.click(screen.getByRole("button", { name: /select caption c02/i }));
+    fireEvent.click(await screen.findByRole("button", { name: /save changes and continue/i }));
+    const retryDialog = await screen.findByRole("dialog", { name: /navigation still pending/i });
+    expect(within(retryDialog).getByRole("button", { name: "Retry navigation" })).toBeVisible();
+    expect(within(retryDialog).queryByRole("button", { name: /save changes and continue/i })).not.toBeInTheDocument();
+    expect(commands.filter((command) => command.type === "ReviseCue")).toHaveLength(1);
+
+    fireEvent.click(within(retryDialog).getByRole("button", { name: "Retry navigation" }));
+    await waitFor(() => expect(screen.getByRole("heading", { name: /selected caption c02/i })).toBeVisible());
+    expect(commands.filter((command) => command.type === "ReviseCue")).toHaveLength(1);
+    expect(commands.filter((command) => command.type === "SelectItem" && command.itemId === "c02")).toHaveLength(2);
+  });
+
+  it("renders immutable payload details and focuses a validated retained evidence window", async () => {
     const onSeek = vi.fn();
-    render(<ReviewHarness initialProject={selectedProject()} onSeek={onSeek} />);
+    render(<ReviewHarness initialProject={selectedProject()} onSeek={onSeek} evidenceContentResolver={retainedFixtureEvidence} />);
 
     fireEvent.click(screen.getByRole("button", { name: "Show immutable payload for C01 r1" }));
     expect(screen.getAllByText("Dr. Nguyen introduces Gibbs free energy.").at(-1)).toBeVisible();
     expect(screen.getByText("1,000–3,500 ms")).toBeVisible();
     expect(screen.getByText("Speaker: Dr. Nguyen")).toBeVisible();
-    expect(screen.getByText(/no bounded evidence window was captured/i)).toBeVisible();
+    expect(screen.getByText(/fixture retained evidence window/i)).toBeVisible();
 
     fireEvent.click(screen.getByRole("button", { name: "Open evidence evidence-c01-r1" }));
-    await waitFor(() => expect(onSeek).toHaveBeenCalledWith(1_000));
+    await waitFor(() => expect(onSeek).toHaveBeenCalledWith(1_200));
     expect(document.getElementById("evidence-evidence-c01-r1")).toHaveFocus();
+  });
+
+  it("fails closed when a Local Evidence Package window does not match its provenance", async () => {
+    const onSeek = vi.fn();
+    const invalidResolver: EvidenceContentResolver = {
+      resolve: (evidence) => ({
+        evidenceId: `${evidence.evidenceId}-wrong`,
+        source: "LocalEvidencePackage",
+        label: "Mismatched fixture window",
+        startMs: 1_200,
+        endMs: 2_100,
+        projectId: evidence.projectId,
+        mediaSha256: evidence.mediaSha256,
+        itemId: evidence.itemId,
+        itemRevision: evidence.itemRevision,
+      }),
+    };
+    render(<ReviewHarness initialProject={selectedProject()} onSeek={onSeek} evidenceContentResolver={invalidResolver} />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Open evidence evidence-c01-r1" }));
+    expect((await screen.findAllByText(/does not match this project’s recorded provenance/i)).at(-1)).toBeVisible();
+    expect(onSeek).not.toHaveBeenCalled();
+    expect(document.getElementById("evidence-evidence-c01-r1")).not.toHaveFocus();
   });
 
   it("clears an incompatible filter before a finding reveals and focuses its target", async () => {
@@ -458,6 +596,51 @@ describe("Review docket human-authority flow", () => {
     expect(within(record).getByRole("button", { name: "Show latest" })).toBeVisible();
   });
 
+  it("links Court Record events to their derived immutable revision and exposes actor filtering", () => {
+    const selected = selectedProject();
+    const revised = applyCommand(selected, {
+      type: "ReviseCue",
+      actor: human,
+      itemId: "c01",
+      cueId: "c01",
+      expectedItemRevision: 1,
+      expectedProjectRevision: selected.projectRevision,
+      patch: { text: "A reviewed immutable revision.", startMs: 1_000, endMs: 3_500, speaker: "Dr. Nguyen" },
+    });
+    if (revised.error !== undefined) throw new Error("Expected fixture revision.");
+    const onFocusItemRevision = vi.fn();
+    render(<CourtRecord project={revised.project} onSelectItem={vi.fn()} onFocusItemRevision={onFocusItemRevision} />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Open C01 r2 in revision ancestry" }));
+    expect(onFocusItemRevision).toHaveBeenCalledWith("c01", 2);
+    fireEvent.click(screen.getByRole("link", { name: "Focus Court Record project revision 3" }));
+    expect(document.querySelector('[data-project-revision="3"]')).toHaveFocus();
+    const actorControl = screen.getAllByRole("button", { name: "Filter Court Record to Human · human" }).at(-1);
+    if (actorControl === undefined) throw new Error("Expected actor control.");
+    fireEvent.click(actorControl);
+    expect(actorControl).toHaveAttribute("aria-pressed", "true");
+    expect(screen.getByRole("button", { name: "Clear actor filter" })).toBeVisible();
+  });
+
+  it("routes an exact Court Record revision link into the matching Revision History control", async () => {
+    const selected = selectedProject();
+    const revised = applyCommand(selected, {
+      type: "ReviseCue",
+      actor: human,
+      itemId: "c01",
+      cueId: "c01",
+      expectedItemRevision: 1,
+      expectedProjectRevision: selected.projectRevision,
+      patch: { text: "Court target revision.", startMs: 1_000, endMs: 3_500, speaker: "Dr. Nguyen" },
+    });
+    if (revised.error !== undefined) throw new Error("Expected fixture revision.");
+    render(<ReviewHarness initialProject={revised.project} />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Open C01 r2 in revision ancestry" }));
+    await waitFor(() => expect(screen.getByRole("button", { name: "Hide immutable payload for C01 r2" })).toHaveFocus());
+    expect(screen.getByText("Court target revision.", { selector: ".revision-history__payload dd" })).toBeVisible();
+  });
+
   it("keeps Object and Sustained-revision dialogs open when a command returns null or throws", async () => {
     const project = sustainedProject();
     const nullCommand = vi.fn(() => null as unknown as CommandResult);
@@ -484,7 +667,7 @@ describe("Review docket human-authority flow", () => {
     expect(screen.getByRole("dialog", { name: /object caption c01/i })).toBeVisible();
   });
 
-  it("marks invalid draft fields accessibly and windows only long semantic dockets while retaining selected focus", async () => {
+  it("marks invalid draft fields accessibly and windows 500 variable-height semantic docket rows while retaining selected focus", async () => {
     const { unmount: unmountInvalidDraft } = render(<ReviewHarness initialProject={selectedProject()} />);
     fireEvent.change(screen.getByLabelText("Start time for Caption C01"), { target: { value: "3500" } });
     fireEvent.change(screen.getByLabelText("End time for Caption C01"), { target: { value: "2000" } });
@@ -492,11 +675,21 @@ describe("Review docket human-authority flow", () => {
     expect(screen.getByText(/start time must be earlier than end time/i)).toBeVisible();
 
     unmountInvalidDraft();
-    const { unmount } = render(<ReviewHarness initialProject={largeReviewProject()} />);
+    const largeProject = largeReviewProject();
+    const longItems = orderedReviewItems(largeProject);
+    const measuredHeights = Object.fromEntries(longItems.map((item, index) => [item.itemId, 72 + (index % 7) * 37]));
+    const layout = createDocketWindowLayout(longItems, measuredHeights);
+    expect(layout.starts).toHaveLength(500);
+    expect(layout.starts[1]).toBe((measuredHeights.c001 ?? 0) + 8);
+    expect(layout.starts[2]).toBeGreaterThan(layout.starts[1]! + 72);
+    expect(layout.totalHeight).toBeGreaterThan(500 * 72);
+
+    const { unmount } = render(<ReviewHarness initialProject={largeProject} />);
     const list = screen.getAllByRole("list", { name: "Review items" }).at(-1);
     expect(list).toHaveAttribute("aria-label", "Review items");
     expect(within(list!).getAllByRole("listitem").length).toBeLessThan(80);
     await waitFor(() => expect(within(list!).getByRole("button", { name: /select caption c500/i })).toHaveFocus());
+    expect(within(list!).getByText(/fixture cue 500./i)).toBeVisible();
     unmount();
   });
 });

@@ -41,6 +41,8 @@ export function WorkbenchShell({ project, mode, sourceObjectUrl, sourceProvenanc
   const [readNativePlayheadMs, setReadNativePlayheadMs] = useState<(() => number) | null>(null);
   const [reviewDraftActive, setReviewDraftActive] = useState(false);
   const reviewItemNavigationRef = useRef<(itemId: string, sourceLabel: string) => void>(() => undefined);
+  const reviewItemRevisionFocusRef = useRef<(itemId: string, itemRevision: number, sourceLabel: string) => void>(() => undefined);
+  const reviewTimelineRebaseRef = useRef<(itemId: string, previousItemRevision: number, project: CaptionProject) => void>(() => undefined);
   const receiveVideoSeek = useCallback((seekToMediaTime: (mediaTimeMs: number) => void) => {
     setReviewSeekToMediaTime(() => seekToMediaTime);
   }, []);
@@ -52,6 +54,18 @@ export function WorkbenchShell({ project, mode, sourceObjectUrl, sourceProvenanc
   }, []);
   const requestReviewItemNavigation = useCallback((itemId: string, sourceLabel: string) => {
     reviewItemNavigationRef.current(itemId, sourceLabel);
+  }, []);
+  const receiveReviewItemRevisionFocus = useCallback((focus: (itemId: string, itemRevision: number, sourceLabel: string) => void) => {
+    reviewItemRevisionFocusRef.current = focus;
+  }, []);
+  const requestReviewItemRevisionFocus = useCallback((itemId: string, itemRevision: number) => {
+    reviewItemRevisionFocusRef.current(itemId, itemRevision, `Court Record ${itemId.toUpperCase()} r${itemRevision}`);
+  }, []);
+  const receiveReviewTimelineRebase = useCallback((rebase: (itemId: string, previousItemRevision: number, project: CaptionProject) => void) => {
+    reviewTimelineRebaseRef.current = rebase;
+  }, []);
+  const reportTimelineCanonicalRevision = useCallback((itemId: string, previousItemRevision: number, canonicalProject: CaptionProject) => {
+    reviewTimelineRebaseRef.current(itemId, previousItemRevision, canonicalProject);
   }, []);
 
   return (
@@ -93,6 +107,7 @@ export function WorkbenchShell({ project, mode, sourceObjectUrl, sourceProvenanc
           onPlayheadReady={receiveNativePlayhead}
           onRequestItemNavigation={requestReviewItemNavigation}
           reviewDraftActive={reviewDraftActive}
+          onCanonicalItemRevision={reportTimelineCanonicalRevision}
           reviewSummary={<ReviewSelectionSummary project={project} />}
         />
 
@@ -102,10 +117,12 @@ export function WorkbenchShell({ project, mode, sourceObjectUrl, sourceProvenanc
           onSeekToMediaTime={reviewSeekToMediaTime}
           footer={<StorageDisclosure mode={mode} />}
           onRegisterItemNavigation={receiveReviewItemNavigation}
+          onRegisterItemRevisionFocus={receiveReviewItemRevisionFocus}
+          onRegisterCanonicalTimelineEdit={receiveReviewTimelineRebase}
           onDraftStateChange={setReviewDraftActive}
           {...(readNativePlayheadMs === null ? {} : { onReadNativePlayheadMs: readNativePlayheadMs })}
         />
-        <CourtRecord project={project} onSelectItem={(itemId) => requestReviewItemNavigation(itemId, `Court Record item ${itemId.toUpperCase()}`)} />
+        <CourtRecord project={project} onSelectItem={(itemId) => requestReviewItemNavigation(itemId, `Court Record item ${itemId.toUpperCase()}`)} onFocusItemRevision={requestReviewItemRevisionFocus} />
       </div>
     </main>
   );

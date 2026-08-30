@@ -114,6 +114,19 @@ describe("Timeline", () => {
     expect(onCommand).not.toHaveBeenCalled();
   });
 
+  it("locks the production reviewDraftActive command path before a timing edit can be issued", () => {
+    const { onCommand } = renderTimeline({ reviewDraftActive: true });
+    const cue = screen.getByRole("button", { name: /caption c01: dr\. nguyen introduces/i });
+    const handle = screen.getByRole("slider", { name: "Adjust start of caption C01" });
+
+    expect(cue).toBeDisabled();
+    expect(handle).toBeDisabled();
+    expect(screen.getByText(/save, discard, or cancel the visible review draft/i)).toHaveAttribute("role", "status");
+    fireEvent.keyDown(handle, { key: "ArrowRight" });
+    fireEvent.keyUp(handle, { key: "ArrowRight" });
+    expect(onCommand).not.toHaveBeenCalled();
+  });
+
   it("keeps cue selection and video seeking on the same Media Time after the canonical command accepts", async () => {
     const { onCommand, seekToMediaTime } = renderTimeline();
 

@@ -1,22 +1,28 @@
 import type { CaptionProject, EvidenceProvenance } from "@cuebench/domain";
 import { useEffect, useState } from "react";
 import type { ReviewableItem } from "./review-utils";
-import { actorLabel, evidenceAnchorId, reviewStateLabel } from "./review-utils";
+import { actorLabel, evidenceAnchorId, revisionFocusId, reviewStateLabel } from "./review-utils";
 
 export interface RevisionHistoryProps {
   readonly project: CaptionProject;
   readonly item: ReviewableItem | null;
   readonly evidence: readonly EvidenceProvenance[];
   readonly onFocusEvidence: (evidenceId: string) => void;
+  /** A Court Record entry may resolve to one immutable historical revision. */
+  readonly focusedRevision?: number;
 }
 
 const formatMs = (value: number): string => value.toLocaleString("en-US");
 
 /** Immutable revision payloads are disclosed on demand without reconstituting history. */
-export function RevisionHistory({ project, item, evidence, onFocusEvidence }: RevisionHistoryProps) {
+export function RevisionHistory({ project, item, evidence, onFocusEvidence, focusedRevision }: RevisionHistoryProps) {
   const [expandedRevision, setExpandedRevision] = useState<number | null>(null);
 
   useEffect(() => setExpandedRevision(null), [item?.itemId]);
+
+  useEffect(() => {
+    if (focusedRevision !== undefined) setExpandedRevision(focusedRevision);
+  }, [focusedRevision, item?.itemId]);
 
   if (item === null) {
     return (
@@ -37,17 +43,18 @@ export function RevisionHistory({ project, item, evidence, onFocusEvidence }: Re
         {[...item.revisions].reverse().map((revision) => {
           const current = revision.itemRevision === item.current.itemRevision;
           const expanded = expandedRevision === revision.itemRevision;
+          const focused = focusedRevision === revision.itemRevision;
           const bindings = evidence.filter((entry) => entry.itemRevision === revision.itemRevision);
           const detailsId = `revision-payload-${item.itemId}-${revision.itemRevision}`;
           return (
-            <li key={revision.itemRevision} aria-current={current ? "true" : undefined}>
+            <li key={revision.itemRevision} aria-current={current ? "true" : undefined} data-focused={focused || undefined}>
               <div>
                 <strong>r{revision.itemRevision}</strong>
                 <span className={`review-state review-state--${revision.state.toLowerCase()}`}>{reviewStateLabel(revision.state)}</span>
               </div>
               <p>{actorLabel(revision.actor)} · {revision.cause}</p>
               <small>{revision.parentItemRevision === null ? "Root revision" : `Parent r${revision.parentItemRevision}`}</small>
-              <button className="text-button" type="button" aria-expanded={expanded} aria-controls={detailsId} onClick={() => setExpandedRevision(expanded ? null : revision.itemRevision)}>
+              <button id={revisionFocusId(item.itemId, revision.itemRevision)} className="text-button" type="button" aria-expanded={expanded} aria-controls={detailsId} onClick={() => setExpandedRevision(expanded ? null : revision.itemRevision)}>
                 {expanded ? `Hide immutable payload for ${item.itemId.toUpperCase()} r${revision.itemRevision}` : `Show immutable payload for ${item.itemId.toUpperCase()} r${revision.itemRevision}`}
               </button>
               {expanded ? (
