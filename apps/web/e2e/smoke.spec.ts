@@ -33,6 +33,7 @@ test("the hardened timeline stays evidence-led in the first desktop viewport and
   await expect(page.getByRole("button", { name: "Mute source audio" })).toBeVisible();
   await expect(page.getByRole("slider", { name: "Source audio volume" })).toBeVisible();
   await expect(page.getByRole("heading", { name: "Shared timeline" })).toBeVisible();
+  await expect(page.getByTestId("waveform-canvas")).toHaveAttribute("data-rendered-height", "58");
   await expect(page.getByRole("heading", { name: "Review Docket" })).toBeVisible();
   await expect(page.getByRole("heading", { name: "Court Record" })).toBeVisible();
 

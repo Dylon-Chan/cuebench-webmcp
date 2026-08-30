@@ -7,6 +7,7 @@ import { projectMediaEvidence } from "../features/evidence/project-media-evidenc
 import { ProjectStart } from "../features/project/ProjectStart";
 import { StorageDisclosure } from "../features/project/StorageDisclosure";
 import type { ProjectMode, ProjectStore } from "../features/project/project-store";
+import type { SourceProvenance } from "../features/project/source-provenance";
 
 export interface AppRoutesProps {
   readonly store: ProjectStore;
@@ -26,11 +27,12 @@ interface WorkbenchShellProps {
   readonly project: CaptionProject;
   readonly mode: ProjectMode | null;
   readonly sourceObjectUrl: string;
+  readonly sourceProvenance: SourceProvenance;
   readonly webMcpAvailable: boolean;
   readonly store: ProjectStore;
 }
 
-export function WorkbenchShell({ project, mode, sourceObjectUrl, webMcpAvailable, store }: WorkbenchShellProps) {
+export function WorkbenchShell({ project, mode, sourceObjectUrl, sourceProvenance, webMcpAvailable, store }: WorkbenchShellProps) {
   const captionCount = project.captions.order.length;
   const descriptionCount = project.audioDescriptions.order.length;
   const validationLabel = project.validation.status === "NotRun"
@@ -70,7 +72,7 @@ export function WorkbenchShell({ project, mode, sourceObjectUrl, webMcpAvailable
         <VideoEvidenceBay
           project={project}
           sourceObjectUrl={sourceObjectUrl}
-          evidence={projectMediaEvidence(project)}
+          evidence={projectMediaEvidence(sourceProvenance)}
           onCommand={(command) => store.executeCommand(command)}
         />
 
@@ -123,11 +125,12 @@ export function WorkbenchShell({ project, mode, sourceObjectUrl, webMcpAvailable
 
 function ProjectRoute({ store, webMcpAvailable }: AppRoutesProps) {
   const snapshot = useSyncExternalStore(store.subscribe, store.getSnapshot, store.getSnapshot);
-  if (snapshot.project === null || snapshot.sourceObjectUrl === null) return <ProjectStart store={store} />;
+  if (snapshot.project === null || snapshot.sourceObjectUrl === null || snapshot.sourceProvenance === null) return <ProjectStart store={store} />;
   return <WorkbenchShell
     project={snapshot.project}
     mode={snapshot.mode}
     sourceObjectUrl={snapshot.sourceObjectUrl}
+    sourceProvenance={snapshot.sourceProvenance}
     webMcpAvailable={webMcpAvailable}
     store={store}
   />;

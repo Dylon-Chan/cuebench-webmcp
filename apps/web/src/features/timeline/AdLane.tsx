@@ -46,7 +46,7 @@ export function AdLane({
         {beats.map((beat) => {
           const timing = previewTiming(beat, editPreview);
           const left = transform.msToX(timing.startMs);
-          const width = Math.max(8, transform.msToX(timing.endMs) - left);
+          const width = transform.msToX(timing.endMs) - left;
           const selected = selectedItemId === beat.itemId;
           const label = `Audio description ${beat.itemId.toUpperCase()}: ${beat.current.description}`;
           return (
@@ -76,7 +76,7 @@ export function AdLane({
                 role="slider"
                 aria-label={`Adjust start of audio description ${beat.itemId.toUpperCase()}`}
                 aria-valuemin={0}
-                aria-valuemax={transform.durationMs}
+                aria-valuemax={timing.endMs - 1}
                 aria-valuenow={timing.startMs}
                 aria-valuetext={`Start time ${formatMediaTime(timing.startMs)}`}
                 aria-orientation="horizontal"
@@ -93,7 +93,7 @@ export function AdLane({
                 type="button"
                 role="slider"
                 aria-label={`Adjust end of audio description ${beat.itemId.toUpperCase()}`}
-                aria-valuemin={0}
+                aria-valuemin={timing.startMs + 1}
                 aria-valuemax={transform.durationMs}
                 aria-valuenow={timing.endMs}
                 aria-valuetext={`End time ${formatMediaTime(timing.endMs)}`}

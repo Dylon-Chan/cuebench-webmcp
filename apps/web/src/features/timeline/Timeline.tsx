@@ -20,7 +20,11 @@ import {
 import { AdLane } from "./AdLane";
 import { CaptionLane } from "./CaptionLane";
 import type { TimelineEditEdge, TimelineEditPreview, TimelineLaneItem } from "./lane-types";
-import { WaveformCanvas, type WaveformPeakPyramid } from "./WaveformCanvas";
+import {
+  TIMELINE_WAVEFORM_HEIGHT_PX,
+  WaveformCanvas,
+  type WaveformPeakPyramid,
+} from "./WaveformCanvas";
 import {
   clampMediaTime,
   clampTimelineViewportStart,
@@ -66,6 +70,7 @@ const humanActor: Actor = { type: "Human", id: "human" };
 const keyboardNudgeMs = 100;
 const keyboardLargeNudgeMs = 1_000;
 const dragThresholdPx = 3;
+const isTimingAdjustmentKey = (key: string): boolean => ["ArrowLeft", "ArrowRight", "ArrowDown", "ArrowUp", "Home", "End"].includes(key);
 
 const defined = <Value,>(value: Value | undefined): value is Value => value !== undefined;
 
@@ -168,6 +173,7 @@ export function Timeline({
   const [editPreview, setEditPreviewState] = useState<TimelineEditPreview | null>(null);
   const [isCommandPending, setIsCommandPending] = useState(false);
   const [commandFeedback, setCommandFeedback] = useState<string | null>(null);
+  const [acceptedFeedback, setAcceptedFeedback] = useState<string | null>(null);
   const [focusAfterAcceptedItemId, setFocusAfterAcceptedItemId] = useState<string | null>(null);
   const transform = useMemo(() => createTimeTransform({
     durationMs: project.media.durationMs,
@@ -215,6 +221,7 @@ export function Timeline({
     commandPendingRef.current = true;
     setIsCommandPending(true);
     setCommandFeedback(null);
+    setAcceptedFeedback(null);
     try {
       const result = await onCommand(command);
       if (epoch !== commandEpochRef.current) return null;
@@ -280,7 +287,16 @@ export function Timeline({
           expectedItemRevision: preview.expectedItemRevision,
           expectedProjectRevision: preview.expectedProjectRevision,
         };
-    void executeTimelineCommand(command);
+    void (async () => {
+      const result = await executeTimelineCommand(command);
+      if (result === null || result.error !== undefined) return;
+      const canonicalItem = itemForProject(result.project, preview.itemId);
+      if (canonicalItem === null) return;
+      const kind = canonicalItem.kind === "CaptionCue" ? "Caption" : "Audio description";
+      setAcceptedFeedback(
+        `${kind} ${canonicalItem.itemId.toUpperCase()} timing updated to ${formatMediaTime(canonicalItem.current.startMs)} to ${formatMediaTime(canonicalItem.current.endMs)}.`,
+      );
+    })();
   }, [actor, executeTimelineCommand, itemForId, setEditPreview]);
 
   const localXForPointer = useCallback((clientX: number) => clientX - (surfaceRef.current?.getBoundingClientRect().left ?? 0), []);
@@ -310,7 +326,7 @@ export function Timeline({
   const onPointerMove = useCallback((event: PointerEvent<HTMLButtonElement>) => {
     const drag = dragRef.current;
     if (drag === null || drag.pointerId !== event.pointerId || commandPendingRef.current) return;
-    if (Math.abs(event.clientX - drag.originClientX) < dragThresholdPx) return;
+    if (!drag.hasMoved && Math.abs(event.clientX - drag.originClientX) < dragThresholdPx) return;
     drag.hasMoved = true;
     const item = itemForId(drag.itemId);
     if (item === null) return;
@@ -348,10 +364,8 @@ export function Timeline({
     item: TimelineLaneItem,
     edge: TimelineEditEdge,
   ) => {
-    if (commandPendingRef.current || (event.key !== "ArrowLeft" && event.key !== "ArrowRight")) return;
+    if (commandPendingRef.current || !isTimingAdjustmentKey(event.key)) return;
     event.preventDefault();
-    const direction = event.key === "ArrowLeft" ? -1 : 1;
-    const step = event.shiftKey ? keyboardLargeNudgeMs : keyboardNudgeMs;
     const currentPreview = editPreviewRef.current;
     const previous = currentPreview?.itemId === item.itemId && currentPreview.edge === edge
       ? currentPreview
@@ -364,7 +378,16 @@ export function Timeline({
           startMs: item.current.startMs,
           endMs: item.current.endMs,
         };
-    const candidate = edge === "start" ? previous.startMs + direction * step : previous.endMs + direction * step;
+    const step = event.shiftKey ? keyboardLargeNudgeMs : keyboardNudgeMs;
+    const decrement = event.key === "ArrowLeft" || event.key === "ArrowDown";
+    const increment = event.key === "ArrowRight" || event.key === "ArrowUp";
+    const candidate = event.key === "Home"
+      ? edge === "start" ? 0 : previous.startMs + 1
+      : event.key === "End"
+        ? edge === "start" ? previous.endMs - 1 : project.media.durationMs
+        : edge === "start"
+          ? previous.startMs + (decrement ? -step : increment ? step : 0)
+          : previous.endMs + (decrement ? -step : increment ? step : 0);
     const timing = clampPreviewTiming(item, edge, candidate, project.media.durationMs);
     setEditPreview({ ...previous, ...timing });
   }, [project.media.durationMs, project.projectRevision, setEditPreview]);
@@ -374,7 +397,7 @@ export function Timeline({
       setEditPreview(null);
       return;
     }
-    if (event.key === "ArrowLeft" || event.key === "ArrowRight") commitPreview();
+    if (isTimingAdjustmentKey(event.key)) commitPreview();
   }, [commitPreview, setEditPreview]);
 
   const changeZoom = (direction: -1 | 1) => {
@@ -431,7 +454,7 @@ export function Timeline({
         data-visible-end-ms={transform.visibleEndMs}
       >
         <div className="timeline-waveform" aria-label="Waveform peak evidence">
-          <WaveformCanvas peakPyramid={peakPyramid} transform={transform} />
+          <WaveformCanvas height={TIMELINE_WAVEFORM_HEIGHT_PX} peakPyramid={peakPyramid} transform={transform} />
         </div>
         <svg className="timeline-scale" viewBox={`0 0 ${transform.widthPx} 26`} preserveAspectRatio="none" aria-hidden="true">
           {ticks.map((time) => {
@@ -511,6 +534,7 @@ export function Timeline({
         <p>Use the cue and audio-description controls above to select or adjust timing. Arrow keys adjust the focused boundary; release the key to commit once.</p>
       </div>
       {previewLabel === null ? null : <p className="timeline-preview-feedback" data-testid="timeline-preview-feedback" role="status" aria-live="polite">{previewLabel}</p>}
+      {acceptedFeedback === null ? null : <p className="timeline-accepted-feedback" data-testid="timeline-accepted-feedback" role="status" aria-live="polite">{acceptedFeedback}</p>}
       {commandFeedback === null ? null : <p className="timeline-command-feedback" role="alert">{commandFeedback}</p>}
     </section>
   );

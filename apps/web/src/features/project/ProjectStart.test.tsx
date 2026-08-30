@@ -93,6 +93,7 @@ describe("ProjectStart", () => {
     await waitFor(() => expect(store.getSnapshot().route).toBe("workbench"));
     expect(store.getSnapshot().project?.title).toBe("CueBench bundled media fixture");
     expect(store.getSnapshot().sourceObjectUrl).toBe("blob:cuebench:preview-1");
+    expect(store.getSnapshot().sourceProvenance).toEqual({ sourceKind: "bundled-fixture", audioPresence: "absent" });
     const project = store.getSnapshot().project;
     expect(project?.projectId).toMatch(/^sample-/);
     expect(project?.projectId).not.toBe("sample-gibbs-free-energy");
@@ -125,6 +126,7 @@ describe("ProjectStart", () => {
     expect(resumedStore.getSnapshot().project?.projectId).toBe(firstStore.getSnapshot().project?.projectId);
     expect(resumedStore.getSnapshot().mode).toBe("durable");
     expect(resumedStore.getSnapshot().sourceObjectUrl).toBe("blob:cuebench:restored-1");
+    expect(resumedStore.getSnapshot().sourceProvenance).toEqual({ sourceKind: "bundled-fixture", audioPresence: "absent" });
   });
 
   it("serializes rapid durable commands and reconciles a stale result to canonical project state", async () => {
@@ -176,12 +178,14 @@ describe("ProjectStart", () => {
     expect(await screen.findByRole("dialog", { name: "Temporary session required" })).toBeVisible();
     expect(screen.getAllByText(/reloading or closing this page loses the project/i)[0]).toBeVisible();
     expect(store.getSnapshot().project).toBeNull();
+    expect(store.getSnapshot().sourceProvenance).toEqual({ sourceKind: "uploaded", audioPresence: "unknown" });
 
     await user.click(screen.getByRole("button", { name: "Continue temporarily" }));
 
     await waitFor(() => expect(store.getSnapshot().route).toBe("workbench"));
     expect(store.getSnapshot().mode).toBe("temporary");
     expect(store.getSnapshot().project?.media.relinkState).toBe("TemporarySession");
+    expect(store.getSnapshot().sourceProvenance).toEqual({ sourceKind: "uploaded", audioPresence: "unknown" });
     expect(await database.projectHeaders.count()).toBe(0);
     expect(await database.sourceBlobs.count()).toBe(0);
   });
@@ -208,6 +212,22 @@ describe("ProjectStart", () => {
     expect(resumedStore.getSnapshot()).toMatchObject({ route: "start", mode: null, sourceObjectUrl: null });
     expect(await database.projectHeaders.count()).toBe(0);
     expect(await database.sourceBlobs.count()).toBe(0);
+  });
+
+  it("keeps an upload with the bundled fixture title unknown until evidence preparation", async () => {
+    const database = new CueBenchDatabase(databaseName());
+    databases.push(database);
+    const store = new ProjectStore({
+      database,
+      browserStorage: browserStorage({ quota: 100_000_000, usage: 0, persisted: true }),
+      mediaDurationProbe: async () => 1_000,
+      objectUrlLease: objectUrlLease("same-title-upload").lease,
+    });
+
+    await store.chooseFile(videoFile("user upload", "CueBench bundled media fixture"));
+
+    expect(store.getSnapshot().route).toBe("workbench");
+    expect(store.getSnapshot().sourceProvenance).toEqual({ sourceKind: "uploaded", audioPresence: "unknown" });
   });
 
   it("does not let a late hydration replace a newer start operation", async () => {

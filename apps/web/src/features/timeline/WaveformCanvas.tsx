@@ -17,6 +17,9 @@ export interface WaveformPeakPyramid {
   readonly levels: readonly WaveformPeakLevel[];
 }
 
+/** Kept in lockstep with the rendered `.timeline-waveform` viewport. */
+export const TIMELINE_WAVEFORM_HEIGHT_PX = 58;
+
 export const EMPTY_WAVEFORM_PEAK_PYRAMID: WaveformPeakPyramid = {
   baseResolutionMs: 10,
   levels: [],
@@ -118,7 +121,7 @@ export interface WaveformCanvasProps {
 }
 
 /** Canvas is intentionally paint-only; all interaction lives in semantic DOM. */
-export function WaveformCanvas({ peakPyramid, transform, height = 84 }: WaveformCanvasProps) {
+export function WaveformCanvas({ peakPyramid, transform, height = TIMELINE_WAVEFORM_HEIGHT_PX }: WaveformCanvasProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
 
   useEffect(() => {
@@ -149,11 +152,11 @@ export function WaveformCanvas({ peakPyramid, transform, height = 84 }: Waveform
       const bucketStartMs = index * level.resolutionMs;
       const x = Math.round(transform.msToX(bucketStartMs)) + 0.5;
       if (x < -1 || x > width + 1) continue;
-      context.moveTo(x, middle + peak.min * middle * 0.9);
-      context.lineTo(x, middle + peak.max * middle * 0.9);
+      context.moveTo(x, middle + clampAmplitude(peak.min) * middle * 0.9);
+      context.lineTo(x, middle + clampAmplitude(peak.max) * middle * 0.9);
     }
     context.stroke();
   }, [height, peakPyramid, transform]);
 
-  return <canvas ref={canvasRef} className="waveform-canvas" data-testid="waveform-canvas" aria-hidden="true" />;
+  return <canvas ref={canvasRef} className="waveform-canvas" data-testid="waveform-canvas" data-rendered-height={height} aria-hidden="true" />;
 }

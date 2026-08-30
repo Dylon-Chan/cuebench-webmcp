@@ -1,4 +1,4 @@
-import type { CaptionProject } from "@cuebench/domain";
+import type { SourceProvenance } from "../project/source-provenance";
 import type { WaveformPeakPyramid } from "../timeline/WaveformCanvas";
 
 /**
@@ -14,15 +14,14 @@ export interface PreparedMediaEvidence {
   readonly failureMessage?: string;
 }
 
-const bundledFixtureTitle = "CueBench bundled media fixture";
-
 /**
- * Task 8 knows the bundled visual fixture has no audio track. Other local
- * sources deliberately remain pending until bounded prepared-media evidence
- * is available; no main-thread fetch, decode, or PCM scan is attempted here.
+ * The adapter consumes trusted local source provenance, not editable project
+ * titles. Other local sources deliberately remain pending until bounded
+ * prepared-media evidence is available; no main-thread fetch, decode, or PCM
+ * scan is attempted here.
  */
-export const projectMediaEvidence = (project: CaptionProject): PreparedMediaEvidence => (
-  project.title === bundledFixtureTitle
+export const projectMediaEvidence = (sourceProvenance: SourceProvenance): PreparedMediaEvidence => (
+  sourceProvenance.audioPresence === "absent"
     ? { audioState: "no-audio", peakPyramid: null }
     : { audioState: "pending", peakPyramid: null }
 );

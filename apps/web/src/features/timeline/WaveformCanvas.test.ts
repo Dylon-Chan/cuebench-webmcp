@@ -1,5 +1,8 @@
-import { describe, expect, it } from "vitest";
-import { createPeakPyramid } from "./WaveformCanvas";
+import { render, screen } from "@testing-library/react";
+import { createElement } from "react";
+import { describe, expect, it, vi } from "vitest";
+import { createTimeTransform } from "./time-transform";
+import { createPeakPyramid, WaveformCanvas } from "./WaveformCanvas";
 
 describe("createPeakPyramid", () => {
   it("uses exact deterministic 10 ms bucket boundaries rather than rounded sample counts", () => {
@@ -48,5 +51,36 @@ describe("createPeakPyramid", () => {
     const pyramid = createPeakPyramid([new Float32Array(), samples], 48_000);
 
     expect(pyramid.levels[0]?.peaks).toEqual([{ min: 0.25, max: 0.5 }]);
+  });
+
+  it("draws at the rendered 58px waveform height, centers peaks, and clips prepared amplitudes", () => {
+    const context = {
+      setTransform: vi.fn(),
+      clearRect: vi.fn(),
+      beginPath: vi.fn(),
+      moveTo: vi.fn(),
+      lineTo: vi.fn(),
+      stroke: vi.fn(),
+      strokeStyle: "",
+      lineWidth: 0,
+    };
+    const getContext = vi.spyOn(HTMLCanvasElement.prototype, "getContext").mockReturnValue(context as unknown as CanvasRenderingContext2D);
+    const transform = createTimeTransform({ durationMs: 10, widthPx: 100 });
+
+    render(createElement(WaveformCanvas, {
+      height: 58,
+      transform,
+      peakPyramid: { baseResolutionMs: 10, levels: [{ resolutionMs: 10, peaks: [{ min: -2, max: 2 }] }] },
+    }));
+
+    const canvas = screen.getByTestId("waveform-canvas");
+    expect(canvas).toHaveAttribute("data-rendered-height", "58");
+    expect(canvas).toHaveProperty("height", 58);
+    expect(canvas).toHaveStyle({ height: "58px" });
+    const [, startY] = context.moveTo.mock.calls[0] ?? [];
+    const [, endY] = context.lineTo.mock.calls[0] ?? [];
+    expect(startY).toBeCloseTo(2.9);
+    expect(endY).toBeCloseTo(55.1);
+    getContext.mockRestore();
   });
 });

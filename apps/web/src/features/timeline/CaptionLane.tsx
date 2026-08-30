@@ -46,7 +46,7 @@ export function CaptionLane({
         {cues.map((cue) => {
           const timing = previewTiming(cue, editPreview);
           const left = transform.msToX(timing.startMs);
-          const width = Math.max(8, transform.msToX(timing.endMs) - left);
+          const width = transform.msToX(timing.endMs) - left;
           const selected = selectedItemId === cue.itemId;
           const label = `Caption ${cue.itemId.toUpperCase()}: ${cue.current.text}`;
           return (
@@ -76,7 +76,7 @@ export function CaptionLane({
                 role="slider"
                 aria-label={`Adjust start of caption ${cue.itemId.toUpperCase()}`}
                 aria-valuemin={0}
-                aria-valuemax={transform.durationMs}
+                aria-valuemax={timing.endMs - 1}
                 aria-valuenow={timing.startMs}
                 aria-valuetext={`Start time ${formatMediaTime(timing.startMs)}`}
                 aria-orientation="horizontal"
@@ -93,7 +93,7 @@ export function CaptionLane({
                 type="button"
                 role="slider"
                 aria-label={`Adjust end of caption ${cue.itemId.toUpperCase()}`}
-                aria-valuemin={0}
+                aria-valuemin={timing.startMs + 1}
                 aria-valuemax={transform.durationMs}
                 aria-valuenow={timing.endMs}
                 aria-valuetext={`End time ${formatMediaTime(timing.endMs)}`}

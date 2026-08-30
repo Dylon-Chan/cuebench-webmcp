@@ -28,6 +28,12 @@ import {
   type IngestedLocalMedia,
   type MediaDurationProbe,
 } from "./local-media";
+import {
+  bundledFixtureSourceProvenance,
+  sourceProvenanceFrom,
+  uploadedSourceProvenance,
+  type SourceProvenance,
+} from "./source-provenance";
 
 export type ProjectMode = "durable" | "temporary";
 export type ProjectRoute = "start" | "temporary-choice" | "workbench";
@@ -44,6 +50,7 @@ export interface PendingUpload {
   readonly projectId: string;
   readonly sourceId: string;
   readonly title: string;
+  readonly sourceProvenance: SourceProvenance;
 }
 
 export interface ProjectStoreSnapshot {
@@ -52,6 +59,8 @@ export interface ProjectStoreSnapshot {
   readonly mode: ProjectMode | null;
   /** Present only with a live, playable Blob-backed object URL. */
   readonly sourceObjectUrl: string | null;
+  /** Trusted local source facts, never inferred from mutable project text. */
+  readonly sourceProvenance: SourceProvenance | null;
   readonly pendingUpload: PendingUpload | null;
   readonly activity: ProjectActivity;
   readonly error: string | null;
@@ -72,6 +81,7 @@ const metadataReserveBytes = 16 * 1024 * 1024;
 const defaultCreateId = (): string => globalThis.crypto.randomUUID();
 const projectModeKey = (projectId: string): string => `project-mode:${projectId}`;
 const projectOwnerKey = (projectId: string): string => `project-owner:${projectId}`;
+const projectSourceProvenanceKey = (projectId: string): string => `project-source-provenance:${projectId}`;
 const lastDurableProjectKey = "last-durable-project";
 
 const emptySnapshot = (): ProjectStoreSnapshot => ({
@@ -79,6 +89,7 @@ const emptySnapshot = (): ProjectStoreSnapshot => ({
   project: null,
   mode: null,
   sourceObjectUrl: null,
+  sourceProvenance: null,
   pendingUpload: null,
   activity: null,
   error: null,
@@ -167,6 +178,7 @@ export class ProjectStore {
         projectId: `sample-${this.createId()}`,
         sourceId: `source-${this.createId()}`,
         title: "CueBench bundled media fixture",
+        sourceProvenance: bundledFixtureSourceProvenance,
       }, epoch);
     } catch (error) {
       this.failCurrentOperation(epoch, userFacingError(error, "CueBench could not open the bundled media fixture."));
@@ -215,6 +227,7 @@ export class ProjectStore {
         projectId: `local-${this.createId()}`,
         sourceId: `source-${this.createId()}`,
         title: titleForFile(file),
+        sourceProvenance: uploadedSourceProvenance,
       }, epoch);
     } catch (error) {
       this.failCurrentOperation(epoch, userFacingError(error, "CueBench could not open this video."));
@@ -324,6 +337,7 @@ export class ProjectStore {
         project,
         mode: "temporary",
         sourceObjectUrl,
+        sourceProvenance: pendingUpload.sourceProvenance,
         pendingUpload: null,
         activity: null,
         error: null,
@@ -383,6 +397,7 @@ export class ProjectStore {
       }
       // The fresh write was schema-validated and already SHA-256 checked by storage.
       objectUrl = objectUrlLease.replace(media.blob);
+      await this.persistSourceProvenance(pendingUpload.projectId, pendingUpload.sourceProvenance);
       await this.persistMode(pendingUpload.projectId, "durable");
       if (!this.isCurrent(epoch)) {
         objectUrlLease.revokeIfCurrent(objectUrl);
@@ -403,6 +418,7 @@ export class ProjectStore {
         project,
         mode: "durable",
         sourceObjectUrl: objectUrl,
+        sourceProvenance: pendingUpload.sourceProvenance,
         pendingUpload: null,
         activity: null,
         error: null,
@@ -439,11 +455,15 @@ export class ProjectStore {
   }
 
   private async activateExistingProject(projectId: string, expectedMode: ProjectMode, epoch: number): Promise<boolean> {
-    const [project, mode] = await Promise.all([
+    const [project, mode, sourceProvenanceSetting] = await Promise.all([
       loadProject(this.database, projectId),
       loadProjectMode(this.database, projectId),
+      loadSetting(this.database, projectSourceProvenanceKey(projectId)),
     ]);
     if (!this.isCurrent(epoch) || project === undefined || mode !== expectedMode) return false;
+    const sourceProvenance = sourceProvenanceSetting === undefined
+      ? uploadedSourceProvenance
+      : sourceProvenanceFrom(sourceProvenanceSetting.value) ?? uploadedSourceProvenance;
     let media: Awaited<ReturnType<typeof loadSourceMedia>>;
     try {
       media = await loadSourceMedia(this.database, projectId, project.media.sha256);
@@ -460,6 +480,7 @@ export class ProjectStore {
       project,
       mode,
       sourceObjectUrl,
+      sourceProvenance,
       pendingUpload: null,
       activity: null,
       error: null,
@@ -533,6 +554,7 @@ export class ProjectStore {
           await Promise.all([
             this.database.settings.delete(projectModeKey(projectId)),
             this.database.settings.delete(projectOwnerKey(projectId)),
+            this.database.settings.delete(projectSourceProvenanceKey(projectId)),
           ]);
         },
       );
@@ -586,7 +608,10 @@ export class ProjectStore {
             || readProjectId(durablePointer?.value) === projectId
           ) return;
           await this.deleteProjectRows(projectId);
-          await this.database.settings.delete(projectModeKey(projectId));
+          await Promise.all([
+            this.database.settings.delete(projectModeKey(projectId)),
+            this.database.settings.delete(projectSourceProvenanceKey(projectId)),
+          ]);
         },
       );
     } catch {
@@ -611,6 +636,10 @@ export class ProjectStore {
 
   private async persistMode(projectId: string, mode: ProjectMode): Promise<void> {
     await saveSetting(this.database, projectModeKey(projectId), { mode });
+  }
+
+  private async persistSourceProvenance(projectId: string, sourceProvenance: SourceProvenance): Promise<void> {
+    await saveSetting(this.database, projectSourceProvenanceKey(projectId), sourceProvenance);
   }
 
   private async rememberDurableProject(projectId: string): Promise<void> {
@@ -643,6 +672,10 @@ export class ProjectStore {
       project: null,
       mode: null,
       sourceObjectUrl: null,
+      // The temporary-decision screen still describes this concrete local
+      // source. Keeping the fact here prevents title-based fallbacks when the
+      // upload is continued in the current page.
+      sourceProvenance: pendingUpload.sourceProvenance,
       pendingUpload,
       activity: null,
       error,

@@ -1,4 +1,5 @@
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { readFileSync } from "node:fs";
 import {
   applyCommand,
   createProject,
@@ -40,6 +41,41 @@ const timelineProject = (): CaptionProject => createProject({
     actor: { type: "CueBenchAI", id: "cuebench-ai" },
     cause: "fixture",
   }],
+});
+
+const adjacentOneSecondCueProject = (): CaptionProject => createProject({
+  projectId: "exact-width-project",
+  title: "Exact timeline width",
+  media: {
+    sourceId: "exact-width-video",
+    sha256: "b".repeat(64),
+    durationMs: 90_000,
+    relinkState: "Linked",
+  },
+  captions: [
+    {
+      kind: "CaptionCue",
+      itemId: "c01",
+      state: "Proposed",
+      startMs: 10_000,
+      endMs: 11_000,
+      text: "One second cue.",
+      speaker: "Dr. Nguyen",
+      actor: { type: "CueBenchAI", id: "cuebench-ai" },
+      cause: "fixture",
+    },
+    {
+      kind: "CaptionCue",
+      itemId: "c02",
+      state: "Proposed",
+      startMs: 11_000,
+      endMs: 12_000,
+      text: "Adjacent cue.",
+      speaker: "Dr. Nguyen",
+      actor: { type: "CueBenchAI", id: "cuebench-ai" },
+      cause: "fixture",
+    },
+  ],
 });
 
 const deferred = <Value,>() => {
@@ -136,6 +172,25 @@ describe("Timeline", () => {
     expect(onCommand).not.toHaveBeenCalled();
   });
 
+  it("continues tracking a drag after intent is established, but does not commit after returning to its original timing", () => {
+    const { onCommand } = renderTimeline();
+    const handle = screen.getByRole("slider", { name: "Adjust start of caption C01" });
+    const surface = screen.getByTestId("timeline-surface");
+    Object.defineProperty(surface, "getBoundingClientRect", {
+      configurable: true,
+      value: () => ({ left: 0, top: 0, width: 900, height: 200, right: 900, bottom: 200, x: 0, y: 0, toJSON: () => ({}) }),
+    });
+
+    fireEvent.pointerDown(handle, { pointerId: 1, clientX: 100 });
+    fireEvent.pointerMove(handle, { pointerId: 1, clientX: 130 });
+    expect(screen.getByTestId("timeline-preview-feedback")).toHaveTextContent("0:13.000");
+    fireEvent.pointerMove(handle, { pointerId: 1, clientX: 100 });
+    expect(screen.getByTestId("timeline-preview-feedback")).toHaveTextContent("0:10.000 to 0:15.000");
+    fireEvent.pointerUp(handle, { pointerId: 1, clientX: 100 });
+
+    expect(onCommand).not.toHaveBeenCalled();
+  });
+
   it("waits for accepted canonical state before seeking and serializes an immediate edit interaction", async () => {
     const project = timelineProject();
     const gate = deferred<CommandResult>();
@@ -194,13 +249,81 @@ describe("Timeline", () => {
     const handle = screen.getByRole("slider", { name: "Adjust start of caption C01" });
     expect(cue).toHaveAttribute("aria-current", "true");
     expect(handle).toHaveAttribute("aria-valuemin", "0");
-    expect(handle).toHaveAttribute("aria-valuemax", "90000");
+    expect(handle).toHaveAttribute("aria-valuemax", "14999");
     expect(handle).toHaveAttribute("aria-valuenow", "10000");
     expect(handle).toHaveAttribute("aria-valuetext", "Start time 0:10.000");
 
     fireEvent.pointerDown(handle, { pointerId: 1, clientX: 100 });
     fireEvent.pointerMove(handle, { pointerId: 1, clientX: 130 });
     expect(screen.getByTestId("timeline-preview-feedback")).toHaveTextContent("Caption C01 start preview");
+  });
+
+  it("keeps projected one-second cue bounds exact at 90 seconds / 900 pixels without overlap", () => {
+    renderTimeline({ project: adjacentOneSecondCueProject() });
+    const first = screen.getByRole("button", { name: /caption c01: one second cue/i }).closest("li");
+    const second = screen.getByRole("button", { name: /caption c02: adjacent cue/i }).closest("li");
+    if (first === null || second === null) throw new Error("Expected projected cue lane items.");
+
+    expect(first.style.left).toBe("100px");
+    expect(first.style.width).toBe("10px");
+    expect(second.style.left).toBe("110px");
+    expect(second.style.width).toBe("10px");
+    expect(Number.parseFloat(first.style.left) + Number.parseFloat(first.style.width)).toBeLessThanOrEqual(Number.parseFloat(second.style.left));
+    expect(readFileSync(`${process.cwd()}/src/styles/index.css`, "utf8")).toMatch(/\.timeline-item\s*\{[^}]*min-width:\s*0;/s);
+  });
+
+  it("uses a 44px mobile finding target while retaining its centered timestamp marker", () => {
+    const stylesheet = readFileSync(`${process.cwd()}/src/styles/index.css`, "utf8");
+    const mobileStyles = stylesheet.slice(stylesheet.indexOf("@media (max-width: 540px)"));
+
+    expect(mobileStyles).toContain(".timeline-finding { width: 44px; min-width: 44px; height: 44px; min-height: 44px; }");
+    expect(mobileStyles).toContain(".timeline-finding::before { top: 17px; left: 17px; }");
+  });
+
+  it("uses legal Caption and audio-description slider bounds and commits each supported key once", async () => {
+    const { onCommand } = renderTimeline();
+    const captionStart = screen.getByRole("slider", { name: "Adjust start of caption C01" });
+    const captionEnd = screen.getByRole("slider", { name: "Adjust end of caption C01" });
+    const adStart = screen.getByRole("slider", { name: "Adjust start of audio description AD01" });
+    const adEnd = screen.getByRole("slider", { name: "Adjust end of audio description AD01" });
+
+    expect(captionStart).toHaveAttribute("aria-valuemin", "0");
+    expect(captionStart).toHaveAttribute("aria-valuemax", "14999");
+    expect(captionEnd).toHaveAttribute("aria-valuemin", "10001");
+    expect(captionEnd).toHaveAttribute("aria-valuemax", "90000");
+    expect(adStart).toHaveAttribute("aria-valuemax", "23999");
+    expect(adEnd).toHaveAttribute("aria-valuemin", "20001");
+
+    fireEvent.keyDown(captionStart, { key: "ArrowLeft" });
+    fireEvent.keyUp(captionStart, { key: "ArrowLeft" });
+    await waitFor(() => expect(onCommand).toHaveBeenCalledTimes(1));
+    expect(onCommand).toHaveBeenLastCalledWith(expect.objectContaining({ type: "AdjustCueTiming", startMs: 9_900 }));
+
+    fireEvent.keyDown(captionStart, { key: "ArrowDown" });
+    fireEvent.keyUp(captionStart, { key: "ArrowDown" });
+    await waitFor(() => expect(onCommand).toHaveBeenCalledTimes(2));
+    expect(onCommand).toHaveBeenLastCalledWith(expect.objectContaining({ type: "AdjustCueTiming", startMs: 9_900 }));
+
+    fireEvent.keyDown(captionEnd, { key: "ArrowRight" });
+    fireEvent.keyUp(captionEnd, { key: "ArrowRight" });
+    await waitFor(() => expect(onCommand).toHaveBeenCalledTimes(3));
+    expect(onCommand).toHaveBeenLastCalledWith(expect.objectContaining({ type: "AdjustCueTiming", endMs: 15_100 }));
+
+    fireEvent.keyDown(captionEnd, { key: "End" });
+    fireEvent.keyUp(captionEnd, { key: "End" });
+    await waitFor(() => expect(onCommand).toHaveBeenCalledTimes(4));
+    expect(onCommand).toHaveBeenLastCalledWith(expect.objectContaining({ type: "AdjustCueTiming", endMs: 90_000 }));
+
+    fireEvent.keyDown(adStart, { key: "ArrowUp" });
+    fireEvent.keyUp(adStart, { key: "ArrowUp" });
+    await waitFor(() => expect(onCommand).toHaveBeenCalledTimes(5));
+    expect(onCommand).toHaveBeenLastCalledWith(expect.objectContaining({ type: "AdjustAudioDescriptionTiming", startMs: 20_100 }));
+
+    fireEvent.keyDown(adEnd, { key: "Home" });
+    fireEvent.keyUp(adEnd, { key: "Home" });
+    await waitFor(() => expect(onCommand).toHaveBeenCalledTimes(6));
+    expect(onCommand).toHaveBeenLastCalledWith(expect.objectContaining({ type: "AdjustAudioDescriptionTiming", endMs: 20_001 }));
+    expect(screen.getByTestId("timeline-accepted-feedback")).toHaveTextContent("Audio description AD01 timing updated");
   });
 
   it("reprojects lanes when the viewport width changes", () => {
