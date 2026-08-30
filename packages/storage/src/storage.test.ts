@@ -1072,17 +1072,36 @@ describe("CueBenchDatabase", () => {
     expect(adopted.error).toBeUndefined();
     expect(adopted.project.activeGenerationRun).toBeNull();
     expect(adopted.project.captions.items["generated-storage"]?.current.text).toBe("Generated");
+    expect(adopted.project.localEvidencePackages).toMatchObject([{
+      packageId: "generation-generation-adopt",
+      runId: "generation-adopt",
+      cueBindings: [{ cueId: "generated-storage", evidenceIds: ["word-1"] }],
+      evidence: { words: [{ evidenceId: "word-1", text: "Generated" }] },
+    }]);
+    expect(adopted.project.evidence).toContainEqual({
+      evidenceId: "word-1",
+      projectId: initial.projectId,
+      mediaSha256: initial.media.sha256,
+      itemId: "generated-storage",
+      itemRevision: 1,
+    });
     const receipt = await loadRunReceipt(db, initial.projectId, "generation-adopt");
     expect(receipt?.receipt.payload).toMatchObject({
-      stagedGenerationResult: { runId: "generation-adopt" },
-      adoption: { status: "adopted", adoptedProjectRevision: adopted.project.projectRevision },
+      signedGenerationReceipt: "opaque",
+      adoption: {
+        status: "adopted",
+        adoptedProjectRevision: adopted.project.projectRevision,
+        localEvidencePackageId: "generation-generation-adopt",
+        cleanupAcknowledgement: "pending",
+      },
     });
+    expect(receipt?.receipt.payload).not.toHaveProperty("stagedGenerationResult");
 
     const stale = await adoptStagedCaptionGenerationResult(db, initial.projectId, command);
-    expect(stale.error?.code).toBe("STALE_PROJECT");
+    expect(stale.error?.code).toBe("STALE_RUN");
     expect((await loadProject(db, initial.projectId))?.projectRevision).toBe(adopted.project.projectRevision);
     expect((await loadRunReceipt(db, initial.projectId, "generation-adopt"))?.receipt.payload).toMatchObject({
-      stagedGenerationResult: { runId: "generation-adopt" },
+      adoption: { localEvidencePackageId: "generation-generation-adopt" },
     });
   });
 });

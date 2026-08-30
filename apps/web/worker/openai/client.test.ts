@@ -39,16 +39,18 @@ describe("CueBench OpenAI provider boundary", () => {
               duration: 31.001,
               segments: [{ id: "segment-a", start: 0, end: 1, speaker: "A", text: "Hello" }],
               text: "Hello",
+              usage: { seconds: 31.001, type: "duration" },
             }
           : {
               text: "Hello",
               words: [{ word: "Hello", start: 0, end: 1 }],
+              usage: { seconds: 31.001, type: "duration" },
             }), { headers: { "content-type": "application/json" } });
       },
     });
 
-    await provider.diarize(audio);
-    await provider.wordTimestamps(audio);
+    const diarization = await provider.diarize(audio);
+    const wordTimestamps = await provider.wordTimestamps(audio);
 
     expect(requests).toHaveLength(2);
     expect(requests.map((request) => request.url)).toEqual([
@@ -71,6 +73,8 @@ describe("CueBench OpenAI provider boundary", () => {
     expect(wordForm.get("response_format")).toBe("verbose_json");
     expect(wordForm.getAll("timestamp_granularities[]")).toEqual(["word"]);
     expect(wordForm.get("chunking_strategy")).toBeNull();
+    expect(diarization).toMatchObject({ store: null, background: null, usage: { audioSeconds: 31.001 } });
+    expect(wordTimestamps).toMatchObject({ store: null, background: null, usage: { audioSeconds: 31.001 } });
   });
 
   it("uses a foreground, non-retained strict Responses request for bounded reconciliation", async () => {

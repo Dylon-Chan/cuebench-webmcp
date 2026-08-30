@@ -49,6 +49,8 @@ export interface WorkerEnv {
   readonly GLOBAL_SPEND_BREAKER_OPEN?: string;
   /** Fixture is the safe default; live requires this explicit server-only opt-in. */
   readonly CUEBENCH_OPENAI_MODE?: "fixture" | "live" | string;
+  /** Explicit test-only media-preparation fixture; production leaves it unset. */
+  readonly CUEBENCH_MEDIA_PREPARATION_MODE?: string;
   readonly OPENAI_API_KEY?: string;
   readonly OPENAI_BASE_URL?: string;
   /** Defaults in the provider adapter, but can be pinned explicitly per deployment. */

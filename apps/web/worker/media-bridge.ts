@@ -4,6 +4,10 @@ import {
   type MediaJobSigningSettings,
   type VerifiedMediaJob,
 } from "./probe";
+import {
+  generationCleanupMarkerKey,
+  generationPreparationWriteLeaseKey,
+} from "./generation-cleanup";
 
 /** The sole virtual hostname available to the uncredentialed media Container. */
 export const MEDIA_STORAGE_BRIDGE_HOST = "cuebench-r2.internal";
@@ -32,6 +36,8 @@ export interface MediaBridgeBucket {
   get: (key: string) => Promise<MediaBridgeObject | null>;
   head: (key: string) => Promise<MediaBridgeObject | null>;
   put: (key: string, value: ReadableStream<Uint8Array>, options: Record<string, unknown>) => Promise<MediaBridgeObject | null>;
+  /** Used only to reclaim a write observed after terminal generation cleanup. */
+  delete: (keys: string | string[]) => Promise<void>;
 }
 
 export interface MediaContainerEnv {
@@ -133,6 +139,18 @@ const responseHeaders = (object: MediaBridgeObject): Headers => {
   return headers;
 };
 
+const streamBytes = (bytes: Uint8Array): ReadableStream<Uint8Array> => {
+  const stream = new ReadableStream<Uint8Array>({
+    start(controller) {
+      controller.enqueue(bytes);
+      controller.close();
+    },
+  });
+  type FixedLengthStreamConstructor = new (length: number) => TransformStream<Uint8Array, Uint8Array>;
+  const FixedLength = (globalThis as unknown as { readonly FixedLengthStream?: FixedLengthStreamConstructor }).FixedLengthStream;
+  return FixedLength === undefined ? stream : stream.pipeThrough(new FixedLength(bytes.byteLength));
+};
+
 const objectMatches = (object: MediaBridgeObject, expectedLength: number, sha256: string, contentType: string): boolean => (
   object.size === expectedLength
   && object.customMetadata?.sha256 === sha256
@@ -152,7 +170,7 @@ const boundedArtifactStream = (
   maximumBytes: number,
 ): ReadableStream<Uint8Array> => {
   let received = 0;
-  return body.pipeThrough(new TransformStream<Uint8Array, Uint8Array>({
+  const bounded = body.pipeThrough(new TransformStream<Uint8Array, Uint8Array>({
     transform(chunk, controller) {
       received += chunk.byteLength;
       if (received > expectedLength || received > maximumBytes) throw new InvalidArtifactStream();
@@ -162,6 +180,15 @@ const boundedArtifactStream = (
       if (received !== expectedLength) throw new InvalidArtifactStream();
     },
   }));
+  // R2 accepts a streaming upload only when Workerd can prove its exact
+  // length. The content-length header is not sufficient after the safety
+  // transform, so retain the declared bound in a FixedLengthStream as well.
+  type FixedLengthStreamConstructor = new (length: number) => TransformStream<Uint8Array, Uint8Array>;
+  const FixedLength = (globalThis as unknown as { readonly FixedLengthStream?: FixedLengthStreamConstructor }).FixedLengthStream;
+  // Node fixture tests have no Workerd stream extension; their in-memory R2
+  // seam already consumes the checked stream. Deployments and Workerd always
+  // take the fixed-length branch before invoking a real R2 binding.
+  return FixedLength === undefined ? bounded : bounded.pipeThrough(new FixedLength(expectedLength));
 };
 
 /**
@@ -213,7 +240,50 @@ export const handleMediaStorageBridge = async (request: Request, env: MediaConta
     return new Response(request.method === "GET" ? object.body ?? null : null, { status: 200, headers: responseHeaders(object) });
   }
   if (request.method !== "PUT" || job.action !== "prepare" || output === null) return forbidden();
-  if (request.headers.get("if-none-match") !== "*") return forbidden();
+  const preparationWriteLease = generationPreparationWriteLeaseKey(job.operationKey, key);
+  const releasePreparationWriteLease = async (): Promise<boolean> => {
+    try {
+      await bucket.delete(preparationWriteLease);
+      return true;
+    } catch {
+      return false;
+    }
+  };
+  // Register before reading the terminal marker. If cleanup wins the race it
+  // either sees this durable lease and remains pending, or we see its marker
+  // and stop before any output can be written. Never release the lease after
+  // an ambiguous post-PUT failure: R2 does not expose cancellation for PUT,
+  // so only this request's settled success path can prove the writer drained.
+  try {
+    const lease = await bucket.put(preparationWriteLease, streamBytes(new TextEncoder().encode(JSON.stringify({
+      version: 1,
+      outputKey: key,
+    }))), {
+      onlyIf: new Headers({ "if-none-match": "*" }),
+      httpMetadata: { contentType: "application/json; charset=utf-8" },
+      customMetadata: { sha256: "0".repeat(64), cuebench_preparation_write_lease: "1" },
+    });
+    if (lease === null) return new Response("CueBench is already preparing this private media artifact.", { status: 409 });
+  } catch {
+    return unavailable();
+  }
+  // A terminal generation action creates an operation fence before sweeping
+  // private R2. This stops a slow Container from publishing additional
+  // derivatives after cancellation/adoption has already captured its exact
+  // artifact inventory. The post-write check below closes the TOCTOU window.
+  const cleanupMarker = generationCleanupMarkerKey(job.operationKey);
+  try {
+    if (await bucket.head(cleanupMarker) !== null) {
+      if (!await releasePreparationWriteLease()) return unavailable();
+      return forbidden();
+    }
+  } catch {
+    return unavailable();
+  }
+  if (request.headers.get("if-none-match") !== "*") {
+    await releasePreparationWriteLease();
+    return forbidden();
+  }
   const declaredLength = request.headers.get("content-length");
   if (
     declaredLength === null
@@ -221,9 +291,15 @@ export const handleMediaStorageBridge = async (request: Request, env: MediaConta
     || !Number.isSafeInteger(Number(declaredLength))
     || Number(declaredLength) <= 0
     || Number(declaredLength) > output.maximumBytes
-  ) return invalidArtifact();
+  ) {
+    await releasePreparationWriteLease();
+    return invalidArtifact();
+  }
   const expectedLength = Number(declaredLength);
-  if (request.headers.get("content-type")?.toLowerCase() !== output.contentType) return invalidArtifact();
+  if (request.headers.get("content-type")?.toLowerCase() !== output.contentType) {
+    await releasePreparationWriteLease();
+    return invalidArtifact();
+  }
   // Only the job-authorized Python Container can provide this artifact digest.
   // R2 receives it as a checksum and the persisted metadata is checked below.
   const expectedSha256 = request.headers.get("x-content-sha256")?.toLowerCase();
@@ -232,8 +308,14 @@ export const handleMediaStorageBridge = async (request: Request, env: MediaConta
     expectedSha256 === undefined
     || !HASH.test(expectedSha256)
     || (output.contentAddressed && expectedKeyHash !== expectedSha256)
-  ) return invalidArtifact();
-  if (request.body === null) return invalidArtifact();
+  ) {
+    await releasePreparationWriteLease();
+    return invalidArtifact();
+  }
+  if (request.body === null) {
+    await releasePreparationWriteLease();
+    return invalidArtifact();
+  }
   const headers = new Headers({ "if-none-match": "*" });
   let stored: MediaBridgeObject | null;
   try {
@@ -244,14 +326,23 @@ export const handleMediaStorageBridge = async (request: Request, env: MediaConta
       sha256: expectedSha256,
     });
   } catch (error) {
+    // An R2/stream failure after the lease was registered is intentionally
+    // ambiguous. Preserve it rather than claiming that an unabortable output
+    // could not still reach R2 after terminal cleanup begins.
     return error instanceof InvalidArtifactStream ? invalidArtifact() : unavailable();
   }
   if (stored === null) {
     try {
       const existing = await bucket.head(key);
-      return existing !== null && objectMatches(existing, expectedLength, expectedSha256, output.contentType)
+      if (await bucket.head(cleanupMarker) !== null) {
+        if (existing !== null) await bucket.delete(key);
+        if (!await releasePreparationWriteLease()) return unavailable();
+        return forbidden();
+      }
+      const response = existing !== null && objectMatches(existing, expectedLength, expectedSha256, output.contentType)
         ? new Response(null, { status: 200, headers: responseHeaders(existing) })
         : new Response("CueBench could not safely publish this media artifact.", { status: 409 });
+      return await releasePreparationWriteLease() ? response : unavailable();
     } catch {
       return unavailable();
     }
@@ -261,7 +352,17 @@ export const handleMediaStorageBridge = async (request: Request, env: MediaConta
     if (persisted === null || !objectMatches(persisted, expectedLength, expectedSha256, output.contentType)) {
       return new Response("CueBench could not verify this media artifact publication.", { status: 503 });
     }
-    return new Response(null, { status: 201, headers: responseHeaders(persisted) });
+    // `nowMs` verifies the signed request at admission; use a fresh clock at
+    // settlement so a slow upload cannot outlive its write lease and later be
+    // reclaimed as though it had already drained.
+    if (Date.now() > job.expiresAtMs || await bucket.head(cleanupMarker) !== null) {
+      await bucket.delete(key);
+      if (!await releasePreparationWriteLease()) return unavailable();
+      return forbidden();
+    }
+    return await releasePreparationWriteLease()
+      ? new Response(null, { status: 201, headers: responseHeaders(persisted) })
+      : unavailable();
   } catch {
     return unavailable();
   }

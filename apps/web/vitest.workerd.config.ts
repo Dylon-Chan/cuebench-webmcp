@@ -15,6 +15,9 @@ const workerOptions = {
       SESSION_HMAC_CURRENT_KEY: "workerd-current-hmac-fixture-32-byte-minimum",
       QUOTA_SALT: "workerd-salted-quota-fixture-32-byte-minimum",
       TURNSTILE_SECRET: "workerd-turnstile-fixture-32-byte-minimum",
+      MEDIA_JOB_HMAC_CURRENT_KEY_ID: "media-v1",
+      MEDIA_JOB_HMAC_CURRENT_KEY: "workerd-media-job-hmac-fixture-32-byte-minimum",
+      CUEBENCH_MEDIA_PREPARATION_MODE: "fixture",
     },
   },
 } as const;

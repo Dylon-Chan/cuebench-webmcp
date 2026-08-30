@@ -115,6 +115,8 @@ function TurnstileGate({ siteKey, disabled, onTokenChange }: TurnstileGateProps)
 export interface HostedProcessingPanelProps {
   readonly projectId: string;
   readonly durationMs: number;
+  /** Browser-canonical identity used to reject a stale restored upload receipt. */
+  readonly mediaSha256: string;
   /** This is the browser-owned local Blob URL from ProjectStore, never a cloud media URL. */
   readonly sourceObjectUrl: string;
   /** Test override only; production reads VITE_TURNSTILE_SITE_KEY. */
@@ -125,15 +127,19 @@ export interface HostedProcessingPanelProps {
  * The hosted route is optional and never becomes a project store: this panel
  * reads the browser-owned Blob only after disclosure and Turnstile acceptance.
  */
-export function HostedProcessingPanel({ projectId, durationMs, sourceObjectUrl, siteKey = configuredSiteKey() }: HostedProcessingPanelProps) {
+export function HostedProcessingPanel({ projectId, durationMs, mediaSha256, sourceObjectUrl, siteKey = configuredSiteKey() }: HostedProcessingPanelProps) {
   const [accepted, setAccepted] = useState(false);
   const [turnstileToken, setTurnstileToken] = useState<string | null>(null);
   const [session, setSession] = useState<{ readonly value: string; readonly expiresAtMs: number } | null>(null);
   const [status, setStatus] = useState("Cloud processing is optional. Your browser remains the canonical project store.");
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
-  const [recovery, setRecovery] = useState(() => loadPersistedCloudUpload(projectId));
+  const [recovery, setRecovery] = useState(() => loadPersistedCloudUpload(projectId, { sha256: mediaSha256, durationMs }));
   const [forceNewOperation, setForceNewOperation] = useState(false);
+  useEffect(() => {
+    setRecovery(loadPersistedCloudUpload(projectId, { sha256: mediaSha256, durationMs }));
+    setForceNewOperation(false);
+  }, [durationMs, mediaSha256, projectId]);
   const currentNow = Date.now();
   const persistedSession = recovery?.session !== undefined && (recovery.sessionExpiresAtMs ?? 0) > currentNow
     ? { value: recovery.session, expiresAtMs: recovery.sessionExpiresAtMs! }
@@ -164,6 +170,7 @@ export function HostedProcessingPanel({ projectId, durationMs, sourceObjectUrl, 
         projectId,
         operationId: nextOperationId,
         source,
+        sourceSha256: mediaSha256,
         durationMs,
         disclosureAccepted: true,
       });
@@ -177,7 +184,7 @@ export function HostedProcessingPanel({ projectId, durationMs, sourceObjectUrl, 
         clearPersistedCloudSession(projectId);
         setSession(null);
         setTurnstileToken(null);
-        setRecovery(loadPersistedCloudUpload(projectId));
+        setRecovery(loadPersistedCloudUpload(projectId, { sha256: mediaSha256, durationMs }));
         setStatus("CueBench needs a fresh anti-abuse verification before it can resume this private operation. Its opaque recovery receipt was kept.");
       }
       if (cause instanceof CloudUploadError && cause.details.status === 410) {
@@ -214,7 +221,7 @@ export function HostedProcessingPanel({ projectId, durationMs, sourceObjectUrl, 
         clearPersistedCloudSession(projectId);
         setSession(null);
         setTurnstileToken(null);
-        setRecovery(loadPersistedCloudUpload(projectId));
+        setRecovery(loadPersistedCloudUpload(projectId, { sha256: mediaSha256, durationMs }));
         setStatus("CueBench needs a fresh anti-abuse verification before it can confirm cleanup. The recovery receipt was kept.");
       }
       if (cause instanceof CloudUploadError && cause.details.status === 410) {

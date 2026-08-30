@@ -2,6 +2,7 @@ import type {
   Actor,
   CertificationSnapshot,
   GenerationTargetTrack,
+  LocalCaptionEvidencePackage,
   MediaSourceSnapshot,
   ProjectItemKind,
   ReviewState,
@@ -142,6 +143,26 @@ export interface GenerationLease {
   readonly runId: string;
   readonly targetTrack: GenerationTargetTrack;
   readonly actor: Actor;
+  /**
+   * Captured exactly when CueBench acquires the lease.  This narrow fence lets
+   * unrelated audio-description work continue while blocking adoption if the
+   * caption target, media, or profile changes.
+   *
+   * Optional only for legacy persisted leases. Those leases can be released,
+   * but never adopted because they lack a trustworthy base state.
+   */
+  readonly base?: {
+    readonly expectedProjectRevision: number;
+    readonly mediaSha256: string;
+    readonly qualityProfileRevision: number;
+    readonly captionOrder: readonly ItemId[];
+    readonly captionItems: readonly {
+      readonly itemId: ItemId;
+      readonly itemRevision: number;
+      readonly state: ReviewState;
+      readonly mergedIntoItemId: ItemId | null;
+    }[];
+  };
 }
 
 export interface DomainEvent {
@@ -183,6 +204,8 @@ export interface CaptionProject {
    * their prior revision so validation requires fresh evidence.
    */
   readonly evidence: readonly EvidenceProvenance[];
+  /** Bounded adopted transcript evidence, included in local backup and review. */
+  readonly localEvidencePackages: readonly LocalCaptionEvidencePackage[];
   readonly captions: CaptionTrack;
   readonly audioDescriptions: AudioDescriptionTrack;
   readonly audioDescriptionGaps: Readonly<Record<string, AudioDescriptionGap>>;
@@ -214,6 +237,7 @@ export interface CreateProjectInput {
   >[];
   readonly audioDescriptionGaps?: readonly AudioDescriptionGap[];
   readonly evidence?: readonly EvidenceProvenance[];
+  readonly localEvidencePackages?: readonly LocalCaptionEvidencePackage[];
 }
 
 const initialValidation = (): ValidationSnapshot => ({
@@ -348,6 +372,7 @@ export const createProject = (input: CreateProjectInput): CaptionProject => {
     title: input.title,
     media: clone(input.media),
     evidence: clone(input.evidence ?? []),
+    localEvidencePackages: clone(input.localEvidencePackages ?? []),
     captions: { kind: "Captions", order: captionOrder, items: captions },
     audioDescriptions: {
       kind: "AudioDescriptions",

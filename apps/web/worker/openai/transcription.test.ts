@@ -82,6 +82,23 @@ describe("two-pass caption evidence alignment", () => {
     ]);
   });
 
+  it("does not mark equal-overlap segments as a conflict when they agree on the same speaker", () => {
+    const evidence = alignCaptionEvidence({
+      text: "Hello",
+      durationMs: 1_000,
+      segments: [
+        { id: "speaker-a-1", startMs: 0, endMs: 750, speaker: "A", text: "Hello" },
+        { id: "speaker-a-2", startMs: 250, endMs: 1_000, speaker: "A", text: "Hello" },
+      ],
+    }, {
+      text: "Hello",
+      words: [{ text: "Hello", startMs: 250, endMs: 750 }],
+    });
+
+    expect(evidence.words[0]).toMatchObject({ speaker: "A", diarizationSegmentIds: ["speaker-a-1", "speaker-a-2"] });
+    expect(evidence.uncertaintySpans).toEqual([]);
+  });
+
   it("preserves raw response hashes and runs both provider passes as typed ports", async () => {
     const provider: CaptionEvidenceProvider = {
       diarize: async () => ({

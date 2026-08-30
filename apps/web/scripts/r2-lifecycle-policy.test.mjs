@@ -78,6 +78,32 @@ describe("CueBench R2 lifecycle deployment policy", () => {
     expect(JSON.parse(calls[1].init.body)).toEqual({ rules: PROCESSING_LIFECYCLE_POLICY.rules });
   });
 
+  it("merges CueBench retention rules over only their ids and preserves unrelated deployed lifecycle rules", async () => {
+    const preservedRule = {
+      id: "existing-audit-retention",
+      enabled: true,
+      conditions: { prefix: "audit/" },
+      deleteObjectsTransition: { condition: { type: "Age", maxAge: 604_800 } },
+    };
+    const calls = [];
+    const fetcher = async (_input, init = {}) => {
+      calls.push(init);
+      if (init.method === "PUT") return apiResponse({});
+      return apiResponse({ rules: [preservedRule, ...PROCESSING_LIFECYCLE_POLICY.rules] });
+    };
+
+    await provisionAndVerifyLifecycle({
+      policy: PROCESSING_LIFECYCLE_POLICY,
+      accountId: "0123456789abcdef0123456789abcdef",
+      apiToken: "fixture-token",
+      fetcher,
+    });
+
+    expect(JSON.parse(calls[1].body)).toEqual({
+      rules: [preservedRule, ...PROCESSING_LIFECYCLE_POLICY.rules],
+    });
+  });
+
   it("reads lifecycle responses through a bounded stream instead of materializing an unbounded response", async () => {
     const fetcher = async (_input, init = {}) => init.method === "PUT"
       ? streamedApiResponse({})

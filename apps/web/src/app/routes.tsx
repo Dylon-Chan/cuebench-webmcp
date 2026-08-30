@@ -3,6 +3,7 @@ import { Navigate, Route, Routes } from "react-router-dom";
 import type { CaptionProject } from "@cuebench/domain";
 import { VideoEvidenceBay } from "../features/evidence/VideoEvidenceBay";
 import { projectMediaEvidence } from "../features/evidence/project-media-evidence";
+import { projectLocalEvidenceContentResolver } from "../features/evidence/project-local-evidence";
 import { CertificationReview } from "../features/export/CertificationReview";
 import { ExportDialog } from "../features/export/ExportDialog";
 import { ImpactSummaryPanel } from "../features/export/ImpactSummaryPanel";
@@ -142,12 +143,14 @@ export function WorkbenchShell({ project, mode, sourceObjectUrl, sourceProvenanc
           onRegisterItemRevisionFocus={receiveReviewItemRevisionFocus}
           onRegisterCanonicalTimelineEdit={receiveReviewTimelineRebase}
           onDraftStateChange={setReviewDraftActive}
+          evidenceContentResolver={projectLocalEvidenceContentResolver(project)}
           {...(readNativePlayheadMs === null ? {} : { onReadNativePlayheadMs: readNativePlayheadMs })}
         />
         <CourtRecord project={project} onSelectItem={(itemId) => requestReviewItemNavigation(itemId, `Court Record item ${itemId.toUpperCase()}`)} onFocusItemRevision={requestReviewItemRevisionFocus} />
         <HostedProcessingPanel
           projectId={project.projectId}
           durationMs={project.media.durationMs}
+          mediaSha256={project.media.sha256}
           sourceObjectUrl={sourceObjectUrl}
         />
         <GenerationStatus project={project} store={store} />

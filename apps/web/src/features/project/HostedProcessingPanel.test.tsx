@@ -12,6 +12,7 @@ describe("HostedProcessingPanel", () => {
     render(createElement(HostedProcessingPanel, {
       projectId: "project-fixture",
       durationMs: 60_000,
+      mediaSha256: "a".repeat(64),
       sourceObjectUrl: "blob:cuebench:source",
       siteKey: "",
     }));

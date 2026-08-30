@@ -9,6 +9,7 @@ import {
   previewProjectImport,
   type CaptionProject,
 } from "../index";
+import { validateCaptionProjectAggregate } from "./aggregate";
 import { fixtureProject } from "../../test/fixtures";
 
 const human = { type: "Human" as const, id: "teacher" };
@@ -75,6 +76,13 @@ describe("project backups", () => {
 
     expect(backup.project.qualityProfile.rules).toEqual(project.qualityProfile.rules);
     expect(backup.exportMetadata.excludedArtifactPaths).toEqual([]);
+  });
+
+  it("migrates pre-local-evidence aggregates to an empty bounded package list", () => {
+    const legacy = structuredClone(fixtureProject()) as unknown as Record<string, unknown>;
+    delete legacy.localEvidencePackages;
+
+    expect(validateCaptionProjectAggregate(legacy)).toMatchObject({ localEvidencePackages: [] });
   });
 
   it("uses an injected storage preview migration and requires a safety backup", () => {

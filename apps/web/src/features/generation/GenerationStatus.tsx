@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
+import * as Dialog from "@radix-ui/react-dialog";
 import type { GenerationRunStatus } from "@cuebench/contracts";
 import type { CaptionProject, CommandResult } from "@cuebench/domain";
 import { loadPersistedCloudUpload, type PersistedCloudUploadRecovery } from "../project/cloud-upload";
@@ -44,10 +45,51 @@ const activeCaptionRunId = (project: CaptionProject): string | null => (
 const hasProposedCaptions = (project: CaptionProject): boolean => Object.values(project.captions.items)
   .some((item) => item.mergedIntoItemId === null && item.current.state === "Proposed");
 
-const hasUploadAuthorization = (recovery: PersistedCloudUploadRecovery | null): recovery is PersistedCloudUploadRecovery & { readonly session: string; readonly operationReceipt: string } => (
+const hasUploadAuthorization = (
+  recovery: PersistedCloudUploadRecovery | null,
+  project: CaptionProject,
+): recovery is PersistedCloudUploadRecovery & { readonly session: string; readonly operationReceipt: string } => (
   recovery !== null
   && typeof recovery.session === "string" && recovery.session.length > 0
   && typeof recovery.operationReceipt === "string" && recovery.operationReceipt.length > 0
+  && recovery.sourceSha256.toLowerCase() === project.media.sha256.toLowerCase()
+  && recovery.durationMs === project.media.durationMs
+);
+
+const hasPendingAdoptionCleanup = (receipt: GenerationClientReceipt | null): receipt is GenerationClientReceipt & {
+  readonly adoption: NonNullable<GenerationClientReceipt["adoption"]>;
+} => receipt?.adoption?.status === "adopted" && receipt.adoption.cleanupAcknowledgement === "pending";
+
+const hasPendingCancellationCleanup = (receipt: GenerationClientReceipt | null): receipt is GenerationClientReceipt & {
+  readonly terminalCleanup: NonNullable<GenerationClientReceipt["terminalCleanup"]>;
+} => receipt?.terminalCleanup?.action === "cancelled" && receipt.terminalCleanup.localLeaseRelease !== "released";
+
+const hasCancellationIntent = (receipt: GenerationClientReceipt | null): receipt is GenerationClientReceipt & {
+  readonly cancellationRequested: NonNullable<GenerationClientReceipt["cancellationRequested"]>;
+} => receipt?.terminalCleanup === undefined && receipt?.cancellationRequested?.status === "requested";
+
+const hasPendingCancellationRecovery = (receipt: GenerationClientReceipt | null): receipt is GenerationClientReceipt => (
+  hasCancellationIntent(receipt) || hasPendingCancellationCleanup(receipt)
+);
+
+const cancellationRecoveryNotice = (receipt: GenerationClientReceipt): string => (
+  hasCancellationIntent(receipt)
+    ? "CueBench is recovering a cancellation request. Private cleanup has not been confirmed yet; retry the protected request."
+    : receipt.terminalCleanup?.cleanupAcknowledgement === "acknowledged"
+    ? "CueBench confirmed private temporary-media cleanup, but this browser still needs to release the local caption lease. Retry recovery."
+    : receipt.terminalCleanup?.cleanupAcknowledgement === "lifecycle-pending"
+      ? "CueBench's private-retention deadline elapsed. The R2 lifecycle backstop remains responsible for any unsettled artifact; retry to release this browser's caption lease."
+      : "CueBench accepted cancellation but still needs to finish private temporary-media cleanup. Keep this browser receipt and retry cleanup."
+);
+
+const hasPendingCleanup = (receipt: GenerationClientReceipt | null): boolean => (
+  hasPendingAdoptionCleanup(receipt) || hasPendingCancellationRecovery(receipt)
+);
+
+const retainedGenerationRunIds = (project: CaptionProject): readonly string[] => (
+  [...project.localEvidencePackages]
+    .sort((left, right) => right.retainedAtMs - left.retainedAtMs || right.runId.localeCompare(left.runId))
+    .map((entry) => entry.runId)
 );
 
 export interface GenerationStatusProps {
@@ -73,25 +115,35 @@ export function GenerationStatus({ project, store, uploadRecovery, client: suppl
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [confirmReplacement, setConfirmReplacement] = useState(false);
-  const [localRecovery, setLocalRecovery] = useState<PersistedCloudUploadRecovery | null>(() => uploadRecovery ?? loadPersistedCloudUpload(project.projectId));
+  const [localRecovery, setLocalRecovery] = useState<PersistedCloudUploadRecovery | null>(() => uploadRecovery ?? loadPersistedCloudUpload(project.projectId, { sha256: project.media.sha256, durationMs: project.media.durationMs }));
   const recovery = uploadRecovery === undefined ? localRecovery : uploadRecovery;
   const hasProposed = hasProposedCaptions(project);
 
   useEffect(() => {
-    setLocalRecovery(uploadRecovery ?? loadPersistedCloudUpload(project.projectId));
-  }, [project.projectId, uploadRecovery]);
+    setLocalRecovery(uploadRecovery ?? loadPersistedCloudUpload(project.projectId, { sha256: project.media.sha256, durationMs: project.media.durationMs }));
+  }, [project.media.durationMs, project.media.sha256, project.projectId, uploadRecovery]);
 
   useEffect(() => {
     let disposed = false;
     setConfirmReplacement(false);
-    if (runId === null) {
+    const candidateRunIds = runId === null ? retainedGenerationRunIds(project) : [runId];
+    if (candidateRunIds.length === 0) {
       setReceipt(null);
       return () => { disposed = true; };
     }
-    void client.loadStoredReceipt(store, project, runId).then((stored) => {
+    void Promise.all(candidateRunIds.map((candidate) => client.loadStoredReceipt(store, project, candidate))).then((storedReceipts) => {
       if (disposed) return;
+      const stored = runId === null
+        ? storedReceipts.find((candidate) => hasPendingCleanup(candidate)) ?? null
+        : storedReceipts[0] ?? null;
       setReceipt(stored);
-      if (stored === null) {
+      if (hasPendingAdoptionCleanup(stored)) {
+        setStage("Completed");
+        setNotice("Caption adoption is complete locally. CueBench still needs to confirm private temporary-media cleanup.");
+      } else if (hasPendingCancellationRecovery(stored)) {
+        if (hasPendingCancellationCleanup(stored)) setStage("Cancelled");
+        setNotice(cancellationRecoveryNotice(stored));
+      } else if (stored === null && runId !== null) {
         setNotice("Caption generation has a local target-track lease but no browser recovery receipt yet. Retry durable dispatch with the same private upload operation.");
       }
     }).catch(() => {
@@ -123,12 +175,12 @@ export function GenerationStatus({ project, store, uploadRecovery, client: suppl
   }, [client, receipt, stage]);
 
   const refreshUploadRecovery = () => {
-    if (uploadRecovery === undefined) setLocalRecovery(loadPersistedCloudUpload(project.projectId));
+    if (uploadRecovery === undefined) setLocalRecovery(loadPersistedCloudUpload(project.projectId, { sha256: project.media.sha256, durationMs: project.media.durationMs }));
   };
 
   const start = async () => {
-    const freshRecovery = uploadRecovery ?? loadPersistedCloudUpload(project.projectId);
-    if (!hasUploadAuthorization(freshRecovery)) {
+    const freshRecovery = uploadRecovery ?? loadPersistedCloudUpload(project.projectId, { sha256: project.media.sha256, durationMs: project.media.durationMs });
+    if (!hasUploadAuthorization(freshRecovery, project)) {
       setError("Complete or refresh optional cloud processing before starting caption generation.");
       return;
     }
@@ -153,7 +205,11 @@ export function GenerationStatus({ project, store, uploadRecovery, client: suppl
     try {
       const status = await client.cancel({ project, store, receipt });
       setStage(status.stage);
-      setNotice("CueBench confirmed cancellation. No partial caption result can be staged or adopted.");
+      const refreshed = await client.loadStoredReceipt(store, project, receipt.runId);
+      setReceipt(refreshed ?? receipt);
+      setNotice(hasPendingCancellationRecovery(refreshed)
+        ? cancellationRecoveryNotice(refreshed)
+        : "CueBench confirmed cancellation. No partial caption result can be staged or adopted.");
     } catch (cause) {
       setError(errorMessage(cause, "CueBench could not cancel this caption-generation run."));
     } finally {
@@ -183,9 +239,45 @@ export function GenerationStatus({ project, store, uploadRecovery, client: suppl
     }
   };
 
+  const retryCleanup = async () => {
+    if (receipt === null || !hasPendingCleanup(receipt)) return;
+    setBusy(true);
+    setError(null);
+    try {
+      if (hasPendingAdoptionCleanup(receipt)) {
+        await client.retryAdoptionCleanup({ store, receipt });
+        setReceipt({
+          ...receipt,
+          adoption: {
+            ...receipt.adoption,
+            cleanupAcknowledgement: "acknowledged",
+          },
+        });
+        setNotice("CueBench confirmed private temporary-media cleanup for the adopted caption run.");
+      } else if (hasPendingCancellationRecovery(receipt)) {
+        await client.retryCancellationCleanup({ project, store, receipt });
+        const refreshed = await client.loadStoredReceipt(store, project, receipt.runId);
+        setReceipt(refreshed ?? receipt);
+        if (refreshed !== null && (hasCancellationIntent(refreshed) || hasPendingCancellationCleanup(refreshed))) {
+          setNotice(cancellationRecoveryNotice(refreshed));
+        } else if (refreshed?.terminalCleanup?.cleanupAcknowledgement === "lifecycle-pending") {
+          setNotice("CueBench released this browser's caption lease after the recorded private-retention deadline. R2 lifecycle cleanup remains pending rather than falsely acknowledged.");
+        } else {
+          setNotice("CueBench confirmed private temporary-media cleanup for the cancelled caption run.");
+        }
+      }
+    } catch (cause) {
+      setError(errorMessage(cause, "CueBench could not confirm private caption-generation cleanup yet. Retry this acknowledgement before starting another run."));
+    } finally {
+      setBusy(false);
+    }
+  };
+
   const waitingForAdoption = stage === "AwaitingAdoption";
+  const pendingCleanup = hasPendingCleanup(receipt);
   const missingRecovery = runId !== null && receipt === null;
-  const canStart = !busy && (runId === null || missingRecovery) && hasUploadAuthorization(recovery);
+  const durableStorage = store.getSnapshot().mode !== "temporary";
+  const canStart = durableStorage && !pendingCleanup && !busy && (runId === null || missingRecovery) && hasUploadAuthorization(recovery, project);
   const otherRunActive = project.activeGenerationRun !== null && project.activeGenerationRun.targetTrack !== "Captions";
 
   return (
@@ -195,27 +287,42 @@ export function GenerationStatus({ project, store, uploadRecovery, client: suppl
       <p role="status" aria-live="polite">{stageLabel(stage)}</p>
       {notice === null ? null : <p role="status">{notice}</p>}
       {receipt === null ? null : <p className="generation-status__receipt">Recovery receipt retained for run {receipt.runId}.</p>}
+      {!durableStorage ? <p role="status">Caption generation is unavailable in this temporary browser session because CueBench cannot retain a recoverable signed receipt or safely hold the target-track lease.</p> : null}
       {otherRunActive ? <p role="status">Another generation target currently holds the project lease.</p> : null}
-      <div className="cloud-processing-panel__actions">
-        <button type="button" className="button button--outline" disabled={!canStart || otherRunActive} onClick={() => void start()}>
-          {missingRecovery ? "Retry durable caption dispatch" : "Generate proposed captions"}
-        </button>
-        {uploadRecovery === undefined ? <button type="button" className="button button--outline" disabled={busy} onClick={refreshUploadRecovery}>Refresh cloud operation</button> : null}
-        {receipt !== null && !isTerminal(stage) && !waitingForAdoption ? <button type="button" className="button button--outline" disabled={busy} onClick={() => void cancel()}>Cancel caption generation</button> : null}
-        {waitingForAdoption && !hasProposed ? <button type="button" className="button button--outline" disabled={busy} onClick={() => void adopt(false)}>Adopt staged captions</button> : null}
-        {waitingForAdoption && hasProposed ? <button type="button" className="button button--outline" disabled={busy} onClick={() => setConfirmReplacement(true)}>Replace proposed captions</button> : null}
-      </div>
-      {runId === null && !hasUploadAuthorization(recovery) ? <p role="status">First complete optional cloud processing so CueBench has an authoritative, private media receipt.</p> : null}
-      {confirmReplacement ? (
-        <div role="dialog" aria-modal="true" aria-label="Replace existing Proposed captions" className="generation-status__confirmation">
-          <h3>Replace existing Proposed captions?</h3>
-          <p>This will replace only existing Proposed captions with the complete staged result. Sustained captions remain untouched and no partial result can be adopted.</p>
-          <div className="cloud-processing-panel__actions">
-            <button type="button" className="button button--outline" disabled={busy} onClick={() => setConfirmReplacement(false)}>Keep current captions</button>
-            <button type="button" className="button" disabled={busy} onClick={() => void adopt(true)}>Confirm replacement of Proposed captions</button>
-          </div>
+      <Dialog.Root open={confirmReplacement} onOpenChange={(open) => { if (!busy) setConfirmReplacement(open); }}>
+        <div className="cloud-processing-panel__actions">
+          <button type="button" className="button button--outline" disabled={!canStart || otherRunActive} onClick={() => void start()}>
+            {missingRecovery ? "Retry durable caption dispatch" : "Generate proposed captions"}
+          </button>
+          {uploadRecovery === undefined ? <button type="button" className="button button--outline" disabled={busy} onClick={refreshUploadRecovery}>Refresh cloud operation</button> : null}
+          {receipt !== null && stage !== "Completed" && stage !== "Cancelled" ? <button type="button" className="button button--outline" disabled={busy} onClick={() => void cancel()}>
+            {waitingForAdoption ? "Discard staged caption result" : stage === "Failed" ? "Release failed caption lease" : "Cancel caption generation"}
+          </button> : null}
+          {pendingCleanup ? <button type="button" className="button button--outline" disabled={busy} onClick={() => void retryCleanup()}>
+            Retry private cleanup
+          </button> : null}
+          {waitingForAdoption && !hasProposed ? <button type="button" className="button button--outline" disabled={busy} onClick={() => void adopt(false)}>Adopt staged captions</button> : null}
+          {waitingForAdoption && hasProposed ? (
+            <Dialog.Trigger asChild>
+              <button type="button" className="button button--outline" disabled={busy}>Replace proposed captions</button>
+            </Dialog.Trigger>
+          ) : null}
         </div>
-      ) : null}
+        <Dialog.Portal>
+          <Dialog.Overlay className="dialog-overlay" />
+          <Dialog.Content className="storage-dialog generation-status__confirmation" aria-describedby="generation-replace-proposed-description">
+            <Dialog.Title>Replace existing Proposed captions?</Dialog.Title>
+            <Dialog.Description id="generation-replace-proposed-description">
+              This will replace only existing Proposed captions with the complete staged result. Sustained captions remain untouched and no partial result can be adopted.
+            </Dialog.Description>
+            <div className="storage-dialog__actions">
+              <Dialog.Close className="button button--outline" type="button" disabled={busy} autoFocus>Keep current captions</Dialog.Close>
+              <button type="button" className="button" disabled={busy} onClick={() => void adopt(true)}>Confirm replacement of Proposed captions</button>
+            </div>
+          </Dialog.Content>
+        </Dialog.Portal>
+      </Dialog.Root>
+      {runId === null && !hasUploadAuthorization(recovery, project) ? <p role="status">First complete optional cloud processing so CueBench has an authoritative, private media receipt for this exact browser media source.</p> : null}
       {error === null ? null : <p role="alert">{error}</p>}
     </section>
   );

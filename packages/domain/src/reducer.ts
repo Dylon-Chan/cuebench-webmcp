@@ -1,4 +1,10 @@
-import type { Actor, CertificationSnapshot, ReviewState, ValidationSnapshot } from "@cuebench/contracts";
+import {
+  MAX_LOCAL_CAPTION_EVIDENCE_WORDS,
+  type Actor,
+  type CertificationSnapshot,
+  type ReviewState,
+  type ValidationSnapshot,
+} from "@cuebench/contracts";
 import type { DomainCommand } from "./commands";
 import { domainError, type DomainError } from "./errors";
 import {
@@ -228,6 +234,40 @@ const sameBrowserAgent = (actor: Actor, authoredBy: Actor) =>
 
 const clone = <Value>(value: Value): Value => structuredClone(value);
 
+const captionLeaseBase = (
+  project: CaptionProject,
+  expectedProjectRevision: number,
+): NonNullable<GenerationLease["base"]> => ({
+  expectedProjectRevision,
+  mediaSha256: project.media.sha256.toLowerCase(),
+  qualityProfileRevision: project.qualityProfile.revision,
+  captionOrder: [...project.captions.order],
+  captionItems: Object.values(project.captions.items)
+    .map((item) => ({
+      itemId: item.itemId,
+      itemRevision: item.current.itemRevision,
+      state: item.current.state,
+      mergedIntoItemId: item.mergedIntoItemId,
+    }))
+    .sort((left, right) => left.itemId.localeCompare(right.itemId)),
+});
+
+const captionBaseMatches = (project: CaptionProject, base: NonNullable<GenerationLease["base"]>): boolean => {
+  if (base.captionOrder.length !== project.captions.order.length || base.captionOrder.some((itemId, index) => itemId !== project.captions.order[index])) {
+    return false;
+  }
+  const current = captionLeaseBase(project, base.expectedProjectRevision);
+  return current.captionItems.length === base.captionItems.length
+    && current.captionItems.every((item, index) => {
+      const expected = base.captionItems[index];
+      return expected !== undefined
+        && item.itemId === expected.itemId
+        && item.itemRevision === expected.itemRevision
+        && item.state === expected.state
+        && item.mergedIntoItemId === expected.mergedIntoItemId;
+    });
+};
+
 /**
  * Evidence is a current binding projection rather than a mutable history.
  * A state-only review transition preserves the exact provenance by cloning
@@ -245,9 +285,28 @@ const carryEvidenceForReviewState = (
     : copied;
 });
 
+/** Keep canonical Local Evidence Package bindings resolvable after a state-only revision. */
+const carryLocalEvidenceForReviewState = (
+  project: CaptionProject,
+  previous: CaptionCue | AudioDescriptionBeat,
+  revised: CaptionCue | AudioDescriptionBeat,
+): CaptionProject["localEvidencePackages"] => project.localEvidencePackages.map((entry) => ({
+  ...entry,
+  cueBindings: entry.cueBindings.map((binding) => (
+    binding.itemId === previous.itemId && binding.itemRevision === previous.current.itemRevision
+      ? { ...binding, itemRevision: revised.current.itemRevision }
+      : binding
+  )),
+}));
+
 export const applyCommand = (project: CaptionProject, command: DomainCommand): CommandResult => {
-  const projectError = staleProject(project, command.expectedProjectRevision);
-  if (projectError !== undefined) return { project, events: [], error: projectError };
+  // Generation adoption/release deliberately fence the leased target state,
+  // not the whole project revision. This permits a Human's unrelated
+  // audio-description work to coexist with an in-flight caption run.
+  if (command.type !== "AdoptCaptionGenerationResult" && command.type !== "ReleaseGenerationRun") {
+    const projectError = staleProject(project, command.expectedProjectRevision);
+    if (projectError !== undefined) return { project, events: [], error: projectError };
+  }
 
   if (command.type === "SelectItem" || command.type === "FocusItem") {
     const item = itemAt(project, command.itemId);
@@ -277,7 +336,14 @@ export const applyCommand = (project: CaptionProject, command: DomainCommand): C
   if (command.type === "StartGenerationRun") {
     if (project.activeGenerationRun !== null) return fail(project, "TARGET_TRACK_LEASE_CONFLICT", "A generation run is already active.");
     if (command.actor.type !== "CueBenchAI") return fail(project, "INVALID_ARGUMENT", "Only CueBench AI starts a generation run.");
-    const activeGenerationRun: GenerationLease = { runId: command.runId, targetTrack: command.targetTrack, actor: clone(command.actor) };
+    const activeGenerationRun: GenerationLease = {
+      runId: command.runId,
+      targetTrack: command.targetTrack,
+      actor: clone(command.actor),
+      // The lease becomes visible in the incremented project revision that
+      // the Worker signs into its generation receipt.
+      base: captionLeaseBase(project, project.projectRevision + 1),
+    };
     return commit(project, command, { activeGenerationRun });
   }
   if (command.type === "AdoptCaptionGenerationResult") {
@@ -285,19 +351,32 @@ export const applyCommand = (project: CaptionProject, command: DomainCommand): C
     if (project.activeGenerationRun?.runId !== command.runId || project.activeGenerationRun.targetTrack !== "Captions") {
       return fail(project, "STALE_RUN", "The matching caption generation run is no longer active.");
     }
-    if (command.expectedQualityProfileRevision !== project.qualityProfile.revision
-      || command.result.expectedQualityProfileRevision !== project.qualityProfile.revision) {
+    const leaseBase = project.activeGenerationRun.base;
+    if (leaseBase === undefined) {
+      return fail(project, "STALE_RUN", "This legacy caption generation lease has no safe base-state fence. Discard it before starting a new run.");
+    }
+    if (
+      command.expectedProjectRevision !== leaseBase.expectedProjectRevision
+      || command.result.expectedProjectRevision !== leaseBase.expectedProjectRevision
+      || command.expectedQualityProfileRevision !== leaseBase.qualityProfileRevision
+      || command.result.expectedQualityProfileRevision !== leaseBase.qualityProfileRevision
+      || project.qualityProfile.revision !== leaseBase.qualityProfileRevision
+    ) {
       return fail(project, "STALE_PROJECT", "The Quality Profile changed after caption generation started.");
     }
     if (
       command.result.runId !== command.runId
       || command.result.projectId !== project.projectId
       || command.result.targetTrack !== "Captions"
-      || command.result.expectedProjectRevision !== command.expectedProjectRevision
       || command.result.evidence.projectId !== project.projectId
       || command.result.evidence.runId !== command.runId
       || command.result.evidence.mediaSha256.toLowerCase() !== project.media.sha256.toLowerCase()
+      || project.media.sha256.toLowerCase() !== leaseBase.mediaSha256
+      || !captionBaseMatches(project, leaseBase)
     ) return fail(project, "MEDIA_HASH_MISMATCH", "The staged evidence does not bind to this exact project media and revision.");
+    if (command.result.evidence.words.length > MAX_LOCAL_CAPTION_EVIDENCE_WORDS) {
+      return fail(project, "INVALID_ARGUMENT", "The staged caption evidence exceeds CueBench's bounded Local Evidence Package.");
+    }
 
     const existingProposed = Object.values(project.captions.items)
       .filter((item) => item.mergedIntoItemId === null && item.current.state === "Proposed");
@@ -349,15 +428,18 @@ export const applyCommand = (project: CaptionProject, command: DomainCommand): C
         ? { ...item, mergedIntoItemId: firstGeneratedId }
         : item,
     ]));
-    const generatedEvidence = command.result.captions.map((cue, index) => ({
-      evidenceId: `generation-${command.runId}-${index + 1}`,
+    const availableEvidenceIds = new Set(command.result.evidence.words.map((word) => word.evidenceId));
+    const generatedEvidence = command.result.captions.flatMap((cue) => cue.evidenceIds.map((evidenceId) => ({
+      evidenceId,
       projectId: project.projectId,
       mediaSha256: project.media.sha256.toLowerCase(),
       itemId: cue.cueId,
       itemRevision: 1,
-    }));
+    })));
     if (
-      generatedEvidence.some((entry) => entry.evidenceId.length > 200)
+      generatedEvidence.some((entry) => !availableEvidenceIds.has(entry.evidenceId))
+      || new Set(generatedEvidence.map((entry) => entry.evidenceId)).size !== generatedEvidence.length
+      || generatedEvidence.some((entry) => entry.evidenceId.length > 200)
       || generatedEvidence.some((entry) => project.evidence.some((existing) => existing.evidenceId === entry.evidenceId))
     ) return fail(project, "INVALID_ARGUMENT", "The staged caption evidence conflicts with project evidence.");
     const firstGenerated = firstGeneratedId === undefined ? undefined : generatedItems[firstGeneratedId];
@@ -368,6 +450,25 @@ export const applyCommand = (project: CaptionProject, command: DomainCommand): C
         items: { ...replacedItems, ...generatedItems },
       },
       evidence: [...project.evidence, ...generatedEvidence],
+      localEvidencePackages: [
+        ...project.localEvidencePackages.filter((entry) => entry.runId !== command.runId),
+        {
+          packageId: `generation-${command.runId}`,
+          runId: command.runId,
+          projectId: project.projectId,
+          mediaSha256: project.media.sha256.toLowerCase(),
+          expectedProjectRevision: leaseBase.expectedProjectRevision,
+          expectedQualityProfileRevision: leaseBase.qualityProfileRevision,
+          retainedAtMs: command.result.createdAtMs,
+          evidence: clone(command.result.evidence),
+          cueBindings: command.result.captions.map((cue) => ({
+            cueId: cue.cueId,
+            itemId: cue.cueId,
+            itemRevision: 1,
+            evidenceIds: [...cue.evidenceIds],
+          })),
+        },
+      ].slice(-4),
       activeGenerationRun: null,
       ...(firstGenerated === undefined ? {} : { selectedItem: selectFor(firstGenerated) }),
       ...withStaleArtifacts(project),
@@ -375,7 +476,7 @@ export const applyCommand = (project: CaptionProject, command: DomainCommand): C
   }
   if (command.type === "ReleaseGenerationRun") {
     if (project.activeGenerationRun?.runId !== command.runId) return fail(project, "STALE_RUN", "The generation run is no longer active.");
-    if (command.actor.type !== "System" && command.actor.type !== "CueBenchAI") return fail(project, "INVALID_ARGUMENT", "Only CueBench AI or System may release a generation run.");
+    if (command.actor.type !== "System" && command.actor.type !== "CueBenchAI" && command.actor.type !== "Human") return fail(project, "INVALID_ARGUMENT", "Only CueBench AI, System, or an authenticated Human may release a generation run.");
     return commit(project, command, { activeGenerationRun: null });
   }
   if (command.type === "ApplyProfile") {
@@ -392,7 +493,14 @@ export const applyCommand = (project: CaptionProject, command: DomainCommand): C
     if (project.activeGenerationRun !== null) return fail(project, "TARGET_TRACK_LEASE_CONFLICT", "Media cannot change while a generation run is active.");
     if (!isFiniteInteger(command.media.durationMs) || command.media.durationMs < 0) return fail(project, "INVALID_ARGUMENT", "Media duration must be a non-negative integer.");
     if (!allTimesFit(project, command.media.durationMs)) return fail(project, "INVALID_ARGUMENT", "Media duration must contain every stored item revision and gap.");
-    return commit(project, command, { media: { ...clone(command.media), relinkState: "Linked" }, ...withStaleArtifacts(project) });
+    // Transcript words and their resolved provenance are evidence of one
+    // exact source hash. Keep the historical cue/revision record, but never
+    // carry a canonical Local Evidence Package across a media replacement.
+    return commit(project, command, {
+      media: { ...clone(command.media), relinkState: "Linked" },
+      localEvidencePackages: [],
+      ...withStaleArtifacts(project),
+    });
   }
   if (command.type === "ValidateProject") {
     if (command.actor.type !== "System") return fail(project, "INVALID_ARGUMENT", "Only System may persist deterministic validation.");
@@ -555,6 +663,7 @@ export const applyCommand = (project: CaptionProject, command: DomainCommand): C
       return commit(project, command, {
         captions: replaceCaption(project, revised),
         evidence: carryEvidenceForReviewState(project, item, revised),
+        localEvidencePackages: carryLocalEvidenceForReviewState(project, item, revised),
         selectedItem: selectFor(revised),
         ...withStaleArtifacts(project),
       }, item.itemId);
@@ -563,6 +672,7 @@ export const applyCommand = (project: CaptionProject, command: DomainCommand): C
     return commit(project, command, {
       audioDescriptions: replaceAudioDescription(project, revised),
       evidence: carryEvidenceForReviewState(project, item, revised),
+      localEvidencePackages: carryLocalEvidenceForReviewState(project, item, revised),
       selectedItem: selectFor(revised),
       ...withStaleArtifacts(project),
     }, item.itemId);
@@ -579,6 +689,7 @@ export const applyCommand = (project: CaptionProject, command: DomainCommand): C
       return commit(project, command, {
         captions: replaceCaption(project, revised),
         evidence: carryEvidenceForReviewState(project, item, revised),
+        localEvidencePackages: carryLocalEvidenceForReviewState(project, item, revised),
         selectedItem: selectFor(revised),
         ...withStaleArtifacts(project),
       }, item.itemId);
@@ -587,6 +698,7 @@ export const applyCommand = (project: CaptionProject, command: DomainCommand): C
     return commit(project, command, {
       audioDescriptions: replaceAudioDescription(project, revised),
       evidence: carryEvidenceForReviewState(project, item, revised),
+      localEvidencePackages: carryLocalEvidenceForReviewState(project, item, revised),
       selectedItem: selectFor(revised),
       ...withStaleArtifacts(project),
     }, item.itemId);

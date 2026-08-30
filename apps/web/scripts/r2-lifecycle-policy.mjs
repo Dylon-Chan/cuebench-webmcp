@@ -181,6 +181,36 @@ const lifecycleRulesFromApi = (result, policy) => {
   }
 };
 
+/**
+ * Lifecycle PUT replaces the full rule collection. Keep every unknown
+ * deployment-owned rule byte-for-byte and replace only the names owned by
+ * CueBench so enabling the private-media backstop cannot silently erase an
+ * unrelated retention policy.
+ */
+export const mergeCueBenchLifecycleRules = (existingRules, policy) => {
+  const validPolicy = validateLifecyclePolicy(policy);
+  if (!Array.isArray(existingRules)) {
+    throw new LifecyclePolicyError("Cloudflare R2 lifecycle API did not return a rules array to preserve.");
+  }
+  const ownedIds = new Set(validPolicy.rules.map((rule) => rule.id));
+  const preserved = existingRules.map(asRecord);
+  if (preserved.some((rule) => rule === null || typeof rule.id !== "string" || rule.id.length === 0)) {
+    throw new LifecyclePolicyError("Cloudflare R2 lifecycle API returned an invalid existing rule, so CueBench will not replace retention configuration.");
+  }
+  return [
+    ...preserved.filter((rule) => !ownedIds.has(rule.id)),
+    ...validPolicy.rules,
+  ];
+};
+
+const lifecycleRulesFromResult = (result) => {
+  const record = asRecord(result);
+  if (record === null || !Array.isArray(record.rules)) {
+    throw new LifecyclePolicyError("CueBench R2 lifecycle API did not return a rules array for preservation.");
+  }
+  return record.rules;
+};
+
 const requireCredentials = (accountId, apiToken) => {
   if (typeof accountId !== "string" || !/^[a-f0-9]{32}$/i.test(accountId)) {
     throw new LifecyclePolicyError("CLOUDFLARE_ACCOUNT_ID must be configured as a 32-character account id before deployment.");
@@ -210,11 +240,12 @@ export const provisionAndVerifyLifecycle = async ({ policy, accountId, apiToken,
     accept: "application/json",
   };
 
-  await readApiResult(await boundedFetch(fetcher, url, { method: "GET", headers }));
+  const existing = lifecycleRulesFromResult(await readApiResult(await boundedFetch(fetcher, url, { method: "GET", headers })));
+  const rules = mergeCueBenchLifecycleRules(existing, validPolicy);
   await readApiResult(await boundedFetch(fetcher, url, {
     method: "PUT",
     headers: { ...headers, "content-type": "application/json" },
-    body: JSON.stringify({ rules: validPolicy.rules }),
+    body: JSON.stringify({ rules }),
   }));
   const verified = await readApiResult(await boundedFetch(fetcher, url, { method: "GET", headers }));
   lifecycleRulesFromApi(verified, validPolicy);

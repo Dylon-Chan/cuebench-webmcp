@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { LocalCaptionEvidencePackageSchema } from "./generation";
 
 /**
  * Strict wire schema for a complete CueBench project aggregate. It is shared
@@ -218,6 +219,18 @@ const generationLease = z.object({
   runId: identifier,
   targetTrack: z.enum(["Captions", "AudioDescriptions"]),
   actor,
+  base: z.object({
+    expectedProjectRevision: positiveInteger,
+    mediaSha256: sha256,
+    qualityProfileRevision: positiveInteger,
+    captionOrder: z.array(identifier),
+    captionItems: z.array(z.object({
+      itemId: identifier,
+      itemRevision: positiveInteger,
+      state: reviewState,
+      mergedIntoItemId: identifier.nullable(),
+    }).strict()),
+  }).strict().optional(),
 }).strict();
 const courtEvent = z.object({
   eventId: identifier,
@@ -251,6 +264,7 @@ export const CaptionProjectAggregateSchema = z.object({
   title: boundedText(1_000),
   media,
   evidence: z.array(evidence),
+  localEvidencePackages: z.array(LocalCaptionEvidencePackageSchema).max(4).default([]),
   captions: z.object({
     kind: z.literal("Captions"),
     order: z.array(identifier),

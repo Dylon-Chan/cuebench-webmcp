@@ -1,5 +1,6 @@
 import {
   CaptionEvidenceBundleSchema,
+  MAX_LOCAL_CAPTION_EVIDENCE_WORDS,
   StagedGenerationResultSchema,
   type CaptionEvidenceBundle,
   type CaptionEvidenceWord,
@@ -21,13 +22,14 @@ import {
 } from "../generation-routes";
 import { resolveWorkerSettings, type WorkerEnv } from "../env";
 import { MediaContainerPreparationService } from "../probe";
+import { fixtureMediaPreparation } from "../media-preparation-fixture";
 import { verifyUploadReceipt } from "../uploads";
 import {
   createOpenAIProvider,
   sha256Hex,
   type ProviderCallProvenance,
 } from "../openai/client";
-import { normalizeForAlignment } from "../openai/transcription";
+import { alignCaptionEvidence, normalizeForAlignment } from "../openai/transcription";
 import { reconcileCaptionEvidence } from "../openai/reconcile";
 
 const DAY_MS = 24 * 60 * 60 * 1_000;
@@ -41,7 +43,10 @@ export interface GenerationStartRequest {
   readonly expectedProjectRevision: number;
   readonly expectedQualityProfileRevision: number;
   /** Browser-canonical source digest, bound into the signed run receipt. */
-  readonly mediaSha256?: string;
+  readonly mediaSha256: string;
+  /** Receipt-bound browser source facts that the authoritative manifest must prove. */
+  readonly sourceByteLength: number;
+  readonly sourceDurationMs: number;
   /** The exact profile snapshot held by the browser when it acquired the lease. */
   readonly qualityProfileRules?: Readonly<Record<string, unknown>>;
   readonly operation: Omit<MediaPreparationRequest, "idempotencyKey">;
@@ -56,6 +61,11 @@ export interface PreparedAudio {
 }
 
 export interface PreparedMediaManifestContents {
+  readonly source: {
+    readonly sha256: string;
+    readonly byteLength: number;
+    readonly durationMs: number;
+  };
   readonly normalizedAudio: PreparedAudio;
 }
 
@@ -229,90 +239,95 @@ const persistStagedForAdoption = async (
   return next;
 };
 
-const normaliseWord = (value: string) => value.normalize("NFKC").trim().toLocaleLowerCase();
-const overlapMs = (first: { readonly startMs: number; readonly endMs: number }, second: { readonly startMs: number; readonly endMs: number }) =>
-  Math.max(0, Math.min(first.endMs, second.endMs) - Math.max(first.startMs, second.startMs));
-
 /**
- * Joins words to speaker evidence deterministically. We never pick a speaker
- * on an equal-overlap disagreement; it becomes an explicit uncertainty span.
+ * Adapter to the one tested two-pass alignment implementation. Generation
+ * keeps its public evidence ids stable per run while preserving every shared
+ * uncertainty and diarization link; it never reimplements tie-breaking here.
  */
 export const alignSpeakerSegmentsToWords = (input: {
   readonly runId: string;
   readonly words: readonly TimestampedWord[];
   readonly speakerSegments: readonly SpeakerSegment[];
 }): { readonly words: readonly AlignedCaptionWord[]; readonly uncertaintySpans: readonly UncertaintySpan[] } => {
-  const words: AlignedCaptionWord[] = [];
-  const uncertaintySpans: UncertaintySpan[] = [];
-  for (const [wordIndex, word] of input.words.entries()) {
-    if (!Number.isSafeInteger(word.startMs) || !Number.isSafeInteger(word.endMs) || word.endMs <= word.startMs || normaliseWord(word.text).length === 0) continue;
-    const candidates = input.speakerSegments
-      .map((segment, segmentIndex) => ({ segment, segmentIndex, overlap: overlapMs(word, segment) }))
-      .filter((candidate) => candidate.overlap > 0)
-      .sort((left, right) => right.overlap - left.overlap || left.segmentIndex - right.segmentIndex);
-    const maxOverlap = candidates[0]?.overlap ?? 0;
-    const winners = candidates.filter((candidate) => candidate.overlap === maxOverlap);
-    const speakerSegmentIds = candidates.map((candidate) => candidate.segment.id ?? `speaker-${candidate.segmentIndex + 1}`);
-    const evidenceId = `word-${input.runId}-${wordIndex + 1}`;
-    let speaker: string | null = null;
-    if (winners.length === 1 && winners[0] !== undefined) speaker = winners[0].segment.speaker.trim() || null;
-    const aligned: AlignedCaptionWord = {
+  const shared = alignCaptionEvidence({
+    text: input.speakerSegments.map((segment) => segment.text).join(" "),
+    durationMs: Math.max(0, ...input.speakerSegments.map((segment) => segment.endMs), ...input.words.map((word) => word.endMs)),
+    segments: input.speakerSegments.map((segment, index) => ({
+      id: segment.id?.trim() || `speaker-${index + 1}`,
+      startMs: segment.startMs,
+      endMs: segment.endMs,
+      speaker: segment.speaker,
+      text: segment.text,
+    })),
+  }, {
+    text: input.words.map((word) => word.text).join(" "),
+    words: input.words.map((word) => ({
+      startMs: word.startMs,
+      endMs: word.endMs,
+      text: word.text,
+    })),
+  });
+  const idBySharedId = new Map<string, string>();
+  const words = shared.words.map((word) => {
+    const evidenceId = `word-${input.runId}-${word.wordPassIndex + 1}`;
+    idBySharedId.set(word.id, evidenceId);
+    return {
       evidenceId,
-      sourceWordIndex: wordIndex,
+      sourceWordIndex: word.wordPassIndex,
       startMs: word.startMs,
       endMs: word.endMs,
       text: word.text.trim(),
-      speaker,
-      speakerSegmentIds,
+      speaker: word.speaker,
+      speakerSegmentIds: [...word.diarizationSegmentIds],
     };
-    words.push(aligned);
-    const wordText = normaliseWord(word.text);
-    const conflictingText = winners.some(({ segment }) => {
-      const segmentText = normaliseWord(segment.text);
-      return segmentText.length > 0 && !segmentText.includes(wordText);
-    });
-    if (winners.length !== 1 || speaker === null || conflictingText) {
-      uncertaintySpans.push({
-        uncertaintyId: `uncertainty-${input.runId}-${wordIndex + 1}`,
-        startMs: word.startMs,
-        endMs: word.endMs,
-        reason: winners.length === 0 ? "speaker-gap" : conflictingText ? "text-conflict" : "speaker-conflict",
-        evidenceIds: [evidenceId, ...speakerSegmentIds],
-      });
-    }
-  }
-  return { words, uncertaintySpans };
+  });
+  return {
+    words,
+    uncertaintySpans: shared.uncertaintySpans.map((span, index) => ({
+      uncertaintyId: `uncertainty-${input.runId}-${index + 1}`,
+      startMs: span.startMs,
+      endMs: span.endMs,
+      reason: span.reason === "NoSpeakerEvidence"
+        ? "speaker-gap"
+        : span.reason === "TranscriptDisagreement"
+          ? "text-conflict"
+          : "speaker-conflict",
+      evidenceIds: [
+        ...span.wordIds.map((id) => idBySharedId.get(id)).filter((id): id is string => id !== undefined),
+        ...span.diarizationSegmentIds,
+      ],
+    })),
+  };
 };
 
 /** Pure deterministic Education-profile segmentation; no model controls cue boundaries. */
 export const segmentEducationCaptions = (input: {
   readonly runId: string;
   readonly words: readonly AlignedCaptionWord[];
+  /** Authoritative source duration from the prepared manifest, never browser UI state. */
+  readonly durationMs: number;
   readonly profileRules?: Readonly<Record<string, unknown>>;
 }): readonly StagedCaptionCue[] => {
+  if (!Number.isSafeInteger(input.durationMs) || input.durationMs <= 0) {
+    throw new Error("CueBench cannot segment captions without an authoritative media duration.");
+  }
   const rules = resolveEducationProfileRules(input.profileRules ?? {}).caption;
-  const result: StagedCaptionCue[] = [];
+  const buckets: AlignedCaptionWord[][] = [];
   let bucket: AlignedCaptionWord[] = [];
   const maxCharacters = rules.maxLineLength * rules.maxLineCount;
   const flush = () => {
     if (bucket.length === 0) return;
-    const first = bucket[0]!;
-    const last = bucket.at(-1)!;
-    const text = bucket.map((word) => word.text.trim()).join(" ").replaceAll(/\s+/g, " ").trim();
-    if (text.length > 0 && last.endMs > first.startMs) {
-      const speakers = new Set(bucket.map((word) => word.speaker).filter((speaker): speaker is string => speaker !== null));
-      result.push({
-        cueId: `caption-${input.runId}-${result.length + 1}`,
-        startMs: first.startMs,
-        endMs: Math.max(first.startMs + Math.min(rules.minDurationMs, rules.maxDurationMs), last.endMs),
-        text,
-        speaker: speakers.size === 1 ? [...speakers][0]! : null,
-        evidenceIds: bucket.map((word) => word.evidenceId),
-      });
-    }
+    buckets.push(bucket);
     bucket = [];
   };
   for (const word of [...input.words].sort((left, right) => left.startMs - right.startMs || left.sourceWordIndex - right.sourceWordIndex)) {
+    if (
+      !Number.isSafeInteger(word.startMs)
+      || !Number.isSafeInteger(word.endMs)
+      || word.startMs < 0
+      || word.endMs <= word.startMs
+      || word.endMs > input.durationMs
+    ) throw new Error("CueBench received word timing outside the authoritative media duration.");
     const prospectiveText = [...bucket, word].map((value) => value.text.trim()).join(" ");
     const first = bucket[0] ?? word;
     const exceedsDuration = word.endMs - first.startMs > rules.maxDurationMs;
@@ -322,6 +337,52 @@ export const segmentEducationCaptions = (input: {
     bucket.push(word);
   }
   flush();
+
+  // A speaker/length split can happen between overlapping word intervals.
+  // Repartition those neighbours rather than publishing overlapping cues.
+  for (let index = 0; index + 1 < buckets.length;) {
+    const current = buckets[index]!;
+    const next = buckets[index + 1]!;
+    if (current.at(-1)!.endMs > next[0]!.startMs) {
+      buckets.splice(index, 2, [...current, ...next]);
+      if (index > 0) index -= 1;
+      continue;
+    }
+    index += 1;
+  }
+
+  const result: StagedCaptionCue[] = [];
+  for (const [index, words] of buckets.entries()) {
+    const first = words[0]!;
+    const last = words.at(-1)!;
+    const nextStart = buckets[index + 1]?.[0]?.startMs ?? input.durationMs;
+    if (nextStart <= first.startMs) {
+      throw new Error("CueBench cannot safely partition caption boundaries at this media timestamp.");
+    }
+    const desiredEnd = Math.max(last.endMs, first.startMs + Math.min(rules.minDurationMs, rules.maxDurationMs));
+    // A final cue or close following boundary may be shorter than profile
+    // minimum; temporal safety and no overlap take precedence.
+    const endMs = Math.min(desiredEnd, nextStart, input.durationMs);
+    const text = words.map((word) => word.text.trim()).join(" ").replaceAll(/\s+/g, " ").trim();
+    if (text.length === 0 || endMs <= first.startMs || endMs < last.endMs) {
+      throw new Error("CueBench cannot safely segment captions within the authoritative media duration.");
+    }
+    const speakers = new Set(words.map((word) => word.speaker).filter((speaker): speaker is string => speaker !== null));
+    result.push({
+      cueId: `caption-${input.runId}-${result.length + 1}`,
+      startMs: first.startMs,
+      endMs,
+      text,
+      speaker: speakers.size === 1 ? [...speakers][0]! : null,
+      evidenceIds: words.map((word) => word.evidenceId),
+    });
+  }
+  for (const [index, cue] of result.entries()) {
+    const next = result[index + 1];
+    if (cue.startMs < 0 || cue.endMs > input.durationMs || cue.endMs <= cue.startMs || (next !== undefined && cue.endMs > next.startMs)) {
+      throw new Error("CueBench segmented overlapping or out-of-range captions.");
+    }
+  }
   return result;
 };
 
@@ -330,7 +391,9 @@ const providerProvenance = (role: GenerationProviderProvenance["role"], source: 
   model: source.model,
   requestHash: source.requestHash,
   responseHash: source.responseHash,
-  store: "store" in source ? source.store : false,
+  // Audio transcription exposes no `store` option. Preserve that capability
+  // truthfully instead of mislabeling it as a Responses `store:false` call.
+  store: "store" in source ? source.store : null,
   requestMetadata: source.requestMetadata ?? {},
   warnings: [...(source.warnings ?? [])],
 });
@@ -341,6 +404,13 @@ const validPreparedAudio = (audio: PreparedAudio): boolean => (
   && Number.isSafeInteger(audio.byteLength) && audio.byteLength > 0
   && Number.isSafeInteger(audio.durationMs) && audio.durationMs >= 0
   && typeof audio.contentType === "string" && audio.contentType.length > 0
+);
+
+const matchesAuthoritativeSource = (manifest: PreparedMediaManifestContents, request: GenerationStartRequest): boolean => (
+  sha256.test(manifest.source.sha256)
+  && manifest.source.sha256.toLowerCase() === request.mediaSha256.toLowerCase()
+  && manifest.source.byteLength === request.sourceByteLength
+  && manifest.source.durationMs === request.sourceDurationMs
 );
 
 /**
@@ -380,7 +450,9 @@ export class CaptionGenerationRunner {
 
       if (run.manifest === undefined) {
         const manifest = await this.dependencies.artifacts.readManifest(run.preparedManifest!);
-        if (!validPreparedAudio(manifest.normalizedAudio)) throw new Error("CueBench prepared media manifest is invalid.");
+        if (!validPreparedAudio(manifest.normalizedAudio) || !matchesAuthoritativeSource(manifest, request)) {
+          throw new Error("CueBench prepared media manifest does not match this signed source identity.");
+        }
         run = await persistArtifacts(this.store, run, { manifest: clone(manifest) });
       }
 
@@ -415,10 +487,15 @@ export class CaptionGenerationRunner {
       }
       if (await cancellationBoundary(this.store, run) !== null) return;
 
+      if (run.reconciled!.words.length > MAX_LOCAL_CAPTION_EVIDENCE_WORDS) {
+        throw new Error("CueBench cannot stage evidence beyond the bounded Local Evidence Package.");
+      }
+
       run = await appendStage(this.store, run, "SegmentingCaptions", { progress: 0 });
       const captions = segmentEducationCaptions({
         runId: request.runId,
         words: run.reconciled!.words,
+        durationMs: run.manifest!.source.durationMs,
         ...(request.qualityProfileRules === undefined ? {} : { profileRules: request.qualityProfileRules }),
       });
       const createdAtMs = this.dependencies.clock?.() ?? Date.now();
@@ -426,7 +503,7 @@ export class CaptionGenerationRunner {
         contractVersion: 1,
         runId: request.runId,
         projectId: request.projectId,
-        mediaSha256: request.mediaSha256 ?? run.preparedManifest!.sha256,
+        mediaSha256: request.mediaSha256,
         preparedManifest: run.preparedManifest,
         normalizedAudio: run.manifest!.normalizedAudio,
         words: run.reconciled!.words,
@@ -525,7 +602,8 @@ export class GenerationRunRecordBackedStore implements GenerationRunStore {
     return found;
   }
 
-  private state(value: unknown): PersistedGenerationRun | null {
+  private state(record: GenerationRunRecord): PersistedGenerationRun | null {
+    const value = record.workflowState;
     if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
     const candidate = value as Partial<PersistedGenerationRun>;
     if (
@@ -533,12 +611,18 @@ export class GenerationRunRecordBackedStore implements GenerationRunStore {
       || !Array.isArray(candidate.stageHistory)
       || typeof candidate.cancelled !== "boolean"
     ) return null;
-    return candidate as PersistedGenerationRun;
+    // R2 stores the staged result in a separate immutable artifact. Older
+    // snapshots may still include it inline, but resume always sees one
+    // coherent state without duplicating word-rich result arrays.
+    return {
+      ...candidate,
+      ...(candidate.staged === undefined && record.stagedResult !== undefined ? { staged: record.stagedResult } : {}),
+    } as PersistedGenerationRun;
   }
 
   public async initialise(request: GenerationStartRequest): Promise<PersistedGenerationRun> {
     const record = await this.record();
-    const existing = this.state(record.workflowState);
+    const existing = this.state(record);
     if (existing !== null) return { ...clone(existing), cancelled: existing.cancelled || record.cancelled };
     const created: PersistedGenerationRun = {
       request: clone(request),
@@ -552,7 +636,7 @@ export class GenerationRunRecordBackedStore implements GenerationRunStore {
   public async read(runId: string): Promise<PersistedGenerationRun | null> {
     if (runId !== this.identity.runId) return null;
     const record = await this.record();
-    const state = this.state(record.workflowState);
+    const state = this.state(record);
     return state === null ? null : { ...clone(state), cancelled: state.cancelled || record.cancelled };
   }
 
@@ -560,12 +644,13 @@ export class GenerationRunRecordBackedStore implements GenerationRunStore {
     if (run.request.runId !== this.identity.runId) throw new Error("CueBench generation state does not match its receipt.");
     const record = await this.record();
     const visible = run.stageHistory.at(-1) ?? record.status;
+    const { staged, ...workflowState } = clone(run);
     await this.records.save({
       ...record,
       status: visible,
       cancelled: record.cancelled || run.cancelled,
-      workflowState: clone(run),
-      ...(run.staged === undefined ? {} : { stagedResult: clone(run.staged) }),
+      workflowState,
+      ...(staged === undefined ? {} : { stagedResult: staged }),
       updatedAtMs: Date.now(),
     });
   }
@@ -573,7 +658,7 @@ export class GenerationRunRecordBackedStore implements GenerationRunStore {
   public async cancel(runId: string): Promise<void> {
     if (runId !== this.identity.runId) return;
     const record = await this.record();
-    const state = this.state(record.workflowState);
+    const state = this.state(record);
     await this.records.save({
       ...record,
       cancelled: true,
@@ -588,7 +673,11 @@ const MAX_NORMALIZED_AUDIO_BYTES = 40 * 1024 * 1024;
 const positiveSafeInteger = (value: unknown): value is number => typeof value === "number" && Number.isSafeInteger(value) && value > 0;
 
 interface PreparedManifestJson {
-  readonly metadata?: { readonly duration_ms?: unknown };
+  readonly metadata?: {
+    readonly sha256?: unknown;
+    readonly duration_ms?: unknown;
+    readonly byte_length?: unknown;
+  };
   readonly normalized_audio?: {
     readonly key?: unknown;
     readonly sha256?: unknown;
@@ -608,6 +697,8 @@ const exactPreparedManifest = async (
   try { parsed = JSON.parse(new TextDecoder().decode(bytes)) as PreparedManifestJson; } catch { throw new Error("CueBench prepared media manifest is invalid."); }
   const audio = parsed.normalized_audio;
   const durationMs = parsed.metadata?.duration_ms;
+  const sourceSha256 = parsed.metadata?.sha256;
+  const sourceByteLength = parsed.metadata?.byte_length;
   const audioKey = audio?.key;
   const audioSha256 = audio?.sha256;
   const audioByteLength = audio?.byte_length;
@@ -615,9 +706,16 @@ const exactPreparedManifest = async (
     typeof audioKey !== "string" || !audioKey.startsWith("prepared/")
     || typeof audioSha256 !== "string" || !sha256.test(audioSha256)
     || !positiveSafeInteger(audioByteLength) || audioByteLength > MAX_NORMALIZED_AUDIO_BYTES
+    || typeof sourceSha256 !== "string" || !sha256.test(sourceSha256)
+    || !positiveSafeInteger(sourceByteLength)
     || !positiveSafeInteger(durationMs)
   ) throw new Error("CueBench prepared media manifest is invalid.");
   return {
+    source: {
+      sha256: sourceSha256.toLowerCase(),
+      byteLength: sourceByteLength,
+      durationMs,
+    },
     normalizedAudio: {
       key: audioKey,
       sha256: audioSha256.toLowerCase(),
@@ -714,8 +812,10 @@ const captionDependenciesFor = (env: WorkerEnv, bucket: R2Bucket): CaptionGenera
     ...(env.OPENAI_BASE_URL === undefined ? {} : { CUEBENCH_OPENAI_BASE_URL: env.OPENAI_BASE_URL }),
     ...(env.CUEBENCH_RECONCILIATION_MODEL === undefined ? {} : { CUEBENCH_RECONCILIATION_MODEL: env.CUEBENCH_RECONCILIATION_MODEL }),
   });
+  const preparation = fixtureMediaPreparation(env, settings.mediaJobSigning)
+    ?? new MediaContainerPreparationService(env.MEDIA_PREPARER, settings.mediaJobSigning);
   return {
-    preparation: new MediaContainerPreparationService(env.MEDIA_PREPARER, settings.mediaJobSigning),
+    preparation,
     artifacts: { readManifest: (manifest) => exactPreparedManifest(bucket, manifest) },
     transcription: {
       diarize: async ({ audio }) => {
@@ -787,35 +887,53 @@ const captionDependenciesFor = (env: WorkerEnv, bucket: R2Bucket): CaptionGenera
   };
 };
 
-export interface CaptionGenerationWorkflowParameters {
+export interface CaptionGenerationRunWorkflowParameters {
+  /** Signed generation capability; each Workflow instance owns exactly one run. */
+  readonly generationReceipt: string;
+  /** Private upload capability retained only in the run record and Workflow params. */
+  readonly uploadReceipt: string;
+}
+
+/**
+ * Legacy upload completion retains a no-provider accounting instance while
+ * Task 11's conservative reservation reconciles. It never invokes prepare;
+ * generation itself always uses the run-specific parameter shape above.
+ */
+export interface UploadAccountingWorkflowParameters {
   readonly receipt: string;
   readonly objectKey: string;
 }
 
-interface StartCaptionGenerationEvent { readonly receipt: string; }
+export type CaptionGenerationWorkflowParameters = CaptionGenerationRunWorkflowParameters | UploadAccountingWorkflowParameters;
 
 /**
- * Actual Cloudflare Workflow binding. Upload completion creates this dormant
- * instance but cannot prepare media; only the signed start event unlocks the
- * internal Task 12 preparation call below.
+ * Actual Cloudflare Workflow binding. Upload completion never creates this
+ * instance: the generation route creates one deterministic instance per run.
+ * This makes an adopted/cancelled run restartable with a new run id rather
+ * than stranding a later start behind a completed one-shot Workflow.
  */
 export class CaptionGenerationWorkflow extends WorkflowEntrypoint<WorkerEnv, CaptionGenerationWorkflowParameters> {
   public override async run(event: Readonly<WorkflowEvent<CaptionGenerationWorkflowParameters>>, step: WorkflowStep): Promise<void> {
-    const start = await step.waitForEvent<StartCaptionGenerationEvent>("wait for signed caption generation", {
-      type: "caption-generation-start",
-      timeout: DAY_MS,
-    });
+    if (!("generationReceipt" in event.payload)) {
+      // This compatibility instance deliberately performs no media preparation
+      // or provider call. The generation route creates the only Workflow that
+      // can touch Task 12's prepare capability.
+      return;
+    }
+    const payload: CaptionGenerationRunWorkflowParameters = event.payload;
     const verified = await step.do("verify caption-generation receipt", async () => {
       const settings = resolveWorkerSettings(this.env);
       const [generation, upload] = await Promise.all([
-        verifyGenerationRunReceipt(start.payload.receipt, settings, Date.now()),
-        verifyUploadReceipt(event.payload.receipt, settings, Date.now()),
+        verifyGenerationRunReceipt(payload.generationReceipt, settings, Date.now()),
+        verifyUploadReceipt(payload.uploadReceipt, settings, Date.now()),
       ]);
       if (
         generation.operationKey !== upload.operationKey
         || generation.operationId !== upload.operationId
-        || generation.objectKey !== event.payload.objectKey
         || generation.objectKey !== upload.objectKey
+        || generation.sessionKey !== upload.sessionKey
+        || generation.sourceByteLength !== upload.media.byteLength
+        || generation.sourceDurationMs !== upload.media.durationMs
       ) throw new Error("CueBench generation receipt does not match its private upload.");
       return { generation, uploadMedia: upload.media, uploadExpiresAtMs: upload.expiresAtMs };
     });
@@ -824,7 +942,11 @@ export class CaptionGenerationWorkflow extends WorkflowEntrypoint<WorkerEnv, Cap
       if (this.env.PROCESSING_BUCKET === undefined) throw new Error("CueBench private generation storage is not configured.");
       const records = new R2GenerationRunRecordStore(this.env.PROCESSING_BUCKET);
       const record = await records.load(claims);
-      if (record === null || record.receipt !== start.payload.receipt) throw new Error("CueBench generation recovery record is unavailable.");
+      if (
+        record === null
+        || record.receipt !== payload.generationReceipt
+        || record.uploadReceipt !== payload.uploadReceipt
+      ) throw new Error("CueBench generation recovery record is unavailable.");
       const runner = new CaptionGenerationRunner(
         new GenerationRunRecordBackedStore(records, claims),
         captionDependenciesFor(this.env, this.env.PROCESSING_BUCKET),
@@ -839,6 +961,8 @@ export class CaptionGenerationWorkflow extends WorkflowEntrypoint<WorkerEnv, Cap
         expectedProjectRevision: claims.expectedProjectRevision,
         expectedQualityProfileRevision: claims.expectedQualityProfileRevision,
         mediaSha256: claims.mediaSha256,
+        sourceByteLength: claims.sourceByteLength,
+        sourceDurationMs: claims.sourceDurationMs,
         ...(record.qualityProfileRules === undefined ? {} : { qualityProfileRules: record.qualityProfileRules }),
         operation: {
           operationId: claims.operationId,
@@ -846,7 +970,7 @@ export class CaptionGenerationWorkflow extends WorkflowEntrypoint<WorkerEnv, Cap
           objectKey: claims.objectKey,
           inputByteLength: verified.uploadMedia.byteLength,
           inputContentType: verified.uploadMedia.contentType,
-          operationReceipt: event.payload.receipt,
+          operationReceipt: payload.uploadReceipt,
           receiptExpiresAtMs: verified.uploadExpiresAtMs,
         },
       });

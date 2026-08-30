@@ -52,6 +52,11 @@ export const GenerationRunReceiptSchema = z.object({
   expectedProjectRevision: ProjectRevisionSchema,
   expectedQualityProfileRevision: ProjectRevisionSchema,
   mediaSha256: Sha256Schema,
+  /** Salted anonymous-session identity; no browser/session identifier is exposed. */
+  sessionKey: z.string().regex(/^[0-9a-f]{64}$/),
+  /** Browser project identity that the prepared manifest must prove before providers run. */
+  sourceByteLength: z.number().int().positive(),
+  sourceDurationMs: SafeTimestampSchema.refine((value) => value > 0),
   operationId: IdentifierSchema,
   operationKey: z.string().regex(/^[0-9a-f]{64}$/),
   objectKey: z.string().min(1).max(1_000),
@@ -81,7 +86,8 @@ export const GenerationProviderProvenanceSchema = z.object({
   model: z.string().trim().min(1).max(200),
   requestHash: Sha256Schema,
   responseHash: Sha256Schema,
-  store: z.boolean(),
+  /** Audio transcription has no store parameter; Responses calls explicitly use false. */
+  store: z.boolean().nullable(),
   requestMetadata: z.record(z.string(), z.string().trim().max(500)).default({}),
   warnings: z.array(z.string().trim().min(1).max(500)).max(32).default([]),
 }).strict();
@@ -134,6 +140,53 @@ export const StagedGenerationResultSchema = z.object({
   }
   if (value.evidence.runId !== value.runId || value.evidence.projectId !== value.projectId) {
     context.addIssue({ code: "custom", message: "Evidence must bind to the staged generation result." });
+  }
+});
+
+export const CueEvidenceBindingSchema = z.object({
+  cueId: IdentifierSchema,
+  itemId: IdentifierSchema,
+  itemRevision: z.number().int().positive(),
+  evidenceIds: z.array(IdentifierSchema).min(1).max(128),
+}).strict();
+
+/** Browser-canonical evidence stays bounded even when a private run is larger. */
+export const MAX_LOCAL_CAPTION_EVIDENCE_WORDS = 5_000;
+
+/**
+ * The browser's canonical, bounded evidence payload after human adoption.
+ * It is intentionally part of the project aggregate (and therefore its
+ * encrypted backup), unlike the short-lived Worker recovery receipt.
+ */
+export const LocalCaptionEvidencePackageSchema = z.object({
+  packageId: IdentifierSchema,
+  runId: IdentifierSchema,
+  projectId: IdentifierSchema,
+  mediaSha256: Sha256Schema,
+  expectedProjectRevision: ProjectRevisionSchema,
+  expectedQualityProfileRevision: ProjectRevisionSchema,
+  retainedAtMs: SafeTimestampSchema,
+  evidence: CaptionEvidenceBundleSchema,
+  cueBindings: z.array(CueEvidenceBindingSchema).max(20_000),
+}).strict().superRefine((value, context) => {
+  if (value.evidence.runId !== value.runId || value.evidence.projectId !== value.projectId || value.evidence.mediaSha256 !== value.mediaSha256) {
+    context.addIssue({ code: "custom", message: "Local evidence must bind to its exact generation run, project, and media." });
+  }
+  if (value.evidence.words.length > MAX_LOCAL_CAPTION_EVIDENCE_WORDS) {
+    context.addIssue({ code: "custom", message: "A Local Evidence Package may retain at most 5,000 word records.", path: ["evidence", "words"] });
+  }
+  const wordIds = new Set(value.evidence.words.map((word) => word.evidenceId));
+  const seenBindingIds = new Set<string>();
+  for (const binding of value.cueBindings) {
+    if (binding.itemId !== binding.cueId) {
+      context.addIssue({ code: "custom", message: "Cue evidence bindings must resolve to their adopted cue item.", path: ["cueBindings"] });
+    }
+    for (const evidenceId of binding.evidenceIds) {
+      if (!wordIds.has(evidenceId) || seenBindingIds.has(evidenceId)) {
+        context.addIssue({ code: "custom", message: "Cue evidence bindings must uniquely resolve to retained word evidence.", path: ["cueBindings"] });
+      }
+      seenBindingIds.add(evidenceId);
+    }
   }
 });
 
@@ -230,3 +283,4 @@ export type GenerationProviderProvenance = z.infer<typeof GenerationProviderProv
 export type CaptionEvidenceBundle = z.infer<typeof CaptionEvidenceBundleSchema>;
 export type StagedCaptionCue = z.infer<typeof StagedCaptionCueSchema>;
 export type StagedGenerationResult = z.infer<typeof StagedGenerationResultSchema>;
+export type LocalCaptionEvidencePackage = z.infer<typeof LocalCaptionEvidencePackageSchema>;

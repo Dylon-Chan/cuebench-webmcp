@@ -323,7 +323,10 @@ const parseUsage = (value: unknown): ProviderUsage | null => {
     inputTokens: finiteNonNegative(usage.input_tokens),
     outputTokens: finiteNonNegative(usage.output_tokens),
     totalTokens: finiteNonNegative(usage.total_tokens),
-    audioSeconds: finiteNonNegative(usage.audio_seconds),
+    // The transcription endpoint’s duration usage object is `{ seconds,
+    // type: "duration" }`; retain the older field only for fixture/backward
+    // compatibility, never as the primary official contract.
+    audioSeconds: finiteNonNegative(usage.seconds) ?? finiteNonNegative(usage.audio_seconds),
   };
 };
 

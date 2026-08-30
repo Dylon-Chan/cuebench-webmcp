@@ -4,6 +4,7 @@ import type {
   MediaSourceSnapshot,
   ValidationSnapshot,
 } from "@cuebench/contracts";
+import { LocalCaptionEvidencePackageSchema } from "@cuebench/contracts";
 import {
   applicableWarningWaivers,
   buildValidationInput,
@@ -220,6 +221,18 @@ const GenerationLeaseSchema = z.object({
   runId: identifier,
   targetTrack: z.enum(["Captions", "AudioDescriptions"]),
   actor: ActorStorageSchema,
+  base: z.object({
+    expectedProjectRevision: positiveSafeInteger,
+    mediaSha256: lowercaseSha256,
+    qualityProfileRevision: positiveSafeInteger,
+    captionOrder: z.array(identifier),
+    captionItems: z.array(z.object({
+      itemId: identifier,
+      itemRevision: positiveSafeInteger,
+      state: z.enum(["Proposed", "AgentReady", "Objected", "Sustained"]),
+      mergedIntoItemId: identifier.nullable(),
+    }).strict()),
+  }).strict().optional(),
 }).strict();
 
 const DomainEventSchema = z.object({
@@ -375,6 +388,7 @@ const CaptionProjectSchema = z.object({
   title: boundedText(1_000),
   media: MediaSourceStorageSchema,
   evidence: z.array(EvidenceProvenanceSchema),
+  localEvidencePackages: z.array(LocalCaptionEvidencePackageSchema).max(4).default([]),
   captions: z.object({
     kind: z.literal("Captions"),
     order: z.array(identifier),
@@ -414,6 +428,7 @@ export interface ProjectHeaderRow {
   readonly projectCreatedAtMs?: number;
   readonly title: string;
   readonly media: MediaSourceSnapshot;
+  readonly localEvidencePackages: readonly import("@cuebench/contracts").LocalCaptionEvidencePackage[];
   readonly captionOrder: readonly string[];
   readonly audioDescriptionOrder: readonly string[];
   readonly audioDescriptionGaps: Readonly<Record<string, import("@cuebench/domain").AudioDescriptionGap>>;
@@ -537,6 +552,7 @@ const ProjectHeaderRowSchema = z.object({
   projectCreatedAtMs: nonNegativeSafeInteger.optional(),
   title: boundedText(1_000),
   media: MediaSourceStorageSchema,
+  localEvidencePackages: z.array(LocalCaptionEvidencePackageSchema).max(4).default([]),
   captionOrder: z.array(identifier),
   audioDescriptionOrder: z.array(identifier),
   audioDescriptionGaps: z.record(z.string(), AudioDescriptionGapSchema),
@@ -1041,6 +1057,36 @@ const assertCertificationPointer = (project: CaptionProject): void => {
   }
 };
 
+/** Keeps the project-local evidence package and compact provenance pointers coherent on rehydrate. */
+const assertLocalEvidencePackages = (project: CaptionProject): void => {
+  assertUnique(project.localEvidencePackages.map((entry) => entry.packageId), "project headers", "Local Evidence Package ids");
+  if (project.localEvidencePackages.length > 4) {
+    throw new StorageReadValidationError("project headers", "Local Evidence Packages exceed the retained bound.");
+  }
+  const evidenceById = new Map(project.evidence.map((entry) => [entry.evidenceId, entry]));
+  for (const entry of project.localEvidencePackages) {
+    if (
+      entry.projectId !== project.projectId
+      || entry.mediaSha256.toLowerCase() !== project.media.sha256.toLowerCase()
+    ) throw new StorageReadValidationError("project headers", "Local Evidence Package belongs to another project or media source.");
+    const words = new Set(entry.evidence.words.map((word) => word.evidenceId));
+    for (const binding of entry.cueBindings) {
+      const item = project.captions.items[binding.itemId];
+      if (
+        item === undefined
+        || binding.cueId !== binding.itemId
+        || !item.revisions.some((revision) => revision.itemRevision === binding.itemRevision)
+      ) throw new StorageReadValidationError("evidence", "Local Evidence Package cue binding references an unknown caption revision.");
+      for (const evidenceId of binding.evidenceIds) {
+        const provenance = evidenceById.get(evidenceId);
+        if (!words.has(evidenceId) || provenance === undefined || provenance.itemId !== binding.itemId) {
+          throw new StorageReadValidationError("evidence", "Local Evidence Package word does not resolve through canonical cue provenance.");
+        }
+      }
+    }
+  }
+};
+
 const assertProjectRelationships = (project: CaptionProject): void => {
   const globalIds = new Set<string>();
   const claimGlobalId = (id: string, table: string) => {
@@ -1088,6 +1134,7 @@ const assertProjectRelationships = (project: CaptionProject): void => {
       }
     }
   }
+  assertLocalEvidencePackages(project);
   if (project.selectedItem !== null) {
     if (project.selectedItem.kind === "AudioDescriptionGap") {
       const gap = project.audioDescriptionGaps[project.selectedItem.itemId];
@@ -1205,6 +1252,7 @@ export const normalizeProject = (
     ...(project.createdAtMs === undefined ? {} : { projectCreatedAtMs: project.createdAtMs }),
     title: project.title,
     media: clone(project.media),
+    localEvidencePackages: clone(project.localEvidencePackages),
     captionOrder: clone(project.captions.order),
     audioDescriptionOrder: clone(project.audioDescriptions.order),
     audioDescriptionGaps: clone(project.audioDescriptionGaps),
@@ -1403,6 +1451,7 @@ export const rehydrateProject = (rows: NormalizedProjectRows): CaptionProject =>
     title: header.title,
     media: clone(header.media),
     evidence: projectEvidence,
+    localEvidencePackages: clone(header.localEvidencePackages),
     captions: { kind: "Captions", order: clone(header.captionOrder), items: captionItems },
     audioDescriptions: { kind: "AudioDescriptions", order: clone(header.audioDescriptionOrder), items: audioDescriptionItems },
     audioDescriptionGaps: clone(header.audioDescriptionGaps),

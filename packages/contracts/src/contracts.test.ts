@@ -643,7 +643,7 @@ describe("generation status contracts", () => {
 });
 
 describe("signed generation receipt contract", () => {
-  it("requires the Worker-signed receipt claims that bind profile, media, and recovery expiry", () => {
+  it("requires the Worker-signed receipt claims that bind ownership, profile, media, and recovery expiry", () => {
     const receipt = {
       contractVersion: 1,
       version: 1,
@@ -655,6 +655,9 @@ describe("signed generation receipt contract", () => {
       expectedProjectRevision: 3,
       expectedQualityProfileRevision: 2,
       mediaSha256: SHA_256,
+      sessionKey: "c".repeat(64),
+      sourceByteLength: 5,
+      sourceDurationMs: 60_000,
       operationId: "operation-1",
       operationKey: "b".repeat(64),
       objectKey: "processing/private-operation",

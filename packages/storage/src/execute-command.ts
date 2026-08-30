@@ -68,8 +68,9 @@ export const executePersistentCommand = async (
 /**
  * The final caption adoption is intentionally a separate, explicit helper:
  * it includes the signed recovery receipt in the same IndexedDB transaction
- * as the expected-revision domain transition. A stale compare-and-swap leaves
- * the evidence package intact and therefore recoverable for the Human.
+ * as the lease/base-state domain transition. The canonical Local Evidence
+ * Package is persisted on the project itself; the receipt retains only
+ * recovery/capability metadata after adoption.
  */
 export const adoptStagedCaptionGenerationResult = async (
   db: CueBenchDatabase,
@@ -128,8 +129,15 @@ export const adoptStagedCaptionGenerationResult = async (
             version: 1,
             payload: {
               ...payload,
-              stagedGenerationResult: parsedResult.data,
-              adoption: { status: "adopted", adoptedProjectRevision: result.project.projectRevision },
+              adoption: {
+                status: "adopted",
+                adoptedProjectRevision: result.project.projectRevision,
+                localEvidencePackageId: `generation-${command.runId}`,
+                // Acknowledgement occurs only after this transaction. Keep a
+                // durable retry marker so an outage cannot abandon immediate
+                // cloud cleanup once the target-track lease has cleared.
+                cleanupAcknowledgement: "pending",
+              },
             },
           },
           savedAtMs: Date.now(),

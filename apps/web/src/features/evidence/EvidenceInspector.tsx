@@ -7,9 +7,9 @@ import {
 } from "../review/review-utils";
 
 /**
- * Task 11 can provide bounded local evidence through this resolver without
- * changing review state or treating remote processing artifacts as project
- * truth. Returning null means the Local Evidence Package did not retain it.
+ * A canonical, bounded Local Evidence Package can provide source content
+ * without exposing short-lived Worker artifacts. Returning null means the
+ * adopted package did not retain this provenance link.
  */
 export interface LocalEvidenceWindow {
   readonly evidenceId: string;
@@ -22,6 +22,19 @@ export interface LocalEvidenceWindow {
   readonly mediaSha256: string;
   readonly itemId: string | null;
   readonly itemRevision: number | null;
+  /** Exact uncertainty spans touching this word, retained with the package. */
+  readonly uncertainty: readonly {
+    readonly uncertaintyId: string;
+    readonly reason: string;
+    readonly startMs: number;
+    readonly endMs: number;
+  }[];
+  /** Resolved, non-secret provider provenance retained with this package. */
+  readonly provenance: readonly {
+    readonly role: string;
+    readonly model: string;
+    readonly store: boolean | null;
+  }[];
 }
 
 export interface EvidenceContentResolver {
@@ -38,11 +51,27 @@ const isInteger = (value: unknown): value is number => typeof value === "number"
 
 const sameNullable = (left: unknown, right: string | number | null): boolean => left === right;
 
+const validRetainedDetails = (window: Partial<LocalEvidenceWindow>): boolean => (
+  Array.isArray(window.uncertainty)
+  && window.uncertainty.every((entry) => (
+    typeof entry === "object" && entry !== null
+    && typeof entry.uncertaintyId === "string" && entry.uncertaintyId.length > 0
+    && typeof entry.reason === "string" && entry.reason.length > 0
+    && isInteger(entry.startMs) && isInteger(entry.endMs)
+    && entry.startMs >= 0 && entry.startMs < entry.endMs
+  ))
+  && Array.isArray(window.provenance)
+  && window.provenance.every((entry) => (
+    typeof entry === "object" && entry !== null
+    && typeof entry.role === "string" && entry.role.length > 0
+    && typeof entry.model === "string" && entry.model.length > 0
+    && (entry.store === null || typeof entry.store === "boolean")
+  ))
+);
+
 /**
- * A Local Evidence Package is optional and deliberately outside canonical
- * project state. Validate every returned binding before allowing it to seek or
- * receive focus, so a stale or mismatched package cannot masquerade as source
- * evidence for the open project.
+ * Local Evidence Packages are canonical project/backup state, but their
+ * resolver remains strictly validated before it can seek or receive focus.
  */
 export const resolveValidatedEvidenceWindow = (
   project: CaptionProject,
@@ -69,7 +98,8 @@ export const resolveValidatedEvidenceWindow = (
     && window.projectId === project.projectId && window.projectId === evidence.projectId
     && window.mediaSha256 === project.media.sha256 && window.mediaSha256 === evidence.mediaSha256
     && sameNullable(window.itemId, evidence.itemId)
-    && sameNullable(window.itemRevision, evidence.itemRevision);
+    && sameNullable(window.itemRevision, evidence.itemRevision)
+    && validRetainedDetails(window);
   if (!valid) {
     return { status: "invalid", message: "The retained evidence window does not match this project’s recorded provenance and was not opened." };
   }
@@ -124,7 +154,11 @@ export function EvidenceInspector({ project, item, indexes, contentResolver, onF
                 ) : resolution.status === "invalid" ? (
                   <span className="evidence-inspector__invalid" role="alert">{resolution.message}</span>
                 ) : (
-                  <span className="evidence-inspector__window">{resolution.window.source} · {resolution.window.label} · {resolution.window.startMs}–{resolution.window.endMs} ms</span>
+                  <span className="evidence-inspector__window">
+                    {resolution.window.source} · {resolution.window.label} · {resolution.window.startMs}–{resolution.window.endMs} ms
+                    {resolution.window.uncertainty.length === 0 ? null : ` · ${resolution.window.uncertainty.map((span) => span.reason).join(", ")}`}
+                    {resolution.window.provenance.length === 0 ? null : ` · ${resolution.window.provenance.map((entry) => `${entry.role}: ${entry.model}`).join(", ")}`}
+                  </span>
                 )}
                 {resolution.status === "invalid" ? null : <button className="text-button" type="button" onClick={() => onFocusEvidence(entry.evidenceId)}>{resolution.status === "available" ? "Focus this evidence" : "Inspect retained provenance"}</button>}
               </li>

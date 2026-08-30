@@ -141,6 +141,38 @@ const currentItemBindings = (project: CaptionProject): ProjectCertification["ite
 const canonicalEvidence = (evidence: readonly EvidenceProvenance[]): readonly EvidenceProvenance[] =>
   [...evidence].sort((left, right) => left.evidenceId.localeCompare(right.evidenceId));
 
+/** Proves retained local transcript content still resolves through project provenance. */
+const assertLocalEvidencePackages = (project: CaptionProject): void => {
+  unique(project.localEvidencePackages.map((entry) => entry.packageId), "Local Evidence Package ids");
+  requireAggregate(project.localEvidencePackages.length <= 4, "Local Evidence Packages exceed the retained bound.");
+  const projectEvidence = new Map(project.evidence.map((entry) => [entry.evidenceId, entry]));
+  for (const entry of project.localEvidencePackages) {
+    requireAggregate(
+      entry.projectId === project.projectId && entry.mediaSha256.toLowerCase() === project.media.sha256.toLowerCase(),
+      "Local Evidence Package belongs to another project or media source.",
+    );
+    const words = new Set(entry.evidence.words.map((word) => word.evidenceId));
+    for (const binding of entry.cueBindings) {
+      const item = project.captions.items[binding.itemId];
+      requireAggregate(
+        item !== undefined
+          && binding.cueId === binding.itemId
+          && item.revisions.some((revision) => revision.itemRevision === binding.itemRevision),
+        "Local Evidence Package cue binding references an unknown caption revision.",
+      );
+      for (const evidenceId of binding.evidenceIds) {
+        const provenance = projectEvidence.get(evidenceId);
+        requireAggregate(
+          words.has(evidenceId)
+            && provenance !== undefined
+            && provenance.itemId === binding.itemId,
+          "Local Evidence Package word does not resolve through canonical cue provenance.",
+        );
+      }
+    }
+  }
+};
+
 const assertValidationRun = (run: ValidationRun, project: CaptionProject, label: string): void => {
   requireAggregate(run.projectId === project.projectId && run.input.projectId === project.projectId, `${label} belongs to another project.`);
   requireAggregate(run.projectRevision === run.input.projectRevision, `${label} revision does not match its immutable input.`);
@@ -219,7 +251,7 @@ const courtActors: Readonly<Record<string, readonly Actor["type"][]>> = {
   ApplyProfile: ["Human"],
   RelinkMedia: ["Human"],
   StartGenerationRun: ["CueBenchAI"],
-  ReleaseGenerationRun: ["CueBenchAI", "System"],
+  ReleaseGenerationRun: ["CueBenchAI", "System", "Human"],
   ExportRoundTripVerified: ["System"],
   GenerationRunStageChanged: ["System"],
   ProjectSerialized: ["System"],
@@ -824,6 +856,7 @@ const assertRelationships = (
       );
     }
   }
+  assertLocalEvidencePackages(project);
   if (project.selectedItem !== null) {
     if (project.selectedItem.kind === "AudioDescriptionGap") {
       const gap = project.audioDescriptionGaps[project.selectedItem.itemId];

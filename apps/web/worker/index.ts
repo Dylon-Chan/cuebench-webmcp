@@ -48,6 +48,7 @@ import {
   isSupportedAuthoritativeMedia,
   type MediaProbe,
 } from "./probe";
+import { fixtureMediaPreparationEnabled } from "./media-preparation-fixture";
 import { recordTelemetry, type TelemetrySink } from "./telemetry";
 import {
   createGenerationRoutes,
@@ -395,6 +396,10 @@ const probeFor = (
 ): MediaProbe | undefined => {
   // Even fixture adapters must not bypass the production authority boundary:
   // neither an unbound service nor a missing dedicated media key may complete R2.
+  // Local Workerd has no Container runtime. Its explicit generation fixture
+  // uses a direct signed preparation adapter and leaves upload probing
+  // unavailable instead of silently substituting a fake authoritative probe.
+  if (fixtureMediaPreparationEnabled(env)) return undefined;
   if (env.MEDIA_PREPARER === undefined || settings.mediaJobSigning === undefined) return undefined;
   return dependencies.mediaProbe ?? new MediaContainerProbeService(env.MEDIA_PREPARER, settings.mediaJobSigning, () => currentNow);
 };

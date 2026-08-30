@@ -695,6 +695,7 @@ const projectFromValidationInput = (input: ValidationInputSnapshot): CaptionProj
     title: "Validation input reconstruction",
     media: { ...input.media } as CaptionProject["media"],
     evidence: input.evidence.map((evidence) => ({ ...evidence })),
+    localEvidencePackages: [],
     captions: { kind: "Captions", order: [...input.captions.order], items: captions },
     audioDescriptions: { kind: "AudioDescriptions", order: [...input.audioDescriptions.order], items: audioDescriptions },
     audioDescriptionGaps: gaps,

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import type { StagedGenerationResult } from "@cuebench/contracts";
+import type { LocalCaptionEvidencePackage, StagedGenerationResult } from "@cuebench/contracts";
 import { applyCommand, createProject, type CaptionProject, type DomainCommand } from "./index";
 import { fixtureProject } from "../test/fixtures";
 
@@ -204,6 +204,186 @@ describe("domain reducer", () => {
     expect(adopted.project.captions.items.c06?.mergedIntoItemId).toBe("generated-1");
     expect(adopted.project.captions.order).toContain("c05");
     expect(adopted.project.captions.order).toContain("generated-1");
+    expect(adopted.project.evidence).toContainEqual({
+      evidenceId: "word-1",
+      projectId: leased.projectId,
+      mediaSha256: leased.media.sha256,
+      itemId: "generated-1",
+      itemRevision: 1,
+    });
+    expect(adopted.project.localEvidencePackages).toHaveLength(1);
+    expect(adopted.project.localEvidencePackages[0]).toMatchObject({
+      runId: "run-adopt-1",
+      cueBindings: [{ cueId: "generated-1", itemId: "generated-1", evidenceIds: ["word-1"] }],
+      evidence: { words: [{ evidenceId: "word-1", text: "Generated" }] },
+    });
+  });
+
+  it("removes canonical local caption evidence when a Human relinks different media", () => {
+    const original = fixtureProject();
+    const retained: LocalCaptionEvidencePackage = {
+      packageId: "generation-retained-run",
+      runId: "retained-run",
+      projectId: original.projectId,
+      mediaSha256: original.media.sha256,
+      expectedProjectRevision: original.projectRevision,
+      expectedQualityProfileRevision: original.qualityProfile.revision,
+      retainedAtMs: 1_700_000_000_000,
+      evidence: {
+        contractVersion: 1,
+        runId: "retained-run",
+        projectId: original.projectId,
+        mediaSha256: original.media.sha256,
+        preparedManifest: { key: "prepared/a/manifests/b.json", sha256: "b".repeat(64) },
+        normalizedAudio: { key: "prepared/a/audio/c.wav", sha256: "c".repeat(64), byteLength: 4, durationMs: original.media.durationMs, contentType: "audio/wav" },
+        words: [{ evidenceId: "retained-word", sourceWordIndex: 0, startMs: 0, endMs: 1_000, text: "Retained", speaker: "Teacher", speakerSegmentIds: ["speaker-retained"] }],
+        uncertaintySpans: [],
+        provenance: [
+          { role: "diarization", model: "fixture", requestHash: "d".repeat(64), responseHash: "e".repeat(64), store: null, requestMetadata: {}, warnings: [] },
+          { role: "word-timestamps", model: "fixture", requestHash: "f".repeat(64), responseHash: "1".repeat(64), store: null, requestMetadata: {}, warnings: [] },
+        ],
+      },
+      cueBindings: [],
+    };
+    const project: CaptionProject = { ...original, localEvidencePackages: [retained] };
+
+    const relinked = applyCommand(project, {
+      type: "RelinkMedia",
+      actor: { type: "Human", id: "teacher" },
+      expectedProjectRevision: project.projectRevision,
+      media: { sourceId: "different-source", sha256: "9".repeat(64), durationMs: project.media.durationMs },
+    });
+
+    expect(relinked.error).toBeUndefined();
+    expect(relinked.project.localEvidencePackages).toEqual([]);
+  });
+
+  it("rebases caption adoption across an unrelated audio-description edit while fencing the leased caption base", () => {
+    const leased = applyCommand(fixtureProject(), {
+      type: "StartGenerationRun",
+      actor: { type: "CueBenchAI", id: "cuebench-ai" },
+      runId: "run-rebase-1",
+      targetTrack: "Captions",
+      expectedProjectRevision: 1,
+    }).project;
+    const editedElsewhere = applyCommand(leased, {
+      type: "ReviseAudioDescription",
+      actor: { type: "Human", id: "teacher" },
+      itemId: "ad01",
+      beatId: "ad01",
+      expectedItemRevision: 1,
+      expectedProjectRevision: leased.projectRevision,
+      patch: { description: "The teacher writes the answer on the board." },
+    }).project;
+    const staged: StagedGenerationResult = {
+      contractVersion: 1,
+      runId: "run-rebase-1",
+      projectId: editedElsewhere.projectId,
+      targetTrack: "Captions",
+      // This is the revision captured when the target-track lease was acquired,
+      // not the unrelated audio-description edit that followed it.
+      expectedProjectRevision: leased.projectRevision,
+      expectedQualityProfileRevision: editedElsewhere.qualityProfile.revision,
+      createdAtMs: 1_700_000_000_000,
+      expiresAtMs: 1_700_086_400_000,
+      evidence: {
+        contractVersion: 1,
+        runId: "run-rebase-1",
+        projectId: editedElsewhere.projectId,
+        mediaSha256: editedElsewhere.media.sha256,
+        preparedManifest: { key: "prepared/a/manifests/b.json", sha256: "b".repeat(64) },
+        normalizedAudio: { key: "prepared/a/audio/c.wav", sha256: "c".repeat(64), byteLength: 4, durationMs: 1_000, contentType: "audio/wav" },
+        words: [{ evidenceId: "word-rebase-1", sourceWordIndex: 0, startMs: 6_000, endMs: 7_000, text: "Generated", speaker: "Teacher", speakerSegmentIds: ["speaker-1"] }],
+        uncertaintySpans: [],
+        provenance: [
+          { role: "diarization", model: "gpt-4o-transcribe-diarize", requestHash: "d".repeat(64), responseHash: "e".repeat(64), store: false, requestMetadata: {}, warnings: [] },
+          { role: "word-timestamps", model: "whisper-1", requestHash: "f".repeat(64), responseHash: "1".repeat(64), store: false, requestMetadata: {}, warnings: [] },
+        ],
+      },
+      captions: [{ cueId: "generated-rebase-1", startMs: 6_000, endMs: 7_000, text: "Generated", speaker: "Teacher", evidenceIds: ["word-rebase-1"] }],
+    };
+    const adopted = applyCommand(editedElsewhere, {
+      type: "AdoptCaptionGenerationResult",
+      actor: { type: "CueBenchAI", id: "cuebench-ai" },
+      runId: "run-rebase-1",
+      expectedProjectRevision: leased.projectRevision,
+      expectedQualityProfileRevision: editedElsewhere.qualityProfile.revision,
+      confirmedProposedReplacement: true,
+      result: staged,
+    });
+
+    expect(adopted.error).toBeUndefined();
+    expect(adopted.project.audioDescriptions.items.ad01?.current.description).toBe("The teacher writes the answer on the board.");
+    expect(adopted.project.activeGenerationRun).toBeNull();
+  });
+
+  it("rejects a staged caption result after its leased caption base was changed and lets a Human release the stale lease", () => {
+    const leased = applyCommand(fixtureProject(), {
+      type: "StartGenerationRun",
+      actor: { type: "CueBenchAI", id: "cuebench-ai" },
+      runId: "run-stale-base-1",
+      targetTrack: "Captions",
+      expectedProjectRevision: 1,
+    }).project;
+    // Models a restored/browser-conflict state: normal caption commands are
+    // already blocked by the lease, but adoption must still fail closed.
+    const unsafeCaptionChange: CaptionProject = {
+      ...leased,
+      captions: {
+        ...leased.captions,
+        items: {
+          ...leased.captions.items,
+          c05: {
+            ...leased.captions.items.c05!,
+            current: { ...leased.captions.items.c05!.current, itemRevision: 2, text: "Changed outside this lease." },
+          },
+        },
+      },
+      projectRevision: leased.projectRevision + 1,
+    };
+    const staged = {
+      contractVersion: 1,
+      runId: "run-stale-base-1",
+      projectId: leased.projectId,
+      targetTrack: "Captions",
+      expectedProjectRevision: leased.projectRevision,
+      expectedQualityProfileRevision: leased.qualityProfile.revision,
+      createdAtMs: 1_700_000_000_000,
+      expiresAtMs: 1_700_086_400_000,
+      evidence: {
+        contractVersion: 1,
+        runId: "run-stale-base-1",
+        projectId: leased.projectId,
+        mediaSha256: leased.media.sha256,
+        preparedManifest: { key: "prepared/a/manifests/b.json", sha256: "b".repeat(64) },
+        normalizedAudio: { key: "prepared/a/audio/c.wav", sha256: "c".repeat(64), byteLength: 4, durationMs: 1_000, contentType: "audio/wav" },
+        words: [{ evidenceId: "word-stale-1", sourceWordIndex: 0, startMs: 6_000, endMs: 7_000, text: "Generated", speaker: "Teacher", speakerSegmentIds: ["speaker-1"] }],
+        uncertaintySpans: [],
+        provenance: [
+          { role: "diarization", model: "gpt-4o-transcribe-diarize", requestHash: "d".repeat(64), responseHash: "e".repeat(64), store: false, requestMetadata: {}, warnings: [] },
+          { role: "word-timestamps", model: "whisper-1", requestHash: "f".repeat(64), responseHash: "1".repeat(64), store: false, requestMetadata: {}, warnings: [] },
+        ],
+      },
+      captions: [{ cueId: "generated-stale-1", startMs: 6_000, endMs: 7_000, text: "Generated", speaker: "Teacher", evidenceIds: ["word-stale-1"] }],
+    } satisfies StagedGenerationResult;
+    const rejected = applyCommand(unsafeCaptionChange, {
+      type: "AdoptCaptionGenerationResult",
+      actor: { type: "CueBenchAI", id: "cuebench-ai" },
+      runId: "run-stale-base-1",
+      expectedProjectRevision: leased.projectRevision,
+      expectedQualityProfileRevision: leased.qualityProfile.revision,
+      confirmedProposedReplacement: true,
+      result: staged,
+    });
+    expect(rejected.error?.code).toBe("MEDIA_HASH_MISMATCH");
+    const released = applyCommand(unsafeCaptionChange, {
+      type: "ReleaseGenerationRun",
+      actor: { type: "Human", id: "teacher" },
+      runId: "run-stale-base-1",
+      expectedProjectRevision: leased.projectRevision,
+    });
+    expect(released.error).toBeUndefined();
+    expect(released.project.activeGenerationRun).toBeNull();
   });
 
   it("stales validation and certification after semantic timing changes without losing historic certification", () => {

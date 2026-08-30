@@ -41,6 +41,8 @@ export interface PersistedCloudUpload {
   readonly projectId: string;
   readonly operationId: string;
   readonly sourceByteLength: number;
+  /** Browser-canonical source identity. A restored receipt is invalid when it changes. */
+  readonly sourceSha256: string;
   readonly sourceContentType: string;
   readonly durationMs: number;
   /** Opaque anonymous bearer needed to resume this exact owner-bound operation. */
@@ -62,6 +64,8 @@ export interface UploadCloudProcessingCopyInput {
   readonly projectId: string;
   readonly operationId: string;
   readonly source: Blob;
+  /** SHA-256 from the locally ingested project media, never a server guess. */
+  readonly sourceSha256: string;
   readonly durationMs: number;
   /** Must be an affirmative UI choice; the client never infers consent. */
   readonly disclosureAccepted: boolean;
@@ -76,7 +80,7 @@ export interface CloudUploadResult {
   readonly operation: PersistedCloudUpload;
 }
 
-export type PersistedCloudUploadRecovery = Pick<PersistedCloudUpload, "operationId"> & Partial<Pick<PersistedCloudUpload, "session" | "sessionExpiresAtMs" | "operationReceipt" | "uploadCapability">>;
+export type PersistedCloudUploadRecovery = Pick<PersistedCloudUpload, "operationId" | "sourceByteLength" | "sourceSha256" | "durationMs"> & Partial<Pick<PersistedCloudUpload, "session" | "sessionExpiresAtMs" | "operationReceipt" | "uploadCapability">>;
 
 export interface CancelCloudProcessingCopyInput {
   readonly fetcher?: CloudUploadFetch;
@@ -130,6 +134,11 @@ const positiveInteger = (value: unknown, fallback: string): number => {
   return value as number;
 };
 
+const sourceSha256 = (value: unknown, fallback: string): string => {
+  if (typeof value !== "string" || !/^[0-9a-f]{64}$/i.test(value)) throw new CloudUploadError(fallback);
+  return value.toLowerCase();
+};
+
 const responseError = async (response: Response, fallback: string): Promise<CloudUploadError> => {
   try {
     const body = await response.json() as { readonly error?: Readonly<Record<string, unknown>> };
@@ -173,7 +182,7 @@ const parseWorkerOperation = (value: unknown): WorkerOperationResponse => {
   };
 };
 
-const parseStored = (value: unknown, input: Pick<UploadCloudProcessingCopyInput, "projectId" | "operationId" | "source" | "durationMs">): PersistedCloudUpload | null => {
+const parseStored = (value: unknown, input: Pick<UploadCloudProcessingCopyInput, "projectId" | "operationId" | "source" | "sourceSha256" | "durationMs">): PersistedCloudUpload | null => {
   if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
   const record = value as Readonly<Record<string, unknown>>;
   if (
@@ -181,6 +190,7 @@ const parseStored = (value: unknown, input: Pick<UploadCloudProcessingCopyInput,
     || record.projectId !== input.projectId
     || record.operationId !== input.operationId
     || record.sourceByteLength !== input.source.size
+    || record.sourceSha256 !== input.sourceSha256.toLowerCase()
     || record.sourceContentType !== input.source.type.trim().toLowerCase()
     || record.durationMs !== input.durationMs
     || !Number.isSafeInteger(record.partSize)
@@ -198,6 +208,7 @@ const parseStored = (value: unknown, input: Pick<UploadCloudProcessingCopyInput,
       projectId: input.projectId,
       operationId: input.operationId,
       sourceByteLength: input.source.size,
+      sourceSha256: sourceSha256(record.sourceSha256, "CueBench's saved source identity is incomplete."),
       sourceContentType: input.source.type.trim().toLowerCase(),
       durationMs: input.durationMs,
       ...(typeof record.session === "string" && record.session.length > 0 ? { session: record.session } : {}),
@@ -240,6 +251,7 @@ const createOperation = async (input: UploadCloudProcessingCopyInput, fetcher: C
       projectId: input.projectId,
       operationId: input.operationId,
       sourceByteLength: input.source.size,
+      sourceSha256: sourceSha256(input.sourceSha256, "CueBench needs the browser-canonical source identity before uploading."),
       sourceContentType: input.source.type.trim().toLowerCase(),
       durationMs: input.durationMs,
       session: input.session,
@@ -256,18 +268,49 @@ const createOperation = async (input: UploadCloudProcessingCopyInput, fetcher: C
 };
 
 /** Returns only opaque recovery state; callers must still obtain explicit user acceptance before using it. */
-export const loadPersistedCloudUpload = (projectId: string, store: CloudUploadReceiptStore | null = defaultReceiptStore()): PersistedCloudUploadRecovery | null => {
+export const loadPersistedCloudUpload = (
+  projectId: string,
+  expectedSource: { readonly sha256: string; readonly durationMs: number } | undefined = undefined,
+  store: CloudUploadReceiptStore | null = defaultReceiptStore(),
+): PersistedCloudUploadRecovery | null => {
   const value = store?.load(receiptKey(projectId));
   if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
   const record = value as Readonly<Record<string, unknown>>;
-  if (record.version !== 1 || typeof record.operationId !== "string" || record.operationId.length === 0) return null;
-  return {
+  const recovered = (() => {
+    try {
+      if (
+        record.version !== 1
+        || typeof record.operationId !== "string" || record.operationId.length === 0
+        || !Number.isSafeInteger(record.sourceByteLength) || (record.sourceByteLength as number) <= 0
+        || !Number.isSafeInteger(record.durationMs) || (record.durationMs as number) <= 0
+      ) return null;
+      return {
     operationId: record.operationId,
+        sourceByteLength: record.sourceByteLength as number,
+        sourceSha256: sourceSha256(record.sourceSha256, "CueBench's saved source identity is incomplete."),
+        durationMs: record.durationMs as number,
     ...(typeof record.session === "string" && record.session.length > 0 ? { session: record.session } : {}),
     ...(Number.isSafeInteger(record.sessionExpiresAtMs) && (record.sessionExpiresAtMs as number) > 0 ? { sessionExpiresAtMs: record.sessionExpiresAtMs as number } : {}),
     ...(typeof record.operationReceipt === "string" && record.operationReceipt.length > 0 ? { operationReceipt: record.operationReceipt } : {}),
     ...(typeof record.uploadCapability === "string" && record.uploadCapability.length > 0 ? { uploadCapability: record.uploadCapability } : {}),
-  };
+      } satisfies PersistedCloudUploadRecovery;
+    } catch {
+      return null;
+    }
+  })();
+  if (
+    recovered === null
+    || (expectedSource !== undefined && (
+      recovered.sourceSha256 !== expectedSource.sha256.toLowerCase()
+      || recovered.durationMs !== expectedSource.durationMs
+    ))
+  ) {
+    // A receipt can authorize a different private media object. Never restore
+    // it after the local project source changed.
+    store?.remove(receiptKey(projectId));
+    return null;
+  }
+  return recovered;
 };
 
 /**

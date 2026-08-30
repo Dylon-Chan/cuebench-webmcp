@@ -8,11 +8,13 @@ import {
   clearPersistedCloudSession,
   clearPersistedCloudUpload,
   createAnonymousCloudSession,
+  loadPersistedCloudUpload,
   uploadCloudProcessingCopy,
   type CloudUploadReceiptStore,
 } from "./cloud-upload";
 
 const source = (): Blob => new Blob(["hello"], { type: "video/webm" });
+const sourceSha256 = "a".repeat(64);
 
 const operation = (overrides: Record<string, unknown> = {}) => ({
   operationReceipt: "opaque-operation-receipt",
@@ -49,6 +51,7 @@ describe("resumable cloud upload client", () => {
       projectId: "project-fixture",
       operationId: "operation-fixture",
       source: source(),
+      sourceSha256,
       durationMs: 60_000,
       disclosureAccepted: false,
     })).rejects.toThrow(/accept.*cloud processing/i);
@@ -70,6 +73,7 @@ describe("resumable cloud upload client", () => {
       projectId: "project-fixture",
       operationId: "operation-fixture",
       source: source(),
+      sourceSha256,
       durationMs: 60_000,
       disclosureAccepted: true,
       receiptStore: persisted.store,
@@ -99,6 +103,7 @@ describe("resumable cloud upload client", () => {
       projectId: "project-fixture",
       operationId: "operation-fixture",
       sourceByteLength: 5,
+      sourceSha256,
       sourceContentType: "video/webm",
       durationMs: 60_000,
       operationReceipt: "opaque-operation-receipt",
@@ -119,6 +124,7 @@ describe("resumable cloud upload client", () => {
       projectId: "project-fixture",
       operationId: "operation-fixture",
       source: source(),
+      sourceSha256,
       durationMs: 60_000,
       disclosureAccepted: true,
       receiptStore: persisted.store,
@@ -144,6 +150,7 @@ describe("resumable cloud upload client", () => {
       projectId: "project-fixture",
       operationId: "operation-fixture",
       source: source(),
+      sourceSha256,
       durationMs: 60_000,
       disclosureAccepted: true,
     })).rejects.toMatchObject({ details: { code: "UNSUPPORTED_ERROR_VERSION", status: 503, retrySafe: false } });
@@ -177,6 +184,7 @@ describe("resumable cloud upload client", () => {
       projectId: "project-fixture",
       operationId: "operation-fixture",
       sourceByteLength: 5,
+      sourceSha256,
       sourceContentType: "video/webm",
       durationMs: 60_000,
       operationReceipt: "expired-opaque-receipt",
@@ -195,6 +203,7 @@ describe("resumable cloud upload client", () => {
       projectId: "project-fixture",
       operationId: "operation-fixture",
       source: source(),
+      sourceSha256,
       durationMs: 60_000,
       disclosureAccepted: true,
       receiptStore: persisted.store,
@@ -202,6 +211,31 @@ describe("resumable cloud upload client", () => {
     expect(persisted.values.size).toBe(0);
 
     clearPersistedCloudUpload("project-fixture", persisted.store);
+    expect(persisted.values.size).toBe(0);
+  });
+
+  it("invalidates a restored receipt when the browser project source changed", () => {
+    const persisted = receiptStore();
+    persisted.store.save("cuebench-cloud-upload:project-fixture", {
+      version: 1,
+      projectId: "project-fixture",
+      operationId: "operation-fixture",
+      sourceByteLength: 5,
+      sourceSha256,
+      sourceContentType: "video/webm",
+      durationMs: 60_000,
+      operationReceipt: "opaque-operation-receipt",
+      uploadCapability: "opaque-capability",
+      partSize: 3,
+      partCount: 2,
+      partReceipts: {},
+    });
+
+    expect(loadPersistedCloudUpload(
+      "project-fixture",
+      { sha256: "b".repeat(64), durationMs: 60_000 },
+      persisted.store,
+    )).toBeNull();
     expect(persisted.values.size).toBe(0);
   });
 

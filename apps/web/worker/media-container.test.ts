@@ -11,6 +11,7 @@ import {
   mediaContainerRequestDisposition,
   settleMediaContainerResponse,
 } from "./media-container";
+import { generationCleanupMarkerKey, generationPreparationWriteLeaseKey } from "./generation-cleanup";
 import { signMediaJob } from "./probe";
 
 const operationKey = "a".repeat(64);
@@ -18,7 +19,7 @@ const sessionKey = "b".repeat(64);
 const inputKey = `processing/${sessionKey}/${operationKey}`;
 const outputPrefix = `prepared/${operationKey}/`;
 const keyRing = { current: { id: "media-current", secret: "media-current-container-bridge-secret-123456" } };
-const now = 1_700_000_000_000;
+const now = Date.now();
 
 interface StoredObject {
   readonly bytes: Uint8Array;
@@ -29,6 +30,8 @@ interface StoredObject {
 class FixtureBridgeBucket implements MediaBridgeBucket {
   public readonly objects = new Map<string, StoredObject>();
   public readonly puts: Array<{ readonly key: string; readonly options: Record<string, unknown> }> = [];
+  public afterSuccessfulPut: ((key: string) => Promise<void>) | undefined;
+  public readonly failingDeletes = new Set<string>();
 
   public async get(key: string) {
     const value = this.objects.get(key);
@@ -62,7 +65,15 @@ class FixtureBridgeBucket implements MediaBridgeBucket {
     const metadata = options.customMetadata as { readonly sha256: string };
     const httpMetadata = options.httpMetadata as { readonly contentType: string };
     this.objects.set(key, { bytes, sha256: metadata.sha256, contentType: httpMetadata.contentType });
+    await this.afterSuccessfulPut?.(key);
     return { size: bytes.byteLength, customMetadata: metadata, httpMetadata, httpEtag: '"fixture-etag"' };
+  }
+
+  public async delete(keys: string | string[]): Promise<void> {
+    for (const key of (typeof keys === "string" ? [keys] : keys)) {
+      if (this.failingDeletes.has(key)) throw new Error("fixture R2 delete failed");
+      this.objects.delete(key);
+    }
   }
 }
 
@@ -104,6 +115,8 @@ class StreamingBridgeBucket implements MediaBridgeBucket {
   public receivedBytes = 0;
   public largestChunk = 0;
   public putCalls = 0;
+  public outputReceivedBytes = 0;
+  public outputPutCalls = 0;
   private readonly stored = new Map<string, { readonly size: number; readonly contentType: string; readonly sha256: string }>();
 
   public async get(): Promise<null> {
@@ -138,7 +151,15 @@ class StreamingBridgeBucket implements MediaBridgeBucket {
     const metadata = options.customMetadata as { readonly sha256: string };
     const httpMetadata = options.httpMetadata as { readonly contentType: string };
     this.stored.set(key, { size, sha256: metadata.sha256, contentType: httpMetadata.contentType });
+    if (!key.includes("/generation-inflight/")) {
+      this.outputPutCalls += 1;
+      this.outputReceivedBytes += size;
+    }
     return { size, customMetadata: metadata, httpMetadata };
+  }
+
+  public async delete(keys: string | string[]): Promise<void> {
+    for (const key of (typeof keys === "string" ? [keys] : keys)) this.stored.delete(key);
   }
 }
 
@@ -230,8 +251,9 @@ describe("operation-keyed media Container bridge", () => {
 
     expect(first.status).toBe(201);
     expect(repeat.status).toBe(200);
-    expect(bucket.puts).toHaveLength(2);
-    expect(bucket.puts[0]?.options).toMatchObject({
+    expect(bucket.puts).toHaveLength(4);
+    expect(bucket.puts.filter((entry) => entry.key.includes("/generation-inflight/"))).toHaveLength(2);
+    expect(bucket.puts.find((entry) => entry.key === key)?.options).toMatchObject({
       onlyIf: expect.any(Headers),
       customMetadata: { sha256: digest },
       sha256: digest,
@@ -258,6 +280,74 @@ describe("operation-keyed media Container bridge", () => {
 
     expect(response.status).toBe(201);
     expect(bucket.objects.get(`${outputPrefix}indexes/${cacheIdentity}.json`)?.sha256).toBe(digest);
+  });
+
+  it("rejects and removes a preparation artifact when terminal cleanup races its R2 publication", async () => {
+    const bucket = new FixtureBridgeBucket();
+    const token = await job("prepare");
+    const body = new TextEncoder().encode('{"manifest":"late"}');
+    const digest = await sha256(body);
+    const key = `${outputPrefix}manifests/${digest}.json`;
+    const markerKey = generationCleanupMarkerKey(operationKey);
+    bucket.afterSuccessfulPut = async (writtenKey) => {
+      if (writtenKey === key) {
+        bucket.objects.set(markerKey, {
+          bytes: new TextEncoder().encode('{"terminal":true}'),
+          contentType: "application/json",
+          sha256: "0".repeat(64),
+        });
+      }
+    };
+
+    const response = await handleMediaStorageBridge(
+      bridgeRequest("PUT", key, token, body, {
+        "content-type": "application/json",
+        "content-length": String(body.byteLength),
+        "x-content-sha256": digest,
+        "if-none-match": "*",
+      }),
+      { PROCESSING_BUCKET: bucket, MEDIA_JOB_HMAC_CURRENT_KEY_ID: keyRing.current.id, MEDIA_JOB_HMAC_CURRENT_KEY: keyRing.current.secret },
+      now + 1,
+    );
+
+    expect(response.status).toBe(403);
+    expect(bucket.objects.get(key)).toBeUndefined();
+    expect(bucket.objects.get(markerKey)).toBeDefined();
+  });
+
+  it("keeps a durable preparation-write lease when post-PUT terminal deletion fails", async () => {
+    const bucket = new FixtureBridgeBucket();
+    const token = await job("prepare");
+    const body = new TextEncoder().encode('{"manifest":"failed-cleanup"}');
+    const digest = await sha256(body);
+    const key = `${outputPrefix}manifests/${digest}.json`;
+    const markerKey = generationCleanupMarkerKey(operationKey);
+    const leaseKey = generationPreparationWriteLeaseKey(operationKey, key);
+    bucket.afterSuccessfulPut = async (writtenKey) => {
+      if (writtenKey === key) {
+        bucket.objects.set(markerKey, {
+          bytes: new TextEncoder().encode('{"terminal":true}'),
+          contentType: "application/json",
+          sha256: "0".repeat(64),
+        });
+      }
+    };
+    bucket.failingDeletes.add(key);
+
+    const response = await handleMediaStorageBridge(
+      bridgeRequest("PUT", key, token, body, {
+        "content-type": "application/json",
+        "content-length": String(body.byteLength),
+        "x-content-sha256": digest,
+        "if-none-match": "*",
+      }),
+      { PROCESSING_BUCKET: bucket, MEDIA_JOB_HMAC_CURRENT_KEY_ID: keyRing.current.id, MEDIA_JOB_HMAC_CURRENT_KEY: keyRing.current.secret },
+      now + 1,
+    );
+
+    expect(response.status).toBe(503);
+    expect(bucket.objects.get(key)).toBeDefined();
+    expect(bucket.objects.get(leaseKey)).toBeDefined();
   });
 
   it("streams a bounded artifact into R2 without materializing a Worker-sized body", async () => {
@@ -292,8 +382,8 @@ describe("operation-keyed media Container bridge", () => {
     );
 
     expect(response.status).toBe(201);
-    expect(bucket.putCalls).toBe(1);
-    expect(bucket.receivedBytes).toBe(expectedLength);
+    expect(bucket.outputPutCalls).toBe(1);
+    expect(bucket.outputReceivedBytes).toBe(expectedLength);
     expect(bucket.largestChunk).toBe(chunkBytes);
     expect(expectedLength).toBeLessThan(128 * 1024 * 1024);
   });
@@ -365,6 +455,7 @@ describe("operation-keyed media Container bridge", () => {
       get: async () => null,
       head: async () => { throw new Error("R2 unavailable"); },
       put: async () => null,
+      delete: async () => undefined,
     };
     const response = await handleMediaStorageBridge(
       new Request("http://cuebench-r2.internal/healthz", { method: "HEAD" }),
