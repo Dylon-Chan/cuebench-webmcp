@@ -170,7 +170,10 @@ function ReviewHarness({ initialProject = reviewProject(), onSeek = vi.fn(), onC
     const defaultResult = applyCommand(projectRef.current, command);
     const result = commandOverride?.(command, defaultResult) ?? defaultResult;
     onCommand?.(command, result);
-    if (result.error === undefined) {
+    // ProjectStore reconciles a newer canonical project even when the command
+    // itself is rejected as stale. Keep this harness faithful to that command
+    // adapter so retry tests exercise the actual review boundary.
+    if (result.project.projectRevision >= projectRef.current.projectRevision) {
       projectRef.current = result.project;
       setProject(result.project);
     }
@@ -425,19 +428,45 @@ describe("Review docket human-authority flow", () => {
     }), expect.anything()));
   });
 
-  it("treats a changed split field as dirty without blocking the split operation itself", async () => {
+  it("guards a split-only structural draft from non-structural actions and navigation loss", async () => {
     render(<ReviewHarness initialProject={selectedProject()} />);
 
     fireEvent.change(screen.getByLabelText("Split point for Caption C01"), { target: { value: "2000" } });
     expect(screen.getByRole("button", { name: "Split Caption C01" })).toBeEnabled();
+    expect(screen.getByRole("button", { name: "Save caption revision" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Merge Caption C01 with C02" })).toBeDisabled();
     expect(screen.getByRole("button", { name: "Object selected revision" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Sustain selected revision" })).toBeDisabled();
 
     fireEvent.click(screen.getByRole("button", { name: /select caption c02/i }));
     const dialog = await screen.findByRole("dialog", { name: /unsaved review draft/i });
-    expect(within(dialog).getByRole("button", { name: /save changes and continue/i })).toBeDisabled();
+    expect(within(dialog).queryByRole("button", { name: /save changes and continue/i })).not.toBeInTheDocument();
+    expect(within(dialog).getByText(/apply the split or discard/i)).toBeVisible();
     expect(screen.getByLabelText("Split point for Caption C01")).toHaveValue(2000);
     fireEvent.click(within(dialog).getByRole("button", { name: /cancel navigation/i }));
     expect(screen.getByLabelText("Split point for Caption C01")).toHaveValue(2000);
+  });
+
+  it("does not offer Save or timing actions for a mixed timing and split draft", async () => {
+    render(<ReviewHarness initialProject={selectedProject()} />);
+
+    fireEvent.change(screen.getByLabelText("Split point for Caption C01"), { target: { value: "2000" } });
+    fireEvent.change(screen.getByLabelText("Start time for Caption C01"), { target: { value: "1100" } });
+
+    expect(screen.getByRole("button", { name: "Split Caption C01" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Apply timing for Caption C01" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Save caption revision" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Merge Caption C01 with C02" })).toBeDisabled();
+    expect(screen.getByText(/apply the split or discard structural changes first/i)).toBeVisible();
+
+    fireEvent.click(screen.getByRole("button", { name: /select caption c02/i }));
+    const dialog = await screen.findByRole("dialog", { name: /unsaved review draft/i });
+    expect(within(dialog).queryByRole("button", { name: /save changes and continue/i })).not.toBeInTheDocument();
+    expect(screen.getByLabelText("Split point for Caption C01")).toHaveValue(2000);
+    expect(screen.getByLabelText("Start time for Caption C01")).toHaveValue(1100);
+    fireEvent.click(within(dialog).getByRole("button", { name: /cancel navigation/i }));
+    expect(screen.getByLabelText("Split point for Caption C01")).toHaveValue(2000);
+    expect(screen.getByLabelText("Start time for Caption C01")).toHaveValue(1100);
   });
 
   it("rebases a clean docket draft after an accepted timeline timing revision without a false dirty lock", async () => {
@@ -504,6 +533,66 @@ describe("Review docket human-authority flow", () => {
     await waitFor(() => expect(screen.getByRole("heading", { name: /selected caption c02/i })).toBeVisible());
     expect(commands.filter((command) => command.type === "ReviseCue")).toHaveLength(1);
     expect(commands.filter((command) => command.type === "SelectItem" && command.itemId === "c02")).toHaveLength(2);
+  });
+
+  it("adopts a newer stale-selection project before retrying navigation without revising twice", async () => {
+    let selectAttempts = 0;
+    let remoteProject: CaptionProject | null = null;
+    const commands: DomainCommand[] = [];
+    const initial = selectedProject();
+    render(<ReviewHarness
+      initialProject={initial}
+      onCommand={(command, result) => {
+        commands.push(command);
+        if (command.type !== "ReviseCue" || result.error !== undefined) return;
+        const remoteRevision = applyCommand(result.project, {
+          type: "ReviseCue",
+          actor: human,
+          itemId: "c02",
+          cueId: "c02",
+          expectedItemRevision: 1,
+          expectedProjectRevision: result.project.projectRevision,
+          patch: {
+            text: "A newer canonical revision changed this cue.",
+            startMs: 3_500,
+            endMs: 5_000,
+            speaker: null,
+          },
+        });
+        if (remoteRevision.error !== undefined) throw new Error("Expected a newer canonical C02 fixture revision.");
+        remoteProject = remoteRevision.project;
+      }}
+      commandOverride={(command, result) => {
+        if (command.type !== "SelectItem" || command.itemId !== "c02") return result;
+        selectAttempts += 1;
+        if (selectAttempts !== 1) return result;
+        if (remoteProject === null) throw new Error("Expected the saved review revision before stale selection.");
+        return {
+          project: remoteProject,
+          events: [],
+          error: domainError("STALE_PROJECT", "A newer canonical review project is available."),
+        };
+      }}
+    />);
+
+    fireEvent.change(screen.getByLabelText("Caption text for C01"), { target: { value: "Saved only once before retry." } });
+    fireEvent.click(screen.getByRole("button", { name: /select caption c02/i }));
+    fireEvent.click(await screen.findByRole("button", { name: /save changes and continue/i }));
+    const retryDialog = await screen.findByRole("dialog", { name: /navigation still pending/i });
+    expect(commands.filter((command) => command.type === "ReviseCue")).toHaveLength(1);
+    const firstSelection = commands.filter((command): command is Extract<DomainCommand, { readonly type: "SelectItem" }> => command.type === "SelectItem");
+    expect(firstSelection).toHaveLength(1);
+    expect(firstSelection[0]).toEqual(expect.objectContaining({ expectedProjectRevision: initial.projectRevision + 1, expectedItemRevision: 1 }));
+
+    fireEvent.click(within(retryDialog).getByRole("button", { name: "Retry navigation" }));
+    await waitFor(() => expect(screen.getByRole("heading", { name: /selected caption c02/i })).toBeVisible());
+    const selections = commands.filter((command): command is Extract<DomainCommand, { readonly type: "SelectItem" }> => command.type === "SelectItem");
+    expect(selections).toHaveLength(2);
+    expect(selections[1]).toEqual(expect.objectContaining({
+      expectedProjectRevision: initial.projectRevision + 2,
+      expectedItemRevision: 2,
+    }));
+    expect(commands.filter((command) => command.type === "ReviseCue")).toHaveLength(1);
   });
 
   it("renders immutable payload details and focuses a validated retained evidence window", async () => {

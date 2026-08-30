@@ -12,6 +12,7 @@ import {
   itemTypeLabel,
   reviewDraftForItem,
   reviewDraftHasContentChanges,
+  reviewDraftHasStructuralChanges,
   reviewDraftIsDirty,
   reviewDraftValidity,
   reviewStateLabel,
@@ -89,6 +90,7 @@ export function SelectedItemPanel({
   const validity = reviewDraftValidity(project, item, activeDraft);
   const draftIsDirty = reviewDraftIsDirty(item, activeDraft);
   const contentDraftIsDirty = reviewDraftHasContentChanges(item, activeDraft);
+  const structuralDraftIsDirty = reviewDraftHasStructuralChanges(item, activeDraft);
   const staleDraft = activeDraft.itemRevision !== item.current.itemRevision;
   const startMs = integerValue(activeDraft.startMs);
   const endMs = integerValue(activeDraft.endMs);
@@ -152,6 +154,7 @@ export function SelectedItemPanel({
   const timingErrorId = `timing-error-${item.itemId}`;
   const proseErrorId = `prose-error-${item.itemId}`;
   const splitErrorId = `split-error-${item.itemId}`;
+  const structuralDraftGuardId = `structural-draft-guard-${item.itemId}`;
   const evidence = evidenceForItem(indexes, item.itemId);
 
   return (
@@ -223,12 +226,14 @@ export function SelectedItemPanel({
         {validity.timingError === null ? null : <p className="review-field-error" id={timingErrorId} role="alert">{validity.timingError}</p>}
         <p className="selected-item-panel__timing-note">Times are integer milliseconds against the native video clock.</p>
         {draftIsDirty ? <p className="selected-item-panel__draft-note">Unsaved text, timing, or caption structure is visible. Save, apply, or discard it before navigating or ruling.</p> : null}
+        {structuralDraftIsDirty ? <p className="selected-item-panel__draft-note" id={structuralDraftGuardId}>Apply the split or discard structural changes first. A caption revision, timing update, merge, navigation, or human ruling cannot include a changed split point or new caption identifier.</p> : null}
         {item.current.state !== "Sustained" ? null : <p className="selected-item-panel__confirmation-note">Changing Sustained work requires confirmation and creates a new Proposed revision.</p>}
         <div className="selected-item-panel__actions">
           <button
             className="button button--outline"
             type="button"
-            disabled={isCommandPending || proseChanged || !timingChanged || timingCommand === null}
+            disabled={isCommandPending || structuralDraftIsDirty || proseChanged || !timingChanged || timingCommand === null}
+            aria-describedby={structuralDraftIsDirty ? structuralDraftGuardId : undefined}
             onClick={() => timingCommand === null ? undefined : onRequestSemanticCommand(timingCommand, `Created Proposed timing revision for ${itemAccessibleLabel(item)}.`)}
           >
             Apply timing for {actionDescription}
@@ -236,7 +241,8 @@ export function SelectedItemPanel({
           <button
             className="button button--signal"
             type="button"
-            disabled={isCommandPending || !contentDraftIsDirty || semanticCommand === null}
+            disabled={isCommandPending || structuralDraftIsDirty || !contentDraftIsDirty || semanticCommand === null}
+            aria-describedby={structuralDraftIsDirty ? structuralDraftGuardId : undefined}
             onClick={() => semanticCommand === null ? undefined : onRequestSemanticCommand(semanticCommand, `Created Proposed revision for ${itemAccessibleLabel(item)}.`)}
           >
             {saveLabel}
@@ -268,7 +274,7 @@ export function SelectedItemPanel({
             {validity.splitError === null ? null : <p className="review-field-error" id={splitErrorId} role="alert">{validity.splitError}</p>}
             <div className="selected-item-panel__actions">
               <button className="button button--outline" type="button" disabled={isCommandPending || contentDraftIsDirty || staleDraft || splitCommand === null} onClick={() => splitCommand === null ? undefined : onRequestSemanticCommand(splitCommand, `Split ${itemAccessibleLabel(item)} at ${splitMs} ms.`)}>Split Caption {item.itemId.toUpperCase()}</button>
-              {adjacent === null ? <p className="caption-structure-tools__empty">No adjacent successor is available to merge.</p> : <button className="button button--outline" type="button" disabled={isCommandPending || contentDraftIsDirty || staleDraft || mergeCommand === null} onClick={() => mergeCommand === null ? undefined : onRequestSemanticCommand(mergeCommand, `Merged ${itemAccessibleLabel(item)} with ${itemAccessibleLabel(adjacent)}.`)}>Merge Caption {item.itemId.toUpperCase()} with {adjacent.itemId.toUpperCase()}</button>}
+              {adjacent === null ? <p className="caption-structure-tools__empty">No adjacent successor is available to merge.</p> : <button className="button button--outline" type="button" disabled={isCommandPending || structuralDraftIsDirty || contentDraftIsDirty || staleDraft || mergeCommand === null} aria-describedby={structuralDraftIsDirty ? structuralDraftGuardId : undefined} onClick={() => mergeCommand === null ? undefined : onRequestSemanticCommand(mergeCommand, `Merged ${itemAccessibleLabel(item)} with ${itemAccessibleLabel(adjacent)}.`)}>Merge Caption {item.itemId.toUpperCase()} with {adjacent.itemId.toUpperCase()}</button>}
             </div>
           </fieldset>
         )}

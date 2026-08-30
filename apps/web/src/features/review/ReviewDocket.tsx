@@ -15,7 +15,6 @@ import {
   type ReactNode,
 } from "react";
 import {
-  EvidenceInspector,
   resolveValidatedEvidenceWindow,
   type EvidenceContentResolver,
 } from "../evidence/EvidenceInspector";
@@ -34,6 +33,7 @@ import {
   primaryFindingItemId,
   reviewDraftForItem,
   reviewDraftHasContentChanges,
+  reviewDraftHasStructuralChanges,
   reviewDraftIsCleanForRevision,
   reviewDraftIsDirty,
   reviewItemForId,
@@ -152,6 +152,10 @@ const currentSelectedItem = (project: CaptionProject): ReviewableItem | null => 
   return reviewItemForId(project, selected.itemId);
 };
 
+const isNewerCanonicalProject = (candidate: CaptionProject, current: CaptionProject): boolean => (
+  candidate.projectId === current.projectId && candidate.projectRevision > current.projectRevision
+);
+
 const commandItemIds = (command: DomainCommand): readonly string[] => {
   if (command.type === "MergeCue") return [command.cueId, command.adjacentCueId];
   if (command.type === "SplitCue" || command.type === "ReviseCue" || command.type === "AdjustCueTiming") return [command.cueId ?? command.itemId ?? ""];
@@ -227,7 +231,8 @@ export function ReviewDocket({ project, onCommand, onSeekToMediaTime, footer, ev
     : selectedItem !== null && draft !== null && draft.itemId === selectedItem.itemId
       ? draft
     : selectedItem === null ? null : reviewDraftForItem(selectedItem);
-  const draftSaveCommand = selectedItem === null || draftForSelectedItem === null || !reviewDraftHasContentChanges(selectedItem, draftForSelectedItem)
+  const structuralDraftIsDirty = reviewDraftHasStructuralChanges(selectedItem, draftForSelectedItem);
+  const draftSaveCommand = selectedItem === null || draftForSelectedItem === null || structuralDraftIsDirty || !reviewDraftHasContentChanges(selectedItem, draftForSelectedItem)
     ? null
     : draftForSelectedItem.itemRevision !== selectedItem.current.itemRevision
       ? null
@@ -333,7 +338,18 @@ export function ReviewDocket({ project, onCommand, onSeekToMediaTime, footer, ev
       expectedItemRevision: target.current.itemRevision,
       expectedProjectRevision: baseProject.projectRevision,
     }, `Selected ${itemAccessibleLabel(target)} and sought its start time in the source video.`);
-    if (result === null || result.error !== undefined) return false;
+    if (result === null || result.error !== undefined) {
+      // Durable command adapters can return the current canonical project with
+      // a stale-selection error. Adopt that newer snapshot for the retry so
+      // the saved revision is never reissued against abandoned guards.
+      if (result !== null && result.error !== undefined && isNewerCanonicalProject(result.project, baseProject)) {
+        syncDraftToCanonical(result.project, currentSelectedItem(result.project)?.itemId ?? null);
+        setPendingNavigation((pending) => pending === null || pending.savedProject === undefined
+          ? pending
+          : { ...pending, savedProject: result.project });
+      }
+      return false;
+    }
     const canonicalItem = reviewItemForId(result.project, target.itemId);
     if (canonicalItem === null) {
       setErrorAnnouncement("CueBench accepted the selection but the item is no longer available in its canonical project state.");
@@ -368,6 +384,10 @@ export function ReviewDocket({ project, onCommand, onSeekToMediaTime, footer, ev
   }, [executeCommand, performNavigation, syncDraftToCanonical]);
 
   const requestSemanticCommand = useCallback((command: DomainCommand, acceptedMessage: string, afterSuccessNavigation?: PendingNavigation) => {
+    if (structuralDraftIsDirty && command.type !== "SplitCue") {
+      setErrorAnnouncement("Apply the split or discard structural changes first. This action cannot include a changed split point or new caption identifier.");
+      return;
+    }
     if (commandChangesSustainedWork(project, command)) {
       setPendingSustainedCommand(afterSuccessNavigation === undefined
         ? { command, acceptedMessage }
@@ -375,7 +395,7 @@ export function ReviewDocket({ project, onCommand, onSeekToMediaTime, footer, ev
       return;
     }
     void applySemanticCommand(command, acceptedMessage, afterSuccessNavigation);
-  }, [applySemanticCommand, project]);
+  }, [applySemanticCommand, project, structuralDraftIsDirty]);
 
   const requestNavigation = useCallback((navigation: PendingNavigation) => {
     if (hasUnsavedDraft) {
@@ -543,8 +563,8 @@ export function ReviewDocket({ project, onCommand, onSeekToMediaTime, footer, ev
   }, [replaceDraft, selectedItem]);
 
   const saveDraftAndContinue = () => {
-    if (pendingNavigation === null || selectedItem === null || draftSaveCommand === null) {
-      setErrorAnnouncement("This draft cannot be saved as one revision. Apply the caption structure operation or discard it before navigating.");
+    if (pendingNavigation === null || selectedItem === null || structuralDraftIsDirty || draftSaveCommand === null) {
+      setErrorAnnouncement("Apply the split or discard structural changes first. A caption revision cannot include a changed split point or new caption identifier.");
       return;
     }
     if (commandChangesSustainedWork(project, draftSaveCommand)) {
@@ -657,13 +677,15 @@ export function ReviewDocket({ project, onCommand, onSeekToMediaTime, footer, ev
           <Dialog.Content className="storage-dialog review-dialog" aria-describedby="unsaved-draft-description">
             <Dialog.Title>{pendingNavigation?.savedProject === undefined ? "Unsaved review draft" : "Navigation still pending"}</Dialog.Title>
             <Dialog.Description id="unsaved-draft-description">{pendingNavigation === null ? "" : pendingNavigation.savedProject === undefined
-              ? `Save, apply, discard, or cancel before opening ${pendingNavigation.label}. The current form displays an unsaved text, timing, or caption-structure change.`
+              ? structuralDraftIsDirty
+                ? `Apply the split or discard structural changes before opening ${pendingNavigation.label}. A caption revision cannot include a changed split point or new caption identifier.`
+                : `Save, apply, discard, or cancel before opening ${pendingNavigation.label}. The current form displays an unsaved text or timing change.`
               : `Your draft was saved in canonical project revision ${pendingNavigation.savedProject.projectRevision}, but ${pendingNavigation.label} could not be opened. Retry navigation without saving a second revision, or cancel.`}</Dialog.Description>
             <div className="storage-dialog__actions">
               <Dialog.Close className="button button--outline" type="button">Cancel navigation</Dialog.Close>
               {pendingNavigation?.savedProject === undefined ? <>
                 <button className="button button--outline" type="button" disabled={isCommandPending} onClick={() => { const navigation = pendingNavigation; discardDraft(); if (navigation !== null) void performNavigation(navigation, project); }}>Discard draft and continue</button>
-                <button className="button button--signal" type="button" disabled={isCommandPending || draftSaveCommand === null} onClick={saveDraftAndContinue}>Save changes and continue</button>
+                {structuralDraftIsDirty ? null : <button className="button button--signal" type="button" disabled={isCommandPending || draftSaveCommand === null} onClick={saveDraftAndContinue}>Save changes and continue</button>}
               </> : <button className="button button--signal" type="button" disabled={isCommandPending} onClick={() => void performNavigation(pendingNavigation, pendingNavigation.savedProject!)}>Retry navigation</button>}
             </div>
           </Dialog.Content>
