@@ -127,6 +127,37 @@ describe("ProjectStart", () => {
     expect(resumedStore.getSnapshot().sourceObjectUrl).toBe("blob:cuebench:restored-1");
   });
 
+  it("serializes rapid durable commands and reconciles a stale result to canonical project state", async () => {
+    const database = new CueBenchDatabase(databaseName());
+    databases.push(database);
+    const store = new ProjectStore({
+      database,
+      browserStorage: browserStorage({ quota: 100_000_000, usage: 0, persisted: true }),
+      objectUrlLease: objectUrlLease("commands").lease,
+      bundledSampleLoader: bundledSampleFile,
+    });
+    await store.openSample();
+    const initial = store.getSnapshot().project!;
+    const command = {
+      type: "AppendCourtRecord" as const,
+      actor: { type: "System" as const, id: "cuebench" },
+      expectedProjectRevision: initial.projectRevision,
+      eventType: "ProjectSerialized" as const,
+      deterministic: true,
+    };
+
+    const [accepted, stale] = await Promise.all([
+      store.executeCommand(command),
+      store.executeCommand(command),
+    ]);
+
+    expect(accepted.error).toBeUndefined();
+    expect(stale.error?.code).toBe("STALE_PROJECT");
+    expect(store.getSnapshot().project?.projectRevision).toBe(accepted.project.projectRevision);
+    expect(store.getSnapshot().error).toMatch(/no longer current/i);
+    expect((await loadProject(database, initial.projectId))?.projectRevision).toBe(accepted.project.projectRevision);
+  });
+
   it("requires an explicit current-page temporary choice when durable browser storage is inadequate", async () => {
     const database = new CueBenchDatabase(databaseName());
     databases.push(database);

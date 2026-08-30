@@ -1,5 +1,12 @@
-import { fireEvent, render, screen } from "@testing-library/react";
-import { createProject, type CaptionProject } from "@cuebench/domain";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import {
+  applyCommand,
+  createProject,
+  domainError,
+  type CaptionProject,
+  type CommandResult,
+  type DomainCommand,
+} from "@cuebench/domain";
 import { describe, expect, it, vi } from "vitest";
 import { Timeline } from "./Timeline";
 
@@ -35,12 +42,21 @@ const timelineProject = (): CaptionProject => createProject({
   }],
 });
 
+const deferred = <Value,>() => {
+  let resolve!: (value: Value) => void;
+  const promise = new Promise<Value>((nextResolve) => {
+    resolve = nextResolve;
+  });
+  return { promise, resolve };
+};
+
 const renderTimeline = (overrides: Partial<React.ComponentProps<typeof Timeline>> = {}) => {
-  const onCommand = vi.fn().mockResolvedValue(undefined);
+  const project = overrides.project ?? timelineProject();
+  const onCommand = vi.fn((command: DomainCommand) => Promise.resolve(applyCommand(project, command)));
   const seekToMediaTime = vi.fn();
   const view = render(
     <Timeline
-      project={timelineProject()}
+      project={project}
       playheadMs={12_000}
       seekToMediaTime={seekToMediaTime}
       onCommand={onCommand}
@@ -52,12 +68,12 @@ const renderTimeline = (overrides: Partial<React.ComponentProps<typeof Timeline>
 };
 
 describe("Timeline", () => {
-  it("keeps cue selection and video seeking on the same Media Time", () => {
+  it("keeps cue selection and video seeking on the same Media Time after the canonical command accepts", async () => {
     const { onCommand, seekToMediaTime } = renderTimeline();
 
     fireEvent.click(screen.getByRole("button", { name: /caption c01: dr\. nguyen introduces/i }));
 
-    expect(seekToMediaTime).toHaveBeenCalledWith(10_000);
+    await waitFor(() => expect(seekToMediaTime).toHaveBeenCalledWith(10_000));
     expect(onCommand).toHaveBeenCalledWith(expect.objectContaining({
       type: "SelectItem",
       itemId: "c01",
@@ -66,9 +82,9 @@ describe("Timeline", () => {
     expect(screen.getByTestId("timeline-playhead")).toHaveAttribute("data-media-time-ms", "12000");
   });
 
-  it("commits exactly one integer timing command when a drag ends", () => {
+  it("commits exactly one integer timing command when a moved drag ends without snapping its grab offset", async () => {
     const { onCommand } = renderTimeline();
-    const handle = screen.getByRole("button", { name: "Adjust start of caption C01" });
+    const handle = screen.getByRole("slider", { name: "Adjust start of caption C01" });
     const surface = screen.getByTestId("timeline-surface");
     Object.defineProperty(surface, "getBoundingClientRect", {
       configurable: true,
@@ -79,29 +95,112 @@ describe("Timeline", () => {
     fireEvent.pointerMove(handle, { pointerId: 1, clientX: 120 });
     fireEvent.pointerUp(handle, { pointerId: 1, clientX: 120 });
 
-    expect(onCommand).toHaveBeenCalledTimes(1);
+    await waitFor(() => expect(onCommand).toHaveBeenCalledTimes(1));
     expect(onCommand).toHaveBeenCalledWith(expect.objectContaining({
       type: "AdjustCueTiming",
       cueId: "c01",
-      startMs: expect.any(Number),
+      startMs: 11_000,
     }));
     const command = onCommand.mock.calls[0]?.[0] as { startMs: number };
     expect(Number.isInteger(command.startMs)).toBe(true);
   });
 
-  it("uses one keyboard-release commit and retains semantic alternatives to the canvas", () => {
+  it("uses one keyboard-release commit and retains semantic alternatives to the canvas", async () => {
     const { onCommand } = renderTimeline();
-    const handle = screen.getByRole("button", { name: "Adjust end of caption C01" });
+    const handle = screen.getByRole("slider", { name: "Adjust end of caption C01" });
 
     fireEvent.keyDown(handle, { key: "ArrowRight" });
     fireEvent.keyDown(handle, { key: "ArrowRight" });
     fireEvent.keyUp(handle, { key: "ArrowRight" });
 
-    expect(onCommand).toHaveBeenCalledTimes(1);
+    await waitFor(() => expect(onCommand).toHaveBeenCalledTimes(1));
     expect(onCommand).toHaveBeenLastCalledWith(expect.objectContaining({ type: "AdjustCueTiming", cueId: "c01" }));
     expect(screen.getByTestId("waveform-canvas")).toBeInstanceOf(HTMLCanvasElement);
     expect(screen.getByRole("slider", { name: "Seek source media" })).toBeVisible();
     expect(screen.getByRole("button", { name: /^audio description ad01:/i })).toBeVisible();
+  });
+
+  it("does not commit a simple handle click, a sub-threshold movement, or a cancelled drag", () => {
+    const { onCommand } = renderTimeline();
+    const handle = screen.getByRole("slider", { name: "Adjust start of caption C01" });
+
+    fireEvent.pointerDown(handle, { pointerId: 1, clientX: 100 });
+    fireEvent.pointerUp(handle, { pointerId: 1, clientX: 100 });
+    fireEvent.pointerDown(handle, { pointerId: 2, clientX: 100 });
+    fireEvent.pointerMove(handle, { pointerId: 2, clientX: 102 });
+    fireEvent.pointerUp(handle, { pointerId: 2, clientX: 102 });
+    fireEvent.pointerDown(handle, { pointerId: 3, clientX: 100 });
+    fireEvent.pointerMove(handle, { pointerId: 3, clientX: 130 });
+    fireEvent.pointerCancel(handle, { pointerId: 3 });
+
+    expect(onCommand).not.toHaveBeenCalled();
+  });
+
+  it("waits for accepted canonical state before seeking and serializes an immediate edit interaction", async () => {
+    const project = timelineProject();
+    const gate = deferred<CommandResult>();
+    const onCommand = vi.fn((command: DomainCommand) => {
+      void command;
+      return gate.promise;
+    });
+    const { seekToMediaTime } = renderTimeline({ project, onCommand });
+    const cue = screen.getByRole("button", { name: /caption c01: dr\. nguyen introduces/i });
+    const handle = screen.getByRole("slider", { name: "Adjust start of caption C01" });
+
+    fireEvent.click(cue);
+
+    expect(seekToMediaTime).not.toHaveBeenCalled();
+    expect(handle).toBeDisabled();
+    fireEvent.pointerDown(handle, { pointerId: 1, clientX: 100 });
+    fireEvent.pointerMove(handle, { pointerId: 1, clientX: 130 });
+    fireEvent.pointerUp(handle, { pointerId: 1, clientX: 130 });
+    expect(onCommand).toHaveBeenCalledTimes(1);
+
+    const command = onCommand.mock.calls[0]?.[0];
+    if (command === undefined) throw new Error("The selection command was not issued.");
+    gate.resolve(applyCommand(project, command));
+
+    await waitFor(() => expect(seekToMediaTime).toHaveBeenCalledWith(10_000));
+    expect(cue).toHaveFocus();
+  });
+
+  it("surfaces a stale command without moving the authoritative video clock", async () => {
+    const project = timelineProject();
+    const onCommand = vi.fn(() => Promise.resolve({
+      project,
+      events: [],
+      error: domainError("STALE_PROJECT", "The project revision is no longer current."),
+    }));
+    const { seekToMediaTime } = renderTimeline({ project, onCommand });
+
+    fireEvent.click(screen.getByRole("button", { name: /caption c01: dr\. nguyen introduces/i }));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent("The project revision is no longer current.");
+    expect(seekToMediaTime).not.toHaveBeenCalled();
+  });
+
+  it("exposes selected items, timing slider values, and live timing previews semantically", () => {
+    const initial = timelineProject();
+    const selectedProject = applyCommand(initial, {
+      type: "SelectItem",
+      actor: { type: "Human", id: "human" },
+      itemId: "c01",
+      expectedItemRevision: 1,
+      expectedProjectRevision: initial.projectRevision,
+    }).project;
+    renderTimeline({ project: selectedProject });
+
+    const cue = screen.getByRole("button", { name: /caption c01: dr\. nguyen introduces/i });
+    const handle = screen.getByRole("slider", { name: "Adjust start of caption C01" });
+    expect(cue).toHaveAttribute("aria-current", "true");
+    expect(handle).toHaveAttribute("aria-valuemin", "0");
+    expect(handle).toHaveAttribute("aria-valuemax", "90000");
+    expect(handle).toHaveAttribute("aria-valuenow", "10000");
+    expect(handle).toHaveAttribute("aria-valuetext", "Start time 0:10.000");
+
+    fireEvent.pointerDown(handle, { pointerId: 1, clientX: 100 });
+    fireEvent.pointerMove(handle, { pointerId: 1, clientX: 130 });
+    expect(screen.getByTestId("timeline-preview-feedback")).toHaveTextContent("Caption C01 start preview");
   });
 
   it("reprojects lanes when the viewport width changes", () => {
@@ -120,5 +219,20 @@ describe("Timeline", () => {
     );
 
     expect(cue.closest("li")?.style.left).not.toBe(narrowLeft);
+  });
+
+  it("stores clamped viewport endpoints while zooming and panning", () => {
+    renderTimeline({ playheadMs: 90_000 });
+    const surface = screen.getByTestId("timeline-surface");
+
+    fireEvent.click(screen.getByRole("button", { name: "Zoom timeline in" }));
+    expect(surface).toHaveAttribute("data-viewport-start-ms", "45000");
+
+    fireEvent.click(screen.getByRole("button", { name: "Pan timeline later" }));
+    expect(surface).toHaveAttribute("data-viewport-start-ms", "45000");
+
+    fireEvent.click(screen.getByRole("button", { name: "Pan timeline earlier" }));
+    fireEvent.click(screen.getByRole("button", { name: "Pan timeline earlier" }));
+    expect(surface).toHaveAttribute("data-viewport-start-ms", "0");
   });
 });

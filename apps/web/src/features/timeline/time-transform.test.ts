@@ -1,6 +1,11 @@
 import fc from "fast-check";
 import { describe, expect, it } from "vitest";
-import { MAX_TIMELINE_ZOOM, MIN_TIMELINE_ZOOM, createTimeTransform } from "./time-transform";
+import {
+  MAX_TIMELINE_ZOOM,
+  MIN_TIMELINE_ZOOM,
+  clampTimelineViewportStart,
+  createTimeTransform,
+} from "./time-transform";
 
 describe("TimeTransform", () => {
   it("round-trips visible Media Time through pixel space without creating float project time", () => {
@@ -43,5 +48,11 @@ describe("TimeTransform", () => {
     expect(resized.visibleStartMs).toBe(transform.visibleStartMs);
     expect(resized.visibleDurationMs).toBe(transform.visibleDurationMs);
     expect(resized.xToMs(resized.msToX(30_000))).toBe(30_000);
+  });
+
+  it("clamps viewport state itself at both media endpoints", () => {
+    expect(clampTimelineViewportStart({ durationMs: 90_000, zoom: 4, viewportStartMs: -10_000 })).toBe(0);
+    expect(clampTimelineViewportStart({ durationMs: 90_000, zoom: 4, viewportStartMs: 999_999 })).toBe(67_500);
+    expect(clampTimelineViewportStart({ durationMs: 90_000, zoom: 1, viewportStartMs: 50_000 })).toBe(0);
   });
 });

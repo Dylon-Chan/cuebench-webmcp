@@ -1,5 +1,17 @@
 import { expect, test } from "@playwright/test";
 
+const openWorkbench = async (page: import("@playwright/test").Page) => {
+  await page.goto("/");
+  await page.getByRole("button", { name: "Open bundled media fixture" }).click();
+  const temporaryChoice = page.getByRole("dialog", { name: "Temporary session required" });
+  const video = page.getByLabel("Verified local source media");
+  await expect(temporaryChoice.or(video)).toBeVisible();
+  if (await temporaryChoice.isVisible()) {
+    await temporaryChoice.getByRole("button", { name: "Continue temporarily" }).click();
+  }
+  await expect(video).toHaveAttribute("src", /^blob:/);
+};
+
 test("the local project start remains usable without a Browser Agent", async ({ page }) => {
   await page.goto("/");
 
@@ -8,12 +20,36 @@ test("the local project start remains usable without a Browser Agent", async ({ 
   await expect(page.getByRole("button", { name: "Upload local video" })).toBeEnabled();
   await expect(page.getByLabel("Local storage notice")).toContainText("canonical project store");
 
-  await page.getByRole("button", { name: "Open bundled media fixture" }).click();
-  const temporaryChoice = page.getByRole("dialog", { name: "Temporary session required" });
-  if (await temporaryChoice.isVisible()) {
-    await temporaryChoice.getByRole("button", { name: "Continue temporarily" }).click();
+  await openWorkbench(page);
+
+  await expect(page.getByRole("main", { name: "CueBench workbench" })).toBeVisible();
+});
+
+test("the hardened timeline stays evidence-led in the first desktop viewport and has no mobile page overflow", async ({ page }) => {
+  await page.setViewportSize({ width: 1536, height: 1024 });
+  await openWorkbench(page);
+
+  await expect(page.getByTestId("media-evidence-status")).toHaveText("No audio track in this source.");
+  await expect(page.getByRole("button", { name: "Mute source audio" })).toBeVisible();
+  await expect(page.getByRole("slider", { name: "Source audio volume" })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Shared timeline" })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Review Docket" })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Court Record" })).toBeVisible();
+
+  for (const region of [
+    page.locator(".instrument-header"),
+    page.locator(".specimen-view"),
+    page.locator(".timeline-shell"),
+    page.locator(".review-docket"),
+    page.locator(".court-record"),
+  ]) {
+    const box = await region.boundingBox();
+    expect(box?.y ?? Number.POSITIVE_INFINITY).toBeLessThan(1024);
+    expect((box?.y ?? Number.POSITIVE_INFINITY) + (box?.height ?? 0)).toBeLessThanOrEqual(1024);
   }
 
-  await expect(page.getByLabel("Verified local source media")).toHaveAttribute("src", /^blob:/);
-  await expect(page.getByRole("main", { name: "CueBench workbench" })).toBeVisible();
+  await page.setViewportSize({ width: 320, height: 720 });
+  await expect(page.getByRole("heading", { name: "Shared timeline" })).toBeVisible();
+  await expect(page.getByRole("slider", { name: "Seek source media" })).toBeVisible();
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
 });

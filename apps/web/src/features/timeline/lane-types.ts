@@ -6,6 +6,7 @@ export type TimelineEditEdge = "start" | "end";
 export interface TimelineEditPreview {
   readonly itemId: string;
   readonly kind: TimelineItemKind;
+  readonly edge: TimelineEditEdge;
   readonly expectedItemRevision: number;
   readonly expectedProjectRevision: number;
   readonly startMs: number;

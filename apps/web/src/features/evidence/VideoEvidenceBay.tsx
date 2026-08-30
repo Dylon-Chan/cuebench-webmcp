@@ -1,30 +1,20 @@
 import type { CaptionProject } from "@cuebench/domain";
-import { useEffect, useRef, useState } from "react";
+import { useRef, useState } from "react";
 import {
   Timeline,
   type TimelineCommandExecutor,
 } from "../timeline/Timeline";
-import {
-  createPeakPyramidFromAudioBuffer,
-  type WaveformPeakPyramid,
-} from "../timeline/WaveformCanvas";
 import { formatMediaTime } from "../timeline/time-transform";
 import { usePlayhead } from "../timeline/use-playhead";
-
-type AudioContextConstructor = new () => AudioContext;
-
-const browserAudioContext = (): AudioContextConstructor | null => {
-  const candidate = globalThis as typeof globalThis & { readonly webkitAudioContext?: AudioContextConstructor };
-  return globalThis.AudioContext ?? candidate.webkitAudioContext ?? null;
-};
+import type { PreparedMediaEvidence } from "./project-media-evidence";
 
 export interface VideoEvidenceBayProps {
   readonly project: CaptionProject;
   /** The live Blob URL owned by ProjectStore; no proxy media source is introduced. */
   readonly sourceObjectUrl: string;
   readonly onCommand: TimelineCommandExecutor;
-  /** Task 11 prepared-media evidence can provide the server-built pyramid directly. */
-  readonly sourcePeakPyramid?: WaveformPeakPyramid | null;
+  /** Prepared-media evidence is supplied by the project/evidence adapter. */
+  readonly evidence: PreparedMediaEvidence;
 }
 
 /**
@@ -35,69 +25,42 @@ export function VideoEvidenceBay({
   project,
   sourceObjectUrl,
   onCommand,
-  sourcePeakPyramid,
+  evidence,
 }: VideoEvidenceBayProps) {
   const videoRef = useRef<HTMLVideoElement>(null);
-  const [derivedPeakPyramid, setDerivedPeakPyramid] = useState<WaveformPeakPyramid | null>(null);
-  const [peakStatus, setPeakStatus] = useState<"preparing" | "ready" | "unavailable">(
-    sourcePeakPyramid === undefined ? "preparing" : sourcePeakPyramid === null ? "unavailable" : "ready",
-  );
+  const [isMuted, setIsMuted] = useState(false);
+  const [volume, setVolume] = useState(1);
   const [mediaError, setMediaError] = useState<string | null>(null);
   const playhead = usePlayhead(videoRef, { durationMs: project.media.durationMs });
 
-  useEffect(() => {
-    if (sourcePeakPyramid !== undefined) {
-      setDerivedPeakPyramid(null);
-      setPeakStatus(sourcePeakPyramid === null ? "unavailable" : "ready");
-      return undefined;
-    }
-    const AudioContext = browserAudioContext();
-    if (AudioContext === null || typeof globalThis.fetch !== "function") {
-      setDerivedPeakPyramid(null);
-      setPeakStatus("unavailable");
-      return undefined;
-    }
-    const controller = new AbortController();
-    const context = new AudioContext();
-    let active = true;
-    let closingContext = false;
-    const closeContext = () => {
-      if (closingContext) return;
-      closingContext = true;
-      void context.close().catch(() => undefined);
-    };
-    setDerivedPeakPyramid(null);
-    setPeakStatus("preparing");
-    void (async () => {
-      try {
-        const response = await fetch(sourceObjectUrl, { signal: controller.signal });
-        if (!response.ok) throw new Error("Source media could not be read for waveform preparation.");
-        const bytes = await response.arrayBuffer();
-        const audio = await context.decodeAudioData(bytes);
-        if (!active) return;
-        setDerivedPeakPyramid(createPeakPyramidFromAudioBuffer(audio));
-        setPeakStatus("ready");
-      } catch (error) {
-        if (!active || (error instanceof DOMException && error.name === "AbortError")) return;
-        setDerivedPeakPyramid(null);
-        setPeakStatus("unavailable");
-      } finally {
-        closeContext();
-      }
-    })();
-    return () => {
-      active = false;
-      controller.abort();
-      closeContext();
-    };
-  }, [sourceObjectUrl, sourcePeakPyramid]);
+  const syncNativeAudioState = () => {
+    const video = videoRef.current;
+    if (video === null) return;
+    setIsMuted(video.muted);
+    setVolume(video.volume);
+  };
 
-  const peakPyramid = sourcePeakPyramid === undefined ? derivedPeakPyramid : sourcePeakPyramid;
-  const peakStatusMessage = peakStatus === "ready"
+  const toggleMute = () => {
+    const video = videoRef.current;
+    if (video === null) return;
+    video.muted = !video.muted;
+    setIsMuted(video.muted);
+  };
+
+  const changeVolume = (nextVolume: number) => {
+    const video = videoRef.current;
+    if (video === null) return;
+    video.volume = Math.max(0, Math.min(1, nextVolume));
+    setVolume(video.volume);
+  };
+
+  const peakStatusMessage = evidence.audioState === "ready"
     ? "Audio peak evidence is ready."
-    : peakStatus === "preparing"
-      ? "Preparing deterministic 10 ms audio peak evidence from this local source."
-      : "Audio peak evidence is unavailable for this source; no decorative waveform is substituted.";
+    : evidence.audioState === "no-audio"
+      ? "No audio track in this source."
+      : evidence.audioState === "failed"
+        ? `Waveform evidence preparation failed${evidence.failureMessage === undefined ? "." : `: ${evidence.failureMessage}`}`
+        : "Waveform pending local evidence preparation.";
 
   return (
     <section className="evidence-bay" aria-labelledby="evidence-bay-heading">
@@ -113,18 +76,34 @@ export function VideoEvidenceBay({
           ref={videoRef}
           className="specimen-view__media"
           src={sourceObjectUrl}
-          muted
           playsInline
           preload="metadata"
           aria-label="Verified local source media"
+          onLoadedMetadata={syncNativeAudioState}
+          onVolumeChange={syncNativeAudioState}
           onError={() => setMediaError("CueBench could not play this local source media.")}
         />
-        <div className="specimen-view__note" role="status">Local source media verified in this browser.</div>
+        <div className="specimen-view__note">Local source media verified in this browser.</div>
       </div>
       <div className="transport-bar" aria-label="Playback transport">
         <button className="transport-control" type="button" onClick={playhead.togglePlayback}>
           {playhead.isPlaying ? "Pause" : "Play"}
         </button>
+        <button className="transport-control" type="button" onClick={toggleMute} aria-label={isMuted ? "Unmute source audio" : "Mute source audio"}>
+          {isMuted ? "Unmute" : "Mute"}
+        </button>
+        <label className="transport-volume">
+          <span>Volume</span>
+          <input
+            type="range"
+            min={0}
+            max={1}
+            step={0.05}
+            value={volume}
+            aria-label="Source audio volume"
+            onChange={(event) => changeVolume(Number(event.currentTarget.value))}
+          />
+        </label>
         <output aria-label="Current media time">{formatMediaTime(playhead.mediaTimeMs)}</output>
         <span aria-hidden="true">/</span>
         <output aria-label="Source duration">{formatMediaTime(project.media.durationMs)}</output>
@@ -137,9 +116,9 @@ export function VideoEvidenceBay({
         playheadMs={playhead.mediaTimeMs}
         seekToMediaTime={playhead.seekToMediaTime}
         onCommand={onCommand}
-        peakPyramid={peakPyramid}
+        peakPyramid={evidence.audioState === "ready" ? evidence.peakPyramid : null}
       />
-      <p className="timeline-evidence-status" role="status">{peakStatusMessage}</p>
+      <p className="timeline-evidence-status" data-testid="media-evidence-status" role="status" aria-live="polite">{peakStatusMessage}</p>
     </section>
   );
 }

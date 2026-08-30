@@ -131,6 +131,8 @@ export class ProjectStore {
   private readonly listeners = new Set<() => void>();
   private readonly ownedProjectTokens = new Map<string, string>();
   private operationEpoch = 0;
+  /** Keeps page-originated domain writes ordered just like the durable CAS boundary. */
+  private commandQueue: Promise<void> = Promise.resolve();
 
   public constructor(options: ProjectStoreOptions = {}) {
     this.database = options.database ?? new CueBenchDatabase();
@@ -239,20 +241,39 @@ export class ProjectStore {
    * commit through the IndexedDB CAS transaction; temporary projects retain the
    * exact command semantics in their explicitly in-memory session.
    */
-  public async executeCommand(command: DomainCommand): Promise<CommandResult> {
-    const snapshot = this.snapshot;
-    if (snapshot.project === null || snapshot.mode === null) {
-      throw new Error("CueBench cannot edit a project before its media is available.");
-    }
-    const projectId = snapshot.project.projectId;
-    const result = snapshot.mode === "durable"
-      ? await executePersistentCommand(this.database, projectId, command)
-      : applyCommand(snapshot.project, command);
+  public executeCommand(command: DomainCommand): Promise<CommandResult> {
+    const execute = async (): Promise<CommandResult> => {
+      const snapshot = this.snapshot;
+      if (snapshot.project === null || snapshot.mode === null) {
+        throw new Error("CueBench cannot edit a project before its media is available.");
+      }
+      const projectId = snapshot.project.projectId;
+      try {
+        const result = snapshot.mode === "durable"
+          ? await executePersistentCommand(this.database, projectId, command)
+          : applyCommand(snapshot.project, command);
 
-    if (result.error === undefined && this.snapshot.project?.projectId === projectId) {
-      this.setSnapshot({ ...this.snapshot, project: result.project, error: null });
-    }
-    return result;
+        // Rejected durable writes can carry newer canonical state from the
+        // transaction. Reconcile it before returning so the next UI command
+        // never continues against an abandoned projection.
+        if (this.snapshot.project?.projectId === projectId) {
+          this.setSnapshot({
+            ...this.snapshot,
+            project: result.project,
+            error: result.error?.message ?? null,
+          });
+        }
+        return result;
+      } catch (error) {
+        if (this.snapshot.project?.projectId === projectId) {
+          this.setSnapshot({ ...this.snapshot, error: userFacingError(error, "CueBench could not apply this project command.") });
+        }
+        throw error;
+      }
+    };
+    const queued = this.commandQueue.then(execute, execute);
+    this.commandQueue = queued.then(() => undefined, () => undefined);
+    return queued;
   }
 
   /** Cancels stale async continuations and releases the only live local-media URL. */

@@ -9,11 +9,13 @@ export interface CaptionLaneProps {
   readonly transform: TimeTransform;
   readonly selectedItemId: string | null;
   readonly editPreview: TimelineEditPreview | null;
+  readonly interactionDisabled: boolean;
   readonly onActivate: (cue: CaptionCue) => void;
+  readonly onRegisterItemButton: (itemId: string, element: HTMLButtonElement | null) => void;
   readonly onPointerDown: (event: PointerEvent<HTMLButtonElement>, cue: CaptionCue, edge: TimelineEditEdge) => void;
   readonly onPointerMove: (event: PointerEvent<HTMLButtonElement>) => void;
   readonly onPointerUp: (event: PointerEvent<HTMLButtonElement>) => void;
-  readonly onPointerCancel: () => void;
+  readonly onPointerCancel: (event: PointerEvent<HTMLButtonElement>) => void;
   readonly onKeyboardAdjust: (event: KeyboardEvent<HTMLButtonElement>, cue: CaptionCue, edge: TimelineEditEdge) => void;
   readonly onKeyboardCommit: (event: KeyboardEvent<HTMLButtonElement>) => void;
 }
@@ -27,7 +29,9 @@ export function CaptionLane({
   transform,
   selectedItemId,
   editPreview,
+  interactionDisabled,
   onActivate,
+  onRegisterItemButton,
   onPointerDown,
   onPointerMove,
   onPointerUp,
@@ -53,7 +57,15 @@ export function CaptionLane({
               data-preview={editPreview?.itemId === cue.itemId || undefined}
               style={{ left: `${left}px`, width: `${width}px` }}
             >
-              <button className="timeline-item__body" type="button" onClick={() => onActivate(cue)} aria-label={label}>
+              <button
+                ref={(element) => onRegisterItemButton(cue.itemId, element)}
+                className="timeline-item__body"
+                type="button"
+                onClick={() => onActivate(cue)}
+                aria-label={label}
+                aria-current={selected ? "true" : undefined}
+                disabled={interactionDisabled}
+              >
                 <strong>{cue.itemId.toUpperCase()}</strong>
                 <span>{cue.current.text}</span>
                 <small>{formatMediaTime(timing.startMs)} → {formatMediaTime(timing.endMs)}</small>
@@ -61,7 +73,14 @@ export function CaptionLane({
               <button
                 className="timeline-item__handle timeline-item__handle--start"
                 type="button"
+                role="slider"
                 aria-label={`Adjust start of caption ${cue.itemId.toUpperCase()}`}
+                aria-valuemin={0}
+                aria-valuemax={transform.durationMs}
+                aria-valuenow={timing.startMs}
+                aria-valuetext={`Start time ${formatMediaTime(timing.startMs)}`}
+                aria-orientation="horizontal"
+                disabled={interactionDisabled}
                 onPointerDown={(event) => onPointerDown(event, cue, "start")}
                 onPointerMove={onPointerMove}
                 onPointerUp={onPointerUp}
@@ -72,7 +91,14 @@ export function CaptionLane({
               <button
                 className="timeline-item__handle timeline-item__handle--end"
                 type="button"
+                role="slider"
                 aria-label={`Adjust end of caption ${cue.itemId.toUpperCase()}`}
+                aria-valuemin={0}
+                aria-valuemax={transform.durationMs}
+                aria-valuenow={timing.endMs}
+                aria-valuetext={`End time ${formatMediaTime(timing.endMs)}`}
+                aria-orientation="horizontal"
+                disabled={interactionDisabled}
                 onPointerDown={(event) => onPointerDown(event, cue, "end")}
                 onPointerMove={onPointerMove}
                 onPointerUp={onPointerUp}

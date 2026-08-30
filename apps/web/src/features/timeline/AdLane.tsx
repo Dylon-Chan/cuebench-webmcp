@@ -9,11 +9,13 @@ export interface AdLaneProps {
   readonly transform: TimeTransform;
   readonly selectedItemId: string | null;
   readonly editPreview: TimelineEditPreview | null;
+  readonly interactionDisabled: boolean;
   readonly onActivate: (beat: AudioDescriptionBeat) => void;
+  readonly onRegisterItemButton: (itemId: string, element: HTMLButtonElement | null) => void;
   readonly onPointerDown: (event: PointerEvent<HTMLButtonElement>, beat: AudioDescriptionBeat, edge: TimelineEditEdge) => void;
   readonly onPointerMove: (event: PointerEvent<HTMLButtonElement>) => void;
   readonly onPointerUp: (event: PointerEvent<HTMLButtonElement>) => void;
-  readonly onPointerCancel: () => void;
+  readonly onPointerCancel: (event: PointerEvent<HTMLButtonElement>) => void;
   readonly onKeyboardAdjust: (event: KeyboardEvent<HTMLButtonElement>, beat: AudioDescriptionBeat, edge: TimelineEditEdge) => void;
   readonly onKeyboardCommit: (event: KeyboardEvent<HTMLButtonElement>) => void;
 }
@@ -27,7 +29,9 @@ export function AdLane({
   transform,
   selectedItemId,
   editPreview,
+  interactionDisabled,
   onActivate,
+  onRegisterItemButton,
   onPointerDown,
   onPointerMove,
   onPointerUp,
@@ -53,7 +57,15 @@ export function AdLane({
               data-preview={editPreview?.itemId === beat.itemId || undefined}
               style={{ left: `${left}px`, width: `${width}px` }}
             >
-              <button className="timeline-item__body" type="button" onClick={() => onActivate(beat)} aria-label={label}>
+              <button
+                ref={(element) => onRegisterItemButton(beat.itemId, element)}
+                className="timeline-item__body"
+                type="button"
+                onClick={() => onActivate(beat)}
+                aria-label={label}
+                aria-current={selected ? "true" : undefined}
+                disabled={interactionDisabled}
+              >
                 <strong>{beat.itemId.toUpperCase()}</strong>
                 <span>{beat.current.description}</span>
                 <small>{formatMediaTime(timing.startMs)} → {formatMediaTime(timing.endMs)}</small>
@@ -61,7 +73,14 @@ export function AdLane({
               <button
                 className="timeline-item__handle timeline-item__handle--start"
                 type="button"
+                role="slider"
                 aria-label={`Adjust start of audio description ${beat.itemId.toUpperCase()}`}
+                aria-valuemin={0}
+                aria-valuemax={transform.durationMs}
+                aria-valuenow={timing.startMs}
+                aria-valuetext={`Start time ${formatMediaTime(timing.startMs)}`}
+                aria-orientation="horizontal"
+                disabled={interactionDisabled}
                 onPointerDown={(event) => onPointerDown(event, beat, "start")}
                 onPointerMove={onPointerMove}
                 onPointerUp={onPointerUp}
@@ -72,7 +91,14 @@ export function AdLane({
               <button
                 className="timeline-item__handle timeline-item__handle--end"
                 type="button"
+                role="slider"
                 aria-label={`Adjust end of audio description ${beat.itemId.toUpperCase()}`}
+                aria-valuemin={0}
+                aria-valuemax={transform.durationMs}
+                aria-valuenow={timing.endMs}
+                aria-valuetext={`End time ${formatMediaTime(timing.endMs)}`}
+                aria-orientation="horizontal"
+                disabled={interactionDisabled}
                 onPointerDown={(event) => onPointerDown(event, beat, "end")}
                 onPointerMove={onPointerMove}
                 onPointerUp={onPointerUp}

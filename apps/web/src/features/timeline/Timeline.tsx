@@ -2,12 +2,14 @@ import type {
   AudioDescriptionBeat,
   CaptionCue,
   CaptionProject,
+  CommandResult,
   DomainCommand,
   QualityFinding,
 } from "@cuebench/domain";
 import type { Actor } from "@cuebench/contracts";
 import {
   useCallback,
+  useEffect,
   useLayoutEffect,
   useMemo,
   useRef,
@@ -19,9 +21,16 @@ import { AdLane } from "./AdLane";
 import { CaptionLane } from "./CaptionLane";
 import type { TimelineEditEdge, TimelineEditPreview, TimelineLaneItem } from "./lane-types";
 import { WaveformCanvas, type WaveformPeakPyramid } from "./WaveformCanvas";
-import { clampMediaTime, clampTimelineZoom, createTimeTransform, formatMediaTime } from "./time-transform";
+import {
+  clampMediaTime,
+  clampTimelineViewportStart,
+  clampTimelineZoom,
+  createTimeTransform,
+  formatMediaTime,
+  visibleTimelineDurationMs,
+} from "./time-transform";
 
-export type TimelineCommandExecutor = (command: DomainCommand) => void | Promise<unknown>;
+export type TimelineCommandExecutor = (command: DomainCommand) => CommandResult | Promise<CommandResult>;
 
 export interface TimelineProps {
   readonly project: CaptionProject;
@@ -42,12 +51,21 @@ interface TimelineViewport {
 
 interface PointerDrag {
   readonly pointerId: number;
+  readonly itemId: string;
   readonly edge: TimelineEditEdge;
+  readonly initialStartMs: number;
+  readonly initialEndMs: number;
+  readonly expectedItemRevision: number;
+  readonly expectedProjectRevision: number;
+  readonly grabOffsetMs: number;
+  readonly originClientX: number;
+  hasMoved: boolean;
 }
 
 const humanActor: Actor = { type: "Human", id: "human" };
 const keyboardNudgeMs = 100;
 const keyboardLargeNudgeMs = 1_000;
+const dragThresholdPx = 3;
 
 const defined = <Value,>(value: Value | undefined): value is Value => value !== undefined;
 
@@ -66,17 +84,20 @@ const itemForFinding = (project: CaptionProject, finding: QualityFinding): Timel
   return project.captions.items[itemId] ?? project.audioDescriptions.items[itemId] ?? null;
 };
 
+const itemForProject = (project: CaptionProject, itemId: string): TimelineLaneItem | null => (
+  project.captions.items[itemId] ?? project.audioDescriptions.items[itemId] ?? null
+);
+
 const clampPreviewTiming = (
   item: TimelineLaneItem,
   edge: TimelineEditEdge,
   candidateMs: number,
   durationMs: number,
+  initialTiming?: Pick<TimelineEditPreview, "startMs" | "endMs">,
 ): Pick<TimelineEditPreview, "startMs" | "endMs"> => {
-  const current = item.current;
+  const current = initialTiming ?? item.current;
   const candidate = clampMediaTime(candidateMs, durationMs);
-  if (edge === "start") {
-    return { startMs: Math.min(candidate, current.endMs - 1), endMs: current.endMs };
-  }
+  if (edge === "start") return { startMs: Math.min(candidate, current.endMs - 1), endMs: current.endMs };
   return { startMs: current.startMs, endMs: Math.max(candidate, current.startMs + 1) };
 };
 
@@ -87,6 +108,18 @@ const timelineTicks = (visibleDurationMs: number, startMs: number, endMs: number
   const ticks: number[] = [];
   for (let time = first; time <= endMs; time += interval) ticks.push(time);
   return ticks;
+};
+
+const commandErrorMessage = (error: unknown): string => error instanceof Error && error.message.length > 0
+  ? error.message
+  : "CueBench could not apply this timeline change. The canonical project state was retained.";
+
+const normalizeViewport = (viewport: TimelineViewport, durationMs: number): TimelineViewport => {
+  const zoom = clampTimelineZoom(viewport.zoom);
+  return {
+    zoom,
+    viewportStartMs: clampTimelineViewportStart({ durationMs, zoom, viewportStartMs: viewport.viewportStartMs }),
+  };
 };
 
 function useTimelineWidth(surfaceRef: React.RefObject<HTMLDivElement | null>, viewportWidth: number | undefined): number {
@@ -110,6 +143,10 @@ function useTimelineWidth(surfaceRef: React.RefObject<HTMLDivElement | null>, vi
   return measuredWidth;
 }
 
+/**
+ * The timeline is a projection only. Every mutation crosses the same domain
+ * command boundary as WebMCP, and native video remains the sole media clock.
+ */
 export function Timeline({
   project,
   playheadMs,
@@ -121,11 +158,17 @@ export function Timeline({
   onSelectionChange,
 }: TimelineProps) {
   const surfaceRef = useRef<HTMLDivElement>(null);
+  const itemButtonRefs = useRef(new Map<string, HTMLButtonElement>());
+  const dragRef = useRef<PointerDrag | null>(null);
+  const editPreviewRef = useRef<TimelineEditPreview | null>(null);
+  const commandPendingRef = useRef(false);
+  const commandEpochRef = useRef(0);
   const widthPx = useTimelineWidth(surfaceRef, viewportWidth);
   const [viewport, setViewport] = useState<TimelineViewport>({ zoom: 1, viewportStartMs: 0 });
   const [editPreview, setEditPreviewState] = useState<TimelineEditPreview | null>(null);
-  const editPreviewRef = useRef<TimelineEditPreview | null>(null);
-  const dragRef = useRef<PointerDrag | null>(null);
+  const [isCommandPending, setIsCommandPending] = useState(false);
+  const [commandFeedback, setCommandFeedback] = useState<string | null>(null);
+  const [focusAfterAcceptedItemId, setFocusAfterAcceptedItemId] = useState<string | null>(null);
   const transform = useMemo(() => createTimeTransform({
     durationMs: project.media.durationMs,
     widthPx,
@@ -137,35 +180,79 @@ export function Timeline({
   const selectedItemId = project.selectedItem?.itemId ?? null;
   const ticks = useMemo(
     () => timelineTicks(transform.visibleDurationMs, transform.visibleStartMs, transform.visibleEndMs),
-    [transform.visibleDurationMs, transform.visibleStartMs, transform.visibleEndMs],
+    [transform.visibleDurationMs, transform.visibleEndMs, transform.visibleStartMs],
   );
+
+  useEffect(() => {
+    setViewport((current) => {
+      const next = normalizeViewport(current, project.media.durationMs);
+      return next.zoom === current.zoom && next.viewportStartMs === current.viewportStartMs ? current : next;
+    });
+  }, [project.media.durationMs]);
+
+  useEffect(() => {
+    if (isCommandPending || focusAfterAcceptedItemId === null) return;
+    itemButtonRefs.current.get(focusAfterAcceptedItemId)?.focus();
+    setFocusAfterAcceptedItemId(null);
+  }, [focusAfterAcceptedItemId, isCommandPending]);
 
   const setEditPreview = useCallback((nextPreview: TimelineEditPreview | null) => {
     editPreviewRef.current = nextPreview;
     setEditPreviewState(nextPreview);
   }, []);
 
-  const itemForId = useCallback((itemId: string): TimelineLaneItem | null => (
-    project.captions.items[itemId] ?? project.audioDescriptions.items[itemId] ?? null
-  ), [project.audioDescriptions.items, project.captions.items]);
+  const registerItemButton = useCallback((itemId: string, element: HTMLButtonElement | null) => {
+    if (element === null) itemButtonRefs.current.delete(itemId);
+    else itemButtonRefs.current.set(itemId, element);
+  }, []);
 
-  const issueCommand = useCallback((command: DomainCommand) => {
-    void Promise.resolve(onCommand(command));
+  const itemForId = useCallback((itemId: string): TimelineLaneItem | null => itemForProject(project, itemId), [project]);
+
+  const executeTimelineCommand = useCallback(async (command: DomainCommand): Promise<CommandResult | null> => {
+    if (commandPendingRef.current) return null;
+    const epoch = commandEpochRef.current + 1;
+    commandEpochRef.current = epoch;
+    commandPendingRef.current = true;
+    setIsCommandPending(true);
+    setCommandFeedback(null);
+    try {
+      const result = await onCommand(command);
+      if (epoch !== commandEpochRef.current) return null;
+      if (result.error !== undefined) setCommandFeedback(result.error.message);
+      return result;
+    } catch (error) {
+      if (epoch === commandEpochRef.current) setCommandFeedback(commandErrorMessage(error));
+      return null;
+    } finally {
+      if (epoch === commandEpochRef.current) {
+        commandPendingRef.current = false;
+        setIsCommandPending(false);
+      }
+    }
   }, [onCommand]);
 
   const selectItem = useCallback((item: TimelineLaneItem) => {
-    seekToMediaTime(item.current.startMs);
-    onSelectionChange?.(item.itemId);
-    issueCommand({
+    if (commandPendingRef.current) return;
+    const command: DomainCommand = {
       type: "SelectItem",
       actor,
       itemId: item.itemId,
       expectedItemRevision: item.current.itemRevision,
       expectedProjectRevision: project.projectRevision,
-    });
-  }, [actor, issueCommand, onSelectionChange, project.projectRevision, seekToMediaTime]);
+    };
+    void (async () => {
+      const result = await executeTimelineCommand(command);
+      if (result === null || result.error !== undefined) return;
+      const canonicalItem = itemForProject(result.project, item.itemId);
+      if (canonicalItem === null) return;
+      seekToMediaTime(canonicalItem.current.startMs);
+      onSelectionChange?.(canonicalItem.itemId);
+      setFocusAfterAcceptedItemId(canonicalItem.itemId);
+    })();
+  }, [actor, executeTimelineCommand, onSelectionChange, project.projectRevision, seekToMediaTime]);
 
   const commitPreview = useCallback(() => {
+    if (commandPendingRef.current) return;
     const preview = editPreviewRef.current;
     if (preview === null) return;
     setEditPreview(null);
@@ -174,9 +261,9 @@ export function Timeline({
       unchangedItem === null
       || (unchangedItem.current.startMs === preview.startMs && unchangedItem.current.endMs === preview.endMs)
     ) return;
-    const command = preview.kind === "CaptionCue"
+    const command: DomainCommand = preview.kind === "CaptionCue"
       ? {
-          type: "AdjustCueTiming" as const,
+          type: "AdjustCueTiming",
           actor,
           cueId: preview.itemId,
           startMs: preview.startMs,
@@ -185,7 +272,7 @@ export function Timeline({
           expectedProjectRevision: preview.expectedProjectRevision,
         }
       : {
-          type: "AdjustAudioDescriptionTiming" as const,
+          type: "AdjustAudioDescriptionTiming",
           actor,
           beatId: preview.itemId,
           startMs: preview.startMs,
@@ -193,50 +280,66 @@ export function Timeline({
           expectedItemRevision: preview.expectedItemRevision,
           expectedProjectRevision: preview.expectedProjectRevision,
         };
-    issueCommand(command);
-  }, [actor, issueCommand, itemForId, setEditPreview]);
+    void executeTimelineCommand(command);
+  }, [actor, executeTimelineCommand, itemForId, setEditPreview]);
 
-  const previewFromPointer = useCallback((item: TimelineLaneItem, edge: TimelineEditEdge, clientX: number) => {
-    const bounds = surfaceRef.current?.getBoundingClientRect();
-    const x = clientX - (bounds?.left ?? 0);
-    const timing = clampPreviewTiming(item, edge, transform.xToMs(x), project.media.durationMs);
-    setEditPreview({
-      itemId: item.itemId,
-      kind: item.kind,
-      expectedItemRevision: item.current.itemRevision,
-      expectedProjectRevision: project.projectRevision,
-      ...timing,
-    });
-  }, [project.media.durationMs, project.projectRevision, setEditPreview, transform]);
+  const localXForPointer = useCallback((clientX: number) => clientX - (surfaceRef.current?.getBoundingClientRect().left ?? 0), []);
 
   const onPointerDown = useCallback((event: PointerEvent<HTMLButtonElement>, item: TimelineLaneItem, edge: TimelineEditEdge) => {
+    if (commandPendingRef.current) return;
     event.preventDefault();
     event.stopPropagation();
-    const pointerId = event.pointerId;
-    dragRef.current = { pointerId, edge };
-    event.currentTarget.setPointerCapture?.(pointerId);
-    previewFromPointer(item, edge, event.clientX);
-  }, [previewFromPointer]);
+    event.currentTarget.focus();
+    const x = localXForPointer(event.clientX);
+    const boundaryMs = edge === "start" ? item.current.startMs : item.current.endMs;
+    dragRef.current = {
+      pointerId: event.pointerId,
+      itemId: item.itemId,
+      edge,
+      initialStartMs: item.current.startMs,
+      initialEndMs: item.current.endMs,
+      expectedItemRevision: item.current.itemRevision,
+      expectedProjectRevision: project.projectRevision,
+      grabOffsetMs: transform.xToMs(x) - boundaryMs,
+      originClientX: event.clientX,
+      hasMoved: false,
+    };
+    event.currentTarget.setPointerCapture?.(event.pointerId);
+  }, [localXForPointer, project.projectRevision, transform]);
 
   const onPointerMove = useCallback((event: PointerEvent<HTMLButtonElement>) => {
     const drag = dragRef.current;
-    const preview = editPreviewRef.current;
-    if (drag === null || preview === null || drag.pointerId !== event.pointerId) return;
-    const item = itemForId(preview.itemId);
+    if (drag === null || drag.pointerId !== event.pointerId || commandPendingRef.current) return;
+    if (Math.abs(event.clientX - drag.originClientX) < dragThresholdPx) return;
+    drag.hasMoved = true;
+    const item = itemForId(drag.itemId);
     if (item === null) return;
-    previewFromPointer(item, drag.edge, event.clientX);
-  }, [itemForId, previewFromPointer]);
+    const candidateMs = transform.xToMs(localXForPointer(event.clientX)) - drag.grabOffsetMs;
+    const timing = clampPreviewTiming(item, drag.edge, candidateMs, project.media.durationMs, {
+      startMs: drag.initialStartMs,
+      endMs: drag.initialEndMs,
+    });
+    setEditPreview({
+      itemId: drag.itemId,
+      kind: item.kind,
+      edge: drag.edge,
+      expectedItemRevision: drag.expectedItemRevision,
+      expectedProjectRevision: drag.expectedProjectRevision,
+      ...timing,
+    });
+  }, [itemForId, localXForPointer, project.media.durationMs, setEditPreview, transform]);
 
   const onPointerUp = useCallback((event: PointerEvent<HTMLButtonElement>) => {
     const drag = dragRef.current;
     if (drag === null || drag.pointerId !== event.pointerId) return;
     dragRef.current = null;
     event.currentTarget.releasePointerCapture?.(event.pointerId);
-    commitPreview();
+    if (drag.hasMoved) commitPreview();
   }, [commitPreview]);
 
-  const onPointerCancel = useCallback(() => {
-    dragRef.current = null;
+  const onPointerCancel = useCallback((event: PointerEvent<HTMLButtonElement>) => {
+    const drag = dragRef.current;
+    if (drag !== null && drag.pointerId === event.pointerId) dragRef.current = null;
     setEditPreview(null);
   }, [setEditPreview]);
 
@@ -245,15 +348,17 @@ export function Timeline({
     item: TimelineLaneItem,
     edge: TimelineEditEdge,
   ) => {
-    if (event.key !== "ArrowLeft" && event.key !== "ArrowRight") return;
+    if (commandPendingRef.current || (event.key !== "ArrowLeft" && event.key !== "ArrowRight")) return;
     event.preventDefault();
     const direction = event.key === "ArrowLeft" ? -1 : 1;
     const step = event.shiftKey ? keyboardLargeNudgeMs : keyboardNudgeMs;
-    const previous = editPreviewRef.current?.itemId === item.itemId
-      ? editPreviewRef.current
+    const currentPreview = editPreviewRef.current;
+    const previous = currentPreview?.itemId === item.itemId && currentPreview.edge === edge
+      ? currentPreview
       : {
           itemId: item.itemId,
           kind: item.kind,
+          edge,
           expectedItemRevision: item.current.itemRevision,
           expectedProjectRevision: project.projectRevision,
           startMs: item.current.startMs,
@@ -275,27 +380,39 @@ export function Timeline({
   const changeZoom = (direction: -1 | 1) => {
     setViewport((current) => {
       const nextZoom = clampTimelineZoom(current.zoom * (direction > 0 ? 2 : 0.5));
-      const nextVisibleDurationMs = Math.max(1, Math.min(project.media.durationMs, Math.ceil(project.media.durationMs / nextZoom)));
-      const anchor = clampMediaTime(playheadMs, project.media.durationMs);
+      const nextVisibleDurationMs = visibleTimelineDurationMs(project.media.durationMs, nextZoom);
+      const anchorMs = clampMediaTime(playheadMs, project.media.durationMs);
       return {
         zoom: nextZoom,
-        viewportStartMs: anchor - Math.floor(nextVisibleDurationMs / 2),
+        viewportStartMs: clampTimelineViewportStart({
+          durationMs: project.media.durationMs,
+          zoom: nextZoom,
+          viewportStartMs: anchorMs - Math.floor(nextVisibleDurationMs / 2),
+        }),
       };
     });
   };
 
   const pan = (direction: -1 | 1) => {
     setViewport((current) => ({
-      ...current,
-      viewportStartMs: current.viewportStartMs + direction * Math.max(1, Math.floor(transform.visibleDurationMs / 2)),
+      zoom: current.zoom,
+      viewportStartMs: clampTimelineViewportStart({
+        durationMs: project.media.durationMs,
+        zoom: current.zoom,
+        viewportStartMs: current.viewportStartMs + direction * Math.max(1, Math.floor(visibleTimelineDurationMs(project.media.durationMs, current.zoom) / 2)),
+      }),
     }));
   };
 
   const findingItems = project.validationRun?.findings ?? [];
   const seekInputValue = clampMediaTime(playheadMs, project.media.durationMs);
+  const previewItem = editPreview === null ? null : itemForId(editPreview.itemId);
+  const previewLabel = previewItem === null || editPreview === null
+    ? null
+    : `${previewItem.kind === "CaptionCue" ? "Caption" : "Audio description"} ${previewItem.itemId.toUpperCase()} ${editPreview.edge} preview ${formatMediaTime(editPreview.startMs)} to ${formatMediaTime(editPreview.endMs)}.`;
 
   return (
-    <section className="timeline-shell" aria-labelledby="timeline-heading">
+    <section className="timeline-shell" aria-labelledby="timeline-heading" aria-busy={isCommandPending || undefined}>
       <div className="region-heading region-heading--compact">
         <div><h2 id="timeline-heading">Shared timeline</h2><p>Native clock · integer Media Time</p></div>
         <div className="timeline-tools" aria-label="Timeline view controls">
@@ -306,10 +423,15 @@ export function Timeline({
           <button type="button" onClick={() => pan(1)} aria-label="Pan timeline later">Later</button>
         </div>
       </div>
-      <div ref={surfaceRef} className="timeline-surface" data-testid="timeline-surface">
+      <div
+        ref={surfaceRef}
+        className="timeline-surface"
+        data-testid="timeline-surface"
+        data-viewport-start-ms={viewport.viewportStartMs}
+        data-visible-end-ms={transform.visibleEndMs}
+      >
         <div className="timeline-waveform" aria-label="Waveform peak evidence">
           <WaveformCanvas peakPyramid={peakPyramid} transform={transform} />
-          <p className="timeline-waveform__status">{peakPyramid?.levels.length ? "Audio peak evidence" : "Audio peak evidence is unavailable until preparation finishes."}</p>
         </div>
         <svg className="timeline-scale" viewBox={`0 0 ${transform.widthPx} 26`} preserveAspectRatio="none" aria-hidden="true">
           {ticks.map((time) => {
@@ -322,7 +444,9 @@ export function Timeline({
           transform={transform}
           selectedItemId={selectedItemId}
           editPreview={editPreview}
+          interactionDisabled={isCommandPending}
           onActivate={selectItem}
+          onRegisterItemButton={registerItemButton}
           onPointerDown={onPointerDown}
           onPointerMove={onPointerMove}
           onPointerUp={onPointerUp}
@@ -335,7 +459,9 @@ export function Timeline({
           transform={transform}
           selectedItemId={selectedItemId}
           editPreview={editPreview}
+          interactionDisabled={isCommandPending}
           onActivate={selectItem}
+          onRegisterItemButton={registerItemButton}
           onPointerDown={onPointerDown}
           onPointerMove={onPointerMove}
           onPointerUp={onPointerUp}
@@ -355,6 +481,7 @@ export function Timeline({
                 style={{ left: `${transform.msToX(item.current.startMs)}px` }}
                 onClick={() => selectItem(item)}
                 aria-label={`${finding.severity} finding for ${item.itemId}: ${finding.message}`}
+                disabled={isCommandPending}
               >
                 {finding.severity === "blocker" ? "Blocking finding" : "Warning finding"}
               </button>
@@ -383,6 +510,8 @@ export function Timeline({
         />
         <p>Use the cue and audio-description controls above to select or adjust timing. Arrow keys adjust the focused boundary; release the key to commit once.</p>
       </div>
+      {previewLabel === null ? null : <p className="timeline-preview-feedback" data-testid="timeline-preview-feedback" role="status" aria-live="polite">{previewLabel}</p>}
+      {commandFeedback === null ? null : <p className="timeline-command-feedback" role="alert">{commandFeedback}</p>}
     </section>
   );
 }

@@ -3,6 +3,7 @@ import { useSyncExternalStore } from "react";
 import { Navigate, Route, Routes } from "react-router-dom";
 import type { CaptionProject } from "@cuebench/domain";
 import { VideoEvidenceBay } from "../features/evidence/VideoEvidenceBay";
+import { projectMediaEvidence } from "../features/evidence/project-media-evidence";
 import { ProjectStart } from "../features/project/ProjectStart";
 import { StorageDisclosure } from "../features/project/StorageDisclosure";
 import type { ProjectMode, ProjectStore } from "../features/project/project-store";
@@ -69,6 +70,7 @@ export function WorkbenchShell({ project, mode, sourceObjectUrl, webMcpAvailable
         <VideoEvidenceBay
           project={project}
           sourceObjectUrl={sourceObjectUrl}
+          evidence={projectMediaEvidence(project)}
           onCommand={(command) => store.executeCommand(command)}
         />
 

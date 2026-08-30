@@ -62,8 +62,8 @@ export const createPeakPyramid = (
     const start = Math.floor((bucketIndex * sampleRate) / 100);
     const end = Math.min(sampleCount, Math.floor(((bucketIndex + 1) * sampleRate) / 100));
     if (end <= start) continue;
-    let minimum = 0;
-    let maximum = 0;
+    let minimum = Number.POSITIVE_INFINITY;
+    let maximum = Number.NEGATIVE_INFINITY;
     for (let channelIndex = 0; channelIndex < channels.length; channelIndex += 1) {
       const channel = channels[channelIndex];
       if (channel === undefined) continue;
@@ -75,7 +75,13 @@ export const createPeakPyramid = (
         maximum = Math.max(maximum, amplitude);
       }
     }
-    basePeaks.push({ min: minimum, max: maximum });
+    // A bucket can be empty only with deliberately irregular input channels.
+    // Preserve its deterministic time slot without inventing a signal.
+    basePeaks.push(
+      minimum === Number.POSITIVE_INFINITY || maximum === Number.NEGATIVE_INFINITY
+        ? { min: 0, max: 0 }
+        : { min: minimum, max: maximum },
+    );
   }
 
   const levels: WaveformPeakLevel[] = [{ resolutionMs: 10, peaks: basePeaks }];

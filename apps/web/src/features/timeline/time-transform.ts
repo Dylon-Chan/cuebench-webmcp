@@ -21,6 +21,12 @@ export interface TimeTransform {
   resize: (widthPx: number) => TimeTransform;
 }
 
+export interface TimelineViewportBoundsOptions {
+  readonly durationMs: number;
+  readonly zoom?: number;
+  readonly viewportStartMs: number;
+}
+
 const finiteInteger = (value: number, fallback = 0): number => Number.isFinite(value)
   ? Math.trunc(value)
   : fallback;
@@ -38,6 +44,23 @@ export const clampMediaTime = (mediaTimeMs: number, durationMs: number): number 
   0,
   Math.max(0, finiteInteger(durationMs)),
 );
+
+export const visibleTimelineDurationMs = (durationMs: number, zoom: number | undefined): number => {
+  const normalizedDurationMs = Math.max(0, finiteInteger(durationMs));
+  if (normalizedDurationMs === 0) return 0;
+  return Math.max(1, Math.min(normalizedDurationMs, Math.ceil(normalizedDurationMs / clampTimelineZoom(zoom))));
+};
+
+/** Clamp the stored viewport state, not only a derived rendering projection. */
+export const clampTimelineViewportStart = ({
+  durationMs,
+  zoom,
+  viewportStartMs,
+}: TimelineViewportBoundsOptions): number => {
+  const normalizedDurationMs = Math.max(0, finiteInteger(durationMs));
+  const visibleDurationMs = visibleTimelineDurationMs(normalizedDurationMs, zoom);
+  return clamp(finiteInteger(viewportStartMs), 0, Math.max(0, normalizedDurationMs - visibleDurationMs));
+};
 
 export const formatMediaTime = (mediaTimeMs: number): string => {
   const value = Math.max(0, finiteInteger(mediaTimeMs));
@@ -57,11 +80,12 @@ export const createTimeTransform = (options: TimeTransformOptions): TimeTransfor
   const durationMs = Math.max(0, finiteInteger(options.durationMs));
   const widthPx = Math.max(1, finiteInteger(options.widthPx, 1));
   const zoom = clampTimelineZoom(options.zoom);
-  const visibleDurationMs = durationMs === 0
-    ? 0
-    : Math.max(1, Math.min(durationMs, Math.ceil(durationMs / zoom)));
-  const maximumStartMs = Math.max(0, durationMs - visibleDurationMs);
-  const visibleStartMs = clamp(finiteInteger(options.viewportStartMs ?? 0), 0, maximumStartMs);
+  const visibleDurationMs = visibleTimelineDurationMs(durationMs, zoom);
+  const visibleStartMs = clampTimelineViewportStart({
+    durationMs,
+    zoom,
+    viewportStartMs: options.viewportStartMs ?? 0,
+  });
   const visibleEndMs = visibleStartMs + visibleDurationMs;
 
   const msToX = (mediaTimeMs: number): number => {
