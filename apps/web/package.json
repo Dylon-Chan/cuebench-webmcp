@@ -19,12 +19,16 @@
     "@radix-ui/react-tabs": "1.1.21",
     "@radix-ui/react-tooltip": "1.2.16",
     "dexie": "4.4.5",
+    "hono": "4.13.5",
     "react": "19.2.8",
     "react-dom": "19.2.8",
     "react-router-dom": "7.18.3",
     "zod": "4.4.3"
   },
   "devDependencies": {
+    "@cloudflare/vite-plugin": "1.54.2",
+    "@cloudflare/vitest-pool-workers": "0.22.0",
+    "@cloudflare/workers-types": "5.20260829.1",
     "@playwright/test": "1.62.1",
     "@tailwindcss/vite": "4.3.3",
     "@testing-library/jest-dom": "7.0.1",
@@ -37,6 +41,7 @@
     "fake-indexeddb": "6.2.5",
     "jsdom": "30.0.1",
     "tailwindcss": "4.3.3",
-    "vite": "8.2.2"
+    "vite": "8.2.2",
+    "wrangler": "4.127.1"
   }
 }

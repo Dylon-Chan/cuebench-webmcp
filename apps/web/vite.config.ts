@@ -1,9 +1,11 @@
 import { configDefaults, defineConfig } from "vitest/config";
+import { cloudflare } from "@cloudflare/vite-plugin";
 import react from "@vitejs/plugin-react";
 import tailwindcss from "@tailwindcss/vite";
 
 export default defineConfig({
-  plugins: [react(), tailwindcss()],
+  // Cloudflare owns the production/runtime boundary while React and Tailwind still own the SPA transform pipeline.
+  plugins: [...cloudflare({ configPath: "./wrangler.jsonc", inspectorPort: false }), react(), tailwindcss()],
   build: {
     assetsInlineLimit: 0,
     rollupOptions: {
