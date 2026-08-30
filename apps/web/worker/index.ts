@@ -23,6 +23,7 @@ import {
   issueUploadCapability,
   issueUploadPartReceipt,
   issueUploadReceipt,
+  type MultipartAbortOutcome,
   normaliseContentType,
   readExactUploadPart,
   validateUploadMetadata,
@@ -536,7 +537,8 @@ const cleanupOperation = async (input: {
   let mustDeleteObject = target.objectState === "completed" || target.objectState === "uncertain";
   if ((target.objectState === "multipart" || target.objectState === "uncertain") && target.multipartUploadId !== null) {
     try {
-      if ((await input.objectStore.abortMultipart({ key: cancellation.record.objectKey, uploadId: target.multipartUploadId })) === "already-completed") mustDeleteObject = true;
+      const outcome: void | MultipartAbortOutcome = await input.objectStore.abortMultipart({ key: cancellation.record.objectKey, uploadId: target.multipartUploadId });
+      if (outcome === "possibly-completed") mustDeleteObject = true;
     } catch {
       r2Acknowledged = false;
     }

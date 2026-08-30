@@ -11,7 +11,9 @@
     "test:workerd": "vitest run --config vitest.workerd.config.ts",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "e2e": "playwright test",
-    "wrangler": "wrangler"
+    "deploy": "node scripts/deploy.mjs",
+    "deploy:dry-run": "node scripts/deploy.mjs --dry-run",
+    "wrangler": "node scripts/wrangler.mjs"
   },
   "dependencies": {
     "@cuebench/contracts": "workspace:*",

@@ -3,7 +3,7 @@ import { createCueBenchWorker } from "./index";
 import { InMemoryQuotaLedger } from "./quota-ledger";
 import { InMemoryUploadCoordinator } from "./upload-operations";
 import type { MediaProbe } from "./probe";
-import { R2PrivateObjectStore, type MultipartPrivateObjectStore } from "./uploads";
+import { R2PrivateObjectStore, classifyMultipartAbortError, type MultipartPrivateObjectStore } from "./uploads";
 import type { WorkerEnv } from "./env";
 
 const partSize = 8 * 1024 * 1024;
@@ -143,12 +143,25 @@ describe("resumable multipart upload boundary", () => {
         abort: async () => { throw { code: "AlreadyCompleted" }; },
       }),
     } as never);
-    await expect(completed.abortMultipart({ key: "processing/opaque", uploadId: "opaque-upload" })).resolves.toBe("already-completed");
+    await expect(completed.abortMultipart({ key: "processing/opaque", uploadId: "opaque-upload" })).resolves.toBe("possibly-completed");
     const unknown = new R2PrivateObjectStore({
       resumeMultipartUpload: () => ({
         abort: async () => { throw new Error("NoSuchUpload in text must not be trusted"); },
       }),
     } as never);
     await expect(unknown.abortMultipart({ key: "processing/opaque", uploadId: "opaque-upload" })).rejects.toThrow(/NoSuchUpload/);
+  });
+
+  it("converges actual Workers R2 NoSuchUpload 10024 by deleting a possibly completed object", async () => {
+    expect(classifyMultipartAbortError({ code: 10024 })).toBe("possibly-completed");
+    expect(classifyMultipartAbortError(new Error("abort: multipart upload does not exist. (10024)"))).toBe("possibly-completed");
+    expect(classifyMultipartAbortError(new Error("NoSuchUpload without the documented numeric suffix"))).toBeNull();
+
+    const store = new R2PrivateObjectStore({
+      resumeMultipartUpload: () => ({
+        abort: async () => { throw { code: 10024, message: "NoSuchUpload (10024)" }; },
+      }),
+    } as never);
+    await expect(store.abortMultipart({ key: "processing/opaque", uploadId: "expired-upload" })).resolves.toBe("possibly-completed");
   });
 });

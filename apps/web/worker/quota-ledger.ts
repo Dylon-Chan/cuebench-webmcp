@@ -59,6 +59,13 @@ export interface SpendFinalization {
   readonly globalSpendLimitCents: number;
 }
 
+/** Operator-controlled breaker state is distinct from a cap-derived computed open. */
+export interface ManualBreakerSetting {
+  readonly open: boolean;
+  readonly nowMs: number;
+  readonly globalSpendLimitCents: number;
+}
+
 export type SpendReservationResult =
   | { readonly accepted: true; readonly existing: boolean; readonly breakerOpen: boolean; readonly spendCents: number }
   | { readonly accepted: false; readonly code: "GLOBAL_BREAKER" | "SPEND_LIMIT" };
@@ -101,6 +108,7 @@ export interface QuotaLedgerPort {
   reserveTts: (input: UsageReservation) => Promise<boolean>;
   reserveSpend: (input: SpendReservation) => Promise<SpendReservationResult>;
   finalizeSpend: (input: SpendFinalization) => Promise<{ readonly persisted: boolean; readonly breakerOpen: boolean; readonly spendCents: number }>;
+  setManualBreaker: (input: ManualBreakerSetting) => Promise<boolean>;
   recordSpend: (input: SpendRecord) => Promise<{ readonly breakerOpen: boolean; readonly spendCents: number }>;
   isGlobalBreakerOpen: (input: { readonly nowMs: number; readonly globalSpendLimitCents: number }) => Promise<boolean>;
   reserveTurnstileSession: (input: TurnstileSessionReservation) => Promise<TurnstileSessionResult>;
@@ -137,6 +145,9 @@ interface MediaCommitMarker {
 interface GlobalSpendState {
   readonly expiresAtMs: number;
   readonly spendCents: number;
+  /** Never inferred from a reservation: only a deliberate operator hard-open persists here. */
+  readonly manualBreakerOpen: boolean;
+  /** Persisted diagnostic snapshot; callers derive the live state from total spend plus manual state. */
   readonly breakerOpen: boolean;
 }
 
@@ -194,7 +205,7 @@ const emptyState = (nowMs: number): LedgerState => ({
   usageMarkers: {},
   spendMarkers: {},
   turnstileSessions: {},
-  global: { expiresAtMs: nowMs + QUOTA_WINDOW_MS, spendCents: 0, breakerOpen: false },
+  global: { expiresAtMs: nowMs + QUOTA_WINDOW_MS, spendCents: 0, manualBreakerOpen: false, breakerOpen: false },
 });
 
 const activeBucket = (bucket: CounterBucket | undefined, nowMs: number): CounterBucket | null => bucket === undefined || bucket.expiresAtMs <= nowMs
@@ -228,6 +239,19 @@ const normaliseState = (input: LedgerState | undefined, nowMs: number): LedgerSt
     sessions = addPending(sessions, reservation.sessionKey, reservation.byteLength, reservation.expiresAtMs);
     networks = addPending(networks, reservation.ipKey, reservation.byteLength, reservation.expiresAtMs);
   }
+  const rawGlobal = state.global as GlobalSpendState & { readonly manualBreakerOpen?: boolean };
+  // Spend is a rolling accounting window, but an operator hard-open is a
+  // separate safety control. Do not silently clear it merely because the
+  // accounting window rolled; only `setManualBreaker({ open: false })` may.
+  const manualBreakerOpen = rawGlobal.manualBreakerOpen ?? rawGlobal.breakerOpen;
+  const global = rawGlobal.expiresAtMs > nowMs
+    ? {
+      ...rawGlobal,
+      // Old v2 records only had `breakerOpen`; retain that conservatively as
+      // operator state rather than reopening an unknown historic hard-open.
+      manualBreakerOpen,
+    }
+    : { expiresAtMs: nowMs + QUOTA_WINDOW_MS, spendCents: 0, manualBreakerOpen, breakerOpen: manualBreakerOpen };
   return {
     sessions,
     networks,
@@ -236,9 +260,7 @@ const normaliseState = (input: LedgerState | undefined, nowMs: number): LedgerSt
     usageMarkers: Object.fromEntries(Object.entries(state.usageMarkers ?? {}).filter(([, marker]) => marker.expiresAtMs > nowMs)),
     spendMarkers: Object.fromEntries(Object.entries(state.spendMarkers ?? {}).filter(([, marker]) => marker.expiresAtMs > nowMs)),
     turnstileSessions: Object.fromEntries(Object.entries(state.turnstileSessions ?? {}).filter(([, marker]) => marker.expiresAtMs > nowMs)),
-    global: state.global.expiresAtMs > nowMs
-      ? state.global
-      : { expiresAtMs: nowMs + QUOTA_WINDOW_MS, spendCents: 0, breakerOpen: false },
+    global,
   };
 };
 
@@ -250,7 +272,7 @@ const replaceBucket = (state: LedgerState, scope: "sessions" | "networks", key: 
 const reserveUpload = (state: LedgerState, input: UploadReservation): { readonly state: LedgerState; readonly result: UploadReservationResult } => {
   const existing = state.reservations[input.reservationKey];
   if (existing !== undefined) return { state, result: { accepted: true, existing: true } };
-  if (state.global.breakerOpen || state.global.spendCents >= input.quotas.globalSpendLimitCents) {
+  if (isGlobalBreakerOpen(state, input.quotas.globalSpendLimitCents)) {
     return { state, result: { accepted: false, code: "GLOBAL_BREAKER" } };
   }
   const session = state.sessions[input.sessionKey] ?? emptyBucket(input.expiresAtMs);
@@ -289,7 +311,7 @@ const commitMedia = (state: LedgerState, input: ActualMediaUsage): { readonly st
   if (reservation === undefined) return { state, result: { accepted: false, code: "RESERVATION_MISSING", releasedPending: false } };
   const released = releaseUploadReservation(state, input.reservationKey, input.nowMs);
   const withoutPending = released.state;
-  if (withoutPending.global.breakerOpen || withoutPending.global.spendCents >= input.quotas.globalSpendLimitCents) {
+  if (isGlobalBreakerOpen(withoutPending, input.quotas.globalSpendLimitCents)) {
     const result: CommitMediaResult = { accepted: false, code: "GLOBAL_BREAKER", releasedPending: true };
     return { state: { ...withoutPending, mediaCommitMarkers: { ...withoutPending.mediaCommitMarkers, [input.reservationKey]: { expiresAtMs: input.nowMs + QUOTA_WINDOW_MS, result } } }, result };
   }
@@ -316,7 +338,7 @@ const commitMedia = (state: LedgerState, input: ActualMediaUsage): { readonly st
 
 const reserveUsage = (state: LedgerState, input: UsageReservation, type: "generation" | "tts"): { readonly state: LedgerState; readonly accepted: boolean } => {
   if (state.usageMarkers[input.usageKey] !== undefined) return { state, accepted: true };
-  if (state.global.breakerOpen || state.global.spendCents >= input.quotas.globalSpendLimitCents) return { state, accepted: false };
+  if (isGlobalBreakerOpen(state, input.quotas.globalSpendLimitCents)) return { state, accepted: false };
   const session = state.sessions[input.sessionKey] ?? emptyBucket(input.nowMs + QUOTA_WINDOW_MS);
   const network = state.networks[input.ipKey] ?? emptyBucket(input.nowMs + QUOTA_WINDOW_MS);
   const field = type === "generation" ? "generationCount" : "ttsCount";
@@ -343,7 +365,7 @@ const recordSpend = (state: LedgerState, input: SpendRecord): { readonly state: 
   const { cents, globalSpendLimitCents: limit } = input;
   const safeCents = Number.isSafeInteger(cents) && cents >= 0 ? cents : 0;
   const spendCents = state.global.spendCents + safeCents;
-  const breakerOpen = state.global.breakerOpen || spendCents >= limit;
+  const breakerOpen = state.global.manualBreakerOpen || spendCents >= limit;
   const next = { ...state, global: { ...state.global, spendCents, breakerOpen } };
   const result = { breakerOpen, spendCents };
   return {
@@ -358,7 +380,7 @@ const reserveSpend = (state: LedgerState, input: SpendReservation): { readonly s
     return { state, result: { accepted: true, existing: true, ...existing.result } };
   }
   const maxCents = Number.isSafeInteger(input.maxCents) && input.maxCents > 0 ? input.maxCents : 0;
-  if (maxCents === 0 || state.global.breakerOpen || state.global.spendCents >= input.globalSpendLimitCents) {
+  if (maxCents === 0 || isGlobalBreakerOpen(state, input.globalSpendLimitCents)) {
     return { state, result: { accepted: false, code: "GLOBAL_BREAKER" } };
   }
   if (state.global.spendCents + maxCents > input.globalSpendLimitCents) {
@@ -369,7 +391,7 @@ const reserveSpend = (state: LedgerState, input: SpendReservation): { readonly s
   const result = { breakerOpen, spendCents };
   const next: LedgerState = {
     ...state,
-    global: { ...state.global, spendCents, breakerOpen: state.global.breakerOpen || breakerOpen },
+    global: { ...state.global, spendCents, breakerOpen },
     spendMarkers: {
       ...state.spendMarkers,
       [input.spendKey]: {
@@ -384,12 +406,15 @@ const reserveSpend = (state: LedgerState, input: SpendReservation): { readonly s
 
 const finalizeSpend = (state: LedgerState, input: SpendFinalization): { readonly state: LedgerState; readonly result: { readonly persisted: boolean; readonly breakerOpen: boolean; readonly spendCents: number } } => {
   const marker = state.spendMarkers[input.spendKey];
-  if (marker === undefined) return { state, result: { persisted: false, breakerOpen: state.global.breakerOpen, spendCents: state.global.spendCents } };
+  if (marker === undefined) return { state, result: { persisted: false, breakerOpen: isGlobalBreakerOpen(state, input.globalSpendLimitCents), spendCents: state.global.spendCents } };
   if (marker.finalizedCents !== undefined) return { state, result: { persisted: true, ...marker.result } };
   const actualCents = Number.isSafeInteger(input.actualCents) && input.actualCents >= 0 ? input.actualCents : marker.reservedCents ?? 0;
   const reservedCents = marker.reservedCents ?? 0;
   const spendCents = Math.max(0, state.global.spendCents + actualCents - reservedCents);
-  const breakerOpen = state.global.breakerOpen || spendCents >= input.globalSpendLimitCents;
+  // A cap-derived reservation open is reversible: authoritative lower usage
+  // reopens processing unless an operator hard-open remains or total spends
+  // and holds still meet the cap.
+  const breakerOpen = state.global.manualBreakerOpen || spendCents >= input.globalSpendLimitCents;
   const result = { breakerOpen, spendCents };
   const next: LedgerState = {
     ...state,
@@ -402,7 +427,15 @@ const finalizeSpend = (state: LedgerState, input: SpendFinalization): { readonly
   return { state: next, result: { persisted: true, ...result } };
 };
 
-const isGlobalBreakerOpen = (state: LedgerState, limit: number): boolean => state.global.breakerOpen || state.global.spendCents >= limit;
+const isGlobalBreakerOpen = (state: LedgerState, limit: number): boolean => state.global.manualBreakerOpen || state.global.spendCents >= limit;
+
+const setManualBreaker = (state: LedgerState, input: ManualBreakerSetting): { readonly state: LedgerState; readonly breakerOpen: boolean } => {
+  const breakerOpen = input.open || state.global.spendCents >= input.globalSpendLimitCents;
+  return {
+    state: { ...state, global: { ...state.global, manualBreakerOpen: input.open, breakerOpen } },
+    breakerOpen,
+  };
+};
 
 const reserveTurnstileSession = (state: LedgerState, input: TurnstileSessionReservation): { readonly state: LedgerState; readonly result: TurnstileSessionResult } => {
   const existing = state.turnstileSessions[input.challengeKey];
@@ -447,6 +480,7 @@ type LedgerAction =
   | { readonly type: "reserve-generation" | "reserve-tts"; readonly nowMs: number; readonly input: UsageReservation }
   | { readonly type: "reserve-spend"; readonly nowMs: number; readonly input: SpendReservation }
   | { readonly type: "finalize-spend"; readonly nowMs: number; readonly input: SpendFinalization }
+  | { readonly type: "set-manual-breaker"; readonly nowMs: number; readonly input: ManualBreakerSetting }
   | { readonly type: "record-spend"; readonly nowMs: number; readonly input: SpendRecord }
   | { readonly type: "check-breaker"; readonly nowMs: number; readonly limit: number }
   | { readonly type: "reserve-turnstile-session"; readonly nowMs: number; readonly input: TurnstileSessionReservation }
@@ -481,6 +515,10 @@ const applyAction = (state: LedgerState, action: LedgerAction): { readonly state
   if (action.type === "finalize-spend") {
     const applied = finalizeSpend(state, action.input);
     return { state: applied.state, value: applied.result };
+  }
+  if (action.type === "set-manual-breaker") {
+    const applied = setManualBreaker(state, action.input);
+    return { state: applied.state, value: { open: applied.breakerOpen } };
   }
   if (action.type === "check-breaker") return { state, value: { open: isGlobalBreakerOpen(state, action.limit) } };
   if (action.type === "reserve-turnstile-session") {
@@ -527,6 +565,7 @@ export class InMemoryQuotaLedger implements QuotaLedgerPort {
       global: {
         expiresAtMs: Number.MAX_SAFE_INTEGER,
         spendCents: options.globalSpendCents ?? 0,
+        manualBreakerOpen: options.globalBreakerOpen ?? false,
         breakerOpen: options.globalBreakerOpen ?? false,
       },
     };
@@ -548,6 +587,7 @@ export class InMemoryQuotaLedger implements QuotaLedgerPort {
   public finalizeSpend(input: SpendFinalization): Promise<{ readonly persisted: boolean; readonly breakerOpen: boolean; readonly spendCents: number }> {
     return Promise.resolve(this.apply({ type: "finalize-spend", nowMs: input.nowMs, input }) as { readonly persisted: boolean; readonly breakerOpen: boolean; readonly spendCents: number });
   }
+  public setManualBreaker(input: ManualBreakerSetting): Promise<boolean> { return Promise.resolve((this.apply({ type: "set-manual-breaker", nowMs: input.nowMs, input }) as { readonly open: boolean }).open); }
   public recordSpend(input: SpendRecord): Promise<{ readonly breakerOpen: boolean; readonly spendCents: number }> {
     return Promise.resolve(this.apply({ type: "record-spend", nowMs: input.nowMs, input }) as { readonly breakerOpen: boolean; readonly spendCents: number });
   }
@@ -585,6 +625,7 @@ export class DurableObjectQuotaLedger implements QuotaLedgerPort {
   public async reserveTts(input: UsageReservation): Promise<boolean> { return (await this.call<{ readonly accepted: boolean }>({ type: "reserve-tts", nowMs: input.nowMs, input })).accepted; }
   public reserveSpend(input: SpendReservation): Promise<SpendReservationResult> { return this.call({ type: "reserve-spend", nowMs: input.nowMs, input }); }
   public finalizeSpend(input: SpendFinalization): Promise<{ readonly persisted: boolean; readonly breakerOpen: boolean; readonly spendCents: number }> { return this.call({ type: "finalize-spend", nowMs: input.nowMs, input }); }
+  public async setManualBreaker(input: ManualBreakerSetting): Promise<boolean> { return (await this.call<{ readonly open: boolean }>({ type: "set-manual-breaker", nowMs: input.nowMs, input })).open; }
   public recordSpend(input: SpendRecord): Promise<{ readonly breakerOpen: boolean; readonly spendCents: number }> {
     return this.call({ type: "record-spend", nowMs: input.nowMs, input });
   }

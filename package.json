@@ -10,7 +10,9 @@
     "test": "pnpm -r test",
     "typecheck": "pnpm -r typecheck",
     "lint": "eslint .",
-    "verify": "pnpm lint && pnpm typecheck && pnpm test"
+    "verify": "pnpm lint && pnpm typecheck && pnpm test",
+    "deploy": "pnpm --filter @cuebench/web deploy",
+    "deploy:dry-run": "pnpm --filter @cuebench/web deploy:dry-run"
   },
   "devDependencies": {
     "@eslint/js": "10.0.1",

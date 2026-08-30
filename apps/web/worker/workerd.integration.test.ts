@@ -123,4 +123,51 @@ describe("workerd hosted upload boundary", () => {
     expect((await reconciled.json() as { readonly state: string }).state).toBe("cancelled");
     expect(await env.PROCESSING_BUCKET.head(receipt.objectKey)).toBeNull();
   });
+
+  it("keeps an invalid multipart abort non-terminal when local workerd cannot identify it as NoSuchUpload", async () => {
+    const anonymousSession = await session();
+    const created = await SELF.fetch(post("/api/uploads", {
+      projectId: "workerd-r2-abort-project",
+      operationId: "workerd-r2-abort-operation",
+      media: { byteLength: 5, durationMs: 60_000, contentType: "video/webm" },
+      disclosureAccepted: true,
+    }, anonymousSession));
+    expect(created.status).toBe(201);
+    const { operationReceipt } = await created.json() as { readonly operationReceipt: string };
+    const receipt = await verifyUploadReceipt(operationReceipt, { keyRing: { current: { id: "v1", secret: env.SESSION_HMAC_CURRENT_KEY } } }, Date.now());
+    // This object makes a NoSuchUpload abort safety-relevant: a completed
+    // object may exist even though the persisted multipart id no longer does.
+    await env.PROCESSING_BUCKET.put(receipt.objectKey, "possibly-completed-private-media");
+    const stub = env.UPLOAD_COORDINATOR.get(env.UPLOAD_COORDINATOR.idFromName(receipt.operationKey));
+
+    await runInDurableObject(stub, async (_instance, state) => {
+      const key = "cuebench-upload-coordinator-v2";
+      const record = await state.storage.get<Record<string, unknown>>(key);
+      if (record === undefined) throw new Error("expected persisted upload coordinator record");
+      await state.storage.put(key, {
+        ...record,
+        state: "pending",
+        multipartUploadId: "expired-no-such-upload",
+        expiresAtMs: Date.now() - 1,
+        completionLease: null,
+        probeLease: null,
+        workflowLease: null,
+        cancellationLease: null,
+        cleanupTarget: null,
+      });
+      await state.storage.setAlarm(Date.now() + 60_000);
+    });
+
+    expect(await runDurableObjectAlarm(stub)).toBe(true);
+    const reconciled = await stub.fetch(new Request("https://upload-coordinator.internal/", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ type: "get", nowMs: Date.now() }),
+    }));
+    // Current Miniflare reports an unknown multipart with generic 10001,
+    // not Workers R2's documented NoSuchUpload (10024). It must therefore
+    // remain explicitly recoverable rather than falsely claim deletion.
+    expect((await reconciled.json() as { readonly state: string }).state).toBe("cleanup-pending");
+    expect(await env.PROCESSING_BUCKET.head(receipt.objectKey)).not.toBeNull();
+  });
 });

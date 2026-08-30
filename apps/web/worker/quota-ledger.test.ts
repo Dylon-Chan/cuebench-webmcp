@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { InMemoryQuotaLedger } from "./quota-ledger";
-import type { AnonymousQuotaLimits } from "./env";
+import { QUOTA_WINDOW_MS, type AnonymousQuotaLimits } from "./env";
+import { InMemoryQuotaLedger, QuotaLedger } from "./quota-ledger";
 
 const quotas = (overrides: Partial<AnonymousQuotaLimits> = {}): AnonymousQuotaLimits => ({
   sessionMediaMinutes: 90,
@@ -18,6 +18,35 @@ const quotas = (overrides: Partial<AnonymousQuotaLimits> = {}): AnonymousQuotaLi
 });
 
 describe("anonymous quota reservation ledger", () => {
+  it("keeps a manually opened breaker across a rolling spend window until an operator closes it", async () => {
+    let persisted: unknown;
+    const ledger = new QuotaLedger({
+      storage: {
+        get: async <Value>(): Promise<Value | undefined> => persisted as Value | undefined,
+        put: async (_key: string, value: unknown): Promise<void> => { persisted = value; },
+      },
+    });
+    const action = async <Value>(value: unknown): Promise<Value> => {
+      const response = await ledger.fetch(new Request("https://quota-ledger.internal/", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(value),
+      }));
+      return response.json() as Promise<Value>;
+    };
+
+    await expect(action<{ readonly open: boolean }>({
+      type: "set-manual-breaker",
+      nowMs: 1_000,
+      input: { open: true, nowMs: 1_000, globalSpendLimitCents: 10 },
+    })).resolves.toEqual({ open: true });
+    await expect(action<{ readonly open: boolean }>({
+      type: "check-breaker",
+      nowMs: 1_000 + QUOTA_WINDOW_MS + 1,
+      limit: 10,
+    })).resolves.toEqual({ open: true });
+  });
+
   it("keeps no-byte upload reservations out of the committed 90-minute media window", async () => {
     const ledger = new InMemoryQuotaLedger();
     const limits = quotas();
@@ -136,6 +165,46 @@ describe("anonymous quota reservation ledger", () => {
     await expect(ledger.reserveSpend({ spendKey: "workflow:another-operation", maxCents: 2, nowMs: 1_003, globalSpendLimitCents: 10 })).resolves.toEqual({
       accepted: false,
       code: "SPEND_LIMIT",
+    });
+  });
+
+  it("reopens a cap-derived breaker when authoritative settlement lowers the aggregate spend below the cap", async () => {
+    const ledger = new InMemoryQuotaLedger();
+
+    await expect(ledger.reserveSpend({ spendKey: "workflow:cap", maxCents: 10, nowMs: 1_000, globalSpendLimitCents: 10 })).resolves.toEqual(expect.objectContaining({
+      accepted: true,
+      breakerOpen: true,
+      spendCents: 10,
+    }));
+    expect(await ledger.isGlobalBreakerOpen({ nowMs: 1_001, globalSpendLimitCents: 10 })).toBe(true);
+    await expect(ledger.finalizeSpend({ spendKey: "workflow:cap", actualCents: 1, nowMs: 1_002, globalSpendLimitCents: 10 })).resolves.toEqual({
+      persisted: true,
+      breakerOpen: false,
+      spendCents: 1,
+    });
+    expect(await ledger.isGlobalBreakerOpen({ nowMs: 1_003, globalSpendLimitCents: 10 })).toBe(false);
+  });
+
+  it("keeps an operator hard-open active after lower authoritative settlement and serializes concurrent reservations", async () => {
+    const ledger = new InMemoryQuotaLedger();
+    const limit = 10;
+    const reservations = await Promise.all([
+      ledger.reserveSpend({ spendKey: "probe:one", maxCents: 5, nowMs: 1_000, globalSpendLimitCents: limit }),
+      ledger.reserveSpend({ spendKey: "workflow:two", maxCents: 5, nowMs: 1_000, globalSpendLimitCents: limit }),
+    ]);
+    expect(reservations).toEqual([
+      expect.objectContaining({ accepted: true, spendCents: 5 }),
+      expect.objectContaining({ accepted: true, spendCents: 10, breakerOpen: true }),
+    ]);
+    await expect(ledger.setManualBreaker({ open: true, nowMs: 1_001, globalSpendLimitCents: limit })).resolves.toBe(true);
+    await Promise.all([
+      ledger.finalizeSpend({ spendKey: "probe:one", actualCents: 1, nowMs: 1_002, globalSpendLimitCents: limit }),
+      ledger.finalizeSpend({ spendKey: "workflow:two", actualCents: 1, nowMs: 1_002, globalSpendLimitCents: limit }),
+    ]);
+    expect(await ledger.isGlobalBreakerOpen({ nowMs: 1_003, globalSpendLimitCents: limit })).toBe(true);
+    await expect(ledger.reserveSpend({ spendKey: "workflow:blocked", maxCents: 1, nowMs: 1_004, globalSpendLimitCents: limit })).resolves.toEqual({
+      accepted: false,
+      code: "GLOBAL_BREAKER",
     });
   });
 });

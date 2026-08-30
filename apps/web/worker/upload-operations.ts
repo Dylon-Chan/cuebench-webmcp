@@ -6,6 +6,7 @@
  */
 
 import { DurableObjectQuotaLedger } from "./quota-ledger";
+import { classifyMultipartAbortError } from "./uploads";
 
 export type UploadOperationState =
   | "creating"
@@ -298,14 +299,6 @@ const newLease = (record: UploadOperationRecord, id: string, nowMs: number, leas
 
 const sameLease = (lease: OperationLease | null, id: string, generation: number): boolean => lease !== null && lease.id === id && lease.generation === generation;
 
-/** Cloudflare exposes terminal multipart outcomes as structured error codes. */
-const multipartAbortOutcome = (error: unknown): "already-absent" | "already-completed" | null => {
-  if (typeof error !== "object" || error === null || Array.isArray(error)) return null;
-  const code = (error as Readonly<Record<string, unknown>>).code;
-  if (code === "AlreadyCompleted") return "already-completed";
-  return code === "NoSuchUpload" || code === "AlreadyAborted" ? "already-absent" : null;
-};
-
 type CoordinatorAction =
   | { readonly type: "begin"; readonly nowMs: number; readonly input: BeginUploadOperationInput }
   | { readonly type: "attach-multipart" | "mark-create-reconciliation"; readonly nowMs: number; readonly uploadId: string }
@@ -581,8 +574,8 @@ export class UploadCoordinator {
       try {
         await bucket.resumeMultipartUpload(result.record.objectKey, target.multipartUploadId).abort();
       } catch (error) {
-        const outcome = multipartAbortOutcome(error);
-        if (outcome === "already-completed") mustDeleteObject = true;
+        const outcome = classifyMultipartAbortError(error);
+        if (outcome === "possibly-completed") mustDeleteObject = true;
         if (outcome === null) r2Acknowledged = false;
       }
     }
