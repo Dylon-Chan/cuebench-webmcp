@@ -5,7 +5,8 @@ import os
 import signal
 import subprocess
 import threading
-from collections.abc import Mapping
+import time
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from pathlib import Path
@@ -25,6 +26,26 @@ class CommandExecutionError(Exception):
 class CommandTimeoutError(CommandExecutionError):
     def __init__(self) -> None:
         super().__init__("CueBench's fixed media tool exceeded its preparation time limit.")
+
+
+class PreparationDeadline:
+    """One monotonic budget shared by every parser process in a signed job."""
+
+    def __init__(self, timeout_seconds: float, *, monotonic_clock: Callable[[], float] = time.monotonic) -> None:
+        if timeout_seconds <= 0:
+            raise MediaServiceError("PROCESSING_TIMEOUT", 504, "CueBench's media preparation timed out.")
+        self._monotonic_clock = monotonic_clock
+        self._ends_at = monotonic_clock() + timeout_seconds
+
+    def remaining_seconds(self, maximum_seconds: float) -> float:
+        remaining = self._ends_at - self._monotonic_clock()
+        if remaining <= 0:
+            raise MediaServiceError("PROCESSING_TIMEOUT", 504, "CueBench's media preparation timed out.")
+        return min(remaining, maximum_seconds)
+
+    def check(self) -> None:
+        """Fail at every bounded non-subprocess stage when the shared job budget is exhausted."""
+        self.remaining_seconds(float("inf"))
 
 
 @dataclass(frozen=True)
@@ -67,12 +88,23 @@ class SafeCommandRunner:
         executable_paths: Mapping[str, str],
         default_timeout_seconds: float,
         maximum_output_bytes: int,
+        environment: Mapping[str, str] | None = None,
     ) -> None:
         if not executable_paths or default_timeout_seconds <= 0 or maximum_output_bytes <= 0:
             raise ValueError("Invalid fixed-command runner configuration.")
         self._executable_paths = dict(executable_paths)
         self._default_timeout_seconds = default_timeout_seconds
         self._maximum_output_bytes = maximum_output_bytes
+        source_environment = os.environ if environment is None else environment
+        self._environment = {
+            "PATH": source_environment.get("PATH", "/usr/bin:/bin"),
+            "LANG": source_environment.get("LANG", "C.UTF-8"),
+            "TMPDIR": source_environment.get("TMPDIR", "/tmp"),
+        }
+
+    @property
+    def default_timeout_seconds(self) -> float:
+        return self._default_timeout_seconds
 
     @staticmethod
     def _kill_process_group(process: subprocess.Popen[bytes]) -> None:
@@ -102,6 +134,7 @@ class SafeCommandRunner:
                 shell=False,
                 close_fds=True,
                 start_new_session=True,
+                env=self._environment,
             )
         except OSError:
             raise CommandExecutionError() from None
@@ -151,15 +184,26 @@ class ProbeResult:
 
 
 class MediaTools(Protocol):
-    def probe(self, input_path: Path) -> ProbeResult: ...
+    def probe(self, input_path: Path, deadline: PreparationDeadline | None = None) -> ProbeResult: ...
 
-    def normalise_audio(self, input_path: Path, output_path: Path) -> None: ...
+    def normalise_audio(
+        self,
+        input_path: Path,
+        output_path: Path,
+        duration_ms: int,
+        maximum_pcm_bytes: int,
+        deadline: PreparationDeadline | None = None,
+    ) -> None: ...
 
-    def detect_scenes(self, input_path: Path, duration_ms: int, maximum_count: int) -> list[int]: ...
+    def detect_scenes(
+        self, input_path: Path, duration_ms: int, maximum_count: int, deadline: PreparationDeadline | None = None
+    ) -> list[int]: ...
 
-    def extract_thumbnail(self, input_path: Path, at_ms: int, output_path: Path) -> None: ...
+    def extract_thumbnail(
+        self, input_path: Path, at_ms: int, output_path: Path, deadline: PreparationDeadline | None = None
+    ) -> None: ...
 
-    def versions(self) -> dict[str, str]: ...
+    def versions(self, deadline: PreparationDeadline | None = None) -> dict[str, str]: ...
 
 
 def _tool_error() -> MediaServiceError:
@@ -193,9 +237,16 @@ class FFmpegMediaTools:
     def __init__(self, runner: CommandRunner) -> None:
         self._runner = runner
 
-    def probe(self, input_path: Path) -> ProbeResult:
+    def _run(self, argv: list[str], deadline: PreparationDeadline | None = None) -> CommandResult:
+        timeout = None
+        if deadline is not None:
+            maximum = self._runner.default_timeout_seconds if isinstance(self._runner, SafeCommandRunner) else 60.0
+            timeout = deadline.remaining_seconds(maximum)
+        return self._runner.run(argv, timeout_seconds=timeout)
+
+    def probe(self, input_path: Path, deadline: PreparationDeadline | None = None) -> ProbeResult:
         try:
-            output = self._runner.run(
+            output = self._run(
                 [
                     "ffprobe",
                     "-v",
@@ -205,11 +256,14 @@ class FFmpegMediaTools:
                     "-of",
                     "json",
                     str(input_path),
-                ]
+                ],
+                deadline,
             )
             if output.stdout_truncated:
                 raise _tool_error()
             decoded = json.loads(output.stdout)
+        except CommandTimeoutError:
+            raise MediaServiceError("PROCESSING_TIMEOUT", 504, "CueBench's media preparation timed out.") from None
         except (CommandExecutionError, json.JSONDecodeError, UnicodeDecodeError):
             raise _tool_error() from None
         if not isinstance(decoded, dict):
@@ -249,9 +303,18 @@ class FFmpegMediaTools:
             raise _tool_error()
         return ProbeResult(container, mime_type, codec, duration_ms, actual_size)
 
-    def normalise_audio(self, input_path: Path, output_path: Path) -> None:
+    def normalise_audio(
+        self,
+        input_path: Path,
+        output_path: Path,
+        duration_ms: int,
+        maximum_pcm_bytes: int,
+        deadline: PreparationDeadline | None = None,
+    ) -> None:
+        if duration_ms <= 0 or maximum_pcm_bytes <= 44:
+            raise _tool_error()
         try:
-            self._runner.run(
+            self._run(
                 [
                     "ffmpeg",
                     "-hide_banner",
@@ -260,6 +323,8 @@ class FFmpegMediaTools:
                     "error",
                     "-i",
                     str(input_path),
+                    "-t",
+                    f"{duration_ms / 1_000:.3f}",
                     "-map",
                     "0:a:0",
                     "-vn",
@@ -271,18 +336,28 @@ class FFmpegMediaTools:
                     "pcm_s16le",
                     "-f",
                     "wav",
+                    "-fs",
+                    str(maximum_pcm_bytes),
                     "-y",
                     str(output_path),
-                ]
+                ],
+                deadline,
             )
         except CommandTimeoutError:
             raise MediaServiceError("PROCESSING_TIMEOUT", 504, "CueBench's media preparation timed out.") from None
         except CommandExecutionError:
             raise _tool_error() from None
-
-    def detect_scenes(self, input_path: Path, duration_ms: int, maximum_count: int) -> list[int]:
         try:
-            result = self._runner.run(
+            if output_path.stat().st_size <= 44 or output_path.stat().st_size > maximum_pcm_bytes:
+                raise _tool_error()
+        except OSError:
+            raise _tool_error() from None
+
+    def detect_scenes(
+        self, input_path: Path, duration_ms: int, maximum_count: int, deadline: PreparationDeadline | None = None
+    ) -> list[int]:
+        try:
+            result = self._run(
                 [
                     "ffmpeg",
                     "-hide_banner",
@@ -291,6 +366,8 @@ class FFmpegMediaTools:
                     "info",
                     "-i",
                     str(input_path),
+                    "-t",
+                    f"{duration_ms / 1_000:.3f}",
                     "-filter:v",
                     "select='gt(scene,0.35)',showinfo",
                     "-frames:v",
@@ -299,18 +376,23 @@ class FFmpegMediaTools:
                     "-f",
                     "null",
                     "-",
-                ]
+                ],
+                deadline,
             )
         except CommandTimeoutError:
             raise MediaServiceError("PROCESSING_TIMEOUT", 504, "CueBench's media preparation timed out.") from None
         except CommandExecutionError:
             raise _tool_error() from None
+        if result.stdout_truncated or result.stderr_truncated:
+            raise _tool_error()
         return parse_scene_timestamps(result.stderr, duration_ms, maximum_count)
 
-    def extract_thumbnail(self, input_path: Path, at_ms: int, output_path: Path) -> None:
+    def extract_thumbnail(
+        self, input_path: Path, at_ms: int, output_path: Path, deadline: PreparationDeadline | None = None
+    ) -> None:
         seek_seconds = f"{at_ms / 1_000:.3f}"
         try:
-            self._runner.run(
+            self._run(
                 [
                     "ffmpeg",
                     "-hide_banner",
@@ -321,6 +403,8 @@ class FFmpegMediaTools:
                     seek_seconds,
                     "-i",
                     str(input_path),
+                    "-t",
+                    "1",
                     "-frames:v",
                     "1",
                     "-vf",
@@ -337,18 +421,19 @@ class FFmpegMediaTools:
                     "webp",
                     "-y",
                     str(output_path),
-                ]
+                ],
+                deadline,
             )
         except CommandTimeoutError:
             raise MediaServiceError("PROCESSING_TIMEOUT", 504, "CueBench's media preparation timed out.") from None
         except CommandExecutionError:
             raise _tool_error() from None
 
-    def versions(self) -> dict[str, str]:
+    def versions(self, deadline: PreparationDeadline | None = None) -> dict[str, str]:
         versions: dict[str, str] = {}
         try:
             for executable in ("ffmpeg", "ffprobe"):
-                result = self._runner.run([executable, "-version"])
+                result = self._run([executable, "-version"], deadline)
                 if result.stdout_truncated or not result.stdout:
                     raise CommandExecutionError()
                 versions[executable] = result.stdout.decode("ascii", errors="replace").splitlines()[0]

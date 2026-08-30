@@ -4,14 +4,21 @@ import hashlib
 import wave
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Protocol
 
 from .models import MediaServiceError
 
 
-def sha256_file(path: Path) -> str:
+class DeadlineCheck(Protocol):
+    def check(self) -> None: ...
+
+
+def sha256_file(path: Path, deadline: DeadlineCheck | None = None) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as source:
         while chunk := source.read(1024 * 1024):
+            if deadline is not None:
+                deadline.check()
             digest.update(chunk)
     return digest.hexdigest()
 
@@ -35,7 +42,7 @@ class NormalizedAudioFacts:
         }
 
 
-def normalized_audio_facts(path: Path) -> NormalizedAudioFacts:
+def normalized_audio_facts(path: Path, deadline: DeadlineCheck | None = None) -> NormalizedAudioFacts:
     try:
         with wave.open(str(path), "rb") as source:
             if (
@@ -48,7 +55,7 @@ def normalized_audio_facts(path: Path) -> NormalizedAudioFacts:
     except (OSError, wave.Error):
         raise MediaServiceError("AUDIO_INVALID", 422, "CueBench could not read normalized media audio.") from None
     return NormalizedAudioFacts(
-        sha256=sha256_file(path),
+        sha256=sha256_file(path, deadline),
         byte_length=path.stat().st_size,
         sample_rate_hz=16_000,
         channels=1,

@@ -1,11 +1,22 @@
 import { configDefaults, defineConfig } from "vitest/config";
+import { fileURLToPath } from "node:url";
 import { cloudflare } from "@cloudflare/vite-plugin";
 import react from "@vitejs/plugin-react";
 import tailwindcss from "@tailwindcss/vite";
 
 export default defineConfig({
   // Cloudflare owns the production/runtime boundary while React and Tailwind still own the SPA transform pipeline.
-  plugins: [...cloudflare({ configPath: "./wrangler.jsonc", inspectorPort: false }), react(), tailwindcss()],
+  // Unit tests exercise adapters with fixtures; asking Vite to start the
+  // configured Container would pull/build an image before a test is collected.
+  // Workerd integration retains the actual Worker configuration separately.
+  plugins: [...(process.env.VITEST === "true" ? [] : cloudflare({ configPath: "./wrangler.jsonc", inspectorPort: false })), react(), tailwindcss()],
+  ...(process.env.VITEST === "true" ? {
+    resolve: {
+      alias: {
+        "cloudflare:workers": fileURLToPath(new URL("./worker/testing/cloudflare-workers-shim.ts", import.meta.url)),
+      },
+    },
+  } : {}),
   build: {
     assetsInlineLimit: 0,
     rollupOptions: {

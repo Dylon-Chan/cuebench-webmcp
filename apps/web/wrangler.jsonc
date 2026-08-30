@@ -24,9 +24,25 @@
       {
         "name": "UPLOAD_COORDINATOR",
         "class_name": "UploadCoordinator"
+      },
+      {
+        "name": "MEDIA_PREPARER",
+        "class_name": "MediaPreparationContainer"
       }
     ]
   },
+  "containers": [
+    {
+      "class_name": "MediaPreparationContainer",
+      "image": "../../services/media/Dockerfile",
+      "image_build_context": "../../services/media",
+      "instance_type": "basic",
+      "max_instances": 2,
+      "constraints": {
+        "regions": ["APAC"]
+      }
+    }
+  ],
   "migrations": [
     {
       "tag": "v1",
@@ -35,6 +51,10 @@
     {
       "tag": "v2",
       "new_sqlite_classes": ["UploadCoordinator"]
+    },
+    {
+      "tag": "v3",
+      "new_sqlite_classes": ["MediaPreparationContainer"]
     }
   ],
   "vars": {

@@ -1,6 +1,6 @@
 [
   {
-    "name": "current-key-canonical-job",
+    "name": "current-key-canonical-probe-job",
     "current_key": {
       "id": "media-current",
       "secret": "media-current-signing-fixture-secret-1234567890"
@@ -10,9 +10,12 @@
       "secret": "media-previous-signing-fixture-secret-123456789"
     },
     "job": {
+      "action": "probe",
       "operation_id": "operation_fixture_01",
       "operation_key": "a6ed777796c212c7dca6b14b7c4be683a167266c9d49ab5220db9d7b6ff9a01c",
       "input_key": "processing/f8ca4f0b30bb8b47aa0e949d97a46cd0b6cce7f07c1e5421e2b304ef7ec2b260/a6ed777796c212c7dca6b14b7c4be683a167266c9d49ab5220db9d7b6ff9a01c",
+      "input_byte_length": 5,
+      "input_content_type": "video/webm",
       "output_prefix": "prepared/a6ed777796c212c7dca6b14b7c4be683a167266c9d49ab5220db9d7b6ff9a01c/",
       "operation_receipt": "fixture-receipt-v1",
       "receipt_sha256": "3736879aacc41e946bc619c0a2521658915c1d27ca40b5bae6b65ae047b82a6f",
@@ -20,6 +23,6 @@
       "issued_at_ms": 1700000000000,
       "expires_at_ms": 1700000600000
     },
-    "token": "eyJjb250cmFjdF92ZXJzaW9uIjoxLCJleHBpcmVzX2F0X21zIjoxNzAwMDAwNjAwMDAwLCJpZGVtcG90ZW5jeV9rZXkiOiJwcm9iZTphNmVkNzc3Nzk2YzIxMmM3ZGNhNmIxNGI3YzRiZTY4M2ExNjcyNjZjOWQ0OWFiNTIyMGRiOWQ3YjZmZjlhMDFjIiwiaW5wdXRfa2V5IjoicHJvY2Vzc2luZy9mOGNhNGYwYjMwYmI4YjQ3YWEwZTk0OWQ5N2E0NmNkMGI2Y2NlN2YwN2MxZTU0MjFlMmIzMDRlZjdlYzJiMjYwL2E2ZWQ3Nzc3OTZjMjEyYzdkY2E2YjE0YjdjNGJlNjgzYTE2NzI2NmM5ZDQ5YWI1MjIwZGI5ZDdiNmZmOWEwMWMiLCJpc3N1ZWRfYXRfbXMiOjE3MDAwMDAwMDAwMDAsImtleV9pZCI6Im1lZGlhLWN1cnJlbnQiLCJvcGVyYXRpb25faWQiOiJvcGVyYXRpb25fZml4dHVyZV8wMSIsIm9wZXJhdGlvbl9rZXkiOiJhNmVkNzc3Nzk2YzIxMmM3ZGNhNmIxNGI3YzRiZTY4M2ExNjcyNjZjOWQ0OWFiNTIyMGRiOWQ3YjZmZjlhMDFjIiwib3V0cHV0X3ByZWZpeCI6InByZXBhcmVkL2E2ZWQ3Nzc3OTZjMjEyYzdkY2E2YjE0YjdjNGJlNjgzYTE2NzI2NmM5ZDQ5YWI1MjIwZGI5ZDdiNmZmOWEwMWMvIiwicmVjZWlwdF9zaGEyNTYiOiIzNzM2ODc5YWFjYzQxZTk0NmJjNjE5YzBhMjUyMTY1ODkxNWMxZDI3Y2E0MGI1YmFlNmI2NWFlMDQ3YjgyYTZmIiwidHlwZSI6ImN1ZWJlbmNoLW1lZGlhLWpvYiJ9.1BUfNi78nJgmbrQwi9RC9Tu_ZSM-WybVmtg-6AopkV0"
+    "signature": "Wg6kdIAGtlypni03QB1ATPzjoxH8zBr74sWvrrpOIhU"
   }
 ]

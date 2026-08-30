@@ -28,7 +28,7 @@ const streamedApiResponse = (result, status = 200) => {
 };
 
 describe("CueBench R2 lifecycle deployment policy", () => {
-  it("declares enabled processing-prefix deletion and multipart-abort transitions at no more than 24 hours", () => {
+  it("declares enabled processing and prepared deletion plus processing multipart-abort transitions at no more than 24 hours", () => {
     expect(validateLifecyclePolicy(PROCESSING_LIFECYCLE_POLICY)).toEqual(PROCESSING_LIFECYCLE_POLICY);
     expect(() => validateLifecyclePolicy({
       ...PROCESSING_LIFECYCLE_POLICY,
@@ -36,6 +36,10 @@ describe("CueBench R2 lifecycle deployment policy", () => {
         ? { ...rule, deleteObjectsTransition: { condition: { type: "Age", maxAge: 86_401 } } }
         : rule),
     })).toThrow(LifecyclePolicyError);
+    expect(() => validateLifecyclePolicy({
+      ...PROCESSING_LIFECYCLE_POLICY,
+      rules: PROCESSING_LIFECYCLE_POLICY.rules.filter((rule) => rule.id !== "cuebench-prepared-expire-24h"),
+    })).toThrow(/prepared/);
   });
 
   it("preflights the checked-in declarative policy without credentials or network access", async () => {

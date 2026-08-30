@@ -9,7 +9,7 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Final
+from typing import Final, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -40,6 +40,10 @@ def private_path_error() -> MediaServiceError:
 
 def invalid_job_error() -> MediaServiceError:
     return MediaServiceError("JOB_INVALID", 401, "CueBench could not verify the internal media job.")
+
+
+def wrong_job_action_error() -> MediaServiceError:
+    return MediaServiceError("JOB_ACTION", 403, "CueBench rejected this internal media job purpose.")
 
 
 @dataclass(frozen=True)
@@ -73,9 +77,12 @@ class MediaJobKeyRing:
 class InternalMediaJob:
     """The job-scoped, signed capability presented only by internal callers."""
 
+    action: Literal["probe", "prepare"]
     operation_id: str
     operation_key: str
     input_key: str
+    input_byte_length: int
+    input_content_type: Literal["video/mp4", "video/webm"]
     output_prefix: str
     receipt_sha256: str
     idempotency_key: str
@@ -98,9 +105,12 @@ def _base64url_decode(value: str) -> bytes:
 def _payload(job: InternalMediaJob, key_id: str) -> bytes:
     return json.dumps(
         {
+            "action": job.action,
             "contract_version": CONTRACT_VERSION,
             "expires_at_ms": job.expires_at_ms,
             "idempotency_key": job.idempotency_key,
+            "input_byte_length": job.input_byte_length,
+            "input_content_type": job.input_content_type,
             "input_key": job.input_key,
             "issued_at_ms": job.issued_at_ms,
             "key_id": key_id,
@@ -133,11 +143,32 @@ def _without_duplicate_keys(pairs: list[tuple[str, object]]) -> dict[str, object
     return result
 
 
-def _required_job_fields(value: object) -> tuple[str, str, str, str, str, str, str, int, int] | None:
+def _required_job_fields(
+    value: object,
+) -> (
+    tuple[
+        Literal["probe", "prepare"],
+        str,
+        str,
+        str,
+        str,
+        int,
+        Literal["video/mp4", "video/webm"],
+        str,
+        str,
+        str,
+        int,
+        int,
+    ]
+    | None
+):
     if not isinstance(value, dict) or set(value) != {
+        "action",
         "contract_version",
         "expires_at_ms",
         "idempotency_key",
+        "input_byte_length",
+        "input_content_type",
         "input_key",
         "issued_at_ms",
         "key_id",
@@ -148,17 +179,21 @@ def _required_job_fields(value: object) -> tuple[str, str, str, str, str, str, s
         "type",
     }:
         return None
+    action = value.get("action")
     key_id = value.get("key_id")
     operation_id = value.get("operation_id")
     operation_key = value.get("operation_key")
     input_key = value.get("input_key")
+    input_byte_length = value.get("input_byte_length")
+    input_content_type = value.get("input_content_type")
     output_prefix = value.get("output_prefix")
     receipt_sha256 = value.get("receipt_sha256")
     idempotency_key = value.get("idempotency_key")
     issued_at_ms = value.get("issued_at_ms")
     expires_at_ms = value.get("expires_at_ms")
     if (
-        value.get("type") != "cuebench-media-job"
+        action not in {"probe", "prepare"}
+        or value.get("type") != "cuebench-media-job"
         or value.get("contract_version") != CONTRACT_VERSION
         or not isinstance(key_id, str)
         or not _KEY_ID.fullmatch(key_id)
@@ -167,6 +202,11 @@ def _required_job_fields(value: object) -> tuple[str, str, str, str, str, str, s
         or not isinstance(operation_key, str)
         or not _OPERATION_KEY.fullmatch(operation_key)
         or not isinstance(input_key, str)
+        or isinstance(input_byte_length, bool)
+        or not isinstance(input_byte_length, int)
+        or input_byte_length <= 0
+        or input_byte_length > 500 * 1024 * 1024
+        or input_content_type not in {"video/mp4", "video/webm"}
         or not isinstance(output_prefix, str)
         or not isinstance(receipt_sha256, str)
         or not _RECEIPT_SHA256.fullmatch(receipt_sha256)
@@ -180,14 +220,17 @@ def _required_job_fields(value: object) -> tuple[str, str, str, str, str, str, s
     if (
         re.fullmatch(rf"processing/[a-f0-9]{{64}}/{operation_key}", input_key) is None
         or output_prefix != f"prepared/{operation_key}/"
-        or idempotency_key != f"probe:{operation_key}"
+        or idempotency_key != f"{action}:{operation_key}"
     ):
         return None
     return (
+        action,
         key_id,
         operation_id,
         operation_key,
         input_key,
+        input_byte_length,
+        input_content_type,
         output_prefix,
         receipt_sha256,
         idempotency_key,
@@ -203,6 +246,7 @@ def verify_internal_job(
     *,
     maximum_future_issued_ms: int = MAX_FUTURE_ISSUED_MS,
     maximum_lifetime_ms: int = MAX_JOB_LIFETIME_MS,
+    expected_action: Literal["probe", "prepare"] | None = None,
 ) -> InternalMediaJob:
     """Verifies integrity before lifecycle semantics, including the one-key rotation window."""
 
@@ -222,10 +266,13 @@ def verify_internal_job(
     if fields is None:
         raise invalid_job_error()
     (
+        action,
         key_id,
         operation_id,
         operation_key,
         input_key,
+        input_byte_length,
+        input_content_type,
         output_prefix,
         receipt_sha256,
         idempotency_key,
@@ -233,9 +280,12 @@ def verify_internal_job(
         expires_at_ms,
     ) = fields
     job = InternalMediaJob(
+        action=action,
         operation_id=operation_id,
         operation_key=operation_key,
         input_key=input_key,
+        input_byte_length=input_byte_length,
+        input_content_type=input_content_type,
         output_prefix=output_prefix,
         receipt_sha256=receipt_sha256,
         idempotency_key=idempotency_key,
@@ -256,6 +306,8 @@ def verify_internal_job(
         raise MediaServiceError("JOB_EXPIRED", 401, "This internal media job has expired.")
     if issued_at_ms > now_ms + maximum_future_issued_ms:
         raise MediaServiceError("JOB_NOT_YET_VALID", 401, "This internal media job is not yet valid.")
+    if expected_action is not None and job.action != expected_action:
+        raise wrong_job_action_error()
     return job
 
 
@@ -265,8 +317,11 @@ def job_fingerprint(job: InternalMediaJob) -> str:
     return hashlib.sha256(
         json.dumps(
             {
+                "action": job.action,
                 "contract_version": CONTRACT_VERSION,
                 "idempotency_key": job.idempotency_key,
+                "input_byte_length": job.input_byte_length,
+                "input_content_type": job.input_content_type,
                 "input_key": job.input_key,
                 "operation_id": job.operation_id,
                 "operation_key": job.operation_key,
@@ -289,6 +344,7 @@ class MediaLimits:
     max_thumbnail_width: int = 320
     max_thumbnail_height: int = 180
     max_thumbnail_bytes: int = 64 * 1024
+    max_thumbnail_total_bytes: int = 512 * 1024
     max_request_bytes: int = 16 * 1024
     max_concurrent_preparations: int = 2
     command_timeout_seconds: float = 60.0
@@ -302,6 +358,7 @@ class MediaLimits:
             or self.max_thumbnail_width <= 0
             or self.max_thumbnail_height <= 0
             or self.max_thumbnail_bytes <= 0
+            or self.max_thumbnail_total_bytes <= 0
             or self.max_request_bytes <= 0
             or self.max_concurrent_preparations <= 0
             or self.command_timeout_seconds <= 0
@@ -319,6 +376,7 @@ class MediaServiceSettings:
     output_prefix: str = "prepared/"
     limits: MediaLimits = field(default_factory=MediaLimits)
     clock: Callable[[], int] = field(default=lambda: int(time.time() * 1_000), compare=False, repr=False)
+    monotonic_clock: Callable[[], float] = field(default=time.monotonic, compare=False, repr=False)
 
     def __post_init__(self) -> None:
         if not self.input_prefix.endswith("/") or not self.output_prefix.endswith("/"):

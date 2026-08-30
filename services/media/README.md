@@ -25,6 +25,13 @@ expired, future-dated, replayed, oversized, and malformed jobs receive a
 sanitized error without exposing input paths, frame content, stderr, or project
 content.
 
+The operation-keyed Container proxy adds the private
+`x-cuebench-media-result: manifest-ref` header to a successful `/v1/prepare`
+request. That response is deliberately limited to
+`{"manifest":{"key":"...","sha256":"..."}}`; the full prepared-evidence
+shape remains available only to direct internal callers. This is the bounded
+Task 13 handoff and not a browser-facing endpoint.
+
 Configure the same dedicated secret in both private runtimes, under their
 runtime-specific names:
 
@@ -41,19 +48,28 @@ The repository ignores `.dev.vars*`, `.env*`, and `.envrc`.
 
 ## Private storage adapter
 
-`FileSystemObjectStore` is the explicit private-object adapter for local runs
-and the Container. `CUEBENCH_MEDIA_INPUT_ROOT` must contain the private object
-key hierarchy, for example
-`/data/input/processing/<session-hash>/<operation-key>`. Prepared artifacts
-are written beneath `CUEBENCH_MEDIA_OUTPUT_ROOT` using their signed
-`prepared/...` keys. Roots, prefixes, traversal, absolute paths, and symlink
-escapes are all rejected before FFmpeg receives an argument.
+`FileSystemObjectStore` is the explicit private-object adapter for local runs.
+For example, `CUEBENCH_MEDIA_INPUT_ROOT` can contain
+`/data/input/processing/<session-hash>/<operation-key>`, while
+`CUEBENCH_MEDIA_OUTPUT_ROOT` receives signed `prepared/...` keys. Roots,
+prefixes, traversal, absolute paths, and symlink escapes are rejected before
+FFmpeg receives an argument.
 
-Production deployment must privately mount or download the authorized R2 object
-into that input root and upload the resulting output tree through an equivalent
-private storage adapter. That R2 transfer/mount configuration is deployment
-wiring; it is intentionally not accepted from the browser and is not replaced
-by a public URL in this service.
+The deployed Cloudflare Container instead uses `BridgeObjectStore`. Its
+`CUEBENCH_MEDIA_STORAGE_BRIDGE_URL` is injected by the operation-keyed
+`MediaPreparationContainer` as `http://cuebench-r2.internal`; it is not a
+browser input. The Container has no R2 binding or R2 credentials. Its sole
+outbound handler runs in the Worker, rechecks the signed job and Durable Object
+operation fence, downloads only the exact signed `processing/` key, and permits
+conditional, hash-verified GET/HEAD/PUT only beneath that job's derived
+`prepared/` prefix. It never offers list or delete. This is the production
+private R2 mount/download-and-publication adapter, not a future no-op.
+
+The Worker config supplies the Container Durable Object binding, SQLite
+migration, bounded APAC/basic instance policy, and the R2 binding. In local
+development, mount private media into the two file-system roots instead of
+providing a public object URL. Browser code never supplies a host path, R2 key,
+or storage credential.
 
 Run locally only with the deterministic uv environment:
 
@@ -65,5 +81,15 @@ source .venv/bin/activate
 uv run pytest -q
 ```
 
-The Docker image installs FFmpeg/FFprobe, runs as an unprivileged user, and has
-a liveness health check at `/healthz`.
+## Image reproducibility
+
+The Dockerfile pins the Docker Official Python 3.12.13 Bookworm image and the
+official Astral uv 0.10.12 image by digest, and pins Debian Bookworm FFmpeg to
+`7:5.1.9-0+deb12u1`. During the build it generates deterministic short media
+and runs real probe/prepare assertions before producing the non-root runtime
+image. `/healthz` fails closed unless ffmpeg, ffprobe, and the selected storage
+adapter are available.
+
+Environment note: if a developer machine cannot reach the official image
+registry, the image build is unavailable until registry access is restored; do
+not substitute an unpinned base image or package version.

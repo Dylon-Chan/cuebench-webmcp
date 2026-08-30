@@ -21,6 +21,12 @@ export const PROCESSING_LIFECYCLE_POLICY = Object.freeze({
       deleteObjectsTransition: Object.freeze({ condition: Object.freeze({ type: "Age", maxAge: MAX_AGE_SECONDS }) }),
     }),
     Object.freeze({
+      id: "cuebench-prepared-expire-24h",
+      enabled: true,
+      conditions: Object.freeze({ prefix: "prepared/" }),
+      deleteObjectsTransition: Object.freeze({ condition: Object.freeze({ type: "Age", maxAge: MAX_AGE_SECONDS }) }),
+    }),
+    Object.freeze({
       id: "cuebench-processing-abort-multipart-24h",
       enabled: true,
       conditions: Object.freeze({ prefix: "processing/" }),
@@ -48,13 +54,13 @@ const requiredAgeTransition = (value) => {
     && condition.maxAge <= MAX_AGE_SECONDS;
 };
 
-const hasRequiredRule = (rules, id, transition) => rules.some((candidate) => {
+const hasRequiredRule = (rules, id, prefix, transition) => rules.some((candidate) => {
   const rule = asRecord(candidate);
   const conditions = rule === null ? null : asRecord(rule.conditions);
   return rule !== null
     && rule.id === id
     && rule.enabled === true
-    && conditions?.prefix === "processing/"
+    && conditions?.prefix === prefix
     && requiredAgeTransition(rule[transition]);
 });
 
@@ -64,10 +70,13 @@ export const validateLifecyclePolicy = (value) => {
   if (policy === null || policy.version !== 1 || typeof policy.bucketName !== "string" || !/^[a-z0-9][a-z0-9-]{1,62}$/.test(policy.bucketName) || !Array.isArray(policy.rules)) {
     throw new LifecyclePolicyError("CueBench R2 lifecycle policy is missing a valid version, bucket name, or rules array.");
   }
-  if (!hasRequiredRule(policy.rules, "cuebench-processing-expire-24h", "deleteObjectsTransition")) {
+  if (!hasRequiredRule(policy.rules, "cuebench-processing-expire-24h", "processing/", "deleteObjectsTransition")) {
     throw new LifecyclePolicyError("CueBench R2 lifecycle policy must delete completed processing/ objects within 24 hours.");
   }
-  if (!hasRequiredRule(policy.rules, "cuebench-processing-abort-multipart-24h", "abortMultipartUploadsTransition")) {
+  if (!hasRequiredRule(policy.rules, "cuebench-prepared-expire-24h", "prepared/", "deleteObjectsTransition")) {
+    throw new LifecyclePolicyError("CueBench R2 lifecycle policy must delete completed prepared/ objects within 24 hours.");
+  }
+  if (!hasRequiredRule(policy.rules, "cuebench-processing-abort-multipart-24h", "processing/", "abortMultipartUploadsTransition")) {
     throw new LifecyclePolicyError("CueBench R2 lifecycle policy must abort incomplete processing/ multipart uploads within 24 hours.");
   }
   return policy;

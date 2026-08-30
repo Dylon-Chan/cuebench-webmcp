@@ -3,21 +3,25 @@ from __future__ import annotations
 import base64
 import hashlib
 import hmac
+import io
 import json
 import os
 import sys
+import threading
 import time
+import urllib.error
 from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
 
-from cuebench_media.app import create_app, create_app_from_environment
+from cuebench_media.app import BridgeObjectStore, FileSystemObjectStore, create_app, create_app_from_environment
 from cuebench_media.models import (
     InternalMediaJob,
     MediaJobKey,
     MediaJobKeyRing,
     MediaLimits,
+    MediaServiceError,
     MediaServiceSettings,
     sign_internal_job,
     verify_internal_job,
@@ -32,31 +36,397 @@ def operation_key_for(operation_id: str) -> str:
 
 
 class MinimalTools:
-    def probe(self, input_path: Path):  # type: ignore[no-untyped-def]
+    def probe(self, input_path: Path, deadline: object | None = None):  # type: ignore[no-untyped-def]
         from cuebench_media.probe import ProbeResult
 
+        del deadline
         return ProbeResult("mp4", "video/mp4", "h264", 1_000, input_path.stat().st_size)
 
-    def normalise_audio(self, input_path: Path, output_path: Path) -> None:
+    def normalise_audio(
+        self,
+        input_path: Path,
+        output_path: Path,
+        duration_ms: int,
+        maximum_pcm_bytes: int,
+        deadline: object | None = None,
+    ) -> None:
         import struct
         import wave
 
-        del input_path
+        del input_path, duration_ms, maximum_pcm_bytes, deadline
         with wave.open(str(output_path), "wb") as wav:
             wav.setnchannels(1)
             wav.setsampwidth(2)
             wav.setframerate(16_000)
             wav.writeframes(struct.pack("<h", 0) * 16_000)
 
-    def detect_scenes(self, input_path: Path, duration_ms: int, maximum_count: int) -> list[int]:
-        del input_path, duration_ms, maximum_count
+    def detect_scenes(
+        self, input_path: Path, duration_ms: int, maximum_count: int, deadline: object | None = None
+    ) -> list[int]:
+        del input_path, duration_ms, maximum_count, deadline
         return []
 
-    def extract_thumbnail(self, input_path: Path, at_ms: int, output_path: Path) -> None:
+    def extract_thumbnail(
+        self, input_path: Path, at_ms: int, output_path: Path, deadline: object | None = None
+    ) -> None:
+        del input_path, at_ms, output_path, deadline
         raise AssertionError("No scene should request a thumbnail")
 
-    def versions(self) -> dict[str, str]:
+    def versions(self, deadline: object | None = None) -> dict[str, str]:
+        del deadline
         return {"ffmpeg": "fixture", "ffprobe": "fixture"}
+
+
+class FakeBridgeResponse:
+    def __init__(self, body: bytes, *, status: int, headers: dict[str, str]) -> None:
+        self._body = io.BytesIO(body)
+        self.status = status
+        self.headers = headers
+
+    def __enter__(self) -> FakeBridgeResponse:
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        self._body.close()
+
+    def read(self, size: int = -1) -> bytes:
+        return self._body.read(size)
+
+
+def test_probe_scopes_the_verified_capability_to_the_private_storage_bridge(tmp_path: Path) -> None:
+    source = b"private bridge source"
+    operation_id = "operation-bridge-0001"
+    operation_key = operation_key_for(operation_id)
+    input_key = f"processing/{SESSION_KEY}/{operation_key}"
+    key_ring = MediaJobKeyRing(current=MediaJobKey("current", b"bridge-media-job-secret-for-tests-0001"))
+    settings = MediaServiceSettings(
+        key_ring=key_ring,
+        input_root=tmp_path / "unused-input",
+        output_root=tmp_path / "unused-output",
+        input_prefix="processing/",
+        output_prefix="prepared/",
+        limits=MediaLimits(max_request_bytes=4 * 1024),
+        clock=lambda: 1_000,
+    )
+    requests: list[object] = []
+
+    def opener(request: object, timeout: int) -> FakeBridgeResponse:
+        del timeout
+        requests.append(request)
+        url = request.full_url
+        if url.endswith("/healthz"):
+            return FakeBridgeResponse(b"", status=204, headers={})
+        assert request.get_method() == "GET"
+        assert url.endswith(f"/{input_key}")
+        assert request.get_header("X-cuebench-media-job")
+        return FakeBridgeResponse(
+            source,
+            status=200,
+            headers={
+                "content-type": "video/mp4",
+                "content-length": str(len(source)),
+                "x-cuebench-sha256": hashlib.sha256(source).hexdigest(),
+            },
+        )
+
+    bridge = BridgeObjectStore(
+        "http://cuebench-r2.internal",
+        input_prefix="processing/",
+        output_prefix="prepared/",
+        maximum_input_bytes=500 * 1024 * 1024,
+        opener=opener,
+    )
+    client = TestClient(create_app(settings=settings, tools=MinimalTools(), store=bridge))
+
+    response = client.post(
+        "/v1/probe",
+        json=signed_body(
+            key_ring,
+            action="probe",
+            operation_id=operation_id,
+            operation_key=operation_key,
+            input_key=input_key,
+            input_byte_length=len(source),
+            input_content_type="video/mp4",
+        ),
+    )
+
+    assert response.status_code == 200
+    assert len(requests) == 1
+
+
+def test_private_storage_bridge_maps_a_missing_input_to_a_sanitized_availability_error(tmp_path: Path) -> None:
+    operation_id = "operation-bridge-missing-0001"
+    operation_key = operation_key_for(operation_id)
+    input_key = f"processing/{SESSION_KEY}/{operation_key}"
+    key_ring = MediaJobKeyRing(current=MediaJobKey("current", b"bridge-missing-media-job-secret-for-tests"))
+    settings = MediaServiceSettings(
+        key_ring=key_ring,
+        input_root=tmp_path / "unused-input",
+        output_root=tmp_path / "unused-output",
+        input_prefix="processing/",
+        output_prefix="prepared/",
+        limits=MediaLimits(max_request_bytes=4 * 1024),
+        clock=lambda: 1_000,
+    )
+
+    def missing(request: object, timeout: int) -> FakeBridgeResponse:
+        del timeout
+        raise urllib.error.HTTPError(request.full_url, 404, "not found", {}, None)
+
+    bridge = BridgeObjectStore(
+        "http://cuebench-r2.internal",
+        input_prefix="processing/",
+        output_prefix="prepared/",
+        maximum_input_bytes=500 * 1024 * 1024,
+        opener=missing,
+    )
+    response = TestClient(create_app(settings=settings, tools=MinimalTools(), store=bridge)).post(
+        "/v1/probe",
+        json=signed_body(
+            key_ring,
+            action="probe",
+            operation_id=operation_id,
+            operation_key=operation_key,
+            input_key=input_key,
+            input_byte_length=1,
+            input_content_type="video/mp4",
+        ),
+    )
+
+    assert response.status_code == 503
+    assert response.json()["error"]["code"] == "PREPARATION_FAILED"
+    assert input_key not in response.text
+
+
+def test_private_storage_bridge_treats_a_missing_cache_pointer_as_a_cache_miss() -> None:
+    key_ring = MediaJobKeyRing(current=MediaJobKey("current", b"bridge-cache-secret-for-tests-0001"))
+    operation_key = operation_key_for("operation-bridge-cache-0001")
+    job = InternalMediaJob(
+        action="prepare",
+        operation_id="operation-bridge-cache-0001",
+        operation_key=operation_key,
+        input_key=f"processing/{SESSION_KEY}/{operation_key}",
+        input_byte_length=1,
+        input_content_type="video/mp4",
+        output_prefix=f"prepared/{operation_key}/",
+        receipt_sha256="a" * 64,
+        idempotency_key=f"prepare:{operation_key}",
+        issued_at_ms=1_000,
+        expires_at_ms=61_000,
+    )
+    token = sign_internal_job(job, key_ring)
+
+    def not_found(request: object, timeout: int) -> FakeBridgeResponse:
+        del timeout
+        raise urllib.error.HTTPError(request.full_url, 404, "not found", {}, None)
+
+    bridge = BridgeObjectStore(
+        "http://cuebench-r2.internal",
+        input_prefix="processing/",
+        output_prefix="prepared/",
+        maximum_input_bytes=500 * 1024 * 1024,
+        opener=not_found,
+    )
+    cache_key = f"prepared/{operation_key}/indexes/{'b' * 64}.json"
+
+    with bridge.job_scope(job, token):
+        assert bridge.read_output_bytes(cache_key) is None
+
+
+def test_private_storage_bridge_checks_the_job_deadline_while_streaming_an_input(tmp_path: Path) -> None:
+    operation_id = "operation-bridge-deadline-0001"
+    operation_key = operation_key_for(operation_id)
+    input_key = f"processing/{SESSION_KEY}/{operation_key}"
+    source = b"x" * (1024 * 1024 + 1)
+    key_ring = MediaJobKeyRing(current=MediaJobKey("current", b"bridge-deadline-media-job-secret-for-tests"))
+    job = InternalMediaJob(
+        action="probe",
+        operation_id=operation_id,
+        operation_key=operation_key,
+        input_key=input_key,
+        input_byte_length=len(source),
+        input_content_type="video/mp4",
+        output_prefix=f"prepared/{operation_key}/",
+        receipt_sha256="a" * 64,
+        idempotency_key=f"probe:{operation_key}",
+        issued_at_ms=1_000,
+        expires_at_ms=61_000,
+    )
+
+    class ExpiringDeadline:
+        def __init__(self) -> None:
+            self.checks = 0
+
+        def check(self) -> None:
+            self.checks += 1
+            if self.checks > 1:
+                from cuebench_media.models import MediaServiceError
+
+                raise MediaServiceError("PROCESSING_TIMEOUT", 504, "CueBench's media preparation timed out.")
+
+    def opener(_: object, timeout: int) -> FakeBridgeResponse:
+        del timeout
+        return FakeBridgeResponse(
+            source,
+            status=200,
+            headers={
+                "content-type": "video/mp4",
+                "content-length": str(len(source)),
+                "x-cuebench-sha256": hashlib.sha256(source).hexdigest(),
+            },
+        )
+
+    bridge = BridgeObjectStore(
+        "http://cuebench-r2.internal",
+        input_prefix="processing/",
+        output_prefix="prepared/",
+        maximum_input_bytes=500 * 1024 * 1024,
+        opener=opener,
+    )
+    deadline = ExpiringDeadline()
+    with (
+        bridge.job_scope(job, sign_internal_job(job, key_ring), deadline=deadline),
+        pytest.raises(MediaServiceError) as timeout,
+    ):
+        bridge.input_path(input_key)
+
+    assert timeout.value.code == "PROCESSING_TIMEOUT"
+    assert deadline.checks > 1
+
+
+def test_prepare_publishes_only_verified_artifacts_through_the_private_r2_bridge(tmp_path: Path) -> None:
+    source = b"private bridge preparation source"
+    operation_id = "operation-bridge-prepare-0001"
+    operation_key = operation_key_for(operation_id)
+    input_key = f"processing/{SESSION_KEY}/{operation_key}"
+    output_prefix = f"prepared/{operation_key}/"
+    key_ring = MediaJobKeyRing(current=MediaJobKey("current", b"bridge-prepare-media-job-secret-for-tests-0001"))
+    settings = MediaServiceSettings(
+        key_ring=key_ring,
+        input_root=tmp_path / "unused-input",
+        output_root=tmp_path / "unused-output",
+        input_prefix="processing/",
+        output_prefix="prepared/",
+        limits=MediaLimits(max_request_bytes=4 * 1024),
+        clock=lambda: 1_000,
+    )
+    stored: dict[str, tuple[bytes, dict[str, str]]] = {}
+
+    def opener(request: object, timeout: int) -> FakeBridgeResponse:
+        del timeout
+        key = request.full_url.removeprefix("http://cuebench-r2.internal/")
+        if request.get_method() == "GET" and key == input_key:
+            return FakeBridgeResponse(
+                source,
+                status=200,
+                headers={
+                    "content-type": "video/mp4",
+                    "content-length": str(len(source)),
+                    "x-cuebench-sha256": hashlib.sha256(source).hexdigest(),
+                },
+            )
+        if request.get_method() == "GET" and key not in stored:
+            raise urllib.error.HTTPError(request.full_url, 404, "not found", {}, None)
+        if request.get_method() == "GET":
+            value, headers = stored[key]
+            return FakeBridgeResponse(value, status=200, headers=headers)
+        assert request.get_method() == "PUT"
+        assert key.startswith(output_prefix)
+        assert request.get_header("X-cuebench-media-job")
+        assert request.get_header("If-none-match") == "*"
+        value = request.data
+        assert isinstance(value, bytes)
+        headers = {
+            "content-type": request.get_header("Content-type"),
+            "content-length": str(len(value)),
+            "x-cuebench-sha256": request.get_header("X-cuebench-sha256"),
+        }
+        if key in stored:
+            previous, previous_headers = stored[key]
+            assert previous == value and previous_headers == headers
+            return FakeBridgeResponse(b"", status=200, headers=headers)
+        stored[key] = (value, headers)
+        return FakeBridgeResponse(b"", status=201, headers=headers)
+
+    bridge = BridgeObjectStore(
+        "http://cuebench-r2.internal",
+        input_prefix="processing/",
+        output_prefix="prepared/",
+        maximum_input_bytes=500 * 1024 * 1024,
+        opener=opener,
+    )
+    client = TestClient(create_app(settings=settings, tools=MinimalTools(), store=bridge))
+
+    response = client.post(
+        "/v1/prepare",
+        json=signed_body(
+            key_ring,
+            action="prepare",
+            operation_id=operation_id,
+            operation_key=operation_key,
+            input_key=input_key,
+            input_byte_length=len(source),
+            input_content_type="video/mp4",
+        ),
+    )
+
+    assert response.status_code == 200
+    assert stored
+    assert all(key.startswith(output_prefix) for key in stored)
+    assert any("/manifests/" in key for key in stored)
+    assert any("/indexes/" in key for key in stored)
+
+
+def test_healthz_fails_closed_when_ffprobe_is_unavailable(tmp_path: Path) -> None:
+    class MissingFfprobeTools(MinimalTools):
+        def versions(self, deadline: object | None = None) -> dict[str, str]:
+            del deadline
+            return {"ffmpeg": "fixture"}
+
+    key_ring = MediaJobKeyRing(current=MediaJobKey("current", b"health-media-job-secret-for-tests-0001"))
+    settings = MediaServiceSettings(
+        key_ring=key_ring,
+        input_root=tmp_path / "input",
+        output_root=tmp_path / "output",
+        input_prefix="processing/",
+        output_prefix="prepared/",
+    )
+    settings.input_root.mkdir(parents=True)
+    client = TestClient(create_app(settings=settings, tools=MissingFfprobeTools()))
+
+    response = client.get("/healthz")
+
+    assert response.status_code == 503
+    assert response.json()["error"]["code"] == "SERVICE_UNAVAILABLE"
+
+
+def test_healthz_fails_closed_when_the_private_r2_bridge_is_unavailable(tmp_path: Path) -> None:
+    key_ring = MediaJobKeyRing(current=MediaJobKey("current", b"bridge-health-media-job-secret-for-tests-0001"))
+    settings = MediaServiceSettings(
+        key_ring=key_ring,
+        input_root=tmp_path / "unused-input",
+        output_root=tmp_path / "unused-output",
+        input_prefix="processing/",
+        output_prefix="prepared/",
+    )
+
+    def unavailable_bridge(_: object, timeout: int) -> FakeBridgeResponse:
+        del timeout
+        raise urllib.error.URLError("fixture unavailable")
+
+    bridge = BridgeObjectStore(
+        "http://cuebench-r2.internal",
+        input_prefix="processing/",
+        output_prefix="prepared/",
+        maximum_input_bytes=500 * 1024 * 1024,
+        opener=unavailable_bridge,
+    )
+
+    response = TestClient(create_app(settings=settings, tools=MinimalTools(), store=bridge)).get("/healthz")
+
+    assert response.status_code == 503
+    assert response.json()["error"]["code"] == "SERVICE_UNAVAILABLE"
 
 
 @pytest.fixture
@@ -85,9 +455,12 @@ def secure_client(tmp_path: Path) -> tuple[TestClient, MediaJobKeyRing, Path, Pa
 def signed_body(
     keys: MediaJobKeyRing,
     *,
+    action: str = "prepare",
     operation_id: str = "operation-security-0001",
     operation_key: str | None = None,
     input_key: str | None = None,
+    input_byte_length: int = len(b"private source content"),
+    input_content_type: str = "video/mp4",
     output_prefix: str | None = None,
     issued_at_ms: int = 1_000,
     expires_at_ms: int = 61_000,
@@ -98,12 +471,15 @@ def signed_body(
     return {
         "job": sign_internal_job(
             InternalMediaJob(
+                action=action,  # type: ignore[arg-type]
                 operation_id=operation_id,
                 operation_key=resolved_operation_key,
                 input_key=input_key or f"processing/{SESSION_KEY}/{resolved_operation_key}",
+                input_byte_length=input_byte_length,
+                input_content_type=input_content_type,  # type: ignore[arg-type]
                 output_prefix=output_prefix or f"prepared/{resolved_operation_key}/",
                 receipt_sha256=receipt_sha256,
-                idempotency_key=idempotency_key or f"probe:{resolved_operation_key}",
+                idempotency_key=idempotency_key or f"{action}:{resolved_operation_key}",
                 issued_at_ms=issued_at_ms,
                 expires_at_ms=expires_at_ms,
             ),
@@ -130,11 +506,32 @@ def test_worker_and_python_share_the_exact_media_job_signature_vector() -> None:
         previous=MediaJobKey(vector["previous_key"]["id"], vector["previous_key"]["secret"].encode()),
     )
 
-    job = verify_internal_job(vector["token"], key_ring, vector["job"]["issued_at_ms"] + 1)
+    canonical_payload = {
+        "action": vector["job"]["action"],
+        "contract_version": 1,
+        "expires_at_ms": vector["job"]["expires_at_ms"],
+        "idempotency_key": vector["job"]["idempotency_key"],
+        "input_byte_length": vector["job"]["input_byte_length"],
+        "input_content_type": vector["job"]["input_content_type"],
+        "input_key": vector["job"]["input_key"],
+        "issued_at_ms": vector["job"]["issued_at_ms"],
+        "key_id": vector["current_key"]["id"],
+        "operation_id": vector["job"]["operation_id"],
+        "operation_key": vector["job"]["operation_key"],
+        "output_prefix": vector["job"]["output_prefix"],
+        "receipt_sha256": vector["job"]["receipt_sha256"],
+        "type": "cuebench-media-job",
+    }
+    encoded_payload = _base64url_encode(json.dumps(canonical_payload, separators=(",", ":"), sort_keys=True).encode())
+    token = f"{encoded_payload}.{vector['signature']}"
+    job = verify_internal_job(token, key_ring, vector["job"]["issued_at_ms"] + 1)
 
+    assert job.action == vector["job"]["action"]
     assert job.operation_id == vector["job"]["operation_id"]
     assert job.operation_key == vector["job"]["operation_key"]
     assert job.input_key == vector["job"]["input_key"]
+    assert job.input_byte_length == vector["job"]["input_byte_length"]
+    assert job.input_content_type == vector["job"]["input_content_type"]
     assert job.output_prefix == vector["job"]["output_prefix"]
     assert job.receipt_sha256 == vector["job"]["receipt_sha256"]
     assert job.idempotency_key == vector["job"]["idempotency_key"]
@@ -202,6 +599,19 @@ def test_tampered_signed_job_cannot_change_bound_input_or_output_prefix(
 
     assert response.status_code == 401
     assert response.json()["error"]["code"] == "JOB_INVALID"
+    assert not list(output_root.rglob("*"))
+
+
+def test_action_bound_capabilities_cannot_cross_probe_and_prepare_routes(
+    secure_client: tuple[TestClient, MediaJobKeyRing, Path, Path],
+) -> None:
+    client, keys, _, output_root = secure_client
+
+    probe_on_prepare = client.post("/v1/prepare", json=signed_body(keys, action="probe"))
+    prepare_on_probe = client.post("/v1/probe", json=signed_body(keys, action="prepare"))
+
+    assert probe_on_prepare.status_code == prepare_on_probe.status_code == 403
+    assert probe_on_prepare.json()["error"]["code"] == prepare_on_probe.json()["error"]["code"] == "JOB_ACTION"
     assert not list(output_root.rglob("*"))
 
 
@@ -300,10 +710,12 @@ def test_environment_factory_starts_without_openai_configuration(
     monkeypatch.setenv("CUEBENCH_MEDIA_INPUT_ROOT", str(tmp_path / "private-input"))
     monkeypatch.setenv("CUEBENCH_MEDIA_OUTPUT_ROOT", str(tmp_path / "private-output"))
 
-    response = TestClient(create_app_from_environment()).get("/healthz")
+    app = create_app_from_environment()
 
-    assert response.status_code == 200
-    assert response.json() == {"status": "ok", "contract_version": 1}
+    # Readiness is deliberately checked separately: this host has no fixed
+    # FFmpeg binaries, so `/healthz` correctly fails closed here. Factory
+    # construction itself must never require an OpenAI configuration.
+    assert app.title == "CueBench media preparation"
 
 
 def test_environment_key_ids_match_worker_normalization_without_rewriting_secret_bytes(
@@ -364,3 +776,79 @@ def test_safe_command_runner_never_interpolates_an_argument_as_shell_code(tmp_pa
 
     assert result.stdout.decode().strip() == malicious_argument
     assert not marker.exists()
+
+
+def test_safe_command_runner_strips_media_storage_and_ai_secrets_from_parser_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    for name in (
+        "CUEBENCH_MEDIA_JOB_HMAC_CURRENT_KEY",
+        "CUEBENCH_MEDIA_STORAGE_BRIDGE_URL",
+        "R2_ACCESS_KEY_ID",
+        "OPENAI_API_KEY",
+    ):
+        monkeypatch.setenv(name, f"fixture-{name}")
+    runner = SafeCommandRunner(
+        executable_paths={"python-test": sys.executable},
+        default_timeout_seconds=1,
+        maximum_output_bytes=4_096,
+    )
+
+    result = runner.run(["python-test", "-c", "import json, os; print(json.dumps(sorted(os.environ)))"])
+    environment = set(json.loads(result.stdout))
+
+    assert {"PATH", "LANG", "TMPDIR"}.issubset(environment)
+    assert not any(name.startswith(("CUEBENCH", "R2_", "OPENAI")) for name in environment)
+
+
+def test_content_addressed_local_publication_is_atomic_verifies_existing_and_cleans_partial_files(
+    tmp_path: Path,
+) -> None:
+    store = FileSystemObjectStore(tmp_path / "input", tmp_path / "output", "processing/", "prepared/")
+    operation_key = "d" * 64
+    value = b'{"artifact":"verified"}'
+    digest = hashlib.sha256(value).hexdigest()
+    key = f"prepared/{operation_key}/manifests/{digest}.json"
+    target = tmp_path / "output" / key
+
+    assert store.put_bytes_if_absent(key, value)
+    assert not store.put_bytes_if_absent(key, value)
+    target.write_bytes(b"partial")
+    with pytest.raises(Exception) as corrupted:
+        store.put_bytes_if_absent(key, value)
+    assert "partial" not in str(corrupted.value)
+
+    failed_key = f"prepared/{operation_key}/manifests/{'e' * 64}.json"
+    failed_target = tmp_path / "output" / failed_key
+    with pytest.raises(RuntimeError):
+        store._write_if_absent(
+            failed_target, lambda destination: (_ for _ in ()).throw(RuntimeError("fixture failure"))
+        )
+    assert not failed_target.exists()
+    assert not list((tmp_path / "output").rglob("*.tmp"))
+
+
+def test_content_addressed_local_publication_has_one_atomic_winner_under_concurrency(tmp_path: Path) -> None:
+    store = FileSystemObjectStore(tmp_path / "input", tmp_path / "output", "processing/", "prepared/")
+    operation_key = "e" * 64
+    value = b"concurrent-verified-artifact"
+    key = f"prepared/{operation_key}/waveforms/{hashlib.sha256(value).hexdigest()}.json"
+    outcomes: list[bool] = []
+    failures: list[BaseException] = []
+
+    def publish() -> None:
+        try:
+            outcomes.append(store.put_bytes_if_absent(key, value))
+        except BaseException as error:  # pragma: no cover - asserted below
+            failures.append(error)
+
+    threads = [threading.Thread(target=publish) for _ in range(4)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=2)
+
+    assert not failures
+    assert outcomes.count(True) == 1
+    assert outcomes.count(False) == 3
+    assert store.read_output_bytes(key) == value

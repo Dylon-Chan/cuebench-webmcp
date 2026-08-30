@@ -1,6 +1,6 @@
 import type { DurableObjectNamespace, R2Bucket } from "@cloudflare/workers-types";
 import type { HmacKeyRing } from "./session";
-import type { MediaJobSigningSettings, MediaProbeBinding } from "./probe";
+import type { MediaJobSigningSettings } from "./probe";
 
 export const MAX_UPLOAD_BYTES = 500 * 1024 * 1024;
 export const MAX_UPLOAD_DURATION_MS = 15 * 60 * 1_000;
@@ -56,7 +56,8 @@ export interface WorkerEnv {
   readonly QUOTA_LEDGER?: DurableObjectNamespace;
   readonly UPLOAD_COORDINATOR?: DurableObjectNamespace;
   readonly PROCESSING_WORKFLOW?: ProcessingWorkflowBinding;
-  readonly MEDIA_PROBE?: MediaProbeBinding;
+  /** Operation-keyed Cloudflare Container Durable Object, never browser reachable. */
+  readonly MEDIA_PREPARER?: DurableObjectNamespace;
   readonly ASSETS?: { fetch: (request: Request) => Promise<Response> };
 }
 

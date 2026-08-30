@@ -16,6 +16,7 @@
     "wrangler": "node scripts/wrangler.mjs"
   },
   "dependencies": {
+    "@cloudflare/containers": "0.3.7",
     "@cuebench/contracts": "workspace:*",
     "@cuebench/domain": "workspace:*",
     "@cuebench/storage": "workspace:*",

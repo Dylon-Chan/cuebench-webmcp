@@ -194,7 +194,7 @@ const makeFixture = (options: {
   const mediaFixtureEnv: Partial<WorkerEnv> = options.probe === undefined ? {} : {
     MEDIA_JOB_HMAC_CURRENT_KEY_ID: "media-fixture-current",
     MEDIA_JOB_HMAC_CURRENT_KEY: "media-fixture-current-secret-with-at-least-32-bytes",
-    MEDIA_PROBE: { fetch: async () => new Response("fixture media binding") },
+    MEDIA_PREPARER: {} as never,
   };
   let identifier = 0;
   return {
@@ -577,12 +577,13 @@ describe("CueBench anonymous multipart Worker", () => {
     let bindingCalls = 0;
     const { app, bucket, workflow } = makeFixture({
       env: {
-        MEDIA_PROBE: {
-          fetch: async () => {
+        MEDIA_PREPARER: {
+          get: () => ({ fetch: async () => {
             bindingCalls += 1;
             return new Response("unexpected");
-          },
-        },
+          } }),
+          idFromName: () => ({}) as never,
+        } as never,
       },
     });
     const session = await issueSession(app);
@@ -616,7 +617,7 @@ describe("CueBench anonymous multipart Worker", () => {
     };
     const { app, bucket, workflow } = makeFixture({
       probe: injectedProbe,
-      env: { MEDIA_PROBE: undefined as never },
+      env: { MEDIA_PREPARER: undefined as never },
     });
     const session = await issueSession(app);
     const operation = await requestUpload(app, session);
@@ -638,8 +639,8 @@ describe("CueBench anonymous multipart Worker", () => {
       env: {
         MEDIA_JOB_HMAC_CURRENT_KEY_ID: "media-current",
         MEDIA_JOB_HMAC_CURRENT_KEY: "media-job-current-secret-with-at-least-32-bytes",
-        MEDIA_PROBE: {
-          fetch: async (request) => {
+        MEDIA_PREPARER: {
+          get: () => ({ fetch: async (request: Request) => {
             mediaRequest = request;
             return new Response(JSON.stringify({
               container: "webm",
@@ -649,8 +650,9 @@ describe("CueBench anonymous multipart Worker", () => {
               byteLength: 5,
               sha256: "a".repeat(64),
             }));
-          },
-        },
+          } }),
+          idFromName: () => ({}) as never,
+        } as never,
       },
     });
     const session = await issueSession(app);

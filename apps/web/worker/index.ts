@@ -43,7 +43,7 @@ import {
   type UploadOperationState,
 } from "./upload-operations";
 import {
-  MediaProbeServiceBinding,
+  MediaContainerProbeService,
   isSupportedAuthoritativeMedia,
   type MediaProbe,
 } from "./probe";
@@ -51,6 +51,16 @@ import { recordTelemetry, type TelemetrySink } from "./telemetry";
 
 export { QuotaLedger } from "./quota-ledger";
 export { UploadCoordinator } from "./upload-operations";
+export { MediaPreparationContainer } from "./media-container";
+export {
+  MediaContainerPreparationService,
+  type MediaPreparation,
+  type MediaPreparationRequest,
+  type PreparedMediaManifest,
+} from "./probe";
+// Required by @cloudflare/containers for `outboundByHost` interception. The
+// browser API never routes to this WorkerEntrypoint.
+export { ContainerProxy } from "@cloudflare/containers";
 
 export interface TurnstileVerification {
   readonly success: boolean;
@@ -375,8 +385,8 @@ const probeFor = (
 ): MediaProbe | undefined => {
   // Even fixture adapters must not bypass the production authority boundary:
   // neither an unbound service nor a missing dedicated media key may complete R2.
-  if (env.MEDIA_PROBE === undefined || settings.mediaJobSigning === undefined) return undefined;
-  return dependencies.mediaProbe ?? new MediaProbeServiceBinding(env.MEDIA_PROBE, settings.mediaJobSigning, () => currentNow);
+  if (env.MEDIA_PREPARER === undefined || settings.mediaJobSigning === undefined) return undefined;
+  return dependencies.mediaProbe ?? new MediaContainerProbeService(env.MEDIA_PREPARER, settings.mediaJobSigning, () => currentNow);
 };
 
 interface DerivedOperation {
@@ -1039,6 +1049,8 @@ export const createCueBenchWorker = (env: WorkerEnv, dependencies: WorkerDepende
           operationId: receipt.operationId,
           operationKey: receipt.operationKey,
           objectKey: receipt.objectKey,
+          inputByteLength: receipt.media.byteLength,
+          inputContentType: receipt.media.contentType === "video/mp4" ? "video/mp4" : "video/webm",
           operationReceipt: receiptToken,
           receiptExpiresAtMs: receipt.receiptExpiresAtMs,
           idempotencyKey: `probe:${receipt.operationKey}`,

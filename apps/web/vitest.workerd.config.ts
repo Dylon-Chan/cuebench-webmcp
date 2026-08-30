@@ -6,6 +6,7 @@ const workerOptions = {
   additionalExports: {
     QuotaLedger: "DurableObject",
     UploadCoordinator: "DurableObject",
+    MediaPreparationContainer: "DurableObject",
   },
   // Fixture-only local bindings. Production values remain Wrangler secrets and are ignored by git.
   miniflare: {

@@ -17,5 +17,14 @@ const run = (command, commandArgs) => spawnSync(command, commandArgs, {
 const lifecycle = run(runtime.execPath, [resolve(scriptDirectory, "r2-lifecycle-policy.mjs"), ...lifecycleArgs]);
 if (lifecycle.status !== 0) runtime.exit(lifecycle.status ?? 1);
 
-const deploy = run(runtime.execPath, [resolve(appDirectory, "node_modules/wrangler/bin/wrangler.js"), "deploy", ...args]);
+// The Vite plugin's generated deploy manifest intentionally contains only its
+// browser bundle view. Deploying the Worker directly is required so Wrangler
+// validates and publishes the Container DO binding, migration, and image.
+const deploy = run(runtime.execPath, [
+  resolve(appDirectory, "node_modules/wrangler/bin/wrangler.js"),
+  "deploy",
+  "--config",
+  "wrangler.jsonc",
+  ...args,
+]);
 runtime.exit(deploy.status ?? 1);
