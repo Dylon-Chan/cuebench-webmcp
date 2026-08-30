@@ -250,13 +250,17 @@ button:disabled { cursor: not-allowed; }
 .timeline-item[data-selected] { z-index: 4; border-color: #67e59c; outline: 2px solid #67e59c; outline-offset: 1px; background: #075737; box-shadow: 0 4px 10px rgb(0 0 0 / 28%), inset 0 1px 0 rgb(239 255 247 / 24%); }
 .timeline-item[data-preview] { border-style: dashed; }
 .timeline-item__body {
+  position: absolute;
+  inset: 0;
+  appearance: none;
   display: grid;
   grid-template-columns: auto minmax(0, 1fr);
   grid-template-rows: auto auto;
   width: 100%;
+  min-width: 0;
   height: 100%;
   overflow: hidden;
-  padding: 0.28rem 1.55rem;
+  padding: 0.28rem min(1.55rem, 35%);
   color: #eaf5f1;
   border: 0;
   border-radius: 2px;
@@ -267,12 +271,22 @@ button:disabled { cursor: not-allowed; }
 .timeline-item__body strong { grid-row: 1; color: #d7f9e5; font-size: 0.64rem; font-weight: 800; letter-spacing: 0.025em; }
 .timeline-item__body span { grid-column: 2; overflow: hidden; padding-left: 0.35rem; font-size: 0.62rem; font-weight: 660; line-height: 1.1; text-overflow: ellipsis; white-space: nowrap; }
 .timeline-item__body small { grid-column: 1 / -1; overflow: hidden; padding-top: 0.12rem; color: #b6d0c8; font-feature-settings: "tnum" 1; font-size: 0.56rem; text-overflow: ellipsis; white-space: nowrap; }
-.timeline-item__handle { position: absolute; top: 50%; z-index: 5; width: 2px; min-width: 0; height: 24px; min-height: 24px; padding: 0; border: 0; background: transparent; transform: translateY(-50%); touch-action: none; }
-.timeline-item__handle::before { position: absolute; top: 0; left: -11px; width: 24px; height: 24px; border: 1px solid transparent; border-radius: 2px; content: ""; }
+.timeline-item__handle { position: absolute; top: 50%; z-index: 5; width: 2px; min-width: 0; height: 2px; min-height: 0; padding: 0; border: 0; background: transparent; transform: translateY(-50%); touch-action: none; }
+.timeline-item__handle::before { position: absolute; width: 24px; height: 24px; border: 1px solid transparent; border-radius: 2px; content: ""; }
 .timeline-item__handle:hover::before, .timeline-item__handle:focus-visible::before { border-color: #8ee9b2; background: rgb(220 255 235 / 44%); }
 .timeline-item__handle:focus-visible { outline-offset: 2px; }
 .timeline-item__handle--start { left: -1px; cursor: ew-resize; }
 .timeline-item__handle--end { right: -1px; cursor: ew-resize; }
+/* Keep the physical line pinned to its exact Media Time boundary. The large
+   targets fan outward and vertically apart, leaving the visual span centre
+   selectable even when adjacent cues are only a few pixels wide. */
+.timeline-item__handle--start::before { top: -25px; left: -24px; }
+.timeline-item__handle--end::before { top: 3px; left: 2px; }
+/* Adjacent short spans share the same horizontal measurement space. Alternate
+   their vertical target bands so their logical controls never hide one
+   another or the body's centre point. */
+.timeline-lane__items > .timeline-item:nth-child(even) .timeline-item__handle--start::before { top: 3px; }
+.timeline-lane__items > .timeline-item:nth-child(even) .timeline-item__handle--end::before { top: -25px; }
 .timeline-findings { position: absolute; inset: 80px 0 auto; z-index: 6; height: 24px; pointer-events: none; }
 .timeline-finding { position: absolute; top: 0; width: 24px; min-width: 24px; height: 24px; min-height: 24px; padding: 0; color: transparent; border: 0; background: transparent; font-size: 0; transform: translateX(-50%); pointer-events: auto; }
 .timeline-finding::before { position: absolute; top: 7px; left: 7px; width: 10px; height: 10px; border-radius: 1px; content: ""; transform: rotate(45deg); }
@@ -368,14 +382,18 @@ button:disabled { cursor: not-allowed; }
   .timeline-tools button { min-height: 44px; }
   .timeline-surface { min-height: 274px; }
   .timeline-waveform { height: 58px; }
-  .timeline-lane { min-height: 96px; }
-  .timeline-lane__items { min-height: 67px; }
-  .timeline-item { top: 7px; min-width: 0; height: 54px; }
-  .timeline-item__body { padding: 0.33rem 2.8rem; }
+  .timeline-lane { min-height: 117px; }
+  .timeline-lane__items { min-height: 94px; }
+  .timeline-item { top: 20px; min-width: 0; height: 54px; }
+  .timeline-item__body { padding: 0.33rem min(2.8rem, 35%); }
   .timeline-item__body span { display: none; }
   .timeline-item__body small { font-size: 0.53rem; }
-  .timeline-item__handle { width: 2px; min-width: 0; height: 44px; min-height: 44px; }
-  .timeline-item__handle::before { left: -21px; width: 44px; height: 44px; }
+  .timeline-item__handle { width: 2px; min-width: 0; height: 2px; min-height: 0; }
+  .timeline-item__handle::before { width: 44px; height: 44px; }
+  .timeline-item__handle--start::before { top: -46px; left: -44px; }
+  .timeline-item__handle--end::before { top: 4px; left: 2px; }
+  .timeline-lane__items > .timeline-item:nth-child(even) .timeline-item__handle--start::before { top: 4px; }
+  .timeline-lane__items > .timeline-item:nth-child(even) .timeline-item__handle--end::before { top: -46px; }
   .timeline-findings { inset-block-start: 80px; }
   .timeline-finding { width: 44px; min-width: 44px; height: 44px; min-height: 44px; }
   .timeline-finding::before { top: 17px; left: 17px; }
