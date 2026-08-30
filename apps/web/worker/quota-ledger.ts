@@ -43,6 +43,26 @@ export interface SpendRecord {
   readonly globalSpendLimitCents: number;
 }
 
+/** A durable conservative hold made before an external provider/workflow call. */
+export interface SpendReservation {
+  readonly spendKey: string;
+  readonly maxCents: number;
+  readonly nowMs: number;
+  readonly globalSpendLimitCents: number;
+}
+
+/** Later authoritative provider usage can safely adjust the earlier hold. */
+export interface SpendFinalization {
+  readonly spendKey: string;
+  readonly actualCents: number;
+  readonly nowMs: number;
+  readonly globalSpendLimitCents: number;
+}
+
+export type SpendReservationResult =
+  | { readonly accepted: true; readonly existing: boolean; readonly breakerOpen: boolean; readonly spendCents: number }
+  | { readonly accepted: false; readonly code: "GLOBAL_BREAKER" | "SPEND_LIMIT" };
+
 /**
  * A one-way hash of a Turnstile response is enough to replay exactly one
  * anonymous session; neither the challenge response nor caller id is stored.
@@ -79,6 +99,8 @@ export interface QuotaLedgerPort {
   commitMedia: (input: ActualMediaUsage) => Promise<CommitMediaResult>;
   reserveGeneration: (input: UsageReservation) => Promise<boolean>;
   reserveTts: (input: UsageReservation) => Promise<boolean>;
+  reserveSpend: (input: SpendReservation) => Promise<SpendReservationResult>;
+  finalizeSpend: (input: SpendFinalization) => Promise<{ readonly persisted: boolean; readonly breakerOpen: boolean; readonly spendCents: number }>;
   recordSpend: (input: SpendRecord) => Promise<{ readonly breakerOpen: boolean; readonly spendCents: number }>;
   isGlobalBreakerOpen: (input: { readonly nowMs: number; readonly globalSpendLimitCents: number }) => Promise<boolean>;
   reserveTurnstileSession: (input: TurnstileSessionReservation) => Promise<TurnstileSessionResult>;
@@ -120,6 +142,8 @@ interface GlobalSpendState {
 
 interface SpendMarker {
   readonly expiresAtMs: number;
+  readonly reservedCents?: number;
+  readonly finalizedCents?: number;
   readonly result: { readonly breakerOpen: boolean; readonly spendCents: number };
 }
 
@@ -328,6 +352,56 @@ const recordSpend = (state: LedgerState, input: SpendRecord): { readonly state: 
   };
 };
 
+const reserveSpend = (state: LedgerState, input: SpendReservation): { readonly state: LedgerState; readonly result: SpendReservationResult } => {
+  const existing = state.spendMarkers[input.spendKey];
+  if (existing !== undefined) {
+    return { state, result: { accepted: true, existing: true, ...existing.result } };
+  }
+  const maxCents = Number.isSafeInteger(input.maxCents) && input.maxCents > 0 ? input.maxCents : 0;
+  if (maxCents === 0 || state.global.breakerOpen || state.global.spendCents >= input.globalSpendLimitCents) {
+    return { state, result: { accepted: false, code: "GLOBAL_BREAKER" } };
+  }
+  if (state.global.spendCents + maxCents > input.globalSpendLimitCents) {
+    return { state, result: { accepted: false, code: "SPEND_LIMIT" } };
+  }
+  const spendCents = state.global.spendCents + maxCents;
+  const breakerOpen = spendCents >= input.globalSpendLimitCents;
+  const result = { breakerOpen, spendCents };
+  const next: LedgerState = {
+    ...state,
+    global: { ...state.global, spendCents, breakerOpen: state.global.breakerOpen || breakerOpen },
+    spendMarkers: {
+      ...state.spendMarkers,
+      [input.spendKey]: {
+        expiresAtMs: input.nowMs + QUOTA_WINDOW_MS,
+        reservedCents: maxCents,
+        result,
+      },
+    },
+  };
+  return { state: next, result: { accepted: true, existing: false, ...result } };
+};
+
+const finalizeSpend = (state: LedgerState, input: SpendFinalization): { readonly state: LedgerState; readonly result: { readonly persisted: boolean; readonly breakerOpen: boolean; readonly spendCents: number } } => {
+  const marker = state.spendMarkers[input.spendKey];
+  if (marker === undefined) return { state, result: { persisted: false, breakerOpen: state.global.breakerOpen, spendCents: state.global.spendCents } };
+  if (marker.finalizedCents !== undefined) return { state, result: { persisted: true, ...marker.result } };
+  const actualCents = Number.isSafeInteger(input.actualCents) && input.actualCents >= 0 ? input.actualCents : marker.reservedCents ?? 0;
+  const reservedCents = marker.reservedCents ?? 0;
+  const spendCents = Math.max(0, state.global.spendCents + actualCents - reservedCents);
+  const breakerOpen = state.global.breakerOpen || spendCents >= input.globalSpendLimitCents;
+  const result = { breakerOpen, spendCents };
+  const next: LedgerState = {
+    ...state,
+    global: { ...state.global, spendCents, breakerOpen },
+    spendMarkers: {
+      ...state.spendMarkers,
+      [input.spendKey]: { ...marker, finalizedCents: actualCents, result },
+    },
+  };
+  return { state: next, result: { persisted: true, ...result } };
+};
+
 const isGlobalBreakerOpen = (state: LedgerState, limit: number): boolean => state.global.breakerOpen || state.global.spendCents >= limit;
 
 const reserveTurnstileSession = (state: LedgerState, input: TurnstileSessionReservation): { readonly state: LedgerState; readonly result: TurnstileSessionResult } => {
@@ -371,6 +445,8 @@ type LedgerAction =
   | { readonly type: "release-upload"; readonly nowMs: number; readonly reservationKey: string }
   | { readonly type: "commit-media"; readonly nowMs: number; readonly input: ActualMediaUsage }
   | { readonly type: "reserve-generation" | "reserve-tts"; readonly nowMs: number; readonly input: UsageReservation }
+  | { readonly type: "reserve-spend"; readonly nowMs: number; readonly input: SpendReservation }
+  | { readonly type: "finalize-spend"; readonly nowMs: number; readonly input: SpendFinalization }
   | { readonly type: "record-spend"; readonly nowMs: number; readonly input: SpendRecord }
   | { readonly type: "check-breaker"; readonly nowMs: number; readonly limit: number }
   | { readonly type: "reserve-turnstile-session"; readonly nowMs: number; readonly input: TurnstileSessionReservation }
@@ -396,6 +472,14 @@ const applyAction = (state: LedgerState, action: LedgerAction): { readonly state
   }
   if (action.type === "record-spend") {
     const applied = recordSpend(state, action.input);
+    return { state: applied.state, value: applied.result };
+  }
+  if (action.type === "reserve-spend") {
+    const applied = reserveSpend(state, action.input);
+    return { state: applied.state, value: applied.result };
+  }
+  if (action.type === "finalize-spend") {
+    const applied = finalizeSpend(state, action.input);
     return { state: applied.state, value: applied.result };
   }
   if (action.type === "check-breaker") return { state, value: { open: isGlobalBreakerOpen(state, action.limit) } };
@@ -460,6 +544,10 @@ export class InMemoryQuotaLedger implements QuotaLedgerPort {
   public commitMedia(input: ActualMediaUsage): Promise<CommitMediaResult> { return Promise.resolve(this.apply({ type: "commit-media", nowMs: input.nowMs, input }) as CommitMediaResult); }
   public reserveGeneration(input: UsageReservation): Promise<boolean> { return Promise.resolve((this.apply({ type: "reserve-generation", nowMs: input.nowMs, input }) as { readonly accepted: boolean }).accepted); }
   public reserveTts(input: UsageReservation): Promise<boolean> { return Promise.resolve((this.apply({ type: "reserve-tts", nowMs: input.nowMs, input }) as { readonly accepted: boolean }).accepted); }
+  public reserveSpend(input: SpendReservation): Promise<SpendReservationResult> { return Promise.resolve(this.apply({ type: "reserve-spend", nowMs: input.nowMs, input }) as SpendReservationResult); }
+  public finalizeSpend(input: SpendFinalization): Promise<{ readonly persisted: boolean; readonly breakerOpen: boolean; readonly spendCents: number }> {
+    return Promise.resolve(this.apply({ type: "finalize-spend", nowMs: input.nowMs, input }) as { readonly persisted: boolean; readonly breakerOpen: boolean; readonly spendCents: number });
+  }
   public recordSpend(input: SpendRecord): Promise<{ readonly breakerOpen: boolean; readonly spendCents: number }> {
     return Promise.resolve(this.apply({ type: "record-spend", nowMs: input.nowMs, input }) as { readonly breakerOpen: boolean; readonly spendCents: number });
   }
@@ -495,6 +583,8 @@ export class DurableObjectQuotaLedger implements QuotaLedgerPort {
   public commitMedia(input: ActualMediaUsage): Promise<CommitMediaResult> { return this.call({ type: "commit-media", nowMs: input.nowMs, input }); }
   public async reserveGeneration(input: UsageReservation): Promise<boolean> { return (await this.call<{ readonly accepted: boolean }>({ type: "reserve-generation", nowMs: input.nowMs, input })).accepted; }
   public async reserveTts(input: UsageReservation): Promise<boolean> { return (await this.call<{ readonly accepted: boolean }>({ type: "reserve-tts", nowMs: input.nowMs, input })).accepted; }
+  public reserveSpend(input: SpendReservation): Promise<SpendReservationResult> { return this.call({ type: "reserve-spend", nowMs: input.nowMs, input }); }
+  public finalizeSpend(input: SpendFinalization): Promise<{ readonly persisted: boolean; readonly breakerOpen: boolean; readonly spendCents: number }> { return this.call({ type: "finalize-spend", nowMs: input.nowMs, input }); }
   public recordSpend(input: SpendRecord): Promise<{ readonly breakerOpen: boolean; readonly spendCents: number }> {
     return this.call({ type: "record-spend", nowMs: input.nowMs, input });
   }

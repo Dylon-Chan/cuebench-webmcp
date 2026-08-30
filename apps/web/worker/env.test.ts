@@ -16,6 +16,10 @@ describe("Worker cryptographic configuration", () => {
     expect(() => resolveWorkerSettings(env({ TURNSTILE_SECRET: "also-too-short" }))).toThrow(/at least 32 bytes/i);
   });
 
+  it("rejects a long but trivially low-entropy secret byte sequence", () => {
+    expect(() => resolveWorkerSettings(env({ SESSION_HMAC_CURRENT_KEY: "a".repeat(64) }))).toThrow(/diversity/i);
+  });
+
   it("trims HMAC identifiers but preserves configured secret bytes exactly during key rotation", () => {
     const previousSecret = " previous-secret-with-at-least-thirty-two-bytes ";
     const settings = resolveWorkerSettings(env({

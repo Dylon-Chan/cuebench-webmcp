@@ -48,7 +48,8 @@ export interface MultipartPrivateObjectStore {
   createMultipart: (key: string, options: { readonly contentType: string; readonly customMetadata: Readonly<Record<string, string>> }) => Promise<{ readonly uploadId: string }>;
   uploadPart: (input: { readonly key: string; readonly uploadId: string; readonly partNumber: number; readonly body: ArrayBuffer }) => Promise<{ readonly etag: string }>;
   completeMultipart: (input: { readonly key: string; readonly uploadId: string; readonly parts: ReadonlyArray<{ readonly partNumber: number; readonly etag: string }> }) => Promise<void>;
-  abortMultipart: (input: { readonly key: string; readonly uploadId: string }) => Promise<void>;
+  /** Known R2 terminal multipart codes are an idempotent cleanup acknowledgement. */
+  abortMultipart: (input: { readonly key: string; readonly uploadId: string }) => Promise<void | "already-absent" | "already-completed">;
   /** An ambiguous complete is reconciled against object existence, never browser metadata. */
   head: (key: string) => Promise<{ readonly exists: boolean }>;
   delete: (key: string) => Promise<void>;
@@ -63,6 +64,20 @@ export class UploadValidationError extends Error {
     this.name = "UploadValidationError";
   }
 }
+
+export class MultipartCleanupError extends Error {
+  public constructor(public readonly code: "NoSuchUpload" | "AlreadyCompleted" | "AlreadyAborted" | "Unknown", message: string) {
+    super(message);
+    this.name = "MultipartCleanupError";
+  }
+}
+
+const r2ErrorCode = (error: unknown): MultipartCleanupError["code"] => {
+  if (error instanceof MultipartCleanupError) return error.code;
+  if (typeof error !== "object" || error === null || Array.isArray(error)) return "Unknown";
+  const code = (error as Readonly<Record<string, unknown>>).code;
+  return code === "NoSuchUpload" || code === "AlreadyCompleted" || code === "AlreadyAborted" ? code : "Unknown";
+};
 
 const supportedVideoType = (contentType: string): boolean => contentType.startsWith("video/");
 
@@ -244,8 +259,17 @@ export class R2PrivateObjectStore implements MultipartPrivateObjectStore {
     await this.bucket.resumeMultipartUpload(input.key, input.uploadId).complete(input.parts.map((part) => ({ partNumber: part.partNumber, etag: part.etag })));
   }
 
-  public async abortMultipart(input: { readonly key: string; readonly uploadId: string }): Promise<void> {
-    await this.bucket.resumeMultipartUpload(input.key, input.uploadId).abort();
+  public async abortMultipart(input: { readonly key: string; readonly uploadId: string }): Promise<void | "already-absent" | "already-completed"> {
+    try {
+      await this.bucket.resumeMultipartUpload(input.key, input.uploadId).abort();
+    } catch (error) {
+      // Use only the typed provider code—not an error-message string—to accept
+      // idempotent terminal cleanup outcomes.
+      const code = r2ErrorCode(error);
+      if (code === "AlreadyCompleted") return "already-completed";
+      if (code === "NoSuchUpload" || code === "AlreadyAborted") return "already-absent";
+      throw error;
+    }
   }
 
   public async head(key: string): Promise<{ readonly exists: boolean }> {

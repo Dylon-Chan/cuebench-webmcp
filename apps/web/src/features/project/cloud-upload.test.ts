@@ -6,6 +6,7 @@ import { CloudProcessingDisclosure } from "./CloudProcessingDisclosure";
 import {
   cancelCloudProcessingCopy,
   clearPersistedCloudSession,
+  clearPersistedCloudUpload,
   createAnonymousCloudSession,
   uploadCloudProcessingCopy,
   type CloudUploadReceiptStore,
@@ -169,11 +170,54 @@ describe("resumable cloud upload client", () => {
     expect(persisted.values.get("cuebench-cloud-upload:project-fixture")).not.toHaveProperty("session");
   });
 
+  it("clears an expired operation receipt rather than looping a no-longer-authorized recovery request", async () => {
+    const persisted = receiptStore();
+    persisted.store.save("cuebench-cloud-upload:project-fixture", {
+      version: 1,
+      projectId: "project-fixture",
+      operationId: "operation-fixture",
+      sourceByteLength: 5,
+      sourceContentType: "video/webm",
+      durationMs: 60_000,
+      operationReceipt: "expired-opaque-receipt",
+      uploadCapability: "expired-capability",
+      partSize: 3,
+      partCount: 2,
+      partReceipts: {},
+    });
+    const fetcher = vi.fn().mockResolvedValue(new Response(JSON.stringify({
+      error: { version: 1, code: "UPLOAD_EXPIRED", message: "expired", retrySafe: false, stateChanged: false, nextAction: "start-new-operation" },
+    }), { status: 410 }));
+
+    await expect(uploadCloudProcessingCopy({
+      fetcher,
+      session: "fresh-session",
+      projectId: "project-fixture",
+      operationId: "operation-fixture",
+      source: source(),
+      durationMs: 60_000,
+      disclosureAccepted: true,
+      receiptStore: persisted.store,
+    })).rejects.toMatchObject({ details: { code: "UPLOAD_EXPIRED", status: 410, nextAction: "start-new-operation" } });
+    expect(persisted.values.size).toBe(0);
+
+    clearPersistedCloudUpload("project-fixture", persisted.store);
+    expect(persisted.values.size).toBe(0);
+  });
+
   it("uses a same-origin Turnstile token and opaque idempotency key to create its anonymous session", async () => {
     const fetcher = vi.fn().mockResolvedValue(new Response(JSON.stringify({ session: "signed-session", expiresAtMs: 9_999 }), { status: 201 }));
 
     await expect(createAnonymousCloudSession({ fetcher, turnstileToken: "turnstile-token", idempotencyKey: "opaque-idempotency" })).resolves.toEqual({ session: "signed-session", expiresAtMs: 9_999 });
     expect(fetcher).toHaveBeenCalledWith("/api/session", expect.objectContaining({ method: "POST" }));
+  });
+
+  it("can request a narrowly scoped fresh Turnstile session solely for cleanup", async () => {
+    const fetcher = vi.fn().mockResolvedValue(new Response(JSON.stringify({ session: "cleanup-session", expiresAtMs: 9_999 }), { status: 201 }));
+
+    await expect(createAnonymousCloudSession({ fetcher, turnstileToken: "turnstile-token", idempotencyKey: "opaque-idempotency", purpose: "cleanup" })).resolves.toEqual({ session: "cleanup-session", expiresAtMs: 9_999 });
+    const init = fetcher.mock.calls[0]?.[1] as RequestInit;
+    expect(JSON.parse(init.body as string)).toMatchObject({ purpose: "cleanup" });
   });
 
   it("requests immediate cleanup for cancellation and removes only opaque local recovery state after success", async () => {

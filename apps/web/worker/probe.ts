@@ -6,10 +6,12 @@ export interface AuthoritativeMediaFacts {
   readonly durationMs: number;
   readonly byteLength: number;
   readonly sha256: string;
+  /** Optional authoritative provider settlement for a paid media-probe call. */
+  readonly providerSpendCents?: number;
 }
 
 export interface MediaProbe {
-  probe: (input: { readonly objectKey: string; readonly operationReceipt: string }) => Promise<AuthoritativeMediaFacts>;
+  probe: (input: { readonly objectKey: string; readonly operationReceipt: string; readonly idempotencyKey: string }) => Promise<AuthoritativeMediaFacts>;
 }
 
 export interface MediaProbeBinding {
@@ -20,7 +22,7 @@ export interface MediaProbeBinding {
 export class MediaProbeServiceBinding implements MediaProbe {
   public constructor(private readonly binding: MediaProbeBinding) {}
 
-  public async probe(input: { readonly objectKey: string; readonly operationReceipt: string }): Promise<AuthoritativeMediaFacts> {
+  public async probe(input: { readonly objectKey: string; readonly operationReceipt: string; readonly idempotencyKey: string }): Promise<AuthoritativeMediaFacts> {
     const response = await this.binding.fetch(new Request("https://cuebench-media.internal/v1/probe", {
       method: "POST",
       headers: { "content-type": "application/json" },
@@ -42,7 +44,8 @@ export const isAuthoritativeMediaFacts = (value: unknown): value is Authoritativ
     && Number.isSafeInteger(facts.durationMs)
     && Number.isSafeInteger(facts.byteLength)
     && typeof facts.sha256 === "string"
-    && /^[a-f0-9]{64}$/i.test(facts.sha256);
+    && /^[a-f0-9]{64}$/i.test(facts.sha256)
+    && (facts.providerSpendCents === undefined || (Number.isSafeInteger(facts.providerSpendCents) && (facts.providerSpendCents as number) >= 0));
 };
 
 export const isSupportedAuthoritativeMedia = (facts: AuthoritativeMediaFacts, limits: { readonly maxBytes: number; readonly maxDurationMs: number }): boolean => (

@@ -1,8 +1,9 @@
 /// <reference types="@cloudflare/vitest-pool-workers/types" />
 
-import { SELF, env } from "cloudflare:test";
+import { SELF, env, runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import { issueAnonymousSession } from "./session";
+import { verifyUploadReceipt } from "./uploads";
 
 const session = async (): Promise<string> => {
   const currentNow = Date.now();
@@ -78,5 +79,48 @@ describe("workerd hosted upload boundary", () => {
     // The runtime path refuses absent authoritative probing before multipart
     // completion, so no completed R2 object survives the response.
     expect((await env.PROCESSING_BUCKET.list()).objects).toHaveLength(0);
+  });
+
+  it("runs a real Durable Object alarm that deletes a queued private-object lifecycle before retaining terminal state", async () => {
+    const anonymousSession = await session();
+    const created = await SELF.fetch(post("/api/uploads", {
+      projectId: "workerd-alarm-project",
+      operationId: "workerd-alarm-operation",
+      media: { byteLength: 5, durationMs: 60_000, contentType: "video/webm" },
+      disclosureAccepted: true,
+    }, anonymousSession));
+    expect(created.status).toBe(201);
+    const { operationReceipt } = await created.json() as { readonly operationReceipt: string };
+    const receipt = await verifyUploadReceipt(operationReceipt, { keyRing: { current: { id: "v1", secret: env.SESSION_HMAC_CURRENT_KEY } } }, Date.now());
+    await env.PROCESSING_BUCKET.put(receipt.objectKey, "queued-private-media");
+    const stub = env.UPLOAD_COORDINATOR.get(env.UPLOAD_COORDINATOR.idFromName(receipt.operationKey));
+
+    await runInDurableObject(stub, async (_instance, state) => {
+      const key = "cuebench-upload-coordinator-v2";
+      const record = await state.storage.get<Record<string, unknown>>(key);
+      if (record === undefined) throw new Error("expected persisted upload coordinator record");
+      await state.storage.put(key, {
+        ...record,
+        state: "queued",
+        expiresAtMs: Date.now() - 1,
+        completionLease: null,
+        probeLease: null,
+        workflowLease: null,
+        cancellationLease: null,
+        cleanupTarget: null,
+      });
+      // Keep it in the future so Miniflare does not naturally fire it before
+      // `runDurableObjectAlarm` exercises the real alarm handler explicitly.
+      await state.storage.setAlarm(Date.now() + 60_000);
+    });
+
+    expect(await runDurableObjectAlarm(stub)).toBe(true);
+    const reconciled = await stub.fetch(new Request("https://upload-coordinator.internal/", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ type: "get", nowMs: Date.now() }),
+    }));
+    expect((await reconciled.json() as { readonly state: string }).state).toBe("cancelled");
+    expect(await env.PROCESSING_BUCKET.head(receipt.objectKey)).toBeNull();
   });
 });

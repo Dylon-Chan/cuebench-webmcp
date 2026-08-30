@@ -3,7 +3,7 @@ import { createCueBenchWorker } from "./index";
 import { InMemoryQuotaLedger } from "./quota-ledger";
 import { InMemoryUploadCoordinator } from "./upload-operations";
 import type { MediaProbe } from "./probe";
-import type { MultipartPrivateObjectStore } from "./uploads";
+import { R2PrivateObjectStore, type MultipartPrivateObjectStore } from "./uploads";
 import type { WorkerEnv } from "./env";
 
 const partSize = 8 * 1024 * 1024;
@@ -128,5 +128,27 @@ describe("resumable multipart upload boundary", () => {
     expect(firstBody.partCount).toBe(2);
     expect(duplicateBody.uploadCapability).toBeTruthy();
     expect(bucket.createCalls).toBe(1);
+  });
+
+  it("treats only typed terminal R2 multipart codes as idempotent abort acknowledgement", async () => {
+    const store = new R2PrivateObjectStore({
+      resumeMultipartUpload: () => ({
+        abort: async () => { throw { code: "NoSuchUpload" }; },
+      }),
+    } as never);
+
+    await expect(store.abortMultipart({ key: "processing/opaque", uploadId: "opaque-upload" })).resolves.toBe("already-absent");
+    const completed = new R2PrivateObjectStore({
+      resumeMultipartUpload: () => ({
+        abort: async () => { throw { code: "AlreadyCompleted" }; },
+      }),
+    } as never);
+    await expect(completed.abortMultipart({ key: "processing/opaque", uploadId: "opaque-upload" })).resolves.toBe("already-completed");
+    const unknown = new R2PrivateObjectStore({
+      resumeMultipartUpload: () => ({
+        abort: async () => { throw new Error("NoSuchUpload in text must not be trusted"); },
+      }),
+    } as never);
+    await expect(unknown.abortMultipart({ key: "processing/opaque", uploadId: "opaque-upload" })).rejects.toThrow(/NoSuchUpload/);
   });
 });

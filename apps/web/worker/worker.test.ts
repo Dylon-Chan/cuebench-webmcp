@@ -87,6 +87,32 @@ class AttachAmbiguousCoordinator extends InMemoryUploadCoordinator {
   }
 }
 
+class FailingFinalizeLedger extends InMemoryQuotaLedger {
+  private failOnce = true;
+
+  public override async finalizeSpend(input: Parameters<InMemoryQuotaLedger["finalizeSpend"]>[0]) {
+    if (this.failOnce) {
+      this.failOnce = false;
+      throw new Error("fixture spend persistence outage");
+    }
+    return super.finalizeSpend(input);
+  }
+}
+
+class FailingCommitLedger extends InMemoryQuotaLedger {
+  public override async commitMedia(): Promise<never> {
+    throw new Error("fixture quota persistence outage");
+  }
+}
+
+/** Simulates an R2 create response lost after the service may retain an unknown multipart id. */
+class UnknownMultipartCreateStore extends FixtureObjectStore {
+  public override async createMultipart(): Promise<{ readonly uploadId: string }> {
+    this.createCalls += 1;
+    throw new Error("ambiguous multipart create");
+  }
+}
+
 /** Simulates R2 completing while the coordinator response is lost. */
 class ProbeTransitionAmbiguousCoordinator extends InMemoryUploadCoordinator {
   private firstProbeTransition = true;
@@ -151,6 +177,7 @@ interface WorkerFixture {
 
 const makeFixture = (options: {
   readonly now?: number;
+  readonly clock?: () => number;
   readonly turnstile?: { readonly success: boolean; readonly hostname?: string; readonly action?: string };
   readonly env?: Partial<WorkerEnv>;
   readonly bucket?: FixtureObjectStore;
@@ -167,7 +194,7 @@ const makeFixture = (options: {
   let identifier = 0;
   return {
     app: createCueBenchWorker(workerEnv(options.env), {
-      clock: () => options.now ?? 1_700_000_000_000,
+      clock: options.clock ?? (() => options.now ?? 1_700_000_000_000),
       createId: () => `fixture-${++identifier}`,
       verifyTurnstile: options.verifyTurnstile ?? (async () => options.turnstile ?? { success: true, hostname: "cuebench.test", action: "cuebench-upload" }),
       quotaLedger: ledger,
@@ -282,6 +309,81 @@ describe("CueBench anonymous multipart Worker", () => {
     expect(bucket.createCalls).toBe(0);
   });
 
+  it("bounds the Turnstile session envelope before body parsing or verification", async () => {
+    let verifierCalls = 0;
+    const { app } = makeFixture({
+      verifyTurnstile: async () => {
+        verifierCalls += 1;
+        return { success: true, hostname: "cuebench.test", action: "cuebench-upload" };
+      },
+    });
+    const response = await app.fetch(new Request("https://cuebench.test/api/session", {
+      method: "POST",
+      headers: { "content-type": "application/json", "content-length": "999999" },
+      body: JSON.stringify({ turnstileToken: "fixture-valid" }),
+    }));
+
+    expect(response.status).toBe(400);
+    expect(verifierCalls).toBe(0);
+  });
+
+  it("rejects an oversized Turnstile token and unexpected session JSON fields", async () => {
+    let verifierCalls = 0;
+    const { app } = makeFixture({ verifyTurnstile: async () => {
+      verifierCalls += 1;
+      return { success: true, hostname: "cuebench.test", action: "cuebench-upload" };
+    } });
+
+    const oversized = await app.fetch(jsonRequest("/api/session", { turnstileToken: "a".repeat(2_049) }));
+    const unexpected = await app.fetch(jsonRequest("/api/session", { turnstileToken: "fixture-token", unexpected: "field" }));
+    expect(oversized.status).toBe(400);
+    expect(unexpected.status).toBe(400);
+    expect(verifierCalls).toBe(0);
+  });
+
+  it("allows a fresh cleanup-only Turnstile session to delete a retained copy even while the static breaker is open", async () => {
+    const coordinator = new InMemoryUploadCoordinator();
+    const ledger = new InMemoryQuotaLedger();
+    const bucket = new FixtureObjectStore();
+    const open = makeFixture({ coordinator, ledger, bucket, env: { GLOBAL_SPEND_BREAKER_OPEN: "true" } });
+    const setup = makeFixture({ coordinator, ledger, bucket });
+    const owner = await issueSession(setup.app);
+    const created = await requestUpload(setup.app, owner);
+    const { operationReceipt } = await created.json() as { readonly operationReceipt: string };
+
+    const sessionResponse = await open.app.fetch(jsonRequest("/api/session", { turnstileToken: "fixture-cleanup-session", purpose: "cleanup" }));
+    expect(sessionResponse.status).toBe(201);
+    const cleanupSession = (await sessionResponse.json() as { readonly session: string }).session;
+    const cancelled = await open.app.fetch(new Request("https://cuebench.test/api/uploads/operation-fixture", {
+      method: "DELETE",
+      headers: { authorization: `Bearer ${cleanupSession}`, "x-cuebench-operation-receipt": operationReceipt },
+    }));
+    expect(cancelled.status).toBe(204);
+    expect(bucket.abortCalls).toBe(1);
+    expect((await requestUpload(open.app, cleanupSession)).status).toBe(403);
+  });
+
+  it("returns the versioned 410 UPLOAD_EXPIRED receipt error without granting operation access", async () => {
+    let currentNow = 1_700_000_000_000;
+    const coordinator = new InMemoryUploadCoordinator();
+    const { app } = makeFixture({ coordinator, clock: () => currentNow, env: { RECOVERY_TTL_SECONDS: "60" } });
+    const owner = await issueSession(app);
+    const created = await requestUpload(app, owner);
+    const { operationReceipt } = await created.json() as { readonly operationReceipt: string };
+    currentNow += 61_000;
+
+    const status = await app.fetch(new Request("https://cuebench.test/api/uploads/operation-fixture", {
+      headers: { authorization: `Bearer ${owner}`, "x-cuebench-operation-receipt": operationReceipt },
+    }));
+    expect(status.status).toBe(410);
+    expect((await status.json() as { readonly error: { readonly version: number; readonly code: string; readonly stateChanged: boolean; readonly nextAction: string } }).error).toEqual(expect.objectContaining({
+      version: 1,
+      code: "UPLOAD_EXPIRED",
+      stateChanged: false,
+      nextAction: "start-new-operation",
+    }));
+  });
+
   it("requires disclosure and validates proposed size/duration before it creates an R2 multipart upload", async () => {
     const { app, bucket } = makeFixture();
     const session = await issueSession(app);
@@ -306,6 +408,23 @@ describe("CueBench anonymous multipart Worker", () => {
     expect(body.error.message).not.toMatch(/no private object was retained/i);
     expect(bucket.createCalls).toBe(1);
     expect(bucket.abortCalls).toBe(1);
+  });
+
+  it("does not falsely acknowledge cleanup when ambiguous multipart creation has no returned upload id", async () => {
+    const bucket = new UnknownMultipartCreateStore();
+    const { app } = makeFixture({ bucket });
+    const session = await issueSession(app);
+
+    const response = await requestUpload(app, session);
+    expect(response.status).toBe(409);
+    expect((await response.json() as { readonly error: { readonly code: string; readonly stateChanged: boolean; readonly retrySafe: boolean; readonly nextAction: string } }).error).toEqual(expect.objectContaining({
+      code: "MULTIPART_CREATE_CLEANUP_PENDING",
+      stateChanged: true,
+      retrySafe: true,
+      nextAction: "retry-cleanup",
+    }));
+    expect(bucket.abortCalls).toBe(0);
+    expect(bucket.deleteCalls).toBe(1);
   });
 
   it("claims a multipart part before reading it, retries an uploaded part idempotently, and never exposes an object URL", async () => {
@@ -461,6 +580,11 @@ describe("CueBench anonymous multipart Worker", () => {
 
     const ambiguous = await appWithProbe.fetch(jsonRequest("/api/uploads/operation-fixture/complete", {}, { session, receipt: operationReceipt }));
     expect(ambiguous.status).toBe(503);
+    expect((await ambiguous.clone().json() as { readonly error: { readonly code: string; readonly stateChanged: boolean; readonly nextAction: string } }).error).toEqual(expect.objectContaining({
+      code: "COMPLETE_RECONCILIATION_REQUIRED",
+      stateChanged: true,
+      nextAction: "retry-completion",
+    }));
     expect(bucket.completed.size).toBe(1);
 
     const { app: appWithoutProbe } = makeFixture({ bucket, ledger, coordinator });
@@ -502,6 +626,44 @@ describe("CueBench anonymous multipart Worker", () => {
     expect(body.error).toEqual(expect.objectContaining({ code: "AUTHORITATIVE_MEDIA_CLEANUP_PENDING", retrySafe: true, stateChanged: true, nextAction: "retry-cleanup" }));
   });
 
+  it("reports a truthful retryable quota reconciliation state after authoritative probing has changed lifecycle", async () => {
+    const { app } = makeFixture({ ledger: new FailingCommitLedger(), probe: probeFor() });
+    const session = await issueSession(app);
+    const operation = await requestUpload(app, session);
+    const { uploadCapability, operationReceipt } = await operation.json() as { readonly uploadCapability: string; readonly operationReceipt: string };
+    expect((await app.fetch(partRequest(session, uploadCapability))).status).toBe(201);
+
+    const response = await app.fetch(jsonRequest("/api/uploads/operation-fixture/complete", {}, { session, receipt: operationReceipt }));
+    expect(response.status).toBe(503);
+    expect((await response.json() as { readonly error: { readonly code: string; readonly retrySafe: boolean; readonly stateChanged: boolean; readonly nextAction: string } }).error).toEqual(expect.objectContaining({
+      code: "QUOTA_RECONCILIATION_REQUIRED",
+      retrySafe: true,
+      stateChanged: true,
+      nextAction: "retry-probe",
+    }));
+  });
+
+  it("reports stateChanged when the dynamic breaker opens after R2 completion and a probe-spend reservation", async () => {
+    const { app } = makeFixture({
+      probe: probeFor(),
+      env: { GLOBAL_SPEND_LIMIT_CENTS: "1", MAX_MEDIA_PROBE_COST_CENTS: "1", MAX_WORKFLOW_PROVIDER_COST_CENTS: "1" },
+    });
+    const session = await issueSession(app);
+    const operation = await requestUpload(app, session);
+    const { uploadCapability, operationReceipt } = await operation.json() as { readonly uploadCapability: string; readonly operationReceipt: string };
+    expect((await app.fetch(partRequest(session, uploadCapability))).status).toBe(201);
+
+    const response = await app.fetch(jsonRequest("/api/uploads/operation-fixture/complete", {}, { session, receipt: operationReceipt }));
+
+    expect(response.status).toBe(429);
+    expect((await response.json() as { readonly error: { readonly code: string; readonly retrySafe: boolean; readonly stateChanged: boolean; readonly nextAction: string } }).error).toEqual(expect.objectContaining({
+      code: "GLOBAL_BREAKER",
+      retrySafe: true,
+      stateChanged: true,
+      nextAction: "retry",
+    }));
+  });
+
   it("probes, commits actual quota, and starts its deterministic workflow exactly once across completion replays", async () => {
     const { app, bucket, workflow } = makeFixture({ probe: probeFor() });
     const session = await issueSession(app);
@@ -517,6 +679,45 @@ describe("CueBench anonymous multipart Worker", () => {
     expect(bucket.completeCalls).toBe(1);
     expect(workflow.starts).toHaveLength(1);
     expect(workflow.starts[0]?.receipt).toBe(operationReceipt);
+  });
+
+  it("fences concurrent authoritative probes and supplies one deterministic provider idempotency key", async () => {
+    const entered = deferred<void>();
+    const release = deferred<void>();
+    const probeKeys: string[] = [];
+    const probe: MediaProbe = {
+      probe: async (input) => {
+        probeKeys.push(input.idempotencyKey);
+        entered.resolve();
+        await release.promise;
+        return {
+          container: "webm",
+          mimeType: "video/webm",
+          codec: "vp9",
+          durationMs: 60_000,
+          byteLength: 5,
+          sha256: "a".repeat(64),
+        };
+      },
+    };
+    const { app } = makeFixture({ probe });
+    const session = await issueSession(app);
+    const operation = await requestUpload(app, session);
+    const { uploadCapability, operationReceipt } = await operation.json() as { readonly uploadCapability: string; readonly operationReceipt: string };
+    expect((await app.fetch(partRequest(session, uploadCapability))).status).toBe(201);
+
+    const first = app.fetch(jsonRequest("/api/uploads/operation-fixture/complete", {}, { session, receipt: operationReceipt }));
+    await entered.promise;
+    const concurrent = await app.fetch(jsonRequest("/api/uploads/operation-fixture/complete", {}, { session, receipt: operationReceipt }));
+    expect(concurrent.status).toBe(503);
+    expect((await concurrent.json() as { readonly error: { readonly code: string; readonly retrySafe: boolean; readonly nextAction: string } }).error).toEqual(expect.objectContaining({
+      code: "PROBE_IN_PROGRESS",
+      retrySafe: true,
+      nextAction: "retry-probe",
+    }));
+    release.resolve();
+    expect((await first).status).toBe(202);
+    expect(probeKeys).toEqual([expect.stringMatching(/^probe:/)]);
   });
 
   it("reconciles an ambiguous R2 multipart completion by object head without a duplicate complete", async () => {
@@ -551,6 +752,24 @@ describe("CueBench anonymous multipart Worker", () => {
     expect(workflow.starts).toHaveLength(1);
   });
 
+  it("does not queue a started workflow until its conservative spend hold is durable, then replays through the deterministic instance", async () => {
+    const ledger = new FailingFinalizeLedger();
+    const workflow = new FixtureWorkflow(false, 2);
+    const { app } = makeFixture({ ledger, workflow, probe: probeFor() });
+    const session = await issueSession(app);
+    const operation = await requestUpload(app, session);
+    const { uploadCapability, operationReceipt } = await operation.json() as { readonly uploadCapability: string; readonly operationReceipt: string };
+    expect((await app.fetch(partRequest(session, uploadCapability))).status).toBe(201);
+
+    const first = await app.fetch(jsonRequest("/api/uploads/operation-fixture/complete", {}, { session, receipt: operationReceipt }));
+    const replay = await app.fetch(jsonRequest("/api/uploads/operation-fixture/complete", {}, { session, receipt: operationReceipt }));
+
+    expect(first.status).toBe(503);
+    expect((await first.json() as { readonly error: { readonly code: string; readonly stateChanged: boolean } }).error).toEqual(expect.objectContaining({ code: "SPEND_RECONCILIATION_REQUIRED", stateChanged: true }));
+    expect(replay.status).toBe(200);
+    expect(workflow.starts).toHaveLength(1);
+  });
+
   it("reconciles an ambiguous Cloudflare Workflow create through get(id).status()", async () => {
     const workflowIds: unknown[] = [];
     let statusCalls = 0;
@@ -581,7 +800,7 @@ describe("CueBench anonymous multipart Worker", () => {
 
   it("records an idempotent provider-spend boundary and opens the dynamic breaker for later reservations", async () => {
     const workflow = new FixtureWorkflow(false, 5);
-    const { app } = makeFixture({ workflow, probe: probeFor(), env: { GLOBAL_SPEND_LIMIT_CENTS: "5" } });
+    const { app } = makeFixture({ workflow, probe: probeFor(), env: { GLOBAL_SPEND_LIMIT_CENTS: "6", MAX_WORKFLOW_PROVIDER_COST_CENTS: "5", MAX_MEDIA_PROBE_COST_CENTS: "1" } });
     const session = await issueSession(app);
     const operation = await requestUpload(app, session);
     const { uploadCapability, operationReceipt } = await operation.json() as { readonly uploadCapability: string; readonly operationReceipt: string };

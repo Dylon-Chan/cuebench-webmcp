@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { InMemoryUploadCoordinator, UploadCoordinator } from "./upload-operations";
+import { InMemoryUploadCoordinator, UploadCoordinator, cleanupTargetForLifecycle } from "./upload-operations";
 
 const operation = {
   ownerSessionKey: "session-hash",
@@ -23,6 +23,24 @@ const readyCoordinator = async (): Promise<InMemoryUploadCoordinator> => {
 };
 
 describe("UploadCoordinator reconciliation state machine", () => {
+  it.each([
+    ["creating", "uncertain"],
+    ["pending", "multipart"],
+    ["uploaded", "multipart"],
+    ["completing", "uncertain"],
+    ["failed-retryable", "uncertain"],
+    ["probing", "completed"],
+    ["ready", "completed"],
+    ["workflow-starting", "completed"],
+    ["queued", "completed"],
+    ["completed", "completed"],
+  ] as const)("derives a retention-safe cleanup target for %s", (state, objectState) => {
+    expect(cleanupTargetForLifecycle({ state, multipartUploadId: "multipart-1" }, "expiry-alarm")).toMatchObject({
+      objectState,
+      multipartUploadId: "multipart-1",
+    });
+  });
+
   it("fences a stale part lease so its late R2 result cannot overwrite a newer receipt", async () => {
     const coordinator = await readyCoordinator();
     const first = await coordinator.claimPart({ partNumber: 1, nowMs: 0, leaseMs: 10, createId: () => "first" });
@@ -102,6 +120,60 @@ describe("UploadCoordinator reconciliation state machine", () => {
     expect(expired?.cleanupTarget).toEqual({ objectState: "multipart", multipartUploadId: "multipart-1", reason: "lease-expired" });
   });
 
+  it("promotes a stale multipart cancellation target after completion may have produced an object", async () => {
+    const coordinator = await readyCoordinator();
+    const part = await coordinator.claimPart({ partNumber: 1, nowMs: 0, leaseMs: 10, createId: () => "part" });
+    if (part.kind !== "claimed") throw new Error("expected part claim");
+    await coordinator.recordPart({ partNumber: 1, claimId: part.claim.id, claimGeneration: part.claim.generation, etag: "etag", byteLength: 8, nowMs: 0 });
+    const completion = await coordinator.beginCompletion({ nowMs: 0, leaseMs: 10, createId: () => "complete" });
+    if (completion.kind !== "claimed") throw new Error("expected completion claim");
+    await coordinator.markProbing({ claimId: completion.claim.id, claimGeneration: completion.claim.generation, nowMs: 0 });
+
+    const cancellation = await coordinator.claimCancellation({
+      nowMs: 1,
+      leaseMs: 10,
+      createId: () => "cancel",
+      target: { objectState: "multipart", multipartUploadId: "multipart-1", reason: "stale-part-retry" },
+    });
+    expect(cancellation.kind).toBe("claimed");
+    if (cancellation.kind !== "claimed") throw new Error("expected cancellation claim");
+    expect(cancellation.record.cleanupTarget).toMatchObject({ objectState: "completed", multipartUploadId: "multipart-1" });
+  });
+
+  it("fences a slow expired completion failure so it cannot overwrite a newer probing state", async () => {
+    const coordinator = await readyCoordinator();
+    const part = await coordinator.claimPart({ partNumber: 1, nowMs: 0, leaseMs: 10, createId: () => "part" });
+    if (part.kind !== "claimed") throw new Error("expected part claim");
+    await coordinator.recordPart({ partNumber: 1, claimId: part.claim.id, claimGeneration: part.claim.generation, etag: "etag", byteLength: 8, nowMs: 0 });
+    const first = await coordinator.beginCompletion({ nowMs: 0, leaseMs: 10, createId: () => "complete-1" });
+    const replacement = await coordinator.beginCompletion({ nowMs: 11, leaseMs: 10, createId: () => "complete-2" });
+    if (first.kind !== "claimed" || replacement.kind !== "claimed") throw new Error("expected completion claims");
+    await coordinator.markProbing({ claimId: replacement.claim.id, claimGeneration: replacement.claim.generation, nowMs: 11 });
+
+    await coordinator.markRetryableFailure({
+      note: "late-complete-error",
+      nowMs: 11,
+      claimId: first.claim.id,
+      claimGeneration: first.claim.generation,
+    });
+    expect((await coordinator.get(11))?.state).toBe("probing");
+  });
+
+  it("serializes probe work with a fenced lease and permits a bounded retry after expiry", async () => {
+    const coordinator = await readyCoordinator();
+    const part = await coordinator.claimPart({ partNumber: 1, nowMs: 0, leaseMs: 10, createId: () => "part" });
+    if (part.kind !== "claimed") throw new Error("expected part claim");
+    await coordinator.recordPart({ partNumber: 1, claimId: part.claim.id, claimGeneration: part.claim.generation, etag: "etag", byteLength: 8, nowMs: 0 });
+    const completion = await coordinator.beginCompletion({ nowMs: 0, leaseMs: 10, createId: () => "complete" });
+    if (completion.kind !== "claimed") throw new Error("expected completion claim");
+    await coordinator.markProbing({ claimId: completion.claim.id, claimGeneration: completion.claim.generation, nowMs: 0 });
+
+    const first = await coordinator.claimProbe({ nowMs: 0, leaseMs: 10, createId: () => "probe-1" });
+    expect(first.kind).toBe("claimed");
+    expect((await coordinator.claimProbe({ nowMs: 1, leaseMs: 10, createId: () => "probe-2" })).kind).toBe("status");
+    expect((await coordinator.claimProbe({ nowMs: 11, leaseMs: 10, createId: () => "probe-3" })).kind).toBe("claimed");
+  });
+
   it("releases an expired workflow-start lease for deterministic status reconciliation instead of stranding", async () => {
     const coordinator = await readyCoordinator();
     const part = await coordinator.claimPart({ partNumber: 1, nowMs: 0, leaseMs: 10, createId: () => "part" });
@@ -110,13 +182,37 @@ describe("UploadCoordinator reconciliation state machine", () => {
     const completion = await coordinator.beginCompletion({ nowMs: 0, leaseMs: 10, createId: () => "complete" });
     if (completion.kind !== "claimed") throw new Error("expected completion claim");
     await coordinator.markProbing({ claimId: completion.claim.id, claimGeneration: completion.claim.generation, nowMs: 0 });
-    await coordinator.markReady(0);
+    const probe = await coordinator.claimProbe({ nowMs: 0, leaseMs: 10, createId: () => "probe" });
+    if (probe.kind !== "claimed") throw new Error("expected probe claim");
+    await coordinator.markReady({ claimId: probe.claim.id, claimGeneration: probe.claim.generation, nowMs: 0 });
     const first = await coordinator.claimWorkflowStart({ nowMs: 0, leaseMs: 10, createId: () => "workflow-1" });
     expect(first.kind).toBe("claimed");
     const replacement = await coordinator.claimWorkflowStart({ nowMs: 11, leaseMs: 10, createId: () => "workflow-2" });
     expect(replacement.kind).toBe("claimed");
     if (first.kind !== "claimed" || replacement.kind !== "claimed") throw new Error("expected workflow claims");
     expect(replacement.claim.generation).toBeGreaterThan(first.claim.generation);
+  });
+
+  it("keeps queued private media on the expiry cleanup schedule until R2 deletion is acknowledged", async () => {
+    const coordinator = await readyCoordinator();
+    const part = await coordinator.claimPart({ partNumber: 1, nowMs: 0, leaseMs: 10, createId: () => "part" });
+    if (part.kind !== "claimed") throw new Error("expected part claim");
+    await coordinator.recordPart({ partNumber: 1, claimId: part.claim.id, claimGeneration: part.claim.generation, etag: "etag", byteLength: 8, nowMs: 0 });
+    const completion = await coordinator.beginCompletion({ nowMs: 0, leaseMs: 10, createId: () => "complete" });
+    if (completion.kind !== "claimed") throw new Error("expected completion claim");
+    await coordinator.markProbing({ claimId: completion.claim.id, claimGeneration: completion.claim.generation, nowMs: 0 });
+    const probe = await coordinator.claimProbe({ nowMs: 0, leaseMs: 10, createId: () => "probe" });
+    if (probe.kind !== "claimed") throw new Error("expected probe claim");
+    await coordinator.markReady({ claimId: probe.claim.id, claimGeneration: probe.claim.generation, nowMs: 0 });
+    const workflow = await coordinator.claimWorkflowStart({ nowMs: 0, leaseMs: 10, createId: () => "workflow" });
+    if (workflow.kind !== "claimed") throw new Error("expected workflow claim");
+    await coordinator.markQueued({ claimId: workflow.claim.id, claimGeneration: workflow.claim.generation, nowMs: 0 });
+
+    const expired = await coordinator.get(10_001);
+    expect(expired).toMatchObject({
+      state: "cleanup-pending",
+      cleanupTarget: { objectState: "completed", multipartUploadId: "multipart-1", reason: "lease-expired" },
+    });
   });
 
   it("uses the Durable Object expiry alarm to abort an abandoned multipart upload and acknowledge quota release", async () => {

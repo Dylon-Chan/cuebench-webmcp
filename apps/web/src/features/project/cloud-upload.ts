@@ -32,6 +32,8 @@ export interface CreateAnonymousCloudSessionInput {
   readonly fetcher?: CloudUploadFetch;
   readonly turnstileToken: string;
   readonly idempotencyKey: string;
+  /** A cleanup-only session cannot resume upload or processing work. */
+  readonly purpose?: "upload" | "cleanup";
 }
 
 export interface PersistedCloudUpload {
@@ -285,6 +287,11 @@ export const clearPersistedCloudSession = (projectId: string, store: CloudUpload
   store?.save(key, recovery);
 };
 
+/** A 410 receipt is no longer usable for any action, so remove only that opaque operation record. */
+export const clearPersistedCloudUpload = (projectId: string, store: CloudUploadReceiptStore | null = defaultReceiptStore()): void => {
+  store?.remove(receiptKey(projectId));
+};
+
 const refreshOperation = async (input: UploadCloudProcessingCopyInput, fetcher: CloudUploadFetch, operation: PersistedCloudUpload): Promise<{ readonly operation: PersistedCloudUpload; readonly uploadedPartNumbers: readonly number[]; readonly status: string }> => {
   const response = await fetcher(`/api/uploads/${encodeURIComponent(input.operationId)}`, {
     headers: {
@@ -315,7 +322,7 @@ export const createAnonymousCloudSession = async (input: CreateAnonymousCloudSes
   const response = await fetcher("/api/session", {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ turnstileToken: input.turnstileToken, idempotencyKey: input.idempotencyKey }),
+    body: JSON.stringify({ turnstileToken: input.turnstileToken, idempotencyKey: input.idempotencyKey, ...(input.purpose === undefined ? {} : { purpose: input.purpose }) }),
   });
   if (!response.ok) throw await responseError(response, "CueBench could not create an anonymous cloud-processing session.");
   const result = await response.json() as Readonly<Record<string, unknown>>;
@@ -338,13 +345,26 @@ export const uploadCloudProcessingCopy = async (input: UploadCloudProcessingCopy
   const fetcher = input.fetcher ?? defaultFetcher();
   const store = input.receiptStore ?? defaultReceiptStore();
   const saved = parseStored(store?.load(receiptKey(input.projectId)) ?? null, input);
-  let state = saved === null
-    ? await createOperation(input, fetcher)
-    : await refreshOperation(input, fetcher, saved);
+  let state: { readonly operation: PersistedCloudUpload; readonly uploadedPartNumbers: readonly number[]; readonly status: string };
+  try {
+    state = saved === null
+      ? await createOperation(input, fetcher)
+      : await refreshOperation(input, fetcher, saved);
+  } catch (error) {
+    if (error instanceof CloudUploadError && error.details.code === "UPLOAD_EXPIRED" && error.details.nextAction === "start-new-operation") {
+      clearPersistedCloudUpload(input.projectId, store);
+    }
+    throw error;
+  }
   let operation = state.operation;
   persist(store, operation);
   if (state.status === "creating") {
-    state = await refreshOperation(input, fetcher, operation);
+    try {
+      state = await refreshOperation(input, fetcher, operation);
+    } catch (error) {
+      if (error instanceof CloudUploadError && error.details.code === "UPLOAD_EXPIRED" && error.details.nextAction === "start-new-operation") clearPersistedCloudUpload(input.projectId, store);
+      throw error;
+    }
     operation = state.operation;
     persist(store, operation);
     if (state.status === "creating") {
@@ -367,7 +387,11 @@ export const uploadCloudProcessingCopy = async (input: UploadCloudProcessingCopy
       },
       body: part,
     });
-    if (!response.ok) throw await responseError(response, "CueBench could not upload this bounded private media part.");
+    if (!response.ok) {
+      const error = await responseError(response, "CueBench could not upload this bounded private media part.");
+      if (error.details.code === "UPLOAD_EXPIRED" && error.details.nextAction === "start-new-operation") clearPersistedCloudUpload(input.projectId, store);
+      throw error;
+    }
     const partResult = await response.json() as Readonly<Record<string, unknown>>;
     const recordedPart = positiveInteger(partResult.partNumber, "CueBench did not return this private multipart receipt's part number.");
     if (recordedPart !== index) throw new CloudUploadError("CueBench returned a private multipart receipt for a different part.");
@@ -383,7 +407,11 @@ export const uploadCloudProcessingCopy = async (input: UploadCloudProcessingCopy
     },
     body: "{}",
   });
-  if (!completion.ok) throw await responseError(completion, "CueBench could not begin authoritative private-media processing.");
+  if (!completion.ok) {
+    const error = await responseError(completion, "CueBench could not begin authoritative private-media processing.");
+    if (error.details.code === "UPLOAD_EXPIRED" && error.details.nextAction === "start-new-operation") clearPersistedCloudUpload(input.projectId, store);
+    throw error;
+  }
   const completed = await completion.json() as Readonly<Record<string, unknown>>;
   const receipt = opaqueString(completed.operationReceipt, "CueBench did not return the private operation receipt after completion.");
   return { receipt, operationReceipt: receipt, status: opaqueString(completed.status, "CueBench did not return private-processing status."), operation };
@@ -399,6 +427,10 @@ export const cancelCloudProcessingCopy = async (input: CancelCloudProcessingCopy
       "x-cuebench-operation-receipt": input.receipt,
     },
   });
-  if (!response.ok) throw await responseError(response, "CueBench could not confirm private-copy cleanup. It remains subject to the 24-hour deletion ceiling.");
+  if (!response.ok) {
+    const error = await responseError(response, "CueBench could not confirm private-copy cleanup. It remains subject to the 24-hour deletion ceiling.");
+    if (error.details.code === "UPLOAD_EXPIRED" && error.details.nextAction === "start-new-operation") clearPersistedCloudUpload(input.projectId, input.receiptStore ?? defaultReceiptStore());
+    throw error;
+  }
   (input.receiptStore ?? defaultReceiptStore())?.remove(receiptKey(input.projectId));
 };

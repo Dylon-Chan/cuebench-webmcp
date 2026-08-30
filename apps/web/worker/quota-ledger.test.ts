@@ -112,4 +112,30 @@ describe("anonymous quota reservation ledger", () => {
     await expect(ledger.recordSpend({ spendKey: "provider-charge-a", cents: 100, nowMs: 1_007, globalSpendLimitCents: limits.globalSpendLimitCents })).resolves.toEqual({ breakerOpen: true, spendCents: 100 });
     expect(await ledger.reserveTts({ sessionKey: "salted-b", ipKey: "other-salted-ip", usageKey: "tts-after-breaker", nowMs: 1_007, quotas: limits })).toBe(false);
   });
+
+  it("holds a nonzero conservative provider maximum before work and settles the idempotent spend key later", async () => {
+    const ledger = new InMemoryQuotaLedger();
+
+    await expect(ledger.reserveSpend({ spendKey: "workflow:opaque-operation", maxCents: 7, nowMs: 1_000, globalSpendLimitCents: 10 })).resolves.toEqual({
+      accepted: true,
+      existing: false,
+      breakerOpen: false,
+      spendCents: 7,
+    });
+    await expect(ledger.reserveSpend({ spendKey: "workflow:opaque-operation", maxCents: 7, nowMs: 1_001, globalSpendLimitCents: 10 })).resolves.toEqual({
+      accepted: true,
+      existing: true,
+      breakerOpen: false,
+      spendCents: 7,
+    });
+    await expect(ledger.finalizeSpend({ spendKey: "workflow:opaque-operation", actualCents: 9, nowMs: 1_002, globalSpendLimitCents: 10 })).resolves.toEqual({
+      persisted: true,
+      breakerOpen: false,
+      spendCents: 9,
+    });
+    await expect(ledger.reserveSpend({ spendKey: "workflow:another-operation", maxCents: 2, nowMs: 1_003, globalSpendLimitCents: 10 })).resolves.toEqual({
+      accepted: false,
+      code: "SPEND_LIMIT",
+    });
+  });
 });

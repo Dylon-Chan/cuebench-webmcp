@@ -39,6 +39,9 @@ export interface WorkerEnv {
   readonly MAX_PENDING_IP_OPERATIONS?: string;
   readonly GLOBAL_SPEND_LIMIT_CENTS?: string;
   readonly GLOBAL_SPEND_BREAKER_OPEN?: string;
+  /** Conservative per-operation reservations before external providers run. */
+  readonly MAX_WORKFLOW_PROVIDER_COST_CENTS?: string;
+  readonly MAX_MEDIA_PROBE_COST_CENTS?: string;
   readonly TURNSTILE_SECRET: string;
   readonly TURNSTILE_VERIFY_URL?: string;
   readonly TURNSTILE_EXPECTED_HOSTNAME?: string;
@@ -77,6 +80,8 @@ export interface WorkerSettings {
   readonly maxUploadDurationMs: number;
   readonly quotas: AnonymousQuotaLimits;
   readonly globalSpendBreakerOpen: boolean;
+  readonly maxWorkflowProviderCostCents: number;
+  readonly maxMediaProbeCostCents: number;
   readonly turnstileSecret: string;
   readonly turnstileVerifyUrl: string;
   /** An explicit production host override; otherwise the Worker verifies its own request host. */
@@ -101,8 +106,14 @@ const nonEmpty = (value: string | undefined, name: string): string => {
 /** Keeps the configured bytes exactly as supplied while rejecting toy secrets. */
 const strongSecret = (value: string | undefined, name: string): string => {
   const secret = nonEmpty(value, name);
-  if (new TextEncoder().encode(secret).byteLength < 32) {
+  const bytes = new TextEncoder().encode(secret);
+  // The exact bytes are passed through unchanged to Web Crypto. This check is
+  // deliberately on decoded UTF-8 bytes rather than trimmed string length.
+  if (bytes.byteLength < 32) {
     throw new WorkerConfigurationError(`${name} must contain at least 32 bytes.`);
+  }
+  if (new Set(bytes).size < 8) {
+    throw new WorkerConfigurationError(`${name} must contain sufficient secret-byte diversity.`);
   }
   return secret;
 };
@@ -162,6 +173,10 @@ export const resolveWorkerSettings = (env: WorkerEnv): WorkerSettings => {
       pendingIpOperations: boundedInt(env.MAX_PENDING_IP_OPERATIONS, 8, "MAX_PENDING_IP_OPERATIONS", 1, 1_000),
     },
     globalSpendBreakerOpen: truthy(env.GLOBAL_SPEND_BREAKER_OPEN),
+    // A non-zero upper bound is reserved before every external processing
+    // provider call. The workflow may settle authoritative usage later.
+    maxWorkflowProviderCostCents: boundedInt(env.MAX_WORKFLOW_PROVIDER_COST_CENTS, 100, "MAX_WORKFLOW_PROVIDER_COST_CENTS", 1, 1_000_000_000),
+    maxMediaProbeCostCents: boundedInt(env.MAX_MEDIA_PROBE_COST_CENTS, 1, "MAX_MEDIA_PROBE_COST_CENTS", 1, 1_000_000_000),
     turnstileSecret: strongSecret(env.TURNSTILE_SECRET, "TURNSTILE_SECRET"),
     turnstileVerifyUrl: env.TURNSTILE_VERIFY_URL?.trim() || "https://challenges.cloudflare.com/turnstile/v0/siteverify",
     ...(env.TURNSTILE_EXPECTED_HOSTNAME?.trim()

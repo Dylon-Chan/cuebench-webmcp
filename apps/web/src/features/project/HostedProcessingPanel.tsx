@@ -3,6 +3,7 @@ import {
   CloudUploadError,
   cancelCloudProcessingCopy,
   clearPersistedCloudSession,
+  clearPersistedCloudUpload,
   createAnonymousCloudSession,
   loadPersistedCloudUpload,
   uploadCloudProcessingCopy,
@@ -141,6 +142,7 @@ export function HostedProcessingPanel({ projectId, durationMs, sourceObjectUrl, 
   const operationReceipt = recovery?.operationReceipt ?? null;
   const operationId = recovery?.operationId ?? null;
   const canStart = accepted && siteKey.length > 0 && (turnstileToken !== null || availableSession !== null) && !busy;
+  const canCancel = accepted && siteKey.length > 0 && operationReceipt !== null && operationId !== null && (availableSession !== null || turnstileToken !== null) && !busy;
 
   const begin = async () => {
     if (!canStart) return;
@@ -179,8 +181,10 @@ export function HostedProcessingPanel({ projectId, durationMs, sourceObjectUrl, 
         setStatus("CueBench needs a fresh anti-abuse verification before it can resume this private operation. Its opaque recovery receipt was kept.");
       }
       if (cause instanceof CloudUploadError && cause.details.status === 410) {
+        clearPersistedCloudUpload(projectId);
+        setRecovery(null);
         setForceNewOperation(true);
-        setStatus("This temporary private operation reached its recovery expiry. Its receipt was retained for status, and a fresh operation id is required.");
+        setStatus("This temporary private operation reached its recovery expiry and can no longer authorize any action. Start a new operation after completing anti-abuse verification.");
       }
       setError(cause instanceof Error ? cause.message : "CueBench could not begin optional cloud processing.");
     } finally {
@@ -189,12 +193,15 @@ export function HostedProcessingPanel({ projectId, durationMs, sourceObjectUrl, 
   };
 
   const cancel = async () => {
-    if (availableSession === null || operationReceipt === null || operationId === null || busy) return;
+    if (operationReceipt === null || operationId === null || busy || (!accepted || siteKey.length === 0) || (availableSession === null && turnstileToken === null)) return;
     setBusy(true);
     setError(null);
     try {
+      const cleanupSession = availableSession === null
+        ? await createAnonymousCloudSession({ turnstileToken: turnstileToken!, idempotencyKey: randomOpaqueId(), purpose: "cleanup" })
+        : { session: availableSession.value, expiresAtMs: availableSession.expiresAtMs };
       await cancelCloudProcessingCopy({
-        session: availableSession.value,
+        session: cleanupSession.session,
         projectId,
         operationId,
         receipt: operationReceipt,
@@ -210,6 +217,12 @@ export function HostedProcessingPanel({ projectId, durationMs, sourceObjectUrl, 
         setRecovery(loadPersistedCloudUpload(projectId));
         setStatus("CueBench needs a fresh anti-abuse verification before it can confirm cleanup. The recovery receipt was kept.");
       }
+      if (cause instanceof CloudUploadError && cause.details.status === 410) {
+        clearPersistedCloudUpload(projectId);
+        setRecovery(null);
+        setForceNewOperation(true);
+        setStatus("This private operation expired before cleanup could be authorized. CueBench's retention reconciler remains responsible for its disclosed deletion ceiling.");
+      }
       setError(cause instanceof Error ? cause.message : "CueBench could not confirm private-copy cleanup. It remains subject to the 24-hour deletion ceiling.");
     } finally {
       setBusy(false);
@@ -222,7 +235,7 @@ export function HostedProcessingPanel({ projectId, durationMs, sourceObjectUrl, 
       <TurnstileGate siteKey={siteKey} disabled={busy || !accepted} onTokenChange={setTurnstileToken} />
       <div className="cloud-processing-panel__actions">
         <button className="button button--outline" type="button" disabled={!canStart} aria-busy={busy} onClick={() => void begin()}>Start cloud processing</button>
-        {operationReceipt === null ? null : <button className="button button--outline" type="button" disabled={busy || availableSession === null} onClick={() => void cancel()}>Cancel cloud processing and delete copy</button>}
+        {operationReceipt === null ? null : <button className="button button--outline" type="button" disabled={!canCancel} onClick={() => void cancel()}>Cancel cloud processing and delete copy</button>}
       </div>
       <p role="status">{status}</p>
       {error === null ? null : <p role="alert">{error}</p>}
