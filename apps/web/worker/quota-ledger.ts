@@ -243,12 +243,13 @@ const normaliseState = (input: LedgerState | undefined, nowMs: number): LedgerSt
   // Spend is a rolling accounting window, but an operator hard-open is a
   // separate safety control. Do not silently clear it merely because the
   // accounting window rolled; only `setManualBreaker({ open: false })` may.
-  const manualBreakerOpen = rawGlobal.manualBreakerOpen ?? rawGlobal.breakerOpen;
+  // Before `manualBreakerOpen` existed, `breakerOpen` was only the cap-derived
+  // diagnostic snapshot. Never migrate that old field into a durable manual
+  // hard-open: an authoritative lower settlement must still reopen the cap.
+  const manualBreakerOpen = rawGlobal.manualBreakerOpen === true;
   const global = rawGlobal.expiresAtMs > nowMs
     ? {
       ...rawGlobal,
-      // Old v2 records only had `breakerOpen`; retain that conservatively as
-      // operator state rather than reopening an unknown historic hard-open.
       manualBreakerOpen,
     }
     : { expiresAtMs: nowMs + QUOTA_WINDOW_MS, spendCents: 0, manualBreakerOpen, breakerOpen: manualBreakerOpen };

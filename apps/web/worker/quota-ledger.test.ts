@@ -47,6 +47,53 @@ describe("anonymous quota reservation ledger", () => {
     })).resolves.toEqual({ open: true });
   });
 
+  it("migrates a legacy cap-open reservation as computed state, then reopens after settlement and rollover", async () => {
+    const createdAtMs = 1_000;
+    let persisted: unknown = {
+      sessions: {},
+      networks: {},
+      reservations: {},
+      mediaCommitMarkers: {},
+      usageMarkers: {},
+      spendMarkers: {
+        "workflow:legacy-cap": {
+          expiresAtMs: createdAtMs + QUOTA_WINDOW_MS,
+          reservedCents: 10,
+          result: { breakerOpen: true, spendCents: 10 },
+        },
+      },
+      turnstileSessions: {},
+      // This pre-manualBreakerOpen record was cap-derived, not an operator
+      // hard-open. Its legacy `breakerOpen` must never become manual state.
+      global: { expiresAtMs: createdAtMs + QUOTA_WINDOW_MS, spendCents: 10, breakerOpen: true },
+    };
+    const ledger = new QuotaLedger({
+      storage: {
+        get: async <Value>(): Promise<Value | undefined> => persisted as Value | undefined,
+        put: async (_key: string, value: unknown): Promise<void> => { persisted = value; },
+      },
+    });
+    const action = async <Value>(value: unknown): Promise<Value> => {
+      const response = await ledger.fetch(new Request("https://quota-ledger.internal/", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(value),
+      }));
+      return response.json() as Promise<Value>;
+    };
+
+    await expect(action<{ readonly persisted: boolean; readonly breakerOpen: boolean; readonly spendCents: number }>({
+      type: "finalize-spend",
+      nowMs: createdAtMs + 1,
+      input: { spendKey: "workflow:legacy-cap", actualCents: 1, nowMs: createdAtMs + 1, globalSpendLimitCents: 10 },
+    })).resolves.toEqual({ persisted: true, breakerOpen: false, spendCents: 1 });
+    await expect(action<{ readonly open: boolean }>({
+      type: "check-breaker",
+      nowMs: createdAtMs + QUOTA_WINDOW_MS + 1,
+      limit: 10,
+    })).resolves.toEqual({ open: false });
+  });
+
   it("keeps no-byte upload reservations out of the committed 90-minute media window", async () => {
     const ledger = new InMemoryQuotaLedger();
     const limits = quotas();
