@@ -2,6 +2,7 @@ import * as Tabs from "@radix-ui/react-tabs";
 import { useSyncExternalStore } from "react";
 import { Navigate, Route, Routes } from "react-router-dom";
 import type { CaptionProject } from "@cuebench/domain";
+import { VideoEvidenceBay } from "../features/evidence/VideoEvidenceBay";
 import { ProjectStart } from "../features/project/ProjectStart";
 import { StorageDisclosure } from "../features/project/StorageDisclosure";
 import type { ProjectMode, ProjectStore } from "../features/project/project-store";
@@ -25,9 +26,10 @@ interface WorkbenchShellProps {
   readonly mode: ProjectMode | null;
   readonly sourceObjectUrl: string;
   readonly webMcpAvailable: boolean;
+  readonly store: ProjectStore;
 }
 
-export function WorkbenchShell({ project, mode, sourceObjectUrl, webMcpAvailable }: WorkbenchShellProps) {
+export function WorkbenchShell({ project, mode, sourceObjectUrl, webMcpAvailable, store }: WorkbenchShellProps) {
   const captionCount = project.captions.order.length;
   const descriptionCount = project.audioDescriptions.order.length;
   const validationLabel = project.validation.status === "NotRun"
@@ -64,40 +66,11 @@ export function WorkbenchShell({ project, mode, sourceObjectUrl, webMcpAvailable
       </header>
 
       <div className="workbench-grid">
-        <section className="evidence-bay" aria-labelledby="evidence-bay-heading">
-          <div className="region-heading">
-            <div>
-              <h1 id="evidence-bay-heading">Evidence bay</h1>
-              <p>{project.media.sourceId} · {formatDuration(project.media.durationMs)}</p>
-            </div>
-            <span className="measurement-label">Native clock</span>
-          </div>
-          <div className="specimen-view" aria-label="Source media specimen">
-            <video className="specimen-view__media" src={sourceObjectUrl} muted playsInline preload="metadata" aria-label="Verified local source media" />
-            <div className="specimen-view__note" role="status">Local source media verified in this browser.</div>
-          </div>
-          <div className="transport-bar" aria-label="Playback transport">
-            <output aria-label="Current media time">00:00.000</output>
-            <span aria-hidden="true">/</span>
-            <output aria-label="Source duration">{formatDuration(project.media.durationMs)}</output>
-            <span className="transport-bar__spacer" />
-            <span className="transport-note">Playback and caption controls initialize with the authoritative media clock.</span>
-          </div>
-          <section className="timeline-shell" aria-labelledby="timeline-heading">
-            <div className="region-heading region-heading--compact">
-              <div><h2 id="timeline-heading">Shared timeline</h2><p>Integer millisecond projection</p></div>
-              <span className="measurement-label">00:00 → {formatDuration(project.media.durationMs)}</span>
-            </div>
-            <div className="waveform-shell" aria-label="Waveform placeholder for the source media">
-              <div className="waveform-signal" aria-hidden="true" />
-              <span className="playhead" aria-hidden="true" />
-            </div>
-            <div className="timeline-lanes">
-              <div><strong>Captions</strong><span>{captionCount === 0 ? "No caption cues yet" : `${captionCount} caption cues`}</span></div>
-              <div><strong>Audio description</strong><span>{descriptionCount === 0 ? "No description beats yet" : `${descriptionCount} description beats`}</span></div>
-            </div>
-          </section>
-        </section>
+        <VideoEvidenceBay
+          project={project}
+          sourceObjectUrl={sourceObjectUrl}
+          onCommand={(command) => store.executeCommand(command)}
+        />
 
         <aside className="review-docket" aria-labelledby="review-docket-heading">
           <div className="region-heading">
@@ -154,6 +127,7 @@ function ProjectRoute({ store, webMcpAvailable }: AppRoutesProps) {
     mode={snapshot.mode}
     sourceObjectUrl={snapshot.sourceObjectUrl}
     webMcpAvailable={webMcpAvailable}
+    store={store}
   />;
 }
 

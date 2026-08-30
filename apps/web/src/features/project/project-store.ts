@@ -1,6 +1,13 @@
-import { createProject, type CaptionProject } from "@cuebench/domain";
+import {
+  applyCommand,
+  createProject,
+  type CaptionProject,
+  type CommandResult,
+  type DomainCommand,
+} from "@cuebench/domain";
 import {
   CueBenchDatabase,
+  executePersistentCommand,
   initializeProject,
   loadProject,
   loadSetting,
@@ -225,6 +232,27 @@ export class ProjectStore {
     if (this.snapshot.activity !== null) return;
     this.invalidateOperations();
     this.setSnapshot(emptySnapshot());
+  }
+
+  /**
+   * The UI uses the same version-guarded reducer as WebMCP. Durable projects
+   * commit through the IndexedDB CAS transaction; temporary projects retain the
+   * exact command semantics in their explicitly in-memory session.
+   */
+  public async executeCommand(command: DomainCommand): Promise<CommandResult> {
+    const snapshot = this.snapshot;
+    if (snapshot.project === null || snapshot.mode === null) {
+      throw new Error("CueBench cannot edit a project before its media is available.");
+    }
+    const projectId = snapshot.project.projectId;
+    const result = snapshot.mode === "durable"
+      ? await executePersistentCommand(this.database, projectId, command)
+      : applyCommand(snapshot.project, command);
+
+    if (result.error === undefined && this.snapshot.project?.projectId === projectId) {
+      this.setSnapshot({ ...this.snapshot, project: result.project, error: null });
+    }
+    return result;
   }
 
   /** Cancels stale async continuations and releases the only live local-media URL. */
