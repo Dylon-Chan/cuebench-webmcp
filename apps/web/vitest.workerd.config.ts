@@ -10,9 +10,9 @@ const workerOptions = {
   // Fixture-only local bindings. Production values remain Wrangler secrets and are ignored by git.
   miniflare: {
     bindings: {
-      SESSION_HMAC_CURRENT_KEY: "workerd-current-hmac-fixture",
-      QUOTA_SALT: "workerd-salted-quota-fixture",
-      TURNSTILE_SECRET: "workerd-turnstile-fixture",
+      SESSION_HMAC_CURRENT_KEY: "workerd-current-hmac-fixture-32-byte-minimum",
+      QUOTA_SALT: "workerd-salted-quota-fixture-32-byte-minimum",
+      TURNSTILE_SECRET: "workerd-turnstile-fixture-32-byte-minimum",
     },
   },
 } as const;

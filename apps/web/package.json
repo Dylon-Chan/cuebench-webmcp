@@ -6,7 +6,8 @@
   "scripts": {
     "dev": "vite",
     "build": "vite build",
-    "test": "vitest run",
+    "test": "pnpm run test:unit && pnpm run test:workerd",
+    "test:unit": "vitest run",
     "test:workerd": "vitest run --config vitest.workerd.config.ts",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "e2e": "playwright test",

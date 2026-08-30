@@ -75,6 +75,8 @@ describe("workerd hosted upload boundary", () => {
     }));
     expect(completed.status).toBe(503);
     expect((await completed.json() as { error: { code: string } }).error.code).toBe("MEDIA_PROBE_UNAVAILABLE");
-    expect((await env.PROCESSING_BUCKET.list()).objects).toHaveLength(1);
+    // The runtime path refuses absent authoritative probing before multipart
+    // completion, so no completed R2 object survives the response.
+    expect((await env.PROCESSING_BUCKET.list()).objects).toHaveLength(0);
   });
 });

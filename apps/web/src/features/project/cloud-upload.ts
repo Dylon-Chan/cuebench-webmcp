@@ -10,6 +10,7 @@ export interface CloudUploadReceiptStore {
 
 export interface CloudUploadErrorDetails {
   readonly code?: string;
+  readonly status?: number;
   readonly retrySafe?: boolean;
   readonly stateChanged?: boolean;
   readonly nextAction?: string;
@@ -42,6 +43,8 @@ export interface PersistedCloudUpload {
   readonly durationMs: number;
   /** Opaque anonymous bearer needed to resume this exact owner-bound operation. */
   readonly session?: string;
+  /** Session expiry is persisted so a stale browser tab cannot silently reuse it. */
+  readonly sessionExpiresAtMs?: number;
   readonly operationReceipt: string;
   readonly uploadCapability: string;
   readonly partSize: number;
@@ -53,6 +56,7 @@ export interface UploadCloudProcessingCopyInput {
   readonly fetcher?: CloudUploadFetch;
   /** A short-lived anonymous session returned by the same-origin Worker after Turnstile. */
   readonly session: string;
+  readonly sessionExpiresAtMs?: number;
   readonly projectId: string;
   readonly operationId: string;
   readonly source: Blob;
@@ -69,6 +73,8 @@ export interface CloudUploadResult {
   readonly status: string;
   readonly operation: PersistedCloudUpload;
 }
+
+export type PersistedCloudUploadRecovery = Pick<PersistedCloudUpload, "operationId"> & Partial<Pick<PersistedCloudUpload, "session" | "sessionExpiresAtMs" | "operationReceipt" | "uploadCapability">>;
 
 export interface CancelCloudProcessingCopyInput {
   readonly fetcher?: CloudUploadFetch;
@@ -126,9 +132,18 @@ const responseError = async (response: Response, fallback: string): Promise<Clou
   try {
     const body = await response.json() as { readonly error?: Readonly<Record<string, unknown>> };
     const error = body.error;
+    if (error !== undefined && error.version !== 1) {
+      return new CloudUploadError("CueBench returned an unsupported private-upload error protocol. Retry only after the browser has refreshed.", {
+        code: "UNSUPPORTED_ERROR_VERSION",
+        status: response.status,
+        retrySafe: false,
+        nextAction: "refresh-browser",
+      });
+    }
     if (typeof error?.message === "string" && error.message.trim().length > 0) {
       return new CloudUploadError(error.message, {
         ...(typeof error.code === "string" ? { code: error.code } : {}),
+        status: response.status,
         ...(typeof error.retrySafe === "boolean" ? { retrySafe: error.retrySafe } : {}),
         ...(typeof error.stateChanged === "boolean" ? { stateChanged: error.stateChanged } : {}),
         ...(typeof error.nextAction === "string" ? { nextAction: error.nextAction } : {}),
@@ -137,7 +152,7 @@ const responseError = async (response: Response, fallback: string): Promise<Clou
   } catch {
     // Do not surface an infrastructure response body: it may contain private request context.
   }
-  return new CloudUploadError(fallback);
+  return new CloudUploadError(fallback, { status: response.status });
 };
 
 const parseWorkerOperation = (value: unknown): WorkerOperationResponse => {
@@ -184,6 +199,7 @@ const parseStored = (value: unknown, input: Pick<UploadCloudProcessingCopyInput,
       sourceContentType: input.source.type.trim().toLowerCase(),
       durationMs: input.durationMs,
       ...(typeof record.session === "string" && record.session.length > 0 ? { session: record.session } : {}),
+      ...(Number.isSafeInteger(record.sessionExpiresAtMs) && (record.sessionExpiresAtMs as number) > 0 ? { sessionExpiresAtMs: record.sessionExpiresAtMs as number } : {}),
       operationReceipt: opaqueString(record.operationReceipt, "CueBench's saved private-operation receipt is incomplete."),
       uploadCapability: opaqueString(record.uploadCapability, "CueBench's saved multipart capability is incomplete."),
       partSize: positiveInteger(record.partSize, "CueBench's saved multipart size is incomplete."),
@@ -225,6 +241,7 @@ const createOperation = async (input: UploadCloudProcessingCopyInput, fetcher: C
       sourceContentType: input.source.type.trim().toLowerCase(),
       durationMs: input.durationMs,
       session: input.session,
+      ...(input.sessionExpiresAtMs === undefined ? {} : { sessionExpiresAtMs: input.sessionExpiresAtMs }),
       operationReceipt: worker.operationReceipt,
       uploadCapability: worker.uploadCapability,
       partSize: worker.partSize,
@@ -237,7 +254,7 @@ const createOperation = async (input: UploadCloudProcessingCopyInput, fetcher: C
 };
 
 /** Returns only opaque recovery state; callers must still obtain explicit user acceptance before using it. */
-export const loadPersistedCloudUpload = (projectId: string, store: CloudUploadReceiptStore | null = defaultReceiptStore()): Pick<PersistedCloudUpload, "operationId" | "session"> | null => {
+export const loadPersistedCloudUpload = (projectId: string, store: CloudUploadReceiptStore | null = defaultReceiptStore()): PersistedCloudUploadRecovery | null => {
   const value = store?.load(receiptKey(projectId));
   if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
   const record = value as Readonly<Record<string, unknown>>;
@@ -245,7 +262,27 @@ export const loadPersistedCloudUpload = (projectId: string, store: CloudUploadRe
   return {
     operationId: record.operationId,
     ...(typeof record.session === "string" && record.session.length > 0 ? { session: record.session } : {}),
+    ...(Number.isSafeInteger(record.sessionExpiresAtMs) && (record.sessionExpiresAtMs as number) > 0 ? { sessionExpiresAtMs: record.sessionExpiresAtMs as number } : {}),
+    ...(typeof record.operationReceipt === "string" && record.operationReceipt.length > 0 ? { operationReceipt: record.operationReceipt } : {}),
+    ...(typeof record.uploadCapability === "string" && record.uploadCapability.length > 0 ? { uploadCapability: record.uploadCapability } : {}),
   };
+};
+
+/**
+ * A 401/403 never discards the opaque operation receipt. It only removes the
+ * expired session bearer so the next explicit Turnstile challenge can rebind a
+ * fresh short capability to the same operation.
+ */
+export const clearPersistedCloudSession = (projectId: string, store: CloudUploadReceiptStore | null = defaultReceiptStore()): void => {
+  const key = receiptKey(projectId);
+  const current = store?.load(key);
+  if (typeof current !== "object" || current === null || Array.isArray(current)) return;
+  const record = current as Readonly<Record<string, unknown>>;
+  if (record.version !== 1) return;
+  const { session: _session, sessionExpiresAtMs: _sessionExpiresAtMs, ...recovery } = record;
+  void _session;
+  void _sessionExpiresAtMs;
+  store?.save(key, recovery);
 };
 
 const refreshOperation = async (input: UploadCloudProcessingCopyInput, fetcher: CloudUploadFetch, operation: PersistedCloudUpload): Promise<{ readonly operation: PersistedCloudUpload; readonly uploadedPartNumbers: readonly number[]; readonly status: string }> => {
@@ -260,6 +297,8 @@ const refreshOperation = async (input: UploadCloudProcessingCopyInput, fetcher: 
   return {
     operation: {
       ...operation,
+      session: input.session,
+      ...(input.sessionExpiresAtMs === undefined ? {} : { sessionExpiresAtMs: input.sessionExpiresAtMs }),
       operationReceipt: worker.operationReceipt,
       uploadCapability: worker.uploadCapability,
       partSize: worker.partSize,

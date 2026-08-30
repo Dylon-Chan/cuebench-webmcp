@@ -35,6 +35,36 @@ export interface UsageReservation {
   readonly quotas: AnonymousQuotaLimits;
 }
 
+/** Opaque, idempotent accounting boundary for a provider charge. */
+export interface SpendRecord {
+  readonly spendKey: string;
+  readonly cents: number;
+  readonly nowMs: number;
+  readonly globalSpendLimitCents: number;
+}
+
+/**
+ * A one-way hash of a Turnstile response is enough to replay exactly one
+ * anonymous session; neither the challenge response nor caller id is stored.
+ */
+export interface TurnstileSessionReservation {
+  readonly challengeKey: string;
+  readonly sessionId: string;
+  readonly siteverifyId: string;
+  readonly issuedAtMs: number;
+  readonly expiresAtMs: number;
+  readonly nowMs: number;
+}
+
+export interface TurnstileSessionResult {
+  readonly sessionId: string;
+  readonly siteverifyId: string;
+  readonly issuedAtMs: number;
+  readonly expiresAtMs: number;
+  readonly verified: boolean;
+  readonly existing: boolean;
+}
+
 export type UploadReservationResult =
   | { readonly accepted: true; readonly existing: boolean }
   | { readonly accepted: false; readonly code: QuotaRejectionCode };
@@ -49,7 +79,11 @@ export interface QuotaLedgerPort {
   commitMedia: (input: ActualMediaUsage) => Promise<CommitMediaResult>;
   reserveGeneration: (input: UsageReservation) => Promise<boolean>;
   reserveTts: (input: UsageReservation) => Promise<boolean>;
-  recordSpend: (input: { readonly cents: number; readonly nowMs: number; readonly globalSpendLimitCents: number }) => Promise<{ readonly breakerOpen: boolean; readonly spendCents: number }>;
+  recordSpend: (input: SpendRecord) => Promise<{ readonly breakerOpen: boolean; readonly spendCents: number }>;
+  isGlobalBreakerOpen: (input: { readonly nowMs: number; readonly globalSpendLimitCents: number }) => Promise<boolean>;
+  reserveTurnstileSession: (input: TurnstileSessionReservation) => Promise<TurnstileSessionResult>;
+  markTurnstileSessionVerified: (input: { readonly challengeKey: string; readonly nowMs: number }) => Promise<TurnstileSessionResult | null>;
+  releaseTurnstileSession: (input: { readonly challengeKey: string; readonly nowMs: number }) => Promise<boolean>;
 }
 
 interface CounterBucket {
@@ -84,12 +118,27 @@ interface GlobalSpendState {
   readonly breakerOpen: boolean;
 }
 
+interface SpendMarker {
+  readonly expiresAtMs: number;
+  readonly result: { readonly breakerOpen: boolean; readonly spendCents: number };
+}
+
+interface TurnstileSessionMarker {
+  readonly sessionId: string;
+  readonly siteverifyId: string;
+  readonly issuedAtMs: number;
+  readonly expiresAtMs: number;
+  readonly verified: boolean;
+}
+
 interface LedgerState {
   readonly sessions: Readonly<Record<string, CounterBucket>>;
   readonly networks: Readonly<Record<string, CounterBucket>>;
   readonly reservations: Readonly<Record<string, PendingReservation>>;
   readonly mediaCommitMarkers: Readonly<Record<string, MediaCommitMarker>>;
   readonly usageMarkers: Readonly<Record<string, UsageMarker>>;
+  readonly spendMarkers: Readonly<Record<string, SpendMarker>>;
+  readonly turnstileSessions: Readonly<Record<string, TurnstileSessionMarker>>;
   readonly global: GlobalSpendState;
 }
 
@@ -119,6 +168,8 @@ const emptyState = (nowMs: number): LedgerState => ({
   reservations: {},
   mediaCommitMarkers: {},
   usageMarkers: {},
+  spendMarkers: {},
+  turnstileSessions: {},
   global: { expiresAtMs: nowMs + QUOTA_WINDOW_MS, spendCents: 0, breakerOpen: false },
 });
 
@@ -158,7 +209,9 @@ const normaliseState = (input: LedgerState | undefined, nowMs: number): LedgerSt
     networks,
     reservations,
     mediaCommitMarkers: Object.fromEntries(Object.entries(state.mediaCommitMarkers ?? {}).filter(([, marker]) => marker.expiresAtMs > nowMs)),
-    usageMarkers: Object.fromEntries(Object.entries(state.usageMarkers).filter(([, marker]) => marker.expiresAtMs > nowMs)),
+    usageMarkers: Object.fromEntries(Object.entries(state.usageMarkers ?? {}).filter(([, marker]) => marker.expiresAtMs > nowMs)),
+    spendMarkers: Object.fromEntries(Object.entries(state.spendMarkers ?? {}).filter(([, marker]) => marker.expiresAtMs > nowMs)),
+    turnstileSessions: Object.fromEntries(Object.entries(state.turnstileSessions ?? {}).filter(([, marker]) => marker.expiresAtMs > nowMs)),
     global: state.global.expiresAtMs > nowMs
       ? state.global
       : { expiresAtMs: nowMs + QUOTA_WINDOW_MS, spendCents: 0, breakerOpen: false },
@@ -260,12 +313,57 @@ const reserveUsage = (state: LedgerState, input: UsageReservation, type: "genera
   };
 };
 
-const recordSpend = (state: LedgerState, cents: number, limit: number): { readonly state: LedgerState; readonly result: { readonly breakerOpen: boolean; readonly spendCents: number } } => {
+const recordSpend = (state: LedgerState, input: SpendRecord): { readonly state: LedgerState; readonly result: { readonly breakerOpen: boolean; readonly spendCents: number } } => {
+  const existing = state.spendMarkers[input.spendKey];
+  if (existing !== undefined) return { state, result: existing.result };
+  const { cents, globalSpendLimitCents: limit } = input;
   const safeCents = Number.isSafeInteger(cents) && cents >= 0 ? cents : 0;
   const spendCents = state.global.spendCents + safeCents;
   const breakerOpen = state.global.breakerOpen || spendCents >= limit;
   const next = { ...state, global: { ...state.global, spendCents, breakerOpen } };
-  return { state: next, result: { breakerOpen, spendCents } };
+  const result = { breakerOpen, spendCents };
+  return {
+    state: { ...next, spendMarkers: { ...next.spendMarkers, [input.spendKey]: { expiresAtMs: input.nowMs + QUOTA_WINDOW_MS, result } } },
+    result,
+  };
+};
+
+const isGlobalBreakerOpen = (state: LedgerState, limit: number): boolean => state.global.breakerOpen || state.global.spendCents >= limit;
+
+const reserveTurnstileSession = (state: LedgerState, input: TurnstileSessionReservation): { readonly state: LedgerState; readonly result: TurnstileSessionResult } => {
+  const existing = state.turnstileSessions[input.challengeKey];
+  if (existing !== undefined) {
+    return { state, result: { ...existing, existing: true } };
+  }
+  const marker: TurnstileSessionMarker = {
+    sessionId: input.sessionId,
+    siteverifyId: input.siteverifyId,
+    issuedAtMs: input.issuedAtMs,
+    expiresAtMs: input.expiresAtMs,
+    verified: false,
+  };
+  return {
+    state: { ...state, turnstileSessions: { ...state.turnstileSessions, [input.challengeKey]: marker } },
+    result: { ...marker, existing: false },
+  };
+};
+
+const markTurnstileSessionVerified = (state: LedgerState, challengeKey: string): { readonly state: LedgerState; readonly result: TurnstileSessionResult | null } => {
+  const marker = state.turnstileSessions[challengeKey];
+  if (marker === undefined) return { state, result: null };
+  const verified = { ...marker, verified: true };
+  return {
+    state: { ...state, turnstileSessions: { ...state.turnstileSessions, [challengeKey]: verified } },
+    result: { ...verified, existing: true },
+  };
+};
+
+const releaseTurnstileSession = (state: LedgerState, challengeKey: string): { readonly state: LedgerState; readonly released: boolean } => {
+  if (state.turnstileSessions[challengeKey] === undefined) return { state, released: false };
+  return {
+    state: { ...state, turnstileSessions: Object.fromEntries(Object.entries(state.turnstileSessions).filter(([key]) => key !== challengeKey)) },
+    released: true,
+  };
 };
 
 type LedgerAction =
@@ -273,7 +371,11 @@ type LedgerAction =
   | { readonly type: "release-upload"; readonly nowMs: number; readonly reservationKey: string }
   | { readonly type: "commit-media"; readonly nowMs: number; readonly input: ActualMediaUsage }
   | { readonly type: "reserve-generation" | "reserve-tts"; readonly nowMs: number; readonly input: UsageReservation }
-  | { readonly type: "record-spend"; readonly nowMs: number; readonly cents: number; readonly limit: number };
+  | { readonly type: "record-spend"; readonly nowMs: number; readonly input: SpendRecord }
+  | { readonly type: "check-breaker"; readonly nowMs: number; readonly limit: number }
+  | { readonly type: "reserve-turnstile-session"; readonly nowMs: number; readonly input: TurnstileSessionReservation }
+  | { readonly type: "mark-turnstile-session-verified"; readonly nowMs: number; readonly challengeKey: string }
+  | { readonly type: "release-turnstile-session"; readonly nowMs: number; readonly challengeKey: string };
 
 const applyAction = (state: LedgerState, action: LedgerAction): { readonly state: LedgerState; readonly value: unknown } => {
   if (action.type === "reserve-upload") {
@@ -292,9 +394,24 @@ const applyAction = (state: LedgerState, action: LedgerAction): { readonly state
     const applied = reserveUsage(state, action.input, action.type === "reserve-generation" ? "generation" : "tts");
     return { state: applied.state, value: { accepted: applied.accepted } };
   }
-  if (action.type !== "record-spend") return { state, value: null };
-  const applied = recordSpend(state, action.cents, action.limit);
-  return { state: applied.state, value: applied.result };
+  if (action.type === "record-spend") {
+    const applied = recordSpend(state, action.input);
+    return { state: applied.state, value: applied.result };
+  }
+  if (action.type === "check-breaker") return { state, value: { open: isGlobalBreakerOpen(state, action.limit) } };
+  if (action.type === "reserve-turnstile-session") {
+    const applied = reserveTurnstileSession(state, action.input);
+    return { state: applied.state, value: applied.result };
+  }
+  if (action.type === "mark-turnstile-session-verified") {
+    const applied = markTurnstileSessionVerified(state, action.challengeKey);
+    return { state: applied.state, value: applied.result };
+  }
+  if (action.type === "release-turnstile-session") {
+    const applied = releaseTurnstileSession(state, action.challengeKey);
+    return { state: applied.state, value: { released: applied.released } };
+  }
+  return { state, value: null };
 };
 
 /** Durable Object storage contains only salted keys, numeric counters, bounded pending leases, expiry, and spend state. */
@@ -343,8 +460,20 @@ export class InMemoryQuotaLedger implements QuotaLedgerPort {
   public commitMedia(input: ActualMediaUsage): Promise<CommitMediaResult> { return Promise.resolve(this.apply({ type: "commit-media", nowMs: input.nowMs, input }) as CommitMediaResult); }
   public reserveGeneration(input: UsageReservation): Promise<boolean> { return Promise.resolve((this.apply({ type: "reserve-generation", nowMs: input.nowMs, input }) as { readonly accepted: boolean }).accepted); }
   public reserveTts(input: UsageReservation): Promise<boolean> { return Promise.resolve((this.apply({ type: "reserve-tts", nowMs: input.nowMs, input }) as { readonly accepted: boolean }).accepted); }
-  public recordSpend(input: { readonly cents: number; readonly nowMs: number; readonly globalSpendLimitCents: number }): Promise<{ readonly breakerOpen: boolean; readonly spendCents: number }> {
-    return Promise.resolve(this.apply({ type: "record-spend", nowMs: input.nowMs, cents: input.cents, limit: input.globalSpendLimitCents }) as { readonly breakerOpen: boolean; readonly spendCents: number });
+  public recordSpend(input: SpendRecord): Promise<{ readonly breakerOpen: boolean; readonly spendCents: number }> {
+    return Promise.resolve(this.apply({ type: "record-spend", nowMs: input.nowMs, input }) as { readonly breakerOpen: boolean; readonly spendCents: number });
+  }
+  public async isGlobalBreakerOpen(input: { readonly nowMs: number; readonly globalSpendLimitCents: number }): Promise<boolean> {
+    return (this.apply({ type: "check-breaker", nowMs: input.nowMs, limit: input.globalSpendLimitCents }) as { readonly open: boolean }).open;
+  }
+  public reserveTurnstileSession(input: TurnstileSessionReservation): Promise<TurnstileSessionResult> {
+    return Promise.resolve(this.apply({ type: "reserve-turnstile-session", nowMs: input.nowMs, input }) as TurnstileSessionResult);
+  }
+  public markTurnstileSessionVerified(input: { readonly challengeKey: string; readonly nowMs: number }): Promise<TurnstileSessionResult | null> {
+    return Promise.resolve(this.apply({ type: "mark-turnstile-session-verified", ...input }) as TurnstileSessionResult | null);
+  }
+  public async releaseTurnstileSession(input: { readonly challengeKey: string; readonly nowMs: number }): Promise<boolean> {
+    return (this.apply({ type: "release-turnstile-session", ...input }) as { readonly released: boolean }).released;
   }
 }
 
@@ -366,8 +495,20 @@ export class DurableObjectQuotaLedger implements QuotaLedgerPort {
   public commitMedia(input: ActualMediaUsage): Promise<CommitMediaResult> { return this.call({ type: "commit-media", nowMs: input.nowMs, input }); }
   public async reserveGeneration(input: UsageReservation): Promise<boolean> { return (await this.call<{ readonly accepted: boolean }>({ type: "reserve-generation", nowMs: input.nowMs, input })).accepted; }
   public async reserveTts(input: UsageReservation): Promise<boolean> { return (await this.call<{ readonly accepted: boolean }>({ type: "reserve-tts", nowMs: input.nowMs, input })).accepted; }
-  public recordSpend(input: { readonly cents: number; readonly nowMs: number; readonly globalSpendLimitCents: number }): Promise<{ readonly breakerOpen: boolean; readonly spendCents: number }> {
-    return this.call({ type: "record-spend", nowMs: input.nowMs, cents: input.cents, limit: input.globalSpendLimitCents });
+  public recordSpend(input: SpendRecord): Promise<{ readonly breakerOpen: boolean; readonly spendCents: number }> {
+    return this.call({ type: "record-spend", nowMs: input.nowMs, input });
+  }
+  public async isGlobalBreakerOpen(input: { readonly nowMs: number; readonly globalSpendLimitCents: number }): Promise<boolean> {
+    return (await this.call<{ readonly open: boolean }>({ type: "check-breaker", nowMs: input.nowMs, limit: input.globalSpendLimitCents })).open;
+  }
+  public reserveTurnstileSession(input: TurnstileSessionReservation): Promise<TurnstileSessionResult> {
+    return this.call({ type: "reserve-turnstile-session", nowMs: input.nowMs, input });
+  }
+  public markTurnstileSessionVerified(input: { readonly challengeKey: string; readonly nowMs: number }): Promise<TurnstileSessionResult | null> {
+    return this.call({ type: "mark-turnstile-session-verified", ...input });
+  }
+  public async releaseTurnstileSession(input: { readonly challengeKey: string; readonly nowMs: number }): Promise<boolean> {
+    return (await this.call<{ readonly released: boolean }>({ type: "release-turnstile-session", ...input })).released;
   }
 }
 

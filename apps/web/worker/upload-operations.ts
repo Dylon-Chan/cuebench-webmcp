@@ -1,8 +1,11 @@
 /**
- * Operation coordination is deliberately separate from quota accounting. It
- * holds only opaque hashes, multipart ids/ETags, and lifecycle state; no
- * filenames, captions, URLs, or project content cross this boundary.
+ * Serial, content-free upload coordination. The Durable Object holds only
+ * opaque identifiers, multipart receipts, leases and lifecycle state. In
+ * particular it never stores captions, filenames, URLs, media bytes or other
+ * project content.
  */
+
+import { DurableObjectQuotaLedger } from "./quota-ledger";
 
 export type UploadOperationState =
   | "creating"
@@ -14,6 +17,7 @@ export type UploadOperationState =
   | "workflow-starting"
   | "queued"
   | "completed"
+  | "cancelling"
   | "cancelled"
   | "cleanup-pending"
   | "failed-retryable";
@@ -24,13 +28,24 @@ export interface UploadedPart {
   readonly byteLength: number;
 }
 
-interface ClaimedPart {
-  readonly claimId: string;
+export interface OperationLease {
+  readonly id: string;
+  readonly generation: number;
   readonly expiresAtMs: number;
 }
 
+export interface CleanupTarget {
+  /** `uncertain` means an external R2 call may have succeeded ambiguously. */
+  readonly objectState: "multipart" | "completed" | "uncertain";
+  readonly multipartUploadId: string | null;
+  readonly reason: string;
+}
+
+type ClaimedPart = OperationLease;
+
 export interface UploadOperationRecord {
   readonly ownerSessionKey: string;
+  /** Saved only as a salted quota identity; it is never checked for recovery ownership. */
   readonly ownerIpKey: string;
   readonly metadataHash: string;
   readonly reservationKey: string;
@@ -45,6 +60,13 @@ export interface UploadOperationRecord {
   readonly multipartUploadId: string | null;
   readonly parts: Readonly<Record<string, UploadedPart>>;
   readonly claims: Readonly<Record<string, ClaimedPart>>;
+  /** Monotonic part generations make an expired body write unable to win later. */
+  readonly partGenerations: Readonly<Record<string, number>>;
+  readonly completionLease: OperationLease | null;
+  readonly workflowLease: OperationLease | null;
+  readonly cancellationLease: OperationLease | null;
+  readonly nextLeaseGeneration: number;
+  readonly cleanupTarget: CleanupTarget | null;
   readonly reconciliationNote: string | null;
 }
 
@@ -68,54 +90,124 @@ export type BeginUploadOperationResult =
   | { readonly kind: "conflict"; readonly record: UploadOperationRecord };
 
 export type PartClaimResult =
-  | { readonly kind: "claimed"; readonly claimId: string; readonly record: UploadOperationRecord }
+  | { readonly kind: "claimed"; readonly claim: OperationLease; readonly record: UploadOperationRecord }
   | { readonly kind: "uploaded"; readonly part: UploadedPart; readonly record: UploadOperationRecord }
   | { readonly kind: "in-progress"; readonly record: UploadOperationRecord }
   | { readonly kind: "unavailable"; readonly record: UploadOperationRecord };
 
+export type PartRecordResult =
+  | { readonly kind: "recorded"; readonly record: UploadOperationRecord }
+  | { readonly kind: "stale"; readonly record: UploadOperationRecord }
+  | { readonly kind: "invalid"; readonly record: UploadOperationRecord };
+
 export type CompletionClaimResult =
-  | { readonly kind: "claimed"; readonly record: UploadOperationRecord }
+  | { readonly kind: "claimed"; readonly claim: OperationLease; readonly record: UploadOperationRecord }
+  | { readonly kind: "status"; readonly record: UploadOperationRecord };
+
+export type CancellationClaimResult =
+  | { readonly kind: "claimed"; readonly claim: OperationLease; readonly record: UploadOperationRecord }
   | { readonly kind: "status"; readonly record: UploadOperationRecord };
 
 export interface UploadCoordinatorPort {
   begin: (input: BeginUploadOperationInput) => Promise<BeginUploadOperationResult>;
   attachMultipart: (input: { readonly uploadId: string; readonly nowMs: number }) => Promise<UploadOperationRecord | null>;
+  /** Records an upload id even when the caller failed after R2 creation but before attach. */
+  markCreateReconciliation: (input: { readonly uploadId: string; readonly nowMs: number }) => Promise<UploadOperationRecord | null>;
   get: (nowMs: number) => Promise<UploadOperationRecord | null>;
   claimPart: (input: { readonly partNumber: number; readonly nowMs: number; readonly leaseMs: number; readonly createId: () => string }) => Promise<PartClaimResult>;
-  releasePart: (input: { readonly partNumber: number; readonly claimId: string; readonly nowMs: number }) => Promise<UploadOperationRecord | null>;
-  recordPart: (input: { readonly partNumber: number; readonly claimId: string; readonly etag: string; readonly byteLength: number; readonly nowMs: number }) => Promise<UploadOperationRecord | null>;
-  beginCompletion: (nowMs: number) => Promise<CompletionClaimResult>;
-  markProbing: (nowMs: number) => Promise<UploadOperationRecord | null>;
+  releasePart: (input: { readonly partNumber: number; readonly claimId: string; readonly claimGeneration: number; readonly nowMs: number }) => Promise<UploadOperationRecord | null>;
+  recordPart: (input: { readonly partNumber: number; readonly claimId: string; readonly claimGeneration: number; readonly etag: string; readonly byteLength: number; readonly nowMs: number }) => Promise<PartRecordResult>;
+  beginCompletion: (input: { readonly nowMs: number; readonly leaseMs: number; readonly createId: () => string }) => Promise<CompletionClaimResult>;
+  markProbing: (input: { readonly claimId: string; readonly claimGeneration: number; readonly nowMs: number }) => Promise<UploadOperationRecord | null>;
   markReady: (nowMs: number) => Promise<UploadOperationRecord | null>;
-  claimWorkflowStart: (nowMs: number) => Promise<CompletionClaimResult>;
-  markQueued: (nowMs: number) => Promise<UploadOperationRecord | null>;
+  claimWorkflowStart: (input: { readonly nowMs: number; readonly leaseMs: number; readonly createId: () => string }) => Promise<CompletionClaimResult>;
+  /** Allows a deterministic workflow status lookup to reconcile an ambiguous create. */
+  reconcileQueued: (input: { readonly nowMs: number; readonly claimId?: string; readonly claimGeneration?: number }) => Promise<UploadOperationRecord | null>;
+  markQueued: (input: { readonly claimId: string; readonly claimGeneration: number; readonly nowMs: number }) => Promise<UploadOperationRecord | null>;
   markRetryableFailure: (note: string, nowMs: number) => Promise<UploadOperationRecord | null>;
-  markCancelled: (pendingCleanup: boolean, nowMs: number) => Promise<UploadOperationRecord | null>;
+  /** Atomically prevents future multipart writes before any R2 deletion call. */
+  claimCancellation: (input: { readonly nowMs: number; readonly leaseMs: number; readonly createId: () => string; readonly target: CleanupTarget }) => Promise<CancellationClaimResult>;
+  /** Cancellation is terminal only once both R2 and quota release acknowledge it. */
+  finishCleanup: (input: { readonly claimId: string; readonly claimGeneration: number; readonly r2Acknowledged: boolean; readonly quotaAcknowledged: boolean; readonly nowMs: number }) => Promise<UploadOperationRecord | null>;
 }
 
 export interface DurableObjectStorage {
   get: <Value>(key: string) => Promise<Value | undefined>;
   put: (key: string, value: unknown) => Promise<void>;
+  setAlarm?: (scheduledTime: number) => Promise<void>;
 }
 
 export interface DurableObjectStateLike {
   readonly storage: DurableObjectStorage;
 }
 
+interface CoordinatorLifecycleEnv {
+  readonly PROCESSING_BUCKET?: {
+    readonly resumeMultipartUpload: (key: string, uploadId: string) => { abort: () => Promise<void> };
+    readonly delete: (key: string) => Promise<void>;
+  };
+  readonly QUOTA_LEDGER?: ConstructorParameters<typeof DurableObjectQuotaLedger>[0];
+}
+
+// Keep the original key so an in-flight v2 operation is reconciled instead of
+// disappearing on deployment. `normaliseRecord` upgrades its shape in place.
 const storageKey = "cuebench-upload-coordinator-v2";
 const partKey = (partNumber: number): string => String(partNumber);
-
-const clearExpiredClaims = (record: UploadOperationRecord, nowMs: number): UploadOperationRecord => ({
-  ...record,
-  claims: Object.fromEntries(Object.entries(record.claims).filter(([, claim]) => claim.expiresAtMs > nowMs)),
-});
-
-const active = (record: UploadOperationRecord | null, nowMs: number): UploadOperationRecord | null => {
-  if (record === null || record.expiresAtMs <= nowMs) return null;
-  return clearExpiredClaims(record, nowMs);
-};
+const terminal = (state: UploadOperationState): boolean => state === "queued" || state === "completed" || state === "cancelled";
+const leaseIsLive = (lease: OperationLease | null, nowMs: number): boolean => lease !== null && lease.expiresAtMs > nowMs;
 
 const withRecord = (record: UploadOperationRecord, next: Partial<UploadOperationRecord>): UploadOperationRecord => ({ ...record, ...next });
+
+const cleanupTargetFor = (record: UploadOperationRecord, reason: string): CleanupTarget => ({
+  objectState: record.multipartUploadId === null ? "uncertain" : "multipart",
+  multipartUploadId: record.multipartUploadId,
+  reason,
+});
+
+/**
+ * Expiry never deletes state. It becomes explicit cleanup work so a client,
+ * Worker alarm, or operational reconciler can truthfully finish private-copy
+ * deletion without losing the multipart id.
+ */
+const normaliseRecord = (input: UploadOperationRecord | null, nowMs: number): UploadOperationRecord | null => {
+  if (input === null) return null;
+  const legacy = input as UploadOperationRecord & {
+    readonly claims?: Readonly<Record<string, Partial<OperationLease> & { readonly claimId?: string }>>;
+    readonly partGenerations?: Readonly<Record<string, number>>;
+    readonly completionLease?: OperationLease | null;
+    readonly workflowLease?: OperationLease | null;
+    readonly cancellationLease?: OperationLease | null;
+    readonly nextLeaseGeneration?: number;
+    readonly cleanupTarget?: CleanupTarget | null;
+  };
+  const claims = Object.fromEntries(Object.entries(legacy.claims ?? {})
+    .filter(([, claim]) => typeof claim.expiresAtMs === "number" && claim.expiresAtMs > nowMs)
+    .map(([key, claim]) => [key, {
+      id: claim.id ?? claim.claimId ?? `legacy-${key}`,
+      generation: claim.generation ?? 0,
+      expiresAtMs: claim.expiresAtMs!,
+    }]));
+  const partGenerations = legacy.partGenerations ?? Object.fromEntries(Object.entries(claims).map(([key, claim]) => [key, claim.generation]));
+  const maxGeneration = Math.max(0, ...Object.values(partGenerations));
+  const record = withRecord(input, {
+    claims,
+    partGenerations,
+    completionLease: leaseIsLive(legacy.completionLease ?? null, nowMs) ? legacy.completionLease! : null,
+    workflowLease: leaseIsLive(legacy.workflowLease ?? null, nowMs) ? legacy.workflowLease! : null,
+    cancellationLease: leaseIsLive(legacy.cancellationLease ?? null, nowMs) ? legacy.cancellationLease! : null,
+    nextLeaseGeneration: legacy.nextLeaseGeneration ?? maxGeneration,
+    cleanupTarget: legacy.cleanupTarget ?? null,
+  });
+  if (record.expiresAtMs > nowMs || terminal(record.state) || record.state === "cleanup-pending" || record.state === "cancelling") return record;
+  return withRecord(record, {
+    state: "cleanup-pending",
+    claims: {},
+    completionLease: null,
+    workflowLease: null,
+    cleanupTarget: record.cleanupTarget ?? cleanupTargetFor(record, "lease-expired"),
+    reconciliationNote: "lease-expired",
+  });
+};
 
 const partExpectedBytes = (record: UploadOperationRecord, partNumber: number): number => {
   if (!Number.isInteger(partNumber) || partNumber < 1 || partNumber > record.partCount) return 0;
@@ -142,69 +234,104 @@ const createRecord = (input: BeginUploadOperationInput): UploadOperationRecord =
   multipartUploadId: null,
   parts: {},
   claims: {},
+  partGenerations: {},
+  completionLease: null,
+  workflowLease: null,
+  cancellationLease: null,
+  nextLeaseGeneration: 0,
+  cleanupTarget: null,
   reconciliationNote: null,
 });
 
 const compatible = (record: UploadOperationRecord, input: BeginUploadOperationInput): boolean => record.ownerSessionKey === input.ownerSessionKey
-  && record.ownerIpKey === input.ownerIpKey
   && record.metadataHash === input.metadataHash
   && record.reservationKey === input.reservationKey
   && record.objectKey === input.objectKey
   && record.byteLength === input.byteLength
   && record.partSize === input.partSize
-  && record.partCount === input.partCount
-  && record.receiptExpiresAtMs === input.receiptExpiresAtMs;
+  && record.partCount === input.partCount;
 
-/** A serial Durable Object per opaque operation hash. */
-export class UploadCoordinator {
-  public constructor(private readonly state: DurableObjectStateLike) {}
+const newLease = (record: UploadOperationRecord, id: string, nowMs: number, leaseMs: number, extendPastOperation = false): { readonly record: UploadOperationRecord; readonly lease: OperationLease } => {
+  const generation = record.nextLeaseGeneration + 1;
+  const lease = { id, generation, expiresAtMs: extendPastOperation ? nowMs + leaseMs : Math.min(record.expiresAtMs, nowMs + leaseMs) };
+  return { record: withRecord(record, { nextLeaseGeneration: generation }), lease };
+};
 
-  public async fetch(request: Request): Promise<Response> {
-    if (request.method !== "POST") return Response.json({ error: "method-not-allowed" }, { status: 405 });
-    let action: CoordinatorAction;
-    try {
-      action = await request.json() as CoordinatorAction;
-    } catch {
-      return Response.json({ error: "invalid-json" }, { status: 400 });
-    }
-    const current = active((await this.state.storage.get<UploadOperationRecord>(storageKey)) ?? null, action.nowMs);
-    const applied = applyAction(current, action);
-    if (applied.record === null) {
-      // DO storage retains no expired operation data.
-      await this.state.storage.put(storageKey, null);
-    } else {
-      await this.state.storage.put(storageKey, applied.record);
-    }
-    return Response.json(applied.value);
-  }
-}
+const sameLease = (lease: OperationLease | null, id: string, generation: number): boolean => lease !== null && lease.id === id && lease.generation === generation;
 
 type CoordinatorAction =
   | { readonly type: "begin"; readonly nowMs: number; readonly input: BeginUploadOperationInput }
-  | { readonly type: "attach-multipart"; readonly nowMs: number; readonly uploadId: string }
+  | { readonly type: "attach-multipart" | "mark-create-reconciliation"; readonly nowMs: number; readonly uploadId: string }
   | { readonly type: "get"; readonly nowMs: number }
   | { readonly type: "claim-part"; readonly nowMs: number; readonly partNumber: number; readonly leaseMs: number; readonly claimId: string }
-  | { readonly type: "release-part"; readonly nowMs: number; readonly partNumber: number; readonly claimId: string }
-  | { readonly type: "record-part"; readonly nowMs: number; readonly partNumber: number; readonly claimId: string; readonly etag: string; readonly byteLength: number }
-  | { readonly type: "begin-completion"; readonly nowMs: number }
-  | { readonly type: "mark-probing" | "mark-ready" | "claim-workflow-start" | "mark-queued"; readonly nowMs: number }
+  | { readonly type: "release-part"; readonly nowMs: number; readonly partNumber: number; readonly claimId: string; readonly claimGeneration: number }
+  | { readonly type: "record-part"; readonly nowMs: number; readonly partNumber: number; readonly claimId: string; readonly claimGeneration: number; readonly etag: string; readonly byteLength: number }
+  | { readonly type: "begin-completion"; readonly nowMs: number; readonly leaseMs: number; readonly claimId: string }
+  | { readonly type: "mark-probing"; readonly nowMs: number; readonly claimId: string; readonly claimGeneration: number }
+  | { readonly type: "mark-ready"; readonly nowMs: number }
+  | { readonly type: "claim-workflow-start"; readonly nowMs: number; readonly leaseMs: number; readonly claimId: string }
+  | { readonly type: "reconcile-queued"; readonly nowMs: number; readonly claimId?: string; readonly claimGeneration?: number }
+  | { readonly type: "mark-queued"; readonly nowMs: number; readonly claimId: string; readonly claimGeneration: number }
   | { readonly type: "retryable-failure"; readonly nowMs: number; readonly note: string }
-  | { readonly type: "mark-cancelled"; readonly nowMs: number; readonly pendingCleanup: boolean };
+  | { readonly type: "claim-cancellation"; readonly nowMs: number; readonly leaseMs: number; readonly claimId: string; readonly target: CleanupTarget }
+  | { readonly type: "finish-cleanup"; readonly nowMs: number; readonly claimId: string; readonly claimGeneration: number; readonly r2Acknowledged: boolean; readonly quotaAcknowledged: boolean };
 
 const partClaim = (record: UploadOperationRecord, action: Extract<CoordinatorAction, { readonly type: "claim-part" }>): { readonly record: UploadOperationRecord; readonly value: PartClaimResult } => {
   const expected = partExpectedBytes(record, action.partNumber);
   if (expected === 0) return { record, value: { kind: "unavailable", record } };
-  const existing = record.parts[partKey(action.partNumber)];
+  const key = partKey(action.partNumber);
+  const existing = record.parts[key];
   if (existing !== undefined) return { record, value: { kind: "uploaded", part: existing, record } };
-  if (record.state !== "pending") return { record, value: { kind: "unavailable", record } };
-  if (record.claims[partKey(action.partNumber)] !== undefined) return { record, value: { kind: "in-progress", record } };
+  if (record.state !== "pending" || record.multipartUploadId === null) return { record, value: { kind: "unavailable", record } };
+  if (record.claims[key] !== undefined) return { record, value: { kind: "in-progress", record } };
+  const generation = (record.partGenerations[key] ?? 0) + 1;
+  const claim: OperationLease = { id: action.claimId, generation, expiresAtMs: Math.min(record.expiresAtMs, action.nowMs + action.leaseMs) };
   const next = withRecord(record, {
-    claims: {
-      ...record.claims,
-      [partKey(action.partNumber)]: { claimId: action.claimId, expiresAtMs: Math.min(record.expiresAtMs, action.nowMs + action.leaseMs) },
-    },
+    claims: { ...record.claims, [key]: claim },
+    partGenerations: { ...record.partGenerations, [key]: generation },
   });
-  return { record: next, value: { kind: "claimed", claimId: action.claimId, record: next } };
+  return { record: next, value: { kind: "claimed", claim, record: next } };
+};
+
+const completionClaim = (record: UploadOperationRecord, action: Extract<CoordinatorAction, { readonly type: "begin-completion" }>): { readonly record: UploadOperationRecord; readonly value: CompletionClaimResult } => {
+  const isRetry = record.state === "completing" && record.completionLease === null;
+  if (!((record.state === "uploaded" || record.state === "failed-retryable" || isRetry) && record.multipartUploadId !== null)) {
+    return { record, value: { kind: "status", record } };
+  }
+  const leased = newLease(record, action.claimId, action.nowMs, action.leaseMs);
+  const next = withRecord(leased.record, { state: "completing", completionLease: leased.lease, reconciliationNote: null });
+  return { record: next, value: { kind: "claimed", claim: leased.lease, record: next } };
+};
+
+const workflowClaim = (record: UploadOperationRecord, action: Extract<CoordinatorAction, { readonly type: "claim-workflow-start" }>): { readonly record: UploadOperationRecord; readonly value: CompletionClaimResult } => {
+  const isRetry = record.state === "workflow-starting" && record.workflowLease === null;
+  if (!(record.state === "ready" || isRetry)) return { record, value: { kind: "status", record } };
+  const leased = newLease(record, action.claimId, action.nowMs, action.leaseMs);
+  const next = withRecord(leased.record, { state: "workflow-starting", workflowLease: leased.lease, reconciliationNote: null });
+  return { record: next, value: { kind: "claimed", claim: leased.lease, record: next } };
+};
+
+const cancellationClaim = (record: UploadOperationRecord, action: Extract<CoordinatorAction, { readonly type: "claim-cancellation" }>): { readonly record: UploadOperationRecord; readonly value: CancellationClaimResult } => {
+  if (record.state === "queued" || record.state === "completed" || record.state === "workflow-starting" || record.state === "cancelled") {
+    return { record, value: { kind: "status", record } };
+  }
+  if (record.state === "cancelling" && record.cancellationLease !== null) return { record, value: { kind: "status", record } };
+  const persistedTarget = record.cleanupTarget;
+  const target: CleanupTarget = persistedTarget ?? {
+    ...action.target,
+    multipartUploadId: action.target.multipartUploadId ?? record.multipartUploadId,
+  };
+  const leased = newLease(record, action.claimId, action.nowMs, action.leaseMs, true);
+  const next = withRecord(leased.record, {
+    state: "cancelling",
+    claims: {},
+    completionLease: null,
+    workflowLease: null,
+    cancellationLease: leased.lease,
+    cleanupTarget: target,
+    reconciliationNote: target.reason,
+  });
+  return { record: next, value: { kind: "claimed", claim: leased.lease, record: next } };
 };
 
 const applyAction = (current: UploadOperationRecord | null, action: CoordinatorAction): { readonly record: UploadOperationRecord | null; readonly value: unknown } => {
@@ -219,39 +346,57 @@ const applyAction = (current: UploadOperationRecord | null, action: CoordinatorA
   }
   if (current === null) return { record: null, value: null };
   if (action.type === "get") return { record: current, value: current };
-  if (action.type === "attach-multipart") {
-    if (current.state !== "creating") return { record: current, value: current };
-    const record = withRecord(current, { multipartUploadId: action.uploadId, state: "pending" });
-    return { record, value: record };
+  if (action.type === "attach-multipart" || action.type === "mark-create-reconciliation") {
+    if (current.state === "creating") {
+      const record = withRecord(current, { multipartUploadId: action.uploadId, state: "pending" });
+      return { record, value: record };
+    }
+    if ((current.state === "cancelling" || current.state === "cleanup-pending") && current.cleanupTarget !== null) {
+      const cleanupTarget = {
+        ...current.cleanupTarget,
+        objectState: current.cleanupTarget.objectState === "completed" ? "uncertain" : current.cleanupTarget.objectState,
+        multipartUploadId: current.cleanupTarget.multipartUploadId ?? action.uploadId,
+      } satisfies CleanupTarget;
+      const record = withRecord(current, { multipartUploadId: current.multipartUploadId ?? action.uploadId, cleanupTarget });
+      return { record, value: record };
+    }
+    return { record: current, value: current };
   }
   if (action.type === "claim-part") {
     const applied = partClaim(current, action);
     return { record: applied.record, value: applied.value };
   }
   if (action.type === "release-part") {
-    const claimed = current.claims[partKey(action.partNumber)];
-    if (claimed === undefined || claimed.claimId !== action.claimId) return { record: current, value: current };
-    const claims = Object.fromEntries(Object.entries(current.claims).filter(([key]) => key !== partKey(action.partNumber)));
-    return { record: withRecord(current, { claims }), value: withRecord(current, { claims }) };
-  }
-  if (action.type === "record-part") {
-    const claimed = current.claims[partKey(action.partNumber)];
-    const expected = partExpectedBytes(current, action.partNumber);
-    if (claimed === undefined || claimed.claimId !== action.claimId || expected !== action.byteLength || action.etag.length === 0) return { record: current, value: null };
-    const claims = Object.fromEntries(Object.entries(current.claims).filter(([key]) => key !== partKey(action.partNumber)));
-    const parts = { ...current.parts, [partKey(action.partNumber)]: { partNumber: action.partNumber, etag: action.etag, byteLength: action.byteLength } };
-    const pending = withRecord(current, { claims, parts });
-    const record = allPartsPresent(pending) ? withRecord(pending, { state: "uploaded" }) : pending;
+    const key = partKey(action.partNumber);
+    const claim = current.claims[key];
+    if (claim === undefined || !sameLease(claim, action.claimId, action.claimGeneration)) return { record: current, value: current };
+    const claims = Object.fromEntries(Object.entries(current.claims).filter(([entry]) => entry !== key));
+    const record = withRecord(current, { claims });
     return { record, value: record };
   }
+  if (action.type === "record-part") {
+    const key = partKey(action.partNumber);
+    const claim = current.claims[key];
+    if (claim === undefined || !sameLease(claim, action.claimId, action.claimGeneration)) {
+      return { record: current, value: { kind: "stale", record: current } satisfies PartRecordResult };
+    }
+    const expected = partExpectedBytes(current, action.partNumber);
+    if (current.state !== "pending" || expected !== action.byteLength || action.etag.length === 0) {
+      return { record: current, value: { kind: "invalid", record: current } satisfies PartRecordResult };
+    }
+    const claims = Object.fromEntries(Object.entries(current.claims).filter(([entry]) => entry !== key));
+    const parts = { ...current.parts, [key]: { partNumber: action.partNumber, etag: action.etag, byteLength: action.byteLength } };
+    const pending = withRecord(current, { claims, parts });
+    const record = allPartsPresent(pending) ? withRecord(pending, { state: "uploaded" }) : pending;
+    return { record, value: { kind: "recorded", record } satisfies PartRecordResult };
+  }
   if (action.type === "begin-completion") {
-    if ((current.state !== "uploaded" && current.state !== "failed-retryable") || current.multipartUploadId === null) return { record: current, value: { kind: "status", record: current } satisfies CompletionClaimResult };
-    const record = withRecord(current, { state: "completing" });
-    return { record, value: { kind: "claimed", record } satisfies CompletionClaimResult };
+    const applied = completionClaim(current, action);
+    return { record: applied.record, value: applied.value };
   }
   if (action.type === "mark-probing") {
-    if (current.state !== "completing" && current.state !== "failed-retryable") return { record: current, value: current };
-    const record = withRecord(current, { state: "probing" });
+    if (current.state !== "completing" || !sameLease(current.completionLease, action.claimId, action.claimGeneration)) return { record: current, value: current };
+    const record = withRecord(current, { state: "probing", completionLease: null });
     return { record, value: record };
   }
   if (action.type === "mark-ready") {
@@ -260,86 +405,153 @@ const applyAction = (current: UploadOperationRecord | null, action: CoordinatorA
     return { record, value: record };
   }
   if (action.type === "claim-workflow-start") {
-    if (current.state !== "ready") return { record: current, value: { kind: "status", record: current } satisfies CompletionClaimResult };
-    const record = withRecord(current, { state: "workflow-starting" });
-    return { record, value: { kind: "claimed", record } satisfies CompletionClaimResult };
+    const applied = workflowClaim(current, action);
+    return { record: applied.record, value: applied.value };
   }
-  if (action.type === "mark-queued") {
-    if (current.state !== "workflow-starting") return { record: current, value: current };
-    const record = withRecord(current, { state: "queued" });
+  if (action.type === "reconcile-queued" || action.type === "mark-queued") {
+    const claimed = action.type === "reconcile-queued" && action.claimId === undefined
+      ? true
+      : sameLease(current.workflowLease, action.claimId!, action.claimGeneration!);
+    if (current.state !== "workflow-starting" || !claimed) return { record: current, value: current };
+    const record = withRecord(current, { state: "queued", workflowLease: null, reconciliationNote: null });
     return { record, value: record };
   }
   if (action.type === "retryable-failure") {
-    const record = withRecord(current, { state: "failed-retryable", reconciliationNote: action.note });
+    if (current.state === "cancelling" || current.state === "cleanup-pending" || terminal(current.state)) return { record: current, value: current };
+    const record = withRecord(current, { state: "failed-retryable", completionLease: null, reconciliationNote: action.note });
     return { record, value: record };
   }
-  if (action.type !== "mark-cancelled") return { record: current, value: current };
-  const record = withRecord(current, { state: action.pendingCleanup ? "cleanup-pending" : "cancelled" });
-  return { record, value: record };
+  if (action.type === "claim-cancellation") {
+    const applied = cancellationClaim(current, action);
+    return { record: applied.record, value: applied.value };
+  }
+  if (action.type === "finish-cleanup") {
+    if (current.state !== "cancelling" || !sameLease(current.cancellationLease, action.claimId, action.claimGeneration)) return { record: current, value: current };
+    const record = action.r2Acknowledged && action.quotaAcknowledged
+      ? withRecord(current, { state: "cancelled", cancellationLease: null, cleanupTarget: null, reconciliationNote: null })
+      : withRecord(current, { state: "cleanup-pending", cancellationLease: null, reconciliationNote: "cleanup-acknowledgement-pending" });
+    return { record, value: record };
+  }
+  return { record: current, value: current };
 };
 
-/** Fixture implementation uses the identical serial state transition functions. */
+const nextAlarmAt = (record: UploadOperationRecord, nowMs: number): number | null => {
+  if (terminal(record.state)) return null;
+  if (record.expiresAtMs > nowMs) return record.expiresAtMs;
+  // Retry a failed cleanup on a bounded cadence without claiming the object is gone.
+  return nowMs + 60_000;
+};
+
+/** A serial Durable Object per opaque operation hash. */
+export class UploadCoordinator {
+  public constructor(private readonly state: DurableObjectStateLike, private readonly lifecycle: CoordinatorLifecycleEnv = {}) {}
+
+  private async persist(record: UploadOperationRecord | null, nowMs: number): Promise<void> {
+    await this.state.storage.put(storageKey, record);
+    const next = record === null ? null : nextAlarmAt(record, nowMs);
+    if (next !== null) await this.state.storage.setAlarm?.(next);
+  }
+
+  public async fetch(request: Request): Promise<Response> {
+    if (request.method !== "POST") return Response.json({ error: "method-not-allowed" }, { status: 405 });
+    let action: CoordinatorAction;
+    try {
+      action = await request.json() as CoordinatorAction;
+    } catch {
+      return Response.json({ error: "invalid-json" }, { status: 400 });
+    }
+    const current = normaliseRecord((await this.state.storage.get<UploadOperationRecord>(storageKey)) ?? null, action.nowMs);
+    const applied = applyAction(current, action);
+    await this.persist(applied.record, action.nowMs);
+    return Response.json(applied.value);
+  }
+
+  /**
+   * Durable Object alarms reconcile expiry without a browser returning. The
+   * target is persisted before calls, so an abort/delete or quota outage stays
+   * truthfully retryable rather than silently orphaning private media.
+   */
+  public async alarm(): Promise<void> {
+    const nowMs = Date.now();
+    const current = normaliseRecord((await this.state.storage.get<UploadOperationRecord>(storageKey)) ?? null, nowMs);
+    if (current === null || terminal(current.state)) return;
+    const action: CoordinatorAction = {
+      type: "claim-cancellation",
+      nowMs,
+      leaseMs: 60_000,
+      claimId: globalThis.crypto.randomUUID(),
+      target: current.cleanupTarget ?? cleanupTargetFor(current, "expiry-alarm"),
+    };
+    const claimed = applyAction(current, action);
+    await this.persist(claimed.record, nowMs);
+    const result = claimed.value as CancellationClaimResult;
+    const bucket = this.lifecycle.PROCESSING_BUCKET;
+    const quotaLedgerNamespace = this.lifecycle.QUOTA_LEDGER;
+    if (result.kind !== "claimed" || bucket === undefined || quotaLedgerNamespace === undefined) return;
+    const target = result.record.cleanupTarget;
+    if (target === null) return;
+    let r2Acknowledged = true;
+    if ((target.objectState === "multipart" || target.objectState === "uncertain") && target.multipartUploadId !== null) {
+      try {
+        await bucket.resumeMultipartUpload(result.record.objectKey, target.multipartUploadId).abort();
+      } catch {
+        r2Acknowledged = false;
+      }
+    }
+    if (target.objectState === "completed" || target.objectState === "uncertain") {
+      try {
+        await bucket.delete(result.record.objectKey);
+      } catch {
+        r2Acknowledged = false;
+      }
+    }
+    const quotaAcknowledged = await (async (): Promise<boolean> => {
+      try {
+        await new DurableObjectQuotaLedger(quotaLedgerNamespace).releaseUploadReservation({ reservationKey: result.record.reservationKey, nowMs });
+        return true;
+      } catch {
+        return false;
+      }
+    })();
+    const finished = applyAction(normaliseRecord((await this.state.storage.get<UploadOperationRecord>(storageKey)) ?? null, nowMs), {
+      type: "finish-cleanup",
+      nowMs,
+      claimId: result.claim.id,
+      claimGeneration: result.claim.generation,
+      r2Acknowledged,
+      quotaAcknowledged,
+    });
+    await this.persist(finished.record, nowMs);
+  }
+}
+
+/** Fixture implementation uses exactly the same serial transition functions. */
 export class InMemoryUploadCoordinator implements UploadCoordinatorPort {
   private record: UploadOperationRecord | null = null;
 
   private apply(action: CoordinatorAction): unknown {
-    const current = active(this.record, action.nowMs);
+    const current = normaliseRecord(this.record, action.nowMs);
     const applied = applyAction(current, action);
     this.record = applied.record;
     return applied.value;
   }
 
-  public async begin(input: BeginUploadOperationInput): Promise<BeginUploadOperationResult> {
-    return this.apply({ type: "begin", nowMs: input.nowMs, input }) as BeginUploadOperationResult;
-  }
-
-  public async attachMultipart(input: { readonly uploadId: string; readonly nowMs: number }): Promise<UploadOperationRecord | null> {
-    return this.apply({ type: "attach-multipart", ...input }) as UploadOperationRecord | null;
-  }
-
-  public async get(nowMs: number): Promise<UploadOperationRecord | null> {
-    return this.apply({ type: "get", nowMs }) as UploadOperationRecord | null;
-  }
-
-  public async claimPart(input: { readonly partNumber: number; readonly nowMs: number; readonly leaseMs: number; readonly createId: () => string }): Promise<PartClaimResult> {
-    return this.apply({ type: "claim-part", nowMs: input.nowMs, partNumber: input.partNumber, leaseMs: input.leaseMs, claimId: input.createId() }) as PartClaimResult;
-  }
-
-  public async releasePart(input: { readonly partNumber: number; readonly claimId: string; readonly nowMs: number }): Promise<UploadOperationRecord | null> {
-    return this.apply({ type: "release-part", ...input }) as UploadOperationRecord | null;
-  }
-
-  public async recordPart(input: { readonly partNumber: number; readonly claimId: string; readonly etag: string; readonly byteLength: number; readonly nowMs: number }): Promise<UploadOperationRecord | null> {
-    return this.apply({ type: "record-part", ...input }) as UploadOperationRecord | null;
-  }
-
-  public async beginCompletion(nowMs: number): Promise<CompletionClaimResult> {
-    return this.apply({ type: "begin-completion", nowMs }) as CompletionClaimResult;
-  }
-
-  public async markProbing(nowMs: number): Promise<UploadOperationRecord | null> {
-    return this.apply({ type: "mark-probing", nowMs }) as UploadOperationRecord | null;
-  }
-
-  public async markReady(nowMs: number): Promise<UploadOperationRecord | null> {
-    return this.apply({ type: "mark-ready", nowMs }) as UploadOperationRecord | null;
-  }
-
-  public async claimWorkflowStart(nowMs: number): Promise<CompletionClaimResult> {
-    return this.apply({ type: "claim-workflow-start", nowMs }) as CompletionClaimResult;
-  }
-
-  public async markQueued(nowMs: number): Promise<UploadOperationRecord | null> {
-    return this.apply({ type: "mark-queued", nowMs }) as UploadOperationRecord | null;
-  }
-
-  public async markRetryableFailure(note: string, nowMs: number): Promise<UploadOperationRecord | null> {
-    return this.apply({ type: "retryable-failure", nowMs, note }) as UploadOperationRecord | null;
-  }
-
-  public async markCancelled(pendingCleanup: boolean, nowMs: number): Promise<UploadOperationRecord | null> {
-    return this.apply({ type: "mark-cancelled", nowMs, pendingCleanup }) as UploadOperationRecord | null;
-  }
+  public async begin(input: BeginUploadOperationInput): Promise<BeginUploadOperationResult> { return this.apply({ type: "begin", nowMs: input.nowMs, input }) as BeginUploadOperationResult; }
+  public async attachMultipart(input: { readonly uploadId: string; readonly nowMs: number }): Promise<UploadOperationRecord | null> { return this.apply({ type: "attach-multipart", ...input }) as UploadOperationRecord | null; }
+  public async markCreateReconciliation(input: { readonly uploadId: string; readonly nowMs: number }): Promise<UploadOperationRecord | null> { return this.apply({ type: "mark-create-reconciliation", ...input }) as UploadOperationRecord | null; }
+  public async get(nowMs: number): Promise<UploadOperationRecord | null> { return this.apply({ type: "get", nowMs }) as UploadOperationRecord | null; }
+  public async claimPart(input: { readonly partNumber: number; readonly nowMs: number; readonly leaseMs: number; readonly createId: () => string }): Promise<PartClaimResult> { return this.apply({ type: "claim-part", nowMs: input.nowMs, partNumber: input.partNumber, leaseMs: input.leaseMs, claimId: input.createId() }) as PartClaimResult; }
+  public async releasePart(input: { readonly partNumber: number; readonly claimId: string; readonly claimGeneration: number; readonly nowMs: number }): Promise<UploadOperationRecord | null> { return this.apply({ type: "release-part", ...input }) as UploadOperationRecord | null; }
+  public async recordPart(input: { readonly partNumber: number; readonly claimId: string; readonly claimGeneration: number; readonly etag: string; readonly byteLength: number; readonly nowMs: number }): Promise<PartRecordResult> { return this.apply({ type: "record-part", ...input }) as PartRecordResult; }
+  public async beginCompletion(input: { readonly nowMs: number; readonly leaseMs: number; readonly createId: () => string }): Promise<CompletionClaimResult> { return this.apply({ type: "begin-completion", nowMs: input.nowMs, leaseMs: input.leaseMs, claimId: input.createId() }) as CompletionClaimResult; }
+  public async markProbing(input: { readonly claimId: string; readonly claimGeneration: number; readonly nowMs: number }): Promise<UploadOperationRecord | null> { return this.apply({ type: "mark-probing", ...input }) as UploadOperationRecord | null; }
+  public async markReady(nowMs: number): Promise<UploadOperationRecord | null> { return this.apply({ type: "mark-ready", nowMs }) as UploadOperationRecord | null; }
+  public async claimWorkflowStart(input: { readonly nowMs: number; readonly leaseMs: number; readonly createId: () => string }): Promise<CompletionClaimResult> { return this.apply({ type: "claim-workflow-start", nowMs: input.nowMs, leaseMs: input.leaseMs, claimId: input.createId() }) as CompletionClaimResult; }
+  public async reconcileQueued(input: { readonly nowMs: number; readonly claimId?: string; readonly claimGeneration?: number }): Promise<UploadOperationRecord | null> { return this.apply({ type: "reconcile-queued", ...input }) as UploadOperationRecord | null; }
+  public async markQueued(input: { readonly claimId: string; readonly claimGeneration: number; readonly nowMs: number }): Promise<UploadOperationRecord | null> { return this.apply({ type: "mark-queued", ...input }) as UploadOperationRecord | null; }
+  public async markRetryableFailure(note: string, nowMs: number): Promise<UploadOperationRecord | null> { return this.apply({ type: "retryable-failure", nowMs, note }) as UploadOperationRecord | null; }
+  public async claimCancellation(input: { readonly nowMs: number; readonly leaseMs: number; readonly createId: () => string; readonly target: CleanupTarget }): Promise<CancellationClaimResult> { return this.apply({ type: "claim-cancellation", nowMs: input.nowMs, leaseMs: input.leaseMs, claimId: input.createId(), target: input.target }) as CancellationClaimResult; }
+  public async finishCleanup(input: { readonly claimId: string; readonly claimGeneration: number; readonly r2Acknowledged: boolean; readonly quotaAcknowledged: boolean; readonly nowMs: number }): Promise<UploadOperationRecord | null> { return this.apply({ type: "finish-cleanup", ...input }) as UploadOperationRecord | null; }
 }
 
 export class DurableObjectUploadCoordinator implements UploadCoordinatorPort {
@@ -357,17 +569,20 @@ export class DurableObjectUploadCoordinator implements UploadCoordinatorPort {
 
   public begin(input: BeginUploadOperationInput): Promise<BeginUploadOperationResult> { return this.call({ type: "begin", nowMs: input.nowMs, input }); }
   public attachMultipart(input: { readonly uploadId: string; readonly nowMs: number }): Promise<UploadOperationRecord | null> { return this.call({ type: "attach-multipart", ...input }); }
+  public markCreateReconciliation(input: { readonly uploadId: string; readonly nowMs: number }): Promise<UploadOperationRecord | null> { return this.call({ type: "mark-create-reconciliation", ...input }); }
   public get(nowMs: number): Promise<UploadOperationRecord | null> { return this.call({ type: "get", nowMs }); }
   public claimPart(input: { readonly partNumber: number; readonly nowMs: number; readonly leaseMs: number; readonly createId: () => string }): Promise<PartClaimResult> { return this.call({ type: "claim-part", nowMs: input.nowMs, partNumber: input.partNumber, leaseMs: input.leaseMs, claimId: input.createId() }); }
-  public releasePart(input: { readonly partNumber: number; readonly claimId: string; readonly nowMs: number }): Promise<UploadOperationRecord | null> { return this.call({ type: "release-part", ...input }); }
-  public recordPart(input: { readonly partNumber: number; readonly claimId: string; readonly etag: string; readonly byteLength: number; readonly nowMs: number }): Promise<UploadOperationRecord | null> { return this.call({ type: "record-part", ...input }); }
-  public beginCompletion(nowMs: number): Promise<CompletionClaimResult> { return this.call({ type: "begin-completion", nowMs }); }
-  public markProbing(nowMs: number): Promise<UploadOperationRecord | null> { return this.call({ type: "mark-probing", nowMs }); }
+  public releasePart(input: { readonly partNumber: number; readonly claimId: string; readonly claimGeneration: number; readonly nowMs: number }): Promise<UploadOperationRecord | null> { return this.call({ type: "release-part", ...input }); }
+  public recordPart(input: { readonly partNumber: number; readonly claimId: string; readonly claimGeneration: number; readonly etag: string; readonly byteLength: number; readonly nowMs: number }): Promise<PartRecordResult> { return this.call({ type: "record-part", ...input }); }
+  public beginCompletion(input: { readonly nowMs: number; readonly leaseMs: number; readonly createId: () => string }): Promise<CompletionClaimResult> { return this.call({ type: "begin-completion", nowMs: input.nowMs, leaseMs: input.leaseMs, claimId: input.createId() }); }
+  public markProbing(input: { readonly claimId: string; readonly claimGeneration: number; readonly nowMs: number }): Promise<UploadOperationRecord | null> { return this.call({ type: "mark-probing", ...input }); }
   public markReady(nowMs: number): Promise<UploadOperationRecord | null> { return this.call({ type: "mark-ready", nowMs }); }
-  public claimWorkflowStart(nowMs: number): Promise<CompletionClaimResult> { return this.call({ type: "claim-workflow-start", nowMs }); }
-  public markQueued(nowMs: number): Promise<UploadOperationRecord | null> { return this.call({ type: "mark-queued", nowMs }); }
+  public claimWorkflowStart(input: { readonly nowMs: number; readonly leaseMs: number; readonly createId: () => string }): Promise<CompletionClaimResult> { return this.call({ type: "claim-workflow-start", nowMs: input.nowMs, leaseMs: input.leaseMs, claimId: input.createId() }); }
+  public reconcileQueued(input: { readonly nowMs: number; readonly claimId?: string; readonly claimGeneration?: number }): Promise<UploadOperationRecord | null> { return this.call({ type: "reconcile-queued", ...input }); }
+  public markQueued(input: { readonly claimId: string; readonly claimGeneration: number; readonly nowMs: number }): Promise<UploadOperationRecord | null> { return this.call({ type: "mark-queued", ...input }); }
   public markRetryableFailure(note: string, nowMs: number): Promise<UploadOperationRecord | null> { return this.call({ type: "retryable-failure", nowMs, note }); }
-  public markCancelled(pendingCleanup: boolean, nowMs: number): Promise<UploadOperationRecord | null> { return this.call({ type: "mark-cancelled", nowMs, pendingCleanup }); }
+  public claimCancellation(input: { readonly nowMs: number; readonly leaseMs: number; readonly createId: () => string; readonly target: CleanupTarget }): Promise<CancellationClaimResult> { return this.call({ type: "claim-cancellation", nowMs: input.nowMs, leaseMs: input.leaseMs, claimId: input.createId(), target: input.target }); }
+  public finishCleanup(input: { readonly claimId: string; readonly claimGeneration: number; readonly r2Acknowledged: boolean; readonly quotaAcknowledged: boolean; readonly nowMs: number }): Promise<UploadOperationRecord | null> { return this.call({ type: "finish-cleanup", ...input }); }
 }
 
 export const expectedPartByteLength = partExpectedBytes;

@@ -43,6 +43,10 @@ class MultipartFixtureStore implements MultipartPrivateObjectStore {
     this.uploads.delete(input.uploadId);
   }
 
+  public async head(key: string): Promise<{ readonly exists: boolean }> {
+    return { exists: this.completed.has(key) };
+  }
+
   public async delete(key: string): Promise<void> {
     this.completed.delete(key);
   }
@@ -50,8 +54,8 @@ class MultipartFixtureStore implements MultipartPrivateObjectStore {
 
 const env = (): WorkerEnv => ({
   SESSION_HMAC_CURRENT_KEY_ID: "current",
-  SESSION_HMAC_CURRENT_KEY: "current-key-for-fixture-only",
-  QUOTA_SALT: "fixture-ledger-salt",
+  SESSION_HMAC_CURRENT_KEY: "current-key-for-fixture-only-32-byte-minimum",
+  QUOTA_SALT: "fixture-ledger-salt-with-32-byte-minimum",
   SESSION_TTL_SECONDS: "3600",
   UPLOAD_CAPABILITY_TTL_SECONDS: "600",
   RECOVERY_TTL_SECONDS: "86400",
@@ -61,7 +65,7 @@ const env = (): WorkerEnv => ({
   MAX_SESSION_TTS: "50",
   GLOBAL_SPEND_LIMIT_CENTS: "1000",
   GLOBAL_SPEND_BREAKER_OPEN: "false",
-  TURNSTILE_SECRET: "fixture-turnstile-secret",
+  TURNSTILE_SECRET: "fixture-turnstile-secret-with-32-byte-minimum",
   TURNSTILE_EXPECTED_HOSTNAME: "cuebench.test",
   TURNSTILE_EXPECTED_ACTION: "cuebench-upload",
   PROCESSING_BUCKET: undefined as never,

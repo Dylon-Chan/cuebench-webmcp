@@ -49,6 +49,8 @@ export interface MultipartPrivateObjectStore {
   uploadPart: (input: { readonly key: string; readonly uploadId: string; readonly partNumber: number; readonly body: ArrayBuffer }) => Promise<{ readonly etag: string }>;
   completeMultipart: (input: { readonly key: string; readonly uploadId: string; readonly parts: ReadonlyArray<{ readonly partNumber: number; readonly etag: string }> }) => Promise<void>;
   abortMultipart: (input: { readonly key: string; readonly uploadId: string }) => Promise<void>;
+  /** An ambiguous complete is reconciled against object existence, never browser metadata. */
+  head: (key: string) => Promise<{ readonly exists: boolean }>;
   delete: (key: string) => Promise<void>;
 }
 
@@ -244,6 +246,10 @@ export class R2PrivateObjectStore implements MultipartPrivateObjectStore {
 
   public async abortMultipart(input: { readonly key: string; readonly uploadId: string }): Promise<void> {
     await this.bucket.resumeMultipartUpload(input.key, input.uploadId).abort();
+  }
+
+  public async head(key: string): Promise<{ readonly exists: boolean }> {
+    return { exists: (await this.bucket.head(key)) !== null };
   }
 
   public delete(key: string): Promise<void> {

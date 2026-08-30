@@ -108,7 +108,8 @@ describe("anonymous quota reservation ledger", () => {
     expect(await ledger.reserveTts({ sessionKey: "salted-a", ipKey: "salted-ip", usageKey: "tts-a", nowMs: 1_004, quotas: limits })).toBe(true);
     expect(await ledger.reserveTts({ sessionKey: "salted-a", ipKey: "salted-ip", usageKey: "tts-b", nowMs: 1_005, quotas: limits })).toBe(false);
 
-    await expect(ledger.recordSpend({ cents: 100, nowMs: 1_006, globalSpendLimitCents: limits.globalSpendLimitCents })).resolves.toEqual({ breakerOpen: true, spendCents: 100 });
+    await expect(ledger.recordSpend({ spendKey: "provider-charge-a", cents: 100, nowMs: 1_006, globalSpendLimitCents: limits.globalSpendLimitCents })).resolves.toEqual({ breakerOpen: true, spendCents: 100 });
+    await expect(ledger.recordSpend({ spendKey: "provider-charge-a", cents: 100, nowMs: 1_007, globalSpendLimitCents: limits.globalSpendLimitCents })).resolves.toEqual({ breakerOpen: true, spendCents: 100 });
     expect(await ledger.reserveTts({ sessionKey: "salted-b", ipKey: "other-salted-ip", usageKey: "tts-after-breaker", nowMs: 1_007, quotas: limits })).toBe(false);
   });
 });

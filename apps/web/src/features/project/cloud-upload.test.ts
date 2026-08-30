@@ -5,6 +5,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { CloudProcessingDisclosure } from "./CloudProcessingDisclosure";
 import {
   cancelCloudProcessingCopy,
+  clearPersistedCloudSession,
   createAnonymousCloudSession,
   uploadCloudProcessingCopy,
   type CloudUploadReceiptStore,
@@ -128,6 +129,44 @@ describe("resumable cloud upload client", () => {
       "/api/uploads/operation-fixture/parts/2",
       "/api/uploads/operation-fixture/complete",
     ]);
+    expect(persisted.values.get("cuebench-cloud-upload:project-fixture")).toMatchObject({ session: "signed-session" });
+  });
+
+  it("rejects an unsupported structured-error version instead of treating an unknown protocol as retryable", async () => {
+    const fetcher = vi.fn().mockResolvedValue(new Response(JSON.stringify({
+      error: { version: 2, code: "FUTURE", message: "unknown protocol", retrySafe: true },
+    }), { status: 503 }));
+
+    await expect(uploadCloudProcessingCopy({
+      fetcher,
+      session: "signed-session",
+      projectId: "project-fixture",
+      operationId: "operation-fixture",
+      source: source(),
+      durationMs: 60_000,
+      disclosureAccepted: true,
+    })).rejects.toMatchObject({ details: { code: "UNSUPPORTED_ERROR_VERSION", status: 503, retrySafe: false } });
+  });
+
+  it("clears only the expired session from persisted recovery material after an authentication error", () => {
+    const persisted = receiptStore();
+    persisted.store.save("cuebench-cloud-upload:project-fixture", {
+      version: 1,
+      operationId: "operation-fixture",
+      operationReceipt: "opaque-receipt",
+      uploadCapability: "opaque-capability",
+      session: "expired-session",
+      sessionExpiresAtMs: 1,
+    });
+
+    clearPersistedCloudSession("project-fixture", persisted.store);
+
+    expect(persisted.values.get("cuebench-cloud-upload:project-fixture")).toEqual(expect.objectContaining({
+      operationId: "operation-fixture",
+      operationReceipt: "opaque-receipt",
+      uploadCapability: "opaque-capability",
+    }));
+    expect(persisted.values.get("cuebench-cloud-upload:project-fixture")).not.toHaveProperty("session");
   });
 
   it("uses a same-origin Turnstile token and opaque idempotency key to create its anonymous session", async () => {

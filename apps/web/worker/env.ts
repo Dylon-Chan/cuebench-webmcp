@@ -7,8 +7,15 @@ export const MAX_UPLOAD_DURATION_MS = 15 * 60 * 1_000;
 export const QUOTA_WINDOW_MS = 24 * 60 * 60 * 1_000;
 export const UPLOAD_PART_BYTES = 8 * 1024 * 1024;
 
+export type ProcessingWorkflowInstanceStatus = "queued" | "running" | "paused" | "errored" | "terminated" | "complete" | "waiting" | "waitingForPause" | "unknown";
+
+/** The Cloudflare Workflows binding surface used for deterministic reconciliation. */
 export interface ProcessingWorkflowBinding {
   create: (options: { readonly id: string; readonly params: unknown }) => Promise<unknown>;
+  /** `Workflow.get(id)` returns an instance whose status must then be queried. */
+  get?: (id: string) => Promise<{
+    readonly status: () => Promise<{ readonly status: ProcessingWorkflowInstanceStatus }>;
+  }>;
 }
 
 export interface WorkerEnv {
@@ -91,6 +98,15 @@ const nonEmpty = (value: string | undefined, name: string): string => {
   return value;
 };
 
+/** Keeps the configured bytes exactly as supplied while rejecting toy secrets. */
+const strongSecret = (value: string | undefined, name: string): string => {
+  const secret = nonEmpty(value, name);
+  if (new TextEncoder().encode(secret).byteLength < 32) {
+    throw new WorkerConfigurationError(`${name} must contain at least 32 bytes.`);
+  }
+  return secret;
+};
+
 const boundedInt = (value: string | undefined, fallback: number, name: string, minimum: number, maximum: number): number => {
   if (value === undefined || value.trim().length === 0) return fallback;
   const parsed = Number(value);
@@ -104,10 +120,14 @@ const truthy = (value: string | undefined): boolean => value === "true";
 
 /** Parses no secret values into responses; invalid configuration fails closed at the API boundary. */
 export const resolveWorkerSettings = (env: WorkerEnv): WorkerSettings => {
-  const currentId = nonEmpty(env.SESSION_HMAC_CURRENT_KEY_ID, "SESSION_HMAC_CURRENT_KEY_ID");
-  const currentSecret = nonEmpty(env.SESSION_HMAC_CURRENT_KEY, "SESSION_HMAC_CURRENT_KEY");
+  // Identifiers are normalized; cryptographic material below is deliberately
+  // not trimmed or otherwise rewritten before Web Crypto imports its bytes.
+  const currentId = nonEmpty(env.SESSION_HMAC_CURRENT_KEY_ID, "SESSION_HMAC_CURRENT_KEY_ID").trim();
+  const currentSecret = strongSecret(env.SESSION_HMAC_CURRENT_KEY, "SESSION_HMAC_CURRENT_KEY");
   const previousId = env.SESSION_HMAC_PREVIOUS_KEY_ID?.trim() || undefined;
-  const previousSecret = env.SESSION_HMAC_PREVIOUS_KEY?.trim() || undefined;
+  const previousSecret = env.SESSION_HMAC_PREVIOUS_KEY === undefined || env.SESSION_HMAC_PREVIOUS_KEY.trim().length === 0
+    ? undefined
+    : strongSecret(env.SESSION_HMAC_PREVIOUS_KEY, "SESSION_HMAC_PREVIOUS_KEY");
   if ((previousId === undefined) !== (previousSecret === undefined)) {
     throw new WorkerConfigurationError("The previous HMAC key id and secret must be configured together.");
   }
@@ -120,7 +140,7 @@ export const resolveWorkerSettings = (env: WorkerEnv): WorkerSettings => {
       current: { id: currentId, secret: currentSecret },
       ...(previousId === undefined || previousSecret === undefined ? {} : { previous: { id: previousId, secret: previousSecret } }),
     },
-    quotaSalt: nonEmpty(env.QUOTA_SALT, "QUOTA_SALT"),
+    quotaSalt: strongSecret(env.QUOTA_SALT, "QUOTA_SALT"),
     sessionTtlMs: sessionTtlSeconds * 1_000,
     uploadCapabilityTtlMs: capabilityTtlSeconds * 1_000,
     recoveryTtlMs: recoveryTtlSeconds * 1_000,
@@ -142,7 +162,7 @@ export const resolveWorkerSettings = (env: WorkerEnv): WorkerSettings => {
       pendingIpOperations: boundedInt(env.MAX_PENDING_IP_OPERATIONS, 8, "MAX_PENDING_IP_OPERATIONS", 1, 1_000),
     },
     globalSpendBreakerOpen: truthy(env.GLOBAL_SPEND_BREAKER_OPEN),
-    turnstileSecret: nonEmpty(env.TURNSTILE_SECRET, "TURNSTILE_SECRET"),
+    turnstileSecret: strongSecret(env.TURNSTILE_SECRET, "TURNSTILE_SECRET"),
     turnstileVerifyUrl: env.TURNSTILE_VERIFY_URL?.trim() || "https://challenges.cloudflare.com/turnstile/v0/siteverify",
     ...(env.TURNSTILE_EXPECTED_HOSTNAME?.trim()
       ? { turnstileExpectedHostname: env.TURNSTILE_EXPECTED_HOSTNAME.trim() }

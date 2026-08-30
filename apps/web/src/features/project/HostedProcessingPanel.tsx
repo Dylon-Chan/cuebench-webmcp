@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import {
   CloudUploadError,
   cancelCloudProcessingCopy,
+  clearPersistedCloudSession,
   createAnonymousCloudSession,
   loadPersistedCloudUpload,
   uploadCloudProcessingCopy,
@@ -126,14 +127,19 @@ export interface HostedProcessingPanelProps {
 export function HostedProcessingPanel({ projectId, durationMs, sourceObjectUrl, siteKey = configuredSiteKey() }: HostedProcessingPanelProps) {
   const [accepted, setAccepted] = useState(false);
   const [turnstileToken, setTurnstileToken] = useState<string | null>(null);
-  const [session, setSession] = useState<string | null>(null);
-  const [operationReceipt, setOperationReceipt] = useState<string | null>(null);
-  const [operationId, setOperationId] = useState<string | null>(null);
+  const [session, setSession] = useState<{ readonly value: string; readonly expiresAtMs: number } | null>(null);
   const [status, setStatus] = useState("Cloud processing is optional. Your browser remains the canonical project store.");
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
-  const [resumable] = useState(() => loadPersistedCloudUpload(projectId));
-  const availableSession = session ?? resumable?.session ?? null;
+  const [recovery, setRecovery] = useState(() => loadPersistedCloudUpload(projectId));
+  const [forceNewOperation, setForceNewOperation] = useState(false);
+  const currentNow = Date.now();
+  const persistedSession = recovery?.session !== undefined && (recovery.sessionExpiresAtMs ?? 0) > currentNow
+    ? { value: recovery.session, expiresAtMs: recovery.sessionExpiresAtMs! }
+    : null;
+  const availableSession = session !== null && session.expiresAtMs > currentNow ? session : persistedSession;
+  const operationReceipt = recovery?.operationReceipt ?? null;
+  const operationId = recovery?.operationId ?? null;
   const canStart = accepted && siteKey.length > 0 && (turnstileToken !== null || availableSession !== null) && !busy;
 
   const begin = async () => {
@@ -143,27 +149,39 @@ export function HostedProcessingPanel({ projectId, durationMs, sourceObjectUrl, 
     try {
       const anonymous = availableSession === null
         ? await createAnonymousCloudSession({ turnstileToken: turnstileToken!, idempotencyKey: randomOpaqueId() })
-        : { session: availableSession, expiresAtMs: 0 };
-      if (session === null) setSession(anonymous.session);
+        : { session: availableSession.value, expiresAtMs: availableSession.expiresAtMs };
+      if (session === null || session.value !== anonymous.session) setSession({ value: anonymous.session, expiresAtMs: anonymous.expiresAtMs });
       if (!sourceObjectUrl.startsWith("blob:")) throw new CloudUploadError("CueBench can only send a browser-owned local media Blob to optional cloud processing.");
       const sourceResponse = await fetch(sourceObjectUrl);
       if (!sourceResponse.ok) throw new CloudUploadError("CueBench could not read the browser-owned local media Blob for cloud processing.");
       const source = await sourceResponse.blob();
-      const nextOperationId = resumable?.operationId ?? randomOpaqueId();
+      const nextOperationId = forceNewOperation ? randomOpaqueId() : recovery?.operationId ?? randomOpaqueId();
       const result = await uploadCloudProcessingCopy({
         session: anonymous.session,
+        sessionExpiresAtMs: anonymous.expiresAtMs,
         projectId,
         operationId: nextOperationId,
         source,
         durationMs,
         disclosureAccepted: true,
       });
-      setOperationReceipt(result.operationReceipt);
-      setOperationId(nextOperationId);
+      setRecovery(result.operation);
+      setForceNewOperation(false);
       setStatus(result.status === "queued"
         ? "Authoritative private-media checks passed and cloud processing is queued. CueBench will request deletion when processing succeeds."
         : `Cloud processing state: ${result.status}.`);
     } catch (cause) {
+      if (cause instanceof CloudUploadError && (cause.details.status === 401 || cause.details.status === 403)) {
+        clearPersistedCloudSession(projectId);
+        setSession(null);
+        setTurnstileToken(null);
+        setRecovery(loadPersistedCloudUpload(projectId));
+        setStatus("CueBench needs a fresh anti-abuse verification before it can resume this private operation. Its opaque recovery receipt was kept.");
+      }
+      if (cause instanceof CloudUploadError && cause.details.status === 410) {
+        setForceNewOperation(true);
+        setStatus("This temporary private operation reached its recovery expiry. Its receipt was retained for status, and a fresh operation id is required.");
+      }
       setError(cause instanceof Error ? cause.message : "CueBench could not begin optional cloud processing.");
     } finally {
       setBusy(false);
@@ -176,15 +194,22 @@ export function HostedProcessingPanel({ projectId, durationMs, sourceObjectUrl, 
     setError(null);
     try {
       await cancelCloudProcessingCopy({
-        session: availableSession,
+        session: availableSession.value,
         projectId,
         operationId,
         receipt: operationReceipt,
       });
-      setOperationReceipt(null);
-      setOperationId(null);
+      setRecovery(null);
+      setForceNewOperation(false);
       setStatus("CueBench confirmed immediate cleanup of the temporary private cloud copy.");
     } catch (cause) {
+      if (cause instanceof CloudUploadError && (cause.details.status === 401 || cause.details.status === 403)) {
+        clearPersistedCloudSession(projectId);
+        setSession(null);
+        setTurnstileToken(null);
+        setRecovery(loadPersistedCloudUpload(projectId));
+        setStatus("CueBench needs a fresh anti-abuse verification before it can confirm cleanup. The recovery receipt was kept.");
+      }
       setError(cause instanceof Error ? cause.message : "CueBench could not confirm private-copy cleanup. It remains subject to the 24-hour deletion ceiling.");
     } finally {
       setBusy(false);
