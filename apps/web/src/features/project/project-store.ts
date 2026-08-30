@@ -241,6 +241,8 @@ export class ProjectStore {
   private readonly ownedProjectTokens = new Map<string, string>();
   private pendingBackupImport: PendingBackupImport | null = null;
   private activeCleanupReceiptId: string | null = null;
+  /** One browser store never sends overlapping hosted-cleanup requests for the same retained receipt. */
+  private readonly cleanupOperations = new Map<string, Promise<CloudCleanupResult>>();
   private operationEpoch = 0;
   /** Keeps page-originated domain writes ordered just like the durable CAS boundary. */
   private commandQueue: Promise<void> = Promise.resolve();
@@ -589,7 +591,20 @@ export class ProjectStore {
                 throw new Error("CueBench cannot overwrite another local project while importing this backup.");
               }
             } else if (pending.replacement !== null) {
-              /** A temporary page-memory project has no durable namespace to replace. */
+              /**
+               * A temporary page-memory project normally has no durable
+               * namespace. Recheck that exact id inside this transaction:
+               * another tab may have imported it while this tab was waiting
+               * for a Human relink confirmation.
+               */
+              const temporaryReplacement = pending.replacement;
+              const [durableHeader, durableMode] = await Promise.all([
+                this.database.projectHeaders.get(temporaryReplacement.projectId),
+                this.database.settings.get(projectModeKey(temporaryReplacement.projectId)),
+              ]);
+              if (durableHeader !== undefined || readMode(durableMode?.value) === "durable") {
+                throw new Error("CueBench's temporary replacement project was saved durably after this preview. Preview the backup again before importing.");
+              }
               exactReplacement = replacementProject;
               if (existingTarget !== undefined) {
                 throw new Error("CueBench cannot overwrite another local project while importing this backup.");
@@ -745,13 +760,12 @@ export class ProjectStore {
 
   /** Lets a future lifecycle surface retry a retained hosted-cleanup receipt without recreating local project data. */
   public async retryCloudCleanup(receiptId: string): Promise<CloudCleanupResult> {
-    const setting = (await this.database.settings.toArray()).find((candidate) => {
-      const value = this.deletionReceiptFrom(candidate.value);
-      return value?.receiptId === receiptId;
-    });
-    const receipt = setting === undefined ? null : this.deletionReceiptFrom(setting.value);
+    const active = this.cleanupOperations.get(receiptId);
+    if (active !== undefined) return active;
+    const receipt = await this.findDeletionReceipt(receiptId);
     if (receipt === null) throw new Error("CueBench could not find that local deletion receipt.");
     this.activeCleanupReceiptId = receipt.receiptId;
+    if (receipt.state === "deleted") return this.cloudCleanupResultFor(receipt);
     return this.completeCloudCleanup(receipt);
   }
 
@@ -1219,6 +1233,26 @@ export class ProjectStore {
     return record as unknown as DeletionReceipt;
   }
 
+  private cloudCleanupResultFor(receipt: DeletionReceipt): CloudCleanupResult {
+    return {
+      status: receipt.state,
+      message: receipt.message,
+    };
+  }
+
+  private async findDeletionReceipt(receiptId: string): Promise<DeletionReceipt | null> {
+    const setting = (await this.database.settings.toArray()).find((candidate) => {
+      const value = this.deletionReceiptFrom(candidate.value);
+      return value?.receiptId === receiptId;
+    });
+    return setting === undefined ? null : this.deletionReceiptFrom(setting.value);
+  }
+
+  private async currentDeletionReceipt(receipt: DeletionReceipt): Promise<DeletionReceipt | null> {
+    const setting = await this.database.settings.get(deletionReceiptKey(receipt.projectId, receipt.receiptId));
+    return setting === undefined ? null : this.deletionReceiptFrom(setting.value);
+  }
+
   private async runCloudCleanupInBackground(receipt: DeletionReceipt): Promise<void> {
     try {
       await this.completeCloudCleanup(receipt);
@@ -1227,21 +1261,37 @@ export class ProjectStore {
     }
   }
 
-  private async completeCloudCleanup(receipt: DeletionReceipt): Promise<CloudCleanupResult> {
+  /** Deduplicates same-store retries before an async database or cloud boundary can interleave. */
+  private completeCloudCleanup(receipt: DeletionReceipt): Promise<CloudCleanupResult> {
+    const active = this.cleanupOperations.get(receipt.receiptId);
+    if (active !== undefined) return active;
+    const operation = this.completeCloudCleanupAttempt(receipt).finally(() => {
+      if (this.cleanupOperations.get(receipt.receiptId) === operation) {
+        this.cleanupOperations.delete(receipt.receiptId);
+      }
+    });
+    this.cleanupOperations.set(receipt.receiptId, operation);
+    return operation;
+  }
+
+  private async completeCloudCleanupAttempt(receipt: DeletionReceipt): Promise<CloudCleanupResult> {
+    const current = await this.currentDeletionReceipt(receipt);
+    if (current === null) {
+      return {
+        status: "pending",
+        message: "CueBench could not find the retained deletion receipt. Cloud cleanup remains pending lifecycle enforcement.",
+      };
+    }
+    if (current.state === "deleted") return this.cloudCleanupResultFor(current);
     const result = await this.requestCloudCleanup({
-      projectId: receipt.projectId,
-      sourceId: receipt.sourceId,
-      activeRunId: receipt.activeRunId,
+      projectId: current.projectId,
+      sourceId: current.sourceId,
+      activeRunId: current.activeRunId,
       cancelActiveWork: true,
     });
-    const updated: DeletionReceipt = {
-      ...receipt,
-      attempts: receipt.attempts + 1,
-      state: result.status === "deleted" ? "deleted" : result.status === "failed" ? "failed" : "pending",
-      message: result.message,
-    };
+    let retained: DeletionReceipt | null;
     try {
-      await saveSetting(this.database, deletionReceiptKey(receipt.projectId, receipt.receiptId), updated);
+      retained = await this.persistCloudCleanupResult(current, result);
     } catch {
       // Do not falsely report a successful hosted cleanup as a durable lifecycle receipt update.
       return {
@@ -1249,6 +1299,13 @@ export class ProjectStore {
         message: "Cloud cleanup returned a result, but CueBench could not retain its deletion receipt. Cleanup remains pending lifecycle enforcement.",
       };
     }
+    if (retained === null) {
+      return {
+        status: "pending",
+        message: "CueBench could not retain the current deletion receipt. Cloud cleanup remains pending lifecycle enforcement.",
+      };
+    }
+    const finalResult = this.cloudCleanupResultFor(retained);
     if (
       this.activeCleanupReceiptId === receipt.receiptId
       && this.snapshot.route === "start"
@@ -1256,10 +1313,51 @@ export class ProjectStore {
     ) {
       this.setSnapshot({
         ...this.snapshot,
-        cleanupNotice: `Local project copy deleted. ${result.message}`,
+        cleanupNotice: `Local project copy deleted. ${finalResult.message}`,
       });
     }
-    return result;
+    return finalResult;
+  }
+
+  /**
+   * The receipt is the cross-tab CAS boundary. `deleted` is terminal: a
+   * delayed timeout or failure may never downgrade it after another tab has
+   * confirmed remote deletion.
+   */
+  private async persistCloudCleanupResult(
+    receipt: DeletionReceipt,
+    result: CloudCleanupResult,
+  ): Promise<DeletionReceipt | null> {
+    let retained: DeletionReceipt | null = null;
+    await this.database.transaction("rw", [this.database.settings], async () => {
+      const setting = await this.database.settings.get(deletionReceiptKey(receipt.projectId, receipt.receiptId));
+      const current = setting === undefined ? null : this.deletionReceiptFrom(setting.value);
+      if (current === null) return;
+      if (current.state === "deleted") {
+        retained = current;
+        return;
+      }
+      const state = result.status === "deleted"
+        ? "deleted"
+        : current.state === "failed" || result.status === "failed"
+          ? "failed"
+          : "pending";
+      const message = state === "failed" && result.status === "pending"
+        ? current.message
+        : result.message;
+      retained = {
+        ...current,
+        attempts: current.attempts + 1,
+        state,
+        message,
+      };
+      await this.database.settings.put({
+        key: deletionReceiptKey(receipt.projectId, receipt.receiptId),
+        value: retained,
+        updatedAtMs: Date.now(),
+      });
+    });
+    return retained;
   }
 
   private async requestCloudCleanup(request: CloudCleanupRequest): Promise<CloudCleanupResult> {

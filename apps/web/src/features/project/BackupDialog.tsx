@@ -49,8 +49,14 @@ const stringAt = (record: Readonly<Record<string, unknown>> | null, key: string,
 const numberAt = (record: Readonly<Record<string, unknown>> | null, key: string): string =>
   record !== null && typeof record[key] === "number" && Number.isFinite(record[key]) ? String(record[key]) : "Unavailable";
 
-const arrayCount = (record: Readonly<Record<string, unknown>> | null, key: string): string =>
-  record !== null && Array.isArray(record[key]) ? String(record[key].length) : "Unavailable";
+/** Portable tracks are `{ order, items }`, not arrays. Prefer visible order and tolerate an older sparse payload by counting its item map. */
+const trackCount = (root: Readonly<Record<string, unknown>> | null, key: string): string => {
+  const track = root === null ? null : asRecord(root[key]);
+  if (track === null) return "Unavailable";
+  if (Array.isArray(track.order)) return String(track.order.length);
+  const items = asRecord(track.items);
+  return items === null ? "Unavailable" : String(Object.keys(items).length);
+};
 
 interface PortableProjectFacts {
   readonly identity: string;
@@ -72,8 +78,8 @@ const portableProjectFacts = (project: unknown): PortableProjectFacts => {
     identity: stringAt(root, "projectId"),
     title: stringAt(root, "title"),
     revision: numberAt(root, "projectRevision"),
-    captions: arrayCount(root, "captions"),
-    audioDescriptions: arrayCount(root, "audioDescriptions"),
+    captions: trackCount(root, "captions"),
+    audioDescriptions: trackCount(root, "audioDescriptions"),
     profile: `${stringAt(profile, "name")} (${stringAt(profile, "profileId")})`,
     certification: stringAt(certification, "status"),
     mediaHash: stringAt(media, "sha256"),
@@ -179,6 +185,7 @@ export function BackupDialog({ project = null, manager, urlApi = browserUrlApi()
   const invalidateAsyncUi = () => {
     asyncGeneration.current += 1;
     revokeDownload();
+    setPending(false);
   };
 
   useEffect(() => () => {
@@ -295,7 +302,6 @@ export function BackupDialog({ project = null, manager, urlApi = browserUrlApi()
         setPreview(null);
         setError(null);
         setMessage(null);
-        setPending(false);
       }
     }}>
       <Dialog.Trigger asChild>
@@ -344,7 +350,7 @@ export function BackupDialog({ project = null, manager, urlApi = browserUrlApi()
           {error === null ? null : <p className="review-command-feedback" role="alert">{error}</p>}
           {message === null ? null : <p className="export-dialog__status" role="status">{message}</p>}
           <div className="storage-dialog__actions">
-            <Dialog.Close className="button button--outline" type="button" disabled={pending}>Close</Dialog.Close>
+            <Dialog.Close className="button button--outline" type="button">Close</Dialog.Close>
           </div>
         </Dialog.Content>
       </Dialog.Portal>

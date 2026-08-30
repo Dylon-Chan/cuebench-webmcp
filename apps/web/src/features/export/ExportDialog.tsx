@@ -1,6 +1,7 @@
 import * as Dialog from "@radix-ui/react-dialog";
 import {
   canonicalTrackFormat,
+  canonicalHash,
   prepareTrackExport,
   type CaptionProject,
   type CommandResult,
@@ -39,6 +40,33 @@ const formatsFor = (trackKind: ExportTrackKind): readonly { readonly value: Trac
   ? [{ value: "vtt", label: "WebVTT (.vtt)" }, { value: "srt", label: "SubRip (.srt)" }]
   : [{ value: "vtt", label: "Audio-description WebVTT (.vtt)" }, { value: "ad-txt", label: "Audio-description script (.txt)" }];
 
+/**
+ * An export verification command necessarily appends audit evidence and
+ * advances `projectRevision`. Those bookkeeping fields do not alter the
+ * downloaded track, so they must not revoke the URL that command just proved.
+ * Every semantic source, profile, validation, and certification field remains
+ * in this key and still invalidates a stale download.
+ */
+const exportSemanticKey = (project: CaptionProject): string => canonicalHash("cuebench.web.export-dialog-content.v1", {
+  contractVersion: project.contractVersion,
+  projectId: project.projectId,
+  createdAtMs: project.createdAtMs,
+  title: project.title,
+  media: project.media,
+  evidence: project.evidence,
+  captions: project.captions,
+  audioDescriptions: project.audioDescriptions,
+  audioDescriptionGaps: project.audioDescriptionGaps,
+  validation: project.validation,
+  validationRun: project.validationRun,
+  validationHistory: project.validationHistory,
+  certification: project.certification,
+  certifications: project.certifications,
+  qualityProfile: project.qualityProfile,
+  warningWaivers: project.warningWaivers,
+  activeGenerationRun: project.activeGenerationRun,
+});
+
 export interface ExportDialogProps {
   readonly project: CaptionProject;
   readonly onCommand: (command: DomainCommand) => CommandResult | Promise<CommandResult>;
@@ -72,13 +100,19 @@ export function ExportDialog({
   const [download, setDownload] = useState<{ readonly href: string; readonly filename: string } | null>(null);
   const liveUrl = useRef<string | null>(null);
   const generation = useRef(0);
-  const certificationId = project.certification.status === "NotCertified" ? "none" : project.certification.certificationId;
-  const projectGenerationKey = `${project.projectId}:${project.projectRevision}:${project.certification.status}:${certificationId}`;
+  const projectGenerationKey = exportSemanticKey(project);
 
   const revokeDownload = () => {
     if (liveUrl.current !== null && urlApi !== null) urlApi.revokeObjectURL(liveUrl.current);
     liveUrl.current = null;
     setDownload(null);
+  };
+
+  /** Cancels stale publication and also returns the dialog to an operable state. */
+  const invalidateAsyncUi = () => {
+    generation.current += 1;
+    revokeDownload();
+    setPending(false);
   };
 
   useEffect(() => () => {
@@ -88,15 +122,13 @@ export function ExportDialog({
 
   /** URLs name exact project/certification bytes; changing either invalidates an older object URL. */
   useEffect(() => {
-    generation.current += 1;
-    revokeDownload();
+    invalidateAsyncUi();
   }, [projectGenerationKey]);
 
   const close = (nextOpen: boolean) => {
     setOpen(nextOpen);
     if (!nextOpen) {
-      generation.current += 1;
-      revokeDownload();
+      invalidateAsyncUi();
       setError(null);
       setNotice(null);
     }
@@ -195,7 +227,7 @@ export function ExportDialog({
           {notice === null ? null : <p className="export-dialog__status" role="status">{notice}</p>}
           {download === null ? null : <p className="export-dialog__status" role="status">Round-trip verified. <a className="button button--signal" href={download.href} download={download.filename}>Download verified export</a></p>}
           <div className="storage-dialog__actions">
-            <Dialog.Close className="button button--outline" type="button" disabled={pending}>Close</Dialog.Close>
+            <Dialog.Close className="button button--outline" type="button">Close</Dialog.Close>
             <button className="button button--signal" type="button" disabled={pending} aria-busy={pending} onClick={() => void prepareDownload()}>Prepare verified download</button>
           </div>
           <ImpactSummaryPanel project={project} compact />

@@ -34,7 +34,16 @@ const newerDescriptor: ProjectImportDescriptor = {
   replacementSafetyBackup: null,
   schemaVersion: 2,
   reason: "NEWER_SCHEMA",
-  project: { title: "Future CueBench project" },
+  project: {
+    projectId: "future-project",
+    title: "Future CueBench project",
+    projectRevision: 12,
+    captions: { order: ["future-c01", "future-c02"], items: { "future-c01": {}, "future-c02": {} } },
+    audioDescriptions: { order: ["future-ad01"], items: { "future-ad01": {} } },
+    qualityProfile: { profileId: "future-profile", name: "Future Profile" },
+    certification: { status: "Current" },
+    media: { sha256: "f".repeat(64) },
+  },
   canImport: false,
 };
 
@@ -64,7 +73,7 @@ const mismatchDescriptor = (): ProjectImportPreview => ({
   canImport: false,
 });
 
-const verifiedDescriptor = (): ProjectImportDescriptor => ({
+const verifiedDescriptor = (): ProjectImportPreview => ({
   ...mismatchDescriptor(),
   mediaRelink: {
     status: "verified",
@@ -97,6 +106,34 @@ const bundledFile = (): File => Object.assign(new Blob(["fixture-media"], { type
   lastModified: 0,
 }) as File;
 
+const deferred = <Value,>() => {
+  let resolve!: (value: Value) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<Value>((nextResolve, nextReject) => {
+    resolve = nextResolve;
+    reject = nextReject;
+  });
+  return { promise, resolve, reject };
+};
+
+const countedProjectFixture = (): CaptionProject => createProject({
+  projectId: "incoming-counted-project",
+  title: "Incoming counted lesson",
+  media: {
+    sourceId: "incoming-video",
+    sha256: "a".repeat(64),
+    durationMs: 90_000,
+    relinkState: "Linked",
+  },
+  captions: [
+    { kind: "CaptionCue", itemId: "incoming-c01", state: "Proposed", startMs: 1_000, endMs: 2_000, text: "First incoming caption.", speaker: null, actor: { type: "CueBenchAI", id: "cuebench-ai" }, cause: "fixture" },
+    { kind: "CaptionCue", itemId: "incoming-c02", state: "Proposed", startMs: 3_000, endMs: 4_000, text: "Second incoming caption.", speaker: null, actor: { type: "CueBenchAI", id: "cuebench-ai" }, cause: "fixture" },
+  ],
+  audioDescriptions: [
+    { kind: "AudioDescriptionBeat", itemId: "incoming-ad01", state: "Proposed", startMs: 5_000, endMs: 6_000, description: "A graph is visible.", actor: { type: "CueBenchAI", id: "cuebench-ai" }, cause: "fixture" },
+  ],
+});
+
 afterEach(() => cleanup());
 
 describe("Backup, relink, and deletion human workflows", () => {
@@ -114,6 +151,8 @@ describe("Backup, relink, and deletion human workflows", () => {
     expect(within(dialog).getByRole("heading", { name: "Read-only portable backup inspector" })).toBeVisible();
     expect(within(dialog).getByText("Incoming title")).toBeVisible();
     expect(within(dialog).getByText("Future CueBench project")).toBeVisible();
+    expect(within(dialog).getByText("Caption items").parentElement).toHaveTextContent("2");
+    expect(within(dialog).getByText("Audio-description items").parentElement).toHaveTextContent("1");
     expect(within(dialog).queryByLabelText("Choose CueBench backup")).not.toBeInTheDocument();
     expect(within(dialog).queryByRole("button", { name: "Create project backup" })).not.toBeInTheDocument();
     expect(within(dialog).queryByRole("button", { name: "Confirm import after relink" })).not.toBeInTheDocument();
@@ -137,6 +176,32 @@ describe("Backup, relink, and deletion human workflows", () => {
     expect(within(dialog).getByRole("button", { name: "Confirm import after relink" })).toBeDisabled();
   });
 
+  it("reads portable track order and items for incoming facts and replacement diffs", async () => {
+    const previous = projectFixture();
+    const incoming = countedProjectFixture();
+    const descriptor: ProjectImportDescriptor = {
+      ...verifiedDescriptor(),
+      project: incoming,
+      replacementSafetyBackup: { projectId: previous.projectId, backup: exportProjectBackup(previous) },
+    };
+    const backupManager = manager(descriptor);
+    render(<BackupDialog project={previous} manager={backupManager} />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Project backup" }));
+    const dialog = await screen.findByRole("dialog", { name: "Project backup and import" });
+    fireEvent.change(within(dialog).getByLabelText("Choose CueBench backup"), {
+      target: { files: [new File(["{}"], "counted.cuebench.json", { type: "application/json" })] },
+    });
+
+    await within(dialog).findByText("Replacement diff");
+    const captions = within(dialog).getAllByText("Caption items");
+    const descriptions = within(dialog).getAllByText("Audio-description items");
+    expect(captions[0]!.parentElement).toHaveTextContent("2");
+    expect(descriptions[0]!.parentElement).toHaveTextContent("1");
+    expect(captions[1]!.parentElement).toHaveTextContent("0 → 2");
+    expect(descriptions[1]!.parentElement).toHaveTextContent("0 → 1");
+  });
+
   it("allows import only after a verified media relink and explicit human confirmation", async () => {
     const backupManager = manager(verifiedDescriptor());
     render(<BackupDialog project={projectFixture()} manager={backupManager} />);
@@ -150,6 +215,58 @@ describe("Backup, relink, and deletion human workflows", () => {
     expect(confirm).toBeEnabled();
     fireEvent.click(confirm);
     await waitFor(() => expect(backupManager.importPreviewedBackup).toHaveBeenCalledTimes(1));
+  });
+
+  it("clears a stale backup request when the project changes, keeps Close available, and never publishes its late URL", async () => {
+    const project = projectFixture();
+    const backup = deferred<{ readonly filename: string; readonly text: string }>();
+    const urlApi = { createObjectURL: vi.fn(() => "blob:cuebench:backup"), revokeObjectURL: vi.fn() };
+    const backupManager: BackupManager = {
+      ...manager(verifiedDescriptor()),
+      exportProjectBackup: vi.fn(() => backup.promise),
+    };
+    const view = render(<BackupDialog project={project} manager={backupManager} urlApi={urlApi} />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Project backup" }));
+    const dialog = await screen.findByRole("dialog", { name: "Project backup and import" });
+    fireEvent.click(within(dialog).getByRole("button", { name: "Create project backup" }));
+    expect(within(dialog).getByRole("button", { name: "Create project backup" })).toBeDisabled();
+
+    view.rerender(<BackupDialog project={{ ...project, projectRevision: project.projectRevision + 1, title: "Changed backup title" }} manager={backupManager} urlApi={urlApi} />);
+    await waitFor(() => expect(within(dialog).getByRole("button", { name: "Create project backup" })).toBeEnabled());
+    expect(within(dialog).getByRole("button", { name: "Close" })).toBeEnabled();
+
+    fireEvent.click(within(dialog).getByRole("button", { name: "Close" }));
+    expect(screen.queryByRole("dialog", { name: "Project backup and import" })).not.toBeInTheDocument();
+    backup.resolve({ filename: "late.cuebench.json", text: "{}" });
+    await Promise.resolve();
+    expect(urlApi.createObjectURL).not.toHaveBeenCalled();
+  });
+
+  it("clears an in-flight import when the imported project projection replaces the old dialog props", async () => {
+    const project = projectFixture();
+    const imported = { ...countedProjectFixture(), projectRevision: 3 };
+    const importGate = deferred<{ readonly project: CaptionProject; readonly cleanupNotice: string }>();
+    const backupManager: BackupManager = {
+      ...manager(verifiedDescriptor()),
+      importPreviewedBackup: vi.fn(() => importGate.promise),
+    };
+    const view = render(<BackupDialog project={project} manager={backupManager} />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Project backup" }));
+    const dialog = await screen.findByRole("dialog", { name: "Project backup and import" });
+    fireEvent.change(within(dialog).getByLabelText("Choose CueBench backup"), {
+      target: { files: [new File(["{}"], "verified.cuebench.json", { type: "application/json" })] },
+    });
+    const confirm = await within(dialog).findByRole("button", { name: "Confirm import after relink" });
+    fireEvent.click(confirm);
+    expect(confirm).toBeDisabled();
+
+    view.rerender(<BackupDialog project={imported} manager={backupManager} />);
+    await waitFor(() => expect(within(dialog).getByRole("button", { name: "Close" })).toBeEnabled());
+    importGate.resolve({ project: imported, cleanupNotice: "Late old import status" });
+    await Promise.resolve();
+    expect(within(dialog).queryByText("Late old import status")).not.toBeInTheDocument();
   });
 
   it("persists both safety backups and replaces local rows only after an exact Media Relink", async () => {
@@ -289,6 +406,45 @@ describe("Backup, relink, and deletion human workflows", () => {
 
     await expect(first.importPreviewedBackup()).rejects.toThrow(/deleted|replacement project changed/i);
     await expect(loadProject(database, projectId)).resolves.toBeUndefined();
+    await database.delete();
+  });
+
+  it("aborts a temporary replacement when another store has since imported that exact temporary namespace durably", async () => {
+    const database = new CueBenchDatabase(`task-10-import-temporary-cas-${crypto.randomUUID()}`);
+    const temporary = new ProjectStore({
+      database,
+      browserStorage: { estimate: async () => ({ quota: 200, usage: 150 }), persist: async () => false },
+      objectUrlLease: new ObjectUrlLease({ createObjectURL: vi.fn(() => "blob:cuebench:temporary"), revokeObjectURL: vi.fn() }),
+      mediaDurationProbe: async () => 90_000,
+    });
+    await temporary.chooseFile(bundledFile());
+    await temporary.continueTemporarily();
+    const temporaryProject = temporary.getSnapshot().project!;
+    const temporaryPortable = await temporary.exportProjectBackup();
+    const incoming = createProject({
+      projectId: "incoming-different-project",
+      title: "Different incoming project",
+      media: { sourceId: "incoming-source", sha256: temporaryProject.media.sha256, durationMs: 90_000, relinkState: "Linked" },
+    });
+
+    await temporary.previewBackupText(JSON.stringify(exportProjectBackup(incoming)));
+    await temporary.relinkImportedMedia(bundledFile());
+
+    const peer = new ProjectStore({
+      database,
+      browserStorage: browserStorage(),
+      objectUrlLease: new ObjectUrlLease({ createObjectURL: vi.fn(() => "blob:cuebench:peer-import"), revokeObjectURL: vi.fn() }),
+      mediaDurationProbe: async () => 90_000,
+    });
+    await peer.previewBackupText(temporaryPortable.text);
+    await peer.relinkImportedMedia(bundledFile());
+    await peer.importPreviewedBackup();
+    const durablePeer = await loadProject(database, temporaryProject.projectId);
+    expect(durablePeer).toMatchObject({ projectId: temporaryProject.projectId });
+
+    await expect(temporary.importPreviewedBackup()).rejects.toThrow(/temporary replacement|replacement project changed/i);
+    await expect(loadProject(database, temporaryProject.projectId)).resolves.toMatchObject({ projectId: temporaryProject.projectId });
+    await expect(loadProject(database, incoming.projectId)).resolves.toBeUndefined();
     await database.delete();
   });
 
@@ -444,6 +600,68 @@ describe("Backup, relink, and deletion human workflows", () => {
     });
     const receipt = (await database.settings.toArray()).find((setting) => setting.key.includes(deletion.receiptId));
     expect(receipt?.value).toMatchObject({ state: "deleted", attempts: 2 });
+    await database.delete();
+  });
+
+  it("shares an in-flight cleanup attempt with a retry and never invokes the hook again after deletion is confirmed", async () => {
+    const database = new CueBenchDatabase(`task-10-cleanup-idempotent-${crypto.randomUUID()}`);
+    const cleanupGate = deferred<{ readonly status: "deleted"; readonly message: string }>();
+    const cloudCleanup = vi.fn(() => cleanupGate.promise);
+    const store = new ProjectStore({
+      database,
+      browserStorage: browserStorage(),
+      objectUrlLease: new ObjectUrlLease({ createObjectURL: vi.fn(() => "blob:cuebench:cleanup"), revokeObjectURL: vi.fn() }),
+      bundledSampleLoader: bundledFile,
+      mediaDurationProbe: async () => 90_000,
+      cloudCleanup,
+      cloudCleanupTimeoutMs: 60_000,
+    });
+    await store.openSample();
+
+    const deletion = await store.deleteCurrentProject();
+    await waitFor(() => expect(cloudCleanup).toHaveBeenCalledTimes(1));
+    const concurrentRetry = store.retryCloudCleanup(deletion.receiptId);
+    expect(cloudCleanup).toHaveBeenCalledTimes(1);
+
+    cleanupGate.resolve({ status: "deleted", message: "Hosted cleanup confirmed." });
+    await expect(concurrentRetry).resolves.toEqual({ status: "deleted", message: "Hosted cleanup confirmed." });
+    await expect(store.retryCloudCleanup(deletion.receiptId)).resolves.toEqual({ status: "deleted", message: "Hosted cleanup confirmed." });
+    expect(cloudCleanup).toHaveBeenCalledTimes(1);
+    await database.delete();
+  });
+
+  it("does not let a late failed cleanup from another store overwrite a confirmed deletion receipt", async () => {
+    const database = new CueBenchDatabase(`task-10-cleanup-monotonic-${crypto.randomUUID()}`);
+    const firstGate = deferred<{ readonly status: "failed"; readonly message: string }>();
+    const firstCloudCleanup = vi.fn(() => firstGate.promise);
+    const first = new ProjectStore({
+      database,
+      browserStorage: browserStorage(),
+      objectUrlLease: new ObjectUrlLease({ createObjectURL: vi.fn(() => "blob:cuebench:first-cleanup"), revokeObjectURL: vi.fn() }),
+      bundledSampleLoader: bundledFile,
+      mediaDurationProbe: async () => 90_000,
+      cloudCleanup: firstCloudCleanup,
+      cloudCleanupTimeoutMs: 60_000,
+    });
+    const secondCloudCleanup = vi.fn(async () => ({ status: "deleted" as const, message: "Hosted cleanup confirmed by retry." }));
+    const second = new ProjectStore({
+      database,
+      browserStorage: browserStorage(),
+      objectUrlLease: new ObjectUrlLease({ createObjectURL: vi.fn(() => "blob:cuebench:second-cleanup"), revokeObjectURL: vi.fn() }),
+      cloudCleanup: secondCloudCleanup,
+    });
+    await first.openSample();
+
+    const deletion = await first.deleteCurrentProject();
+    await waitFor(() => expect(firstCloudCleanup).toHaveBeenCalledTimes(1));
+    await expect(second.retryCloudCleanup(deletion.receiptId)).resolves.toEqual({ status: "deleted", message: "Hosted cleanup confirmed by retry." });
+    firstGate.resolve({ status: "failed", message: "Late hosted cleanup failure." });
+    await new Promise((resolve) => setTimeout(resolve, 15));
+
+    const receipt = (await database.settings.toArray()).find((setting) => setting.key.includes(deletion.receiptId));
+    expect(receipt?.value).toMatchObject({ state: "deleted", message: "Hosted cleanup confirmed by retry." });
+    await expect(second.retryCloudCleanup(deletion.receiptId)).resolves.toEqual({ status: "deleted", message: "Hosted cleanup confirmed by retry." });
+    expect(secondCloudCleanup).toHaveBeenCalledTimes(1);
     await database.delete();
   });
 

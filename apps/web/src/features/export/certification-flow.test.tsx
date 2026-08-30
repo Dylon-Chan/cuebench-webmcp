@@ -1,5 +1,6 @@
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import {
+  applyCommand,
   createProject,
   prepareTrackExport,
   type CaptionProject,
@@ -8,6 +9,7 @@ import {
   type ProjectTrackExport,
   type QualityFinding,
 } from "@cuebench/domain";
+import { useEffect, useState } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { CertificationReview } from "./CertificationReview";
 import { ExportDialog } from "./ExportDialog";
@@ -74,6 +76,49 @@ const exportUrlApi = () => ({
   createObjectURL: vi.fn(() => "blob:cuebench:export-1"),
   revokeObjectURL: vi.fn(),
 });
+
+const mutateExportedCaption = (current: CaptionProject): CaptionProject => {
+  const caption = current.captions.items.c01!;
+  const revision = {
+    ...caption.current,
+    text: "Dr. Nguyen revises the Gibbs free energy explanation.",
+    itemRevision: caption.current.itemRevision + 1,
+    parentItemRevision: caption.current.itemRevision,
+  };
+  return {
+    ...current,
+    projectRevision: current.projectRevision + 1,
+    captions: {
+      ...current.captions,
+      items: { ...current.captions.items, c01: { ...caption, current: revision, revisions: [...caption.revisions, revision] } },
+    },
+  };
+};
+
+function StoreBackedExportHarness({
+  urlApi,
+  mutateExportContent = false,
+}: {
+  readonly urlApi: ReturnType<typeof exportUrlApi>;
+  readonly mutateExportContent?: boolean;
+}) {
+  const [project, setProject] = useState(() => projectFixture());
+  useEffect(() => {
+    if (mutateExportContent) setProject(mutateExportedCaption);
+  }, [mutateExportContent]);
+  return (
+    <ExportDialog
+      project={project}
+      urlApi={urlApi}
+      createExportId={() => "store-backed-export"}
+      onCommand={async (command) => {
+        const result = applyCommand(project, command);
+        if (result.error === undefined) setProject(result.project);
+        return result;
+      }}
+    />
+  );
+}
 
 afterEach(() => cleanup());
 
@@ -232,7 +277,25 @@ describe("Certification and export human workflows", () => {
     }));
   });
 
-  it("revokes and suppresses a stale export URL when the project revision changes while preparation is in flight", async () => {
+  it("keeps the verified download visible when its own round-trip record rerenders the store, then revokes it for a real content change", async () => {
+    const urlApi = exportUrlApi();
+    const view = render(<StoreBackedExportHarness urlApi={urlApi} />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Export tracks" }));
+    const dialog = await screen.findByRole("dialog", { name: "Export track" });
+    fireEvent.click(within(dialog).getByRole("button", { name: "Prepare verified download" }));
+
+    await waitFor(() => expect(within(dialog).getByRole("button", { name: "Prepare verified download" })).toBeEnabled());
+    expect(await within(dialog).findByRole("link", { name: "Download verified export" })).toBeVisible();
+    expect(urlApi.createObjectURL).toHaveBeenCalledTimes(1);
+
+    view.rerender(<StoreBackedExportHarness urlApi={urlApi} mutateExportContent />);
+
+    await waitFor(() => expect(within(dialog).queryByRole("link", { name: "Download verified export" })).not.toBeInTheDocument());
+    expect(urlApi.revokeObjectURL).toHaveBeenCalledWith("blob:cuebench:export-1");
+  });
+
+  it("revokes and suppresses a stale export URL when exported content changes while preparation is in flight", async () => {
     const project = projectFixture();
     const urlApi = exportUrlApi();
     let resolvePrepared!: (value: ProjectTrackExport) => void;
@@ -244,7 +307,8 @@ describe("Certification and export human workflows", () => {
     fireEvent.click(screen.getByRole("button", { name: "Export tracks" }));
     const dialog = await screen.findByRole("dialog", { name: "Export track" });
     fireEvent.click(within(dialog).getByRole("button", { name: "Prepare verified download" }));
-    view.rerender(<ExportDialog project={{ ...project, projectRevision: project.projectRevision + 1 }} onCommand={onCommand} urlApi={urlApi} prepareExport={prepareExport} />);
+    view.rerender(<ExportDialog project={{ ...project, projectRevision: project.projectRevision + 1, title: "Changed export title" }} onCommand={onCommand} urlApi={urlApi} prepareExport={prepareExport} />);
+    await waitFor(() => expect(within(dialog).getByRole("button", { name: "Close" })).toBeEnabled());
     resolvePrepared(prepareTrackExport({ project, trackKind: "Captions", format: "vtt", disposition: "draft" }));
 
     await waitFor(() => expect(prepareExport).toHaveBeenCalledTimes(1));
