@@ -21,10 +21,11 @@ const formatDuration = (durationMs: number): string => {
 interface WorkbenchShellProps {
   readonly project: CaptionProject;
   readonly mode: ProjectMode | null;
+  readonly sourceObjectUrl: string;
   readonly webMcpAvailable: boolean;
 }
 
-export function WorkbenchShell({ project, mode, webMcpAvailable }: WorkbenchShellProps) {
+export function WorkbenchShell({ project, mode, sourceObjectUrl, webMcpAvailable }: WorkbenchShellProps) {
   const captionCount = project.captions.order.length;
   const descriptionCount = project.audioDescriptions.order.length;
   const hasSelection = project.selectedItem !== null;
@@ -47,11 +48,17 @@ export function WorkbenchShell({ project, mode, webMcpAvailable }: WorkbenchShel
           <div><dt>Project</dt><dd>{project.title}</dd></div>
           <div><dt>Validation</dt><dd>{validationLabel}</dd></div>
           <div><dt>Storage</dt><dd>{mode === "temporary" ? "Temporary session" : "Browser durable"}</dd></div>
-          <div><dt>WebMCP</dt><dd className={webMcpAvailable ? "state-ok" : "state-muted"}>{webMcpAvailable ? "Agent connected" : "Browser Agent unavailable"}</dd></div>
+          <div><dt>WebMCP</dt><dd className={webMcpAvailable ? "state-ok" : "state-muted"}>{webMcpAvailable ? "Page API available" : "Browser Agent tools unavailable"}</dd></div>
         </dl>
+        <div className="header-compact-status" aria-label="Storage and Browser Agent status">
+          <span><b>Storage</b>{mode === "temporary" ? "Temporary" : "Browser durable"}</span>
+          <span><b>WebMCP</b>{webMcpAvailable ? "Page API available" : "Tools unavailable"}</span>
+        </div>
         <div className="header-actions">
-          <button className="header-button" type="button">Settings</button>
-          <button className="header-button" type="button">Export</button>
+          <span id="settings-unavailable" className="visually-hidden">Settings are not available in this project shell yet.</span>
+          <span id="export-unavailable" className="visually-hidden">Export is available after the export workflow is added.</span>
+          <button className="header-button" type="button" disabled aria-describedby="settings-unavailable">Settings (later)</button>
+          <button className="header-button" type="button" disabled aria-describedby="export-unavailable">Export (later)</button>
         </div>
       </header>
 
@@ -65,22 +72,15 @@ export function WorkbenchShell({ project, mode, webMcpAvailable }: WorkbenchShel
             <span className="measurement-label">Native clock</span>
           </div>
           <div className="specimen-view" aria-label="Source media specimen">
-            <div className="specimen-view__slide">
-              <span className="specimen-view__axis" aria-hidden="true" />
-              <span className="specimen-view__curve" aria-hidden="true" />
-              <p>Source media ready for review</p>
-              <strong>{project.title}</strong>
-              <span>Visible evidence stays attached to its media time.</span>
-            </div>
-            <div className="specimen-view__note">Original video is retained locally; playback attaches here.</div>
+            <video className="specimen-view__media" src={sourceObjectUrl} muted playsInline preload="metadata" aria-label="Verified local source media" />
+            <div className="specimen-view__note" role="status">Local source media verified in this browser.</div>
           </div>
           <div className="transport-bar" aria-label="Playback transport">
-            <button type="button" className="transport-control" aria-label="Play source media">Play</button>
             <output aria-label="Current media time">00:00.000</output>
             <span aria-hidden="true">/</span>
             <output aria-label="Source duration">{formatDuration(project.media.durationMs)}.000</output>
             <span className="transport-bar__spacer" />
-            <button type="button" className="transport-control">Captions</button>
+            <span className="transport-note">Playback and caption controls initialize with the authoritative media clock.</span>
           </div>
           <section className="timeline-shell" aria-labelledby="timeline-heading">
             <div className="region-heading region-heading--compact">
@@ -132,7 +132,8 @@ export function WorkbenchShell({ project, mode, webMcpAvailable }: WorkbenchShel
       <section className="court-record" aria-labelledby="court-record-heading">
         <div className="region-heading region-heading--compact">
           <div><h2 id="court-record-heading">Court Record</h2><p>Append-only project provenance</p></div>
-          <button className="header-button" type="button">View full record</button>
+          <span id="record-unavailable" className="visually-hidden">The full Court Record view is not available in this project shell yet.</span>
+          <button className="header-button" type="button" disabled aria-describedby="record-unavailable">Full record (later)</button>
         </div>
         <div className="court-record__empty">
           <span className="record-rule" aria-hidden="true" />
@@ -145,8 +146,13 @@ export function WorkbenchShell({ project, mode, webMcpAvailable }: WorkbenchShel
 
 function ProjectRoute({ store, webMcpAvailable }: AppRoutesProps) {
   const snapshot = useSyncExternalStore(store.subscribe, store.getSnapshot, store.getSnapshot);
-  if (snapshot.project === null) return <ProjectStart store={store} />;
-  return <WorkbenchShell project={snapshot.project} mode={snapshot.mode} webMcpAvailable={webMcpAvailable} />;
+  if (snapshot.project === null || snapshot.sourceObjectUrl === null) return <ProjectStart store={store} />;
+  return <WorkbenchShell
+    project={snapshot.project}
+    mode={snapshot.mode}
+    sourceObjectUrl={snapshot.sourceObjectUrl}
+    webMcpAvailable={webMcpAvailable}
+  />;
 }
 
 export function AppRoutes({ store, webMcpAvailable }: AppRoutesProps) {

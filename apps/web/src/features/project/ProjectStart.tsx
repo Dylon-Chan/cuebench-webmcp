@@ -1,5 +1,5 @@
 import * as Dialog from "@radix-ui/react-dialog";
-import { useSyncExternalStore, type ChangeEvent } from "react";
+import { useRef, useSyncExternalStore, type ChangeEvent } from "react";
 import { StorageDisclosure } from "./StorageDisclosure";
 import type { ProjectStore } from "./project-store";
 
@@ -10,6 +10,13 @@ export interface ProjectStartProps {
 export function ProjectStart({ store }: ProjectStartProps) {
   const snapshot = useSyncExternalStore(store.subscribe, store.getSnapshot, store.getSnapshot);
   const temporaryChoiceOpen = snapshot.route === "temporary-choice";
+  const uploadInput = useRef<HTMLInputElement>(null);
+  const busy = snapshot.activity !== null;
+  const busyMessage = snapshot.activity === "hydrating"
+    ? "Restoring a local project…"
+    : snapshot.activity === "saving"
+      ? "Saving and verifying local media…"
+      : "Preparing bundled media or local video…";
 
   const onFileChange = (event: ChangeEvent<HTMLInputElement>) => {
     const file = event.currentTarget.files?.item(0);
@@ -23,29 +30,39 @@ export function ProjectStart({ store }: ProjectStartProps) {
         <div className="instrument-mark" aria-hidden="true"><span /><span /><span /></div>
         <h1 id="project-start-heading">Set the evidence on the bench.</h1>
         <p>
-          Open the short teaching sample or bring a video you are ready to review. CueBench keeps the human judgment in view from the first cue.
+          Open the bundled media fixture or bring a video you are ready to review. CueBench keeps the human judgment in view from the first cue.
         </p>
         <div className="project-start__actions">
-          <button className="button button--signal" type="button" onClick={() => void store.openSample()}>
-            Open bundled sample
+          <button className="button button--signal" type="button" disabled={busy} onClick={() => void store.openSample()}>
+            Open bundled media fixture
           </button>
-          <label className="button button--outline" htmlFor="source-video">
+          <button className="button button--outline" type="button" disabled={busy} onClick={() => uploadInput.current?.click()}>
             Upload local video
-          </label>
-          <input id="source-video" className="visually-hidden" aria-label="Choose video" type="file" accept="video/*" onChange={onFileChange} />
+          </button>
+          <input
+            ref={uploadInput}
+            id="source-video"
+            className="visually-hidden"
+            aria-label="Choose video"
+            type="file"
+            accept="video/*"
+            tabIndex={-1}
+            onChange={onFileChange}
+          />
         </div>
+        {busy ? <p className="form-status" role="status" aria-live="polite">{busyMessage}</p> : null}
         {snapshot.error === null ? null : <p className="form-error" role="alert">{snapshot.error}</p>}
         <StorageDisclosure mode={null} />
         <p className="project-start__limits">Video limits: 500 MB and 15 minutes. No account is required.</p>
       </section>
 
       <section className="project-start__measurements" aria-label="CueBench project workflow">
-        <div><strong>01</strong><span>Choose source media</span></div>
-        <div><strong>02</strong><span>Review visible evidence</span></div>
-        <div><strong>03</strong><span>Make the human ruling</span></div>
+        <div><strong>Source</strong><span>Choose media stored in this browser</span></div>
+        <div><strong>Evidence</strong><span>Review visible evidence against time</span></div>
+        <div><strong>Ruling</strong><span>Keep the final human decision explicit</span></div>
       </section>
 
-      <Dialog.Root open={temporaryChoiceOpen} onOpenChange={(open) => { if (!open) store.cancelPendingUpload(); }}>
+      <Dialog.Root open={temporaryChoiceOpen} onOpenChange={(open) => { if (!open && !busy) store.cancelPendingUpload(); }}>
         <Dialog.Portal>
           <Dialog.Overlay className="dialog-overlay" />
           <Dialog.Content className="storage-dialog" aria-describedby="temporary-session-description">
@@ -54,11 +71,12 @@ export function ProjectStart({ store }: ProjectStartProps) {
               This browser cannot offer enough durable storage for this video. A temporary session is usable now, but is not recoverable after this browser session ends.
             </Dialog.Description>
             <StorageDisclosure mode="temporary" />
+            {snapshot.error === null ? null : <p className="form-error" role="alert">{snapshot.error}</p>}
             <div className="storage-dialog__actions">
-              <Dialog.Close asChild>
-                <button className="button button--outline" type="button">Choose another video</button>
-              </Dialog.Close>
-              <button className="button button--signal" type="button" onClick={() => void store.continueTemporarily()}>
+              <button className="button button--outline" type="button" disabled={busy} onClick={() => store.cancelPendingUpload()}>
+                Choose another video
+              </button>
+              <button className="button button--signal" type="button" disabled={busy} aria-busy={busy} onClick={() => void store.continueTemporarily()}>
                 Continue temporarily
               </button>
             </div>

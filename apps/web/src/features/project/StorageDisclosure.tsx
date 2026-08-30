@@ -9,14 +9,14 @@ export function StorageDisclosure({ mode }: StorageDisclosureProps) {
     return (
       <aside className="storage-disclosure storage-disclosure--temporary" aria-label="Temporary session notice">
         <strong>Temporary session</strong>
-        <span>This project remains usable now, but it is not promised recoverable after this browser session ends.</span>
+        <span>This project is usable now and is remembered only for this browser session; recovery is not promised after the session ends.</span>
       </aside>
     );
   }
   return (
     <aside className="storage-disclosure" aria-label="Local storage notice">
       <strong>Stored in this browser</strong>
-      <span>Project data and source media are kept locally with IndexedDB until you choose hosted processing.</span>
+      <span>This browser is the canonical project store. If you later request processing, CueBench uses a separate private temporary copy; it does not replace this local project.</span>
     </aside>
   );
 }

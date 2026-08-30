@@ -24,6 +24,7 @@ export function App({ store, webMcpAvailable }: AppProps) {
 
   useEffect(() => {
     void resolvedStore.restoreLastDurableProject();
+    return () => resolvedStore.dispose();
   }, [resolvedStore]);
 
   return (
