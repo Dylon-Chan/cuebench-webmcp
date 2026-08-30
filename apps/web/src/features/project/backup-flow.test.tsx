@@ -111,6 +111,11 @@ describe("Backup, relink, and deletion human workflows", () => {
     });
 
     expect(await within(dialog).findByText(/read-only/i)).toBeVisible();
+    expect(within(dialog).getByRole("heading", { name: "Read-only portable backup inspector" })).toBeVisible();
+    expect(within(dialog).getByText("Incoming title")).toBeVisible();
+    expect(within(dialog).getByText("Future CueBench project")).toBeVisible();
+    expect(within(dialog).queryByLabelText("Choose CueBench backup")).not.toBeInTheDocument();
+    expect(within(dialog).queryByRole("button", { name: "Create project backup" })).not.toBeInTheDocument();
     expect(within(dialog).queryByRole("button", { name: "Confirm import after relink" })).not.toBeInTheDocument();
   });
 
@@ -125,6 +130,9 @@ describe("Backup, relink, and deletion human workflows", () => {
     });
 
     expect(await within(dialog).findByText(/safety backup/i)).toBeVisible();
+    expect(within(dialog).getByText("Incoming identity")).toBeVisible();
+    expect(within(dialog).getByText("Schema version")).toBeVisible();
+    expect(within(dialog).getByText(/New project/i)).toBeVisible();
     expect(within(dialog).getByText(/does not match the SHA-256/i)).toBeVisible();
     expect(within(dialog).getByRole("button", { name: "Confirm import after relink" })).toBeDisabled();
   });
@@ -209,12 +217,262 @@ describe("Backup, relink, and deletion human workflows", () => {
     fireEvent.change(within(dialog).getByLabelText("Type the project title to confirm deletion"), { target: { value: liveProject.title } });
     fireEvent.click(confirm);
 
-    expect(await within(dialog).findByRole("status")).toHaveTextContent("Cloud cleanup remains pending lifecycle enforcement.");
+    expect(await within(dialog).findByRole("status")).toHaveTextContent("Cloud cleanup is pending lifecycle enforcement");
     expect(cloudCleanup).toHaveBeenCalledWith(expect.objectContaining({ projectId: liveProject.projectId, cancelActiveWork: true }));
     expect(await loadProject(database, liveProject.projectId)).toBeUndefined();
     await expect(database.narrationBlobs.where("projectId").equals(liveProject.projectId).count()).resolves.toBe(0);
     await expect(database.sourceBlobs.where("projectId").equals(liveProject.projectId).count()).resolves.toBe(0);
     expect(revokeObjectURL).toHaveBeenCalledWith("blob:cuebench:project");
     await database.delete();
+  });
+
+  it("aborts an import preview after a peer tab edits the replacement project and keeps its old media URL live", async () => {
+    const database = new CueBenchDatabase(`task-10-import-cas-edit-${crypto.randomUUID()}`);
+    const oldUrl = "blob:cuebench:old";
+    const revokeObjectURL = vi.fn();
+    const first = new ProjectStore({
+      database,
+      browserStorage: browserStorage(),
+      objectUrlLease: new ObjectUrlLease({ createObjectURL: vi.fn(() => oldUrl), revokeObjectURL }),
+      bundledSampleLoader: bundledFile,
+      mediaDurationProbe: async () => 90_000,
+    });
+    await first.openSample();
+    const second = new ProjectStore({
+      database,
+      browserStorage: browserStorage(),
+      objectUrlLease: new ObjectUrlLease({ createObjectURL: vi.fn(() => "blob:cuebench:peer"), revokeObjectURL: vi.fn() }),
+      mediaDurationProbe: async () => 90_000,
+    });
+    await second.restoreLastDurableProject();
+    const before = first.getSnapshot().project!;
+
+    await first.previewBackupText((await first.exportProjectBackup()).text);
+    await first.relinkImportedMedia(bundledFile());
+    await second.executeCommand({
+      type: "AppendCourtRecord",
+      actor: { type: "System", id: "cuebench" },
+      expectedProjectRevision: second.getSnapshot().project!.projectRevision,
+      eventType: "ProjectSerialized",
+      deterministic: true,
+    });
+
+    await expect(first.importPreviewedBackup()).rejects.toThrow(/replacement project changed/i);
+    expect(first.getSnapshot().sourceObjectUrl).toBe(oldUrl);
+    expect(revokeObjectURL).not.toHaveBeenCalledWith(oldUrl);
+    expect((await loadProject(database, before.projectId))?.projectRevision).toBe(2);
+    await database.delete();
+  });
+
+  it("aborts an import preview after a peer tab deletes the replacement project", async () => {
+    const database = new CueBenchDatabase(`task-10-import-cas-delete-${crypto.randomUUID()}`);
+    const first = new ProjectStore({
+      database,
+      browserStorage: browserStorage(),
+      objectUrlLease: new ObjectUrlLease({ createObjectURL: vi.fn(() => "blob:cuebench:old"), revokeObjectURL: vi.fn() }),
+      bundledSampleLoader: bundledFile,
+      mediaDurationProbe: async () => 90_000,
+    });
+    await first.openSample();
+    const second = new ProjectStore({
+      database,
+      browserStorage: browserStorage(),
+      objectUrlLease: new ObjectUrlLease({ createObjectURL: vi.fn(() => "blob:cuebench:peer"), revokeObjectURL: vi.fn() }),
+      mediaDurationProbe: async () => 90_000,
+    });
+    await second.restoreLastDurableProject();
+    const projectId = first.getSnapshot().project!.projectId;
+
+    await first.previewBackupText((await first.exportProjectBackup()).text);
+    await first.relinkImportedMedia(bundledFile());
+    await second.deleteCurrentProject();
+
+    await expect(first.importPreviewedBackup()).rejects.toThrow(/deleted|replacement project changed/i);
+    await expect(loadProject(database, projectId)).resolves.toBeUndefined();
+    await database.delete();
+  });
+
+  it("reconciles forward after a post-commit UI fault instead of retaining a dead old media URL", async () => {
+    const database = new CueBenchDatabase(`task-10-import-reconcile-${crypto.randomUUID()}`);
+    const createObjectURL = vi.fn()
+      .mockReturnValueOnce("blob:cuebench:old")
+      .mockReturnValueOnce("blob:cuebench:prepared");
+    const revokeObjectURL = vi.fn();
+    const store = new ProjectStore({
+      database,
+      browserStorage: browserStorage(),
+      objectUrlLease: new ObjectUrlLease({ createObjectURL, revokeObjectURL }),
+      bundledSampleLoader: bundledFile,
+      mediaDurationProbe: async () => 90_000,
+      afterImportCommitted: () => { throw new Error("render callback fault"); },
+    });
+    await store.openSample();
+    const projectId = store.getSnapshot().project!.projectId;
+    await store.previewBackupText((await store.exportProjectBackup()).text);
+    await store.relinkImportedMedia(bundledFile());
+
+    await store.importPreviewedBackup();
+
+    expect(store.getSnapshot().sourceObjectUrl).toBe("blob:cuebench:prepared");
+    expect(store.getSnapshot().error).toMatch(/recovered locally/i);
+    expect(revokeObjectURL).toHaveBeenCalledWith("blob:cuebench:old");
+    await expect(loadProject(database, projectId)).resolves.toMatchObject({ projectId });
+    await database.delete();
+  });
+
+  it("serializes a durable peer-tab revision rather than silently exporting a stale projection", async () => {
+    const database = new CueBenchDatabase(`task-10-export-fresh-${crypto.randomUUID()}`);
+    const first = new ProjectStore({
+      database,
+      browserStorage: browserStorage(),
+      objectUrlLease: new ObjectUrlLease({ createObjectURL: vi.fn(() => "blob:cuebench:first"), revokeObjectURL: vi.fn() }),
+      bundledSampleLoader: bundledFile,
+      mediaDurationProbe: async () => 90_000,
+    });
+    await first.openSample();
+    const second = new ProjectStore({
+      database,
+      browserStorage: browserStorage(),
+      objectUrlLease: new ObjectUrlLease({ createObjectURL: vi.fn(() => "blob:cuebench:second"), revokeObjectURL: vi.fn() }),
+      mediaDurationProbe: async () => 90_000,
+    });
+    await second.restoreLastDurableProject();
+    const staleProjection = first.getSnapshot().project!;
+    await second.executeCommand({
+      type: "AppendCourtRecord",
+      actor: { type: "System", id: "cuebench" },
+      expectedProjectRevision: second.getSnapshot().project!.projectRevision,
+      eventType: "ProjectSerialized",
+      deterministic: true,
+    });
+
+    const backup = await first.exportProjectBackup();
+    const freshTrack = await first.prepareFreshTrackExport({
+      project: staleProjection,
+      trackKind: "Captions",
+      format: "vtt",
+      disposition: "draft",
+    });
+    const parsed = JSON.parse(backup.text) as { readonly project: CaptionProject };
+    expect(freshTrack.project.projectRevision).toBe(2);
+    expect(freshTrack.prepared.filename).toContain(".draft.vtt");
+    expect(parsed.project.projectRevision).toBe(2);
+    expect(first.getSnapshot().project?.projectRevision).toBe(2);
+    expect(backup.freshnessNotice).toMatch(/another browser tab/i);
+    await database.delete();
+  });
+
+  it("captures a peer-tab active run in the retained deletion receipt and does not await a never-resolving cloud hook", async () => {
+    const database = new CueBenchDatabase(`task-10-delete-background-${crypto.randomUUID()}`);
+    const cloudCleanup = vi.fn(() => new Promise<never>(() => undefined));
+    const first = new ProjectStore({
+      database,
+      browserStorage: browserStorage(),
+      objectUrlLease: new ObjectUrlLease({ createObjectURL: vi.fn(() => "blob:cuebench:first"), revokeObjectURL: vi.fn() }),
+      bundledSampleLoader: bundledFile,
+      mediaDurationProbe: async () => 90_000,
+      cloudCleanup,
+      cloudCleanupTimeoutMs: 1,
+    });
+    await first.openSample();
+    const second = new ProjectStore({
+      database,
+      browserStorage: browserStorage(),
+      objectUrlLease: new ObjectUrlLease({ createObjectURL: vi.fn(() => "blob:cuebench:second"), revokeObjectURL: vi.fn() }),
+      mediaDurationProbe: async () => 90_000,
+    });
+    await second.restoreLastDurableProject();
+    const peerMedia = second.getSnapshot().project!.media;
+    await second.executeCommand({
+      type: "RelinkMedia",
+      actor: { type: "Human", id: "teacher" },
+      expectedProjectRevision: second.getSnapshot().project!.projectRevision,
+      media: {
+        sourceId: "concurrent-relinked-source",
+        sha256: peerMedia.sha256,
+        durationMs: peerMedia.durationMs,
+      },
+    });
+    await second.executeCommand({
+      type: "StartGenerationRun",
+      actor: { type: "CueBenchAI", id: "cuebench-ai" },
+      expectedProjectRevision: second.getSnapshot().project!.projectRevision,
+      runId: "run-concurrent-delete",
+      targetTrack: "Captions",
+    });
+
+    const deletion = await first.deleteCurrentProject();
+    expect(first.getSnapshot().route).toBe("start");
+    expect(deletion.cloudCleanup.status).toBe("pending");
+    await waitFor(() => expect(cloudCleanup).toHaveBeenCalledWith(expect.objectContaining({
+      sourceId: "concurrent-relinked-source",
+      activeRunId: "run-concurrent-delete",
+      cancelActiveWork: true,
+    })));
+    await waitFor(async () => {
+      const receipt = (await database.settings.toArray()).find((setting) => setting.key.includes(deletion.receiptId));
+      expect(receipt?.value).toMatchObject({ state: "pending", activeRunId: "run-concurrent-delete" });
+    });
+    await database.delete();
+  });
+
+  it("retains a failed cloud cleanup receipt so a later lifecycle retry can report a confirmed result", async () => {
+    const database = new CueBenchDatabase(`task-10-delete-retry-${crypto.randomUUID()}`);
+    const cloudCleanup = vi.fn()
+      .mockRejectedValueOnce(new Error("hosted cleanup unavailable"))
+      .mockResolvedValueOnce({ status: "deleted" as const, message: "Hosted source cleanup confirmed." });
+    const store = new ProjectStore({
+      database,
+      browserStorage: browserStorage(),
+      objectUrlLease: new ObjectUrlLease({ createObjectURL: vi.fn(() => "blob:cuebench:retry"), revokeObjectURL: vi.fn() }),
+      bundledSampleLoader: bundledFile,
+      mediaDurationProbe: async () => 90_000,
+      cloudCleanup,
+      cloudCleanupTimeoutMs: 5,
+    });
+    await store.openSample();
+
+    const deletion = await store.deleteCurrentProject();
+    await waitFor(async () => {
+      const receipt = (await database.settings.toArray()).find((setting) => setting.key.includes(deletion.receiptId));
+      expect(receipt?.value).toMatchObject({ state: "failed" });
+    });
+
+    await expect(store.retryCloudCleanup(deletion.receiptId)).resolves.toEqual({
+      status: "deleted",
+      message: "Hosted source cleanup confirmed.",
+    });
+    const receipt = (await database.settings.toArray()).find((setting) => setting.key.includes(deletion.receiptId));
+    expect(receipt?.value).toMatchObject({ state: "deleted", attempts: 2 });
+    await database.delete();
+  });
+
+  it("imports a verified backup as a new durable project from the start screen state", async () => {
+    const producerDatabase = new CueBenchDatabase(`task-10-import-new-source-${crypto.randomUUID()}`);
+    const producer = new ProjectStore({
+      database: producerDatabase,
+      browserStorage: browserStorage(),
+      objectUrlLease: new ObjectUrlLease({ createObjectURL: vi.fn(() => "blob:cuebench:producer"), revokeObjectURL: vi.fn() }),
+      bundledSampleLoader: bundledFile,
+      mediaDurationProbe: async () => 90_000,
+    });
+    await producer.openSample();
+    const portable = await producer.exportProjectBackup();
+    const importDatabase = new CueBenchDatabase(`task-10-import-new-target-${crypto.randomUUID()}`);
+    const importer = new ProjectStore({
+      database: importDatabase,
+      browserStorage: browserStorage(),
+      objectUrlLease: new ObjectUrlLease({ createObjectURL: vi.fn(() => "blob:cuebench:importer"), revokeObjectURL: vi.fn() }),
+      mediaDurationProbe: async () => 90_000,
+    });
+
+    const preview = await importer.previewBackupText(portable.text);
+    expect(preview.mode).toBe("preview");
+    await importer.relinkImportedMedia(bundledFile());
+    const imported = await importer.importPreviewedBackup();
+
+    expect(importer.getSnapshot()).toMatchObject({ route: "workbench", mode: "durable", project: { projectId: imported.project.projectId } });
+    await producerDatabase.delete();
+    await importDatabase.delete();
   });
 });

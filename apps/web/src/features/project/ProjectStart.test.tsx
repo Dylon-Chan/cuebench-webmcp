@@ -75,6 +75,20 @@ describe("ProjectStart", () => {
     await Promise.all(databases.splice(0).map(async (database) => database.delete()));
   });
 
+  it("offers backup restore before a local project is open", () => {
+    const database = new CueBenchDatabase(databaseName());
+    databases.push(database);
+    const store = new ProjectStore({
+      database,
+      browserStorage: browserStorage({ quota: 100_000_000, usage: 0, persisted: true }),
+      objectUrlLease: objectUrlLease("restore-control").lease,
+    });
+
+    render(<ProjectStart store={store} />);
+
+    expect(screen.getByRole("button", { name: "Restore project backup" })).toBeVisible();
+  });
+
   it("opens the bundled sample without an account", async () => {
     const database = new CueBenchDatabase(databaseName());
     databases.push(database);

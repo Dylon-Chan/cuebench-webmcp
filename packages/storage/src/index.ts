@@ -7,6 +7,7 @@ export {
   StorageStaleWriteError,
   initializeProject,
   loadProject,
+  loadProjectInTransaction,
   narrationBlobKey,
   runReceiptKey,
   sourceBlobKey,

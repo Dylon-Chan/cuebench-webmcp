@@ -13,6 +13,7 @@ import {
 } from "@cuebench/domain";
 import { useEffect, useRef, useState } from "react";
 import { ImpactSummaryPanel } from "./ImpactSummaryPanel";
+import type { FreshProjectTrackExport } from "../project/project-store";
 
 const systemExportActor = { type: "System" as const, id: "cuebench-export" };
 
@@ -42,7 +43,9 @@ export interface ExportDialogProps {
   readonly project: CaptionProject;
   readonly onCommand: (command: DomainCommand) => CommandResult | Promise<CommandResult>;
   readonly urlApi?: ExportUrlApi | null;
-  readonly prepareExport?: (request: ProjectTrackExportRequest) => ProjectTrackExport;
+  readonly prepareExport?: (request: ProjectTrackExportRequest) => ProjectTrackExport | Promise<ProjectTrackExport>;
+  /** Store-owned canonical export boundary used by the workbench; it returns the revision that must receive the round-trip record. */
+  readonly prepareFreshExport?: (request: ProjectTrackExportRequest) => Promise<FreshProjectTrackExport>;
   readonly now?: () => number;
   readonly createExportId?: () => string;
 }
@@ -55,6 +58,7 @@ export function ExportDialog({
   onCommand,
   urlApi = browserUrlApi(),
   prepareExport = prepareTrackExport,
+  prepareFreshExport,
   now = () => Date.now(),
   createExportId = defaultExportId,
 }: ExportDialogProps) {
@@ -64,8 +68,12 @@ export function ExportDialog({
   const [disposition, setDisposition] = useState<ExportDisposition>("draft");
   const [pending, setPending] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
   const [download, setDownload] = useState<{ readonly href: string; readonly filename: string } | null>(null);
   const liveUrl = useRef<string | null>(null);
+  const generation = useRef(0);
+  const certificationId = project.certification.status === "NotCertified" ? "none" : project.certification.certificationId;
+  const projectGenerationKey = `${project.projectId}:${project.projectRevision}:${project.certification.status}:${certificationId}`;
 
   const revokeDownload = () => {
     if (liveUrl.current !== null && urlApi !== null) urlApi.revokeObjectURL(liveUrl.current);
@@ -74,34 +82,52 @@ export function ExportDialog({
   };
 
   useEffect(() => () => {
+    generation.current += 1;
     if (liveUrl.current !== null && urlApi !== null) urlApi.revokeObjectURL(liveUrl.current);
   }, [urlApi]);
+
+  /** URLs name exact project/certification bytes; changing either invalidates an older object URL. */
+  useEffect(() => {
+    generation.current += 1;
+    revokeDownload();
+  }, [projectGenerationKey]);
 
   const close = (nextOpen: boolean) => {
     setOpen(nextOpen);
     if (!nextOpen) {
+      generation.current += 1;
       revokeDownload();
       setError(null);
+      setNotice(null);
     }
   };
 
   const changeTrack = (nextTrack: ExportTrackKind) => {
     setTrackKind(nextTrack);
     setFormat(formatsFor(nextTrack)[0]!.value);
+    generation.current += 1;
     revokeDownload();
   };
 
   const prepareDownload = async () => {
+    const requestGeneration = ++generation.current;
     setPending(true);
     setError(null);
+    setNotice(null);
     revokeDownload();
     try {
       /** Domain throws if serialization, parsing, normalization, or comparison disagrees. */
-      const prepared = prepareExport({ project, trackKind, format, disposition });
+      const request = { project, trackKind, format, disposition } satisfies ProjectTrackExportRequest;
+      const fresh = prepareFreshExport === undefined ? null : await prepareFreshExport(request);
+      if (requestGeneration !== generation.current) return;
+      const prepared = fresh === null ? await prepareExport(request) : fresh.prepared;
+      if (requestGeneration !== generation.current) return;
+      const canonicalProject = fresh?.project ?? project;
+      if (fresh?.freshnessNotice !== null && fresh?.freshnessNotice !== undefined) setNotice(fresh.freshnessNotice);
       const result = await onCommand({
         type: "RecordExportRoundTrip",
         actor: systemExportActor,
-        expectedProjectRevision: project.projectRevision,
+        expectedProjectRevision: canonicalProject.projectRevision,
         exportId: createExportId(),
         trackKind,
         format: canonicalTrackFormat(format),
@@ -109,6 +135,7 @@ export function ExportDialog({
         verifiedAtMs: now(),
         text: prepared.text,
       });
+      if (requestGeneration !== generation.current) return;
       if (result.error !== undefined) {
         setError(result.error.message);
         return;
@@ -119,12 +146,16 @@ export function ExportDialog({
       }
       /** The Blob and object URL are deliberately created after both verification and its durable record. */
       const href = urlApi.createObjectURL(new Blob([prepared.text], { type: mimeTypeFor(format) }));
+      if (requestGeneration !== generation.current) {
+        urlApi.revokeObjectURL(href);
+        return;
+      }
       liveUrl.current = href;
       setDownload({ href, filename: prepared.filename });
     } catch (cause) {
-      setError(cause instanceof Error ? cause.message : "CueBench could not prepare this export.");
+      if (requestGeneration === generation.current) setError(cause instanceof Error ? cause.message : "CueBench could not prepare this export.");
     } finally {
-      setPending(false);
+      if (requestGeneration === generation.current) setPending(false);
     }
   };
 
@@ -148,12 +179,12 @@ export function ExportDialog({
               </select>
             </label>
             <label className="review-field" htmlFor="export-format"><span>Format</span>
-              <select id="export-format" value={format} disabled={pending} onChange={(event) => { setFormat(event.currentTarget.value as TrackFormat); revokeDownload(); }}>
+              <select id="export-format" value={format} disabled={pending} onChange={(event) => { setFormat(event.currentTarget.value as TrackFormat); generation.current += 1; revokeDownload(); }}>
                 {formatsFor(trackKind).map((candidate) => <option key={candidate.value} value={candidate.value}>{candidate.label}</option>)}
               </select>
             </label>
             <label className="review-field" htmlFor="export-disposition"><span>Export version</span>
-              <select id="export-disposition" value={disposition} disabled={pending} onChange={(event) => { setDisposition(event.currentTarget.value as ExportDisposition); revokeDownload(); }}>
+              <select id="export-disposition" value={disposition} disabled={pending} onChange={(event) => { setDisposition(event.currentTarget.value as ExportDisposition); generation.current += 1; revokeDownload(); }}>
                 <option value="draft">Current draft</option>
                 <option value="certified">Latest current certification</option>
               </select>
@@ -161,6 +192,7 @@ export function ExportDialog({
           </div>
           <p className="export-dialog__note">Filenames state whether the file is a <b>.draft</b> or <b>.certified</b> export.</p>
           {error === null ? null : <p className="review-command-feedback" role="alert">{error}</p>}
+          {notice === null ? null : <p className="export-dialog__status" role="status">{notice}</p>}
           {download === null ? null : <p className="export-dialog__status" role="status">Round-trip verified. <a className="button button--signal" href={download.href} download={download.filename}>Download verified export</a></p>}
           <div className="storage-dialog__actions">
             <Dialog.Close className="button button--outline" type="button" disabled={pending}>Close</Dialog.Close>

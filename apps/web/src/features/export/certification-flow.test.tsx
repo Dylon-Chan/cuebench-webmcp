@@ -159,6 +159,24 @@ describe("Certification and export human workflows", () => {
     })));
   });
 
+  it("supplies an honest built-in profile preset when no agent proposal inbox is configured", async () => {
+    const project = projectFixture();
+    const onCommand = vi.fn(async () => accepted(project));
+    render(<ProfileProposalDialog project={project} onCommand={onCommand} />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Review profile proposal" }));
+    const dialog = await screen.findByRole("dialog", { name: "Quality profile proposal" });
+    expect(within(dialog).getAllByText(/CueBench built-in preset/i)[0]).toBeVisible();
+    expect(within(dialog).getByText(/not a compliance claim/i)).toBeVisible();
+    expect(within(dialog).getByText("rules.caption.maxReadingSpeedCps")).toBeVisible();
+    fireEvent.click(within(dialog).getByRole("button", { name: "Apply proposed profile" }));
+
+    await waitFor(() => expect(onCommand).toHaveBeenCalledWith(expect.objectContaining({
+      type: "ApplyProfile",
+      actor: human,
+    })));
+  });
+
   it("refreshes a stale readiness hash immediately before the human confirmation", async () => {
     const project = projectFixture();
     const first = readiness({ readinessHash: `sha256:${"1".repeat(64)}` });
@@ -212,6 +230,26 @@ describe("Certification and export human workflows", () => {
       actor: { type: "System", id: "cuebench-export" },
       disposition: "draft",
     }));
+  });
+
+  it("revokes and suppresses a stale export URL when the project revision changes while preparation is in flight", async () => {
+    const project = projectFixture();
+    const urlApi = exportUrlApi();
+    let resolvePrepared!: (value: ProjectTrackExport) => void;
+    const pendingPrepared = new Promise<ProjectTrackExport>((resolve) => { resolvePrepared = resolve; });
+    const prepareExport = vi.fn(() => pendingPrepared);
+    const onCommand = vi.fn(async () => accepted(project));
+    const view = render(<ExportDialog project={project} onCommand={onCommand} urlApi={urlApi} prepareExport={prepareExport} />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Export tracks" }));
+    const dialog = await screen.findByRole("dialog", { name: "Export track" });
+    fireEvent.click(within(dialog).getByRole("button", { name: "Prepare verified download" }));
+    view.rerender(<ExportDialog project={{ ...project, projectRevision: project.projectRevision + 1 }} onCommand={onCommand} urlApi={urlApi} prepareExport={prepareExport} />);
+    resolvePrepared(prepareTrackExport({ project, trackKind: "Captions", format: "vtt", disposition: "draft" }));
+
+    await waitFor(() => expect(prepareExport).toHaveBeenCalledTimes(1));
+    expect(onCommand).not.toHaveBeenCalled();
+    expect(urlApi.createObjectURL).not.toHaveBeenCalled();
   });
 
   it("uses the certified filename label and blocks a mismatch before any download URL exists", async () => {

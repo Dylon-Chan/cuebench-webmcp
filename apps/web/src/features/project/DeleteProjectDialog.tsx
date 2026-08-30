@@ -48,7 +48,7 @@ export function DeleteProjectDialog({ project, onDelete }: DeleteProjectDialogPr
         <Dialog.Content className="storage-dialog delete-dialog" aria-describedby="delete-project-description">
           <Dialog.Title>Delete CueBench project</Dialog.Title>
           <Dialog.Description id="delete-project-description">
-            This Human-confirmed action removes the local project, source media, cached narration, findings, revisions, Court Record, certifications, settings, and recovery receipts. CueBench also requests cloud cleanup, which may remain subject to lifecycle enforcement.
+            This Human-confirmed action removes the local project, source media, cached narration, findings, revisions, Court Record, certifications, and project settings. CueBench retains only a minimal deletion receipt so pending cloud cleanup can be reported or retried truthfully.
           </Dialog.Description>
           <label className="review-field" htmlFor="delete-project-confirmation">
             <span>Type the project title to confirm deletion</span>

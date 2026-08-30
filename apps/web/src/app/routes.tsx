@@ -6,7 +6,7 @@ import { projectMediaEvidence } from "../features/evidence/project-media-evidenc
 import { CertificationReview } from "../features/export/CertificationReview";
 import { ExportDialog } from "../features/export/ExportDialog";
 import { ImpactSummaryPanel } from "../features/export/ImpactSummaryPanel";
-import { ProfileProposalDialog } from "../features/export/ProfileProposalDialog";
+import { ProfileProposalDialog, builtInProfileProposal } from "../features/export/ProfileProposalDialog";
 import { ValidationPanel } from "../features/export/ValidationPanel";
 import { BackupDialog } from "../features/project/BackupDialog";
 import { DeleteProjectDialog } from "../features/project/DeleteProjectDialog";
@@ -98,9 +98,17 @@ export function WorkbenchShell({ project, mode, sourceObjectUrl, sourceProvenanc
         </div>
         <div className="header-actions">
           <ValidationPanel project={project} onCommand={(command) => store.executeCommand(command)} />
-          <ProfileProposalDialog project={project} onCommand={(command) => store.executeCommand(command)} />
+          <ProfileProposalDialog
+            project={project}
+            proposal={builtInProfileProposal(project)}
+            onCommand={(command) => store.executeCommand(command)}
+          />
           <CertificationReview project={project} onCommand={(command) => store.executeCommand(command)} />
-          <ExportDialog project={project} onCommand={(command) => store.executeCommand(command)} />
+          <ExportDialog
+            project={project}
+            onCommand={(command) => store.executeCommand(command)}
+            prepareFreshExport={(request) => store.prepareFreshTrackExport(request)}
+          />
           <BackupDialog project={project} manager={store} />
           <DeleteProjectDialog project={project} onDelete={() => store.deleteCurrentProject()} />
         </div>

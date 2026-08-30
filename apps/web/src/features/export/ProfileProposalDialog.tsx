@@ -42,8 +42,33 @@ const collectDiff = (before: unknown, after: unknown, path = "rules"): readonly 
   return JSON.stringify(before) === JSON.stringify(after) ? [] : [{ path, before: displayValue(before), after: displayValue(after) }];
 };
 
+/**
+ * An honest, local preset keeps the Profile control useful even when no agent
+ * inbox is configured. It proposes one visible policy change only; it never
+ * claims accessibility/compliance and still requires a Human ApplyProfile
+ * command after the immutable diff is reviewed.
+ */
+export const builtInProfileProposal = (project: CaptionProject): ProfileProposal => {
+  const currentRules = structuredClone(project.qualityProfile.rules);
+  const root = asRecord(currentRules) ?? {};
+  const caption = asRecord(root.caption) ?? {};
+  const currentLimit = typeof caption.maxReadingSpeedCps === "number" ? caption.maxReadingSpeedCps : 20;
+  const proposedLimit = currentLimit === 18 ? 20 : 18;
+  return {
+    proposalId: `builtin-readable-caption-${project.projectId}-${project.projectRevision}-${proposedLimit}`,
+    createdBy: "CueBench built-in preset",
+    rationale: `Offer a human-reviewable caption reading-speed policy of ${proposedLimit} characters per second. This is a local preset, not a compliance claim.`,
+    profileId: `${project.qualityProfile.profileId}-readable-caption`,
+    name: `${project.qualityProfile.name} — readable captions`,
+    rules: {
+      ...root,
+      caption: { ...caption, maxReadingSpeedCps: proposedLimit },
+    },
+  };
+};
+
 /** A Browser Agent may supply a proposal, but the displayed diff is not editable and only this Human UI can apply it. */
-export function ProfileProposalDialog({ project, proposal = null, onCommand }: ProfileProposalDialogProps) {
+export function ProfileProposalDialog({ project, proposal = builtInProfileProposal(project), onCommand }: ProfileProposalDialogProps) {
   const [open, setOpen] = useState(false);
   const [pending, setPending] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -89,7 +114,7 @@ export function ProfileProposalDialog({ project, proposal = null, onCommand }: P
             Profile proposals are suggestions only. Applying one creates a new immutable profile revision and makes current validation and certification stale.
           </Dialog.Description>
           {frozenProposal === null ? (
-            <p className="export-dialog__empty">No Browser Agent profile proposal is awaiting Human review.</p>
+            <p className="export-dialog__empty">No profile proposal is available for Human review.</p>
           ) : (
             <>
               <div className="export-dialog__reading">

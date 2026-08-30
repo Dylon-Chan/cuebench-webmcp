@@ -2,12 +2,16 @@ import {
   applyCommand,
   createProject,
   buildProjectBackupFilename,
+  canonicalHash,
   exportProjectBackup as exportProjectBackupManifest,
+  prepareTrackExport as prepareDomainTrackExport,
   previewProjectImport,
   type CaptionProject,
   type CommandResult,
   type DomainCommand,
   type ProjectImportDescriptor,
+  type ProjectTrackExport,
+  type ProjectTrackExportRequest,
 } from "@cuebench/domain";
 import {
   CueBenchDatabase,
@@ -15,6 +19,7 @@ import {
   executePersistentCommand,
   initializeProject,
   loadProject,
+  loadProjectInTransaction,
   loadSetting,
   loadSourceMedia,
   saveSetting,
@@ -35,6 +40,7 @@ import {
   type IngestedLocalMedia,
   type MediaDurationProbe,
 } from "./local-media";
+import { parseBoundedBackupJson } from "./backup-import-safety";
 import {
   bundledFixtureSourceProvenance,
   sourceProvenanceFrom,
@@ -55,7 +61,7 @@ export interface CloudCleanupRequest {
 }
 
 export interface CloudCleanupResult {
-  readonly status: "deleted" | "pending";
+  readonly status: "deleted" | "pending" | "failed";
   readonly message: string;
 }
 
@@ -65,11 +71,21 @@ export interface ProjectDeletionResult {
   readonly localDeleted: true;
   readonly cloudCleanup: CloudCleanupResult;
   readonly cleanupNotice: string;
+  /** Retained locally so a pending hosted cleanup can be retried truthfully. */
+  readonly receiptId: string;
 }
 
 export interface ProjectBackupDownload {
   readonly filename: string;
   readonly text: string;
+  /** A durable peer updated the project before serialization; this backup uses that canonical version. */
+  readonly freshnessNotice?: string;
+}
+
+export interface FreshProjectTrackExport {
+  readonly project: CaptionProject;
+  readonly prepared: ProjectTrackExport;
+  readonly freshnessNotice: string | null;
 }
 
 export interface ImportedProjectResult {
@@ -115,6 +131,10 @@ export interface ProjectStoreOptions {
   readonly bundledSampleLoader?: () => File | Promise<File>;
   /** Optional hosted-cleanup seam populated by Task 15. Its absence is reported as lifecycle-pending, never success. */
   readonly cloudCleanup?: CloudCleanupHook;
+  /** Bounds hosted deletion work; local deletion never waits indefinitely on a cloud hook. */
+  readonly cloudCleanupTimeoutMs?: number;
+  /** Test seam: a synchronous UI-side fault after commit must reconcile forward, never restore a dead preview. */
+  readonly afterImportCommitted?: () => void;
   /** Test seam for proving that a stale restore cannot replace a newer operation. */
   readonly beforeRestoreLoad?: () => Promise<void>;
 }
@@ -127,6 +147,26 @@ const projectSourceProvenanceKey = (projectId: string): string => `project-sourc
 const lastDurableProjectKey = "last-durable-project";
 const importSafetyBackupKey = (projectId: string, backupId: string): string => `import-safety-backup:${projectId}:${backupId}`;
 const replacementSafetyBackupKey = (projectId: string, backupId: string): string => `replacement-safety-backup:${projectId}:${backupId}`;
+const deletionReceiptKey = (projectId: string, receiptId: string): string => `project-deletion-receipt:${projectId}:${receiptId}`;
+const importReplacementHash = (project: CaptionProject): string => canonicalHash("cuebench.web.import-replacement.v1", project);
+
+interface ReplacementImportExpectation {
+  readonly projectId: string;
+  readonly projectRevision: number;
+  readonly projectHash: string;
+  readonly mode: ProjectMode;
+}
+
+interface DeletionReceipt {
+  readonly receiptId: string;
+  readonly projectId: string;
+  readonly sourceId: string;
+  readonly activeRunId: string | null;
+  readonly createdAtMs: number;
+  readonly attempts: number;
+  readonly state: "pending" | "deleted" | "failed";
+  readonly message: string;
+}
 
 const emptySnapshot = (): ProjectStoreSnapshot => ({
   route: "start",
@@ -144,6 +184,8 @@ interface PendingBackupImport {
   readonly originalEnvelope: unknown;
   readonly descriptor: ProjectImportDescriptor;
   readonly relinkFile: File | null;
+  /** Exact canonical target visible to the Human at preview time, or null for a new local project. */
+  readonly replacement: ReplacementImportExpectation | null;
 }
 
 const humanImportActor = { type: "Human" as const, id: "human" };
@@ -189,6 +231,8 @@ export class ProjectStore {
   private readonly bundledSampleLoader: () => File | Promise<File>;
   private readonly beforeRestoreLoad: (() => Promise<void>) | undefined;
   private readonly cloudCleanup: CloudCleanupHook | undefined;
+  private readonly cloudCleanupTimeoutMs: number;
+  private readonly afterImportCommitted: (() => void) | undefined;
   private objectUrlLease: ObjectUrlLease | null;
   private triedObjectUrlLease = false;
   private readonly createId: () => string;
@@ -196,6 +240,7 @@ export class ProjectStore {
   private readonly listeners = new Set<() => void>();
   private readonly ownedProjectTokens = new Map<string, string>();
   private pendingBackupImport: PendingBackupImport | null = null;
+  private activeCleanupReceiptId: string | null = null;
   private operationEpoch = 0;
   /** Keeps page-originated domain writes ordered just like the durable CAS boundary. */
   private commandQueue: Promise<void> = Promise.resolve();
@@ -210,6 +255,8 @@ export class ProjectStore {
     this.bundledSampleLoader = options.bundledSampleLoader ?? createBundledSampleFile;
     this.beforeRestoreLoad = options.beforeRestoreLoad;
     this.cloudCleanup = options.cloudCleanup;
+    this.cloudCleanupTimeoutMs = Math.max(1, Math.trunc(options.cloudCleanupTimeoutMs ?? 5_000));
+    this.afterImportCommitted = options.afterImportCommitted;
   }
 
   public getSnapshot = (): ProjectStoreSnapshot => this.snapshot;
@@ -350,35 +397,59 @@ export class ProjectStore {
 
   /** Produces a portable manifest only; source video remains in browser storage and is never serialized. */
   public async exportProjectBackup(): Promise<ProjectBackupDownload> {
-    const project = this.snapshot.project;
-    if (project === null) throw new Error("CueBench cannot back up a project before its media is available.");
+    const { project, freshnessNotice } = await this.freshProjectForSerialization();
     const backup = exportProjectBackupManifest(project, { exportedAtMs: Date.now() });
     return {
       filename: buildProjectBackupFilename(project.title),
       text: JSON.stringify(backup, null, 2),
+      ...(freshnessNotice === null ? {} : { freshnessNotice }),
+    };
+  }
+
+  /**
+   * Export serialization is intentionally owned by the store rather than a
+   * possibly stale React projection. A peer-tab edit becomes an explicit UI
+   * refresh before round-trip verification can record its bytes.
+   */
+  public async prepareTrackExport(request: ProjectTrackExportRequest): Promise<ProjectTrackExport> {
+    return (await this.prepareFreshTrackExport(request)).prepared;
+  }
+
+  public async prepareFreshTrackExport(request: ProjectTrackExportRequest): Promise<FreshProjectTrackExport> {
+    const { project, freshnessNotice } = await this.freshProjectForSerialization(request.project.projectId);
+    if (project.projectId !== request.project.projectId) {
+      throw new Error("CueBench project identity changed before export. Review the current project and try again.");
+    }
+    return {
+      project,
+      prepared: prepareDomainTrackExport({ ...request, project }),
+      freshnessNotice,
     };
   }
 
   /** Parses and previews an import without changing local storage. This UI-only boundary always supplies Human provenance. */
   public async previewBackupText(text: string): Promise<ProjectImportDescriptor> {
-    const project = this.snapshot.project;
-    if (project === null) throw new Error("Open a project before previewing a backup replacement.");
+    const originalEnvelope = parseBoundedBackupJson(text);
+    const visibleProject = this.snapshot.project;
+    const replacement = visibleProject === null
+      ? null
+      : await this.freshProjectForSerialization(visibleProject.projectId);
     this.pendingBackupImport = null;
-    let originalEnvelope: unknown;
-    try {
-      originalEnvelope = JSON.parse(text) as unknown;
-    } catch {
-      throw new Error("CueBench could not parse this backup JSON.");
-    }
     const descriptor = previewProjectImport(originalEnvelope, {
       actor: humanImportActor,
-      replaceProject: project,
+      ...(replacement === null ? {} : { replaceProject: replacement.project }),
       migration: describeImportedProject,
     });
     this.pendingBackupImport = {
       originalEnvelope: structuredClone(originalEnvelope),
       descriptor,
       relinkFile: null,
+      replacement: replacement === null ? null : {
+        projectId: replacement.project.projectId,
+        projectRevision: replacement.project.projectRevision,
+        projectHash: importReplacementHash(replacement.project),
+        mode: this.snapshot.mode ?? "durable",
+      },
     };
     return descriptor;
   }
@@ -395,7 +466,9 @@ export class ProjectStore {
     ]);
     const descriptor = previewProjectImport(pending.originalEnvelope, {
       actor: humanImportActor,
-      ...(this.snapshot.project === null ? {} : { replaceProject: this.snapshot.project }),
+      ...(pending.descriptor.replacementSafetyBackup === null
+        ? {}
+        : { replaceProject: pending.descriptor.replacementSafetyBackup.backup.project }),
       migration: describeImportedProject,
       relinkedMedia: {
         sourceId: `import-source-${this.createId()}`,
@@ -420,31 +493,34 @@ export class ProjectStore {
       || initiallyPending.descriptor.mode !== "preview"
       || initiallyPending.relinkFile === null
       || !initiallyPending.descriptor.canImport
-      || initiallySnapshot.project === null
       || initiallySnapshot.activity !== null
     ) {
       throw new Error("CueBench needs a compatible preview and a SHA-256-verified media relink before import.");
     }
 
     this.invalidateOperations();
+    const importEpoch = this.operationEpoch;
     this.setSnapshot({ ...initiallySnapshot, activity: "importing", error: null, cleanupNotice: null });
     try {
       /** Let any already-started persistent command settle before replacing its project namespace. */
       await this.commandQueue;
+      if (!this.isCurrent(importEpoch)) throw new Error("CueBench stopped this import before it could commit.");
       const current = this.snapshot;
       const pending = this.pendingBackupImport;
-      if (current.project === null || pending === null || pending.descriptor.mode !== "preview" || pending.relinkFile === null) {
+      if (pending === null || pending.descriptor.mode !== "preview" || pending.relinkFile === null) {
         throw new Error("CueBench's import preview changed before confirmation. Preview the backup again.");
       }
+      const replacementProject = await this.canonicalReplacementForImport(pending, current);
       const relinkFile = pending.relinkFile;
 
       const [inspected, sha256] = await Promise.all([
         inspectLocalMedia(relinkFile, this.mediaDurationProbe),
         hashLocalMedia(relinkFile),
       ]);
+      if (!this.isCurrent(importEpoch)) throw new Error("CueBench stopped this import before it could commit.");
       const exactPreview = previewProjectImport(pending.originalEnvelope, {
         actor: humanImportActor,
-        replaceProject: current.project,
+        ...(replacementProject === null ? {} : { replaceProject: replacementProject }),
         migration: describeImportedProject,
         relinkedMedia: {
           sourceId: pending.descriptor.project.media.sourceId,
@@ -460,7 +536,6 @@ export class ProjectStore {
         throw new LocalMediaError("object-url-unavailable", "This browser cannot safely preview the relinked local media.");
       }
 
-      const replacementProject = current.project;
       const importedProject = exactPreview.project;
       const backupId = this.createId();
       /** The SHA-256 was recomputed immediately above; write its immutable binding within the same local transaction. */
@@ -475,78 +550,112 @@ export class ProjectStore {
         fileName: relinkFile.name,
         savedAtMs: Date.now(),
       };
-      await this.database.transaction(
-        "rw",
-        [
-          this.database.projectHeaders,
-          this.database.items,
-          this.database.revisions,
-          this.database.findings,
-          this.database.evidence,
-          this.database.courtRecord,
-          this.database.certifications,
-          this.database.sourceBlobs,
-          this.database.narrationBlobs,
-          this.database.runReceipts,
-          this.database.settings,
-        ],
-        async () => {
-          const existingTarget = await this.database.projectHeaders.get(importedProject.projectId);
-          if (existingTarget !== undefined && importedProject.projectId !== replacementProject.projectId) {
-            throw new Error("CueBench cannot overwrite another local project while importing this backup.");
-          }
+      /** Candidate media stays live only after both its second hash and durable transaction succeed. */
+      const preparedObjectUrl = objectUrlLease.prepare(relinkFile);
+      try {
+        await this.database.transaction(
+          "rw",
+          [
+            this.database.projectHeaders,
+            this.database.items,
+            this.database.revisions,
+            this.database.findings,
+            this.database.evidence,
+            this.database.courtRecord,
+            this.database.certifications,
+            this.database.sourceBlobs,
+            this.database.narrationBlobs,
+            this.database.runReceipts,
+            this.database.settings,
+          ],
+          async () => {
+            const existingTarget = await this.database.projectHeaders.get(importedProject.projectId);
+            let exactReplacement: CaptionProject | null = null;
+            if (pending.replacement !== null && pending.replacement.mode === "durable") {
+              const expected = pending.replacement;
+              const header = await this.database.projectHeaders.get(expected.projectId);
+              const canonical = header === undefined ? undefined : await loadProjectInTransaction(this.database, expected.projectId);
+              if (
+                header === undefined
+                || canonical === undefined
+                || header.projectRevision !== expected.projectRevision
+                || canonical.projectRevision !== expected.projectRevision
+                || importReplacementHash(canonical) !== expected.projectHash
+              ) {
+                throw new Error("CueBench's replacement project changed, was deleted, or was recreated after this preview. Preview the backup again before importing.");
+              }
+              exactReplacement = canonical;
+              if (existingTarget !== undefined && importedProject.projectId !== expected.projectId) {
+                throw new Error("CueBench cannot overwrite another local project while importing this backup.");
+              }
+            } else if (pending.replacement !== null) {
+              /** A temporary page-memory project has no durable namespace to replace. */
+              exactReplacement = replacementProject;
+              if (existingTarget !== undefined) {
+                throw new Error("CueBench cannot overwrite another local project while importing this backup.");
+              }
+            } else if (existingTarget !== undefined) {
+              throw new Error("CueBench cannot overwrite a project created after this import preview. Preview the backup again.");
+            }
 
-          /** Persist recovery material before replacing any local row. */
-          await this.database.settings.put({
-            key: importSafetyBackupKey(importedProject.projectId, backupId),
-            value: exactPreview.safetyBackup,
-            updatedAtMs: Date.now(),
-          });
-          if (exactPreview.replacementSafetyBackup !== null) {
+            /** Recovery snapshots are built from the exact canonical target observed by the transaction, never a stale React projection. */
             await this.database.settings.put({
-              key: replacementSafetyBackupKey(replacementProject.projectId, backupId),
-              value: exactPreview.replacementSafetyBackup,
+              key: importSafetyBackupKey(importedProject.projectId, backupId),
+              value: exactPreview.safetyBackup,
               updatedAtMs: Date.now(),
             });
-          }
-
-          await this.deleteProjectRows(replacementProject.projectId);
-          /** Keep the just-written recovery copies during an import replacement. */
-          await this.deleteProjectSettings(replacementProject.projectId, false);
-          await initializeProject(this.database, importedProject);
-          await this.database.sourceBlobs.add(verifiedMediaRow);
-          await this.database.settings.put({ key: projectModeKey(importedProject.projectId), value: { mode: "durable" }, updatedAtMs: Date.now() });
-          await this.database.settings.put({ key: projectSourceProvenanceKey(importedProject.projectId), value: uploadedSourceProvenance, updatedAtMs: Date.now() });
-          await this.database.settings.put({ key: lastDurableProjectKey, value: { projectId: importedProject.projectId }, updatedAtMs: Date.now() });
-        },
-      );
-
-      const persistedProject = await loadProject(this.database, importedProject.projectId);
-      if (persistedProject === undefined) throw new Error("CueBench could not verify the imported project after writing local storage.");
-      const persistedMedia = await loadSourceMedia(this.database, importedProject.projectId, importedProject.media.sha256);
-      if (
-        persistedMedia === undefined
-        || persistedMedia.sourceId !== importedProject.media.sourceId
-        || persistedMedia.sha256 !== importedProject.media.sha256
-        || persistedMedia.byteLength !== relinkFile.size
-      ) {
-        throw new Error("CueBench could not verify the saved Media Relink binding.");
+            if (exactReplacement !== null) {
+              await this.database.settings.put({
+                key: replacementSafetyBackupKey(exactReplacement.projectId, backupId),
+                value: {
+                  projectId: exactReplacement.projectId,
+                  backup: exportProjectBackupManifest(exactReplacement),
+                },
+                updatedAtMs: Date.now(),
+              });
+              await this.deleteProjectRows(exactReplacement.projectId);
+              /** Keep the just-written recovery copies during an import replacement. */
+              await this.deleteProjectSettings(exactReplacement.projectId, false);
+            }
+            await initializeProject(this.database, importedProject);
+            await this.database.sourceBlobs.add(verifiedMediaRow);
+            await this.database.settings.put({ key: projectModeKey(importedProject.projectId), value: { mode: "durable" }, updatedAtMs: Date.now() });
+            await this.database.settings.put({ key: projectSourceProvenanceKey(importedProject.projectId), value: uploadedSourceProvenance, updatedAtMs: Date.now() });
+            await this.database.settings.put({ key: lastDurableProjectKey, value: { projectId: importedProject.projectId }, updatedAtMs: Date.now() });
+          },
+        );
+      } catch (error) {
+        preparedObjectUrl.revoke();
+        throw error;
       }
-      const sourceObjectUrl = objectUrlLease.replace(relinkFile);
+
+      if (!this.isCurrent(importEpoch)) {
+        preparedObjectUrl.revoke();
+        throw new Error("CueBench stopped this import after local storage committed. Reopen the project to continue from the durable copy.");
+      }
+
+      /** No await is permitted after this point: storage is committed, so the UI always advances to the same verified media URL. */
+      let postCommitIssue: string | null = null;
+      try {
+        this.afterImportCommitted?.();
+      } catch (error) {
+        postCommitIssue = userFacingError(error, "CueBench recovered the imported project after a UI update fault.");
+      }
+      const sourceObjectUrl = objectUrlLease.adopt(preparedObjectUrl);
       const cleanupNotice = "Imported project is stored in this browser. The selected local video was verified through Media Relink before replacement.";
       this.pendingBackupImport = null;
       this.setSnapshot({
         route: "workbench",
-        project: persistedProject,
+        project: importedProject,
         mode: "durable",
         sourceObjectUrl,
         sourceProvenance: uploadedSourceProvenance,
         pendingUpload: null,
         activity: null,
-        error: null,
+        error: postCommitIssue === null ? null : `Imported project recovered locally: ${postCommitIssue}`,
         cleanupNotice,
       });
-      return { project: persistedProject, cleanupNotice };
+      return { project: importedProject, cleanupNotice };
     } catch (error) {
       if (this.snapshot.activity === "importing") {
         this.setSnapshot({ ...this.snapshot, activity: null, error: userFacingError(error, "CueBench could not import this backup.") });
@@ -570,6 +679,7 @@ export class ProjectStore {
       const current = this.snapshot;
       if (current.project === null || current.mode === null) throw new Error("CueBench project state changed before deletion could begin.");
 
+      let deletionReceipt: DeletionReceipt | null = null;
       if (current.mode === "durable") {
         await this.database.transaction(
           "rw",
@@ -587,21 +697,44 @@ export class ProjectStore {
             this.database.settings,
           ],
           async () => {
-            await this.deleteProjectRows(current.project!.projectId);
-            await this.deleteProjectSettings(current.project!.projectId, true);
+            const canonical = await loadProjectInTransaction(this.database, current.project!.projectId);
+            if (canonical === undefined) {
+              throw new Error("CueBench's project was already removed by another browser tab.");
+            }
+            deletionReceipt = this.newDeletionReceipt(canonical);
+            await this.deleteProjectRows(canonical.projectId);
+            await this.deleteProjectSettings(canonical.projectId, true);
             const durablePointer = await this.database.settings.get(lastDurableProjectKey);
-            if (readProjectId(durablePointer?.value) === current.project!.projectId) {
+            if (readProjectId(durablePointer?.value) === canonical.projectId) {
               await this.database.settings.delete(lastDurableProjectKey);
             }
+            await this.database.settings.put({
+              key: deletionReceiptKey(deletionReceipt.projectId, deletionReceipt.receiptId),
+              value: deletionReceipt,
+              updatedAtMs: Date.now(),
+            });
           },
         );
+      } else {
+        deletionReceipt = this.newDeletionReceipt(current.project);
+        await this.database.settings.put({
+          key: deletionReceiptKey(deletionReceipt.projectId, deletionReceipt.receiptId),
+          value: deletionReceipt,
+          updatedAtMs: Date.now(),
+        });
       }
 
+      if (deletionReceipt === null) throw new Error("CueBench could not retain the local deletion receipt.");
       this.objectUrlLease?.revoke();
-      const cloudCleanup = await this.requestCloudCleanup(current.project);
+      const cloudCleanup: CloudCleanupResult = {
+        status: "pending",
+        message: "Cloud cleanup is pending lifecycle enforcement; CueBench will record the hosted result when it is confirmed.",
+      };
       const cleanupNotice = `Local project copy deleted. ${cloudCleanup.message}`;
+      this.activeCleanupReceiptId = deletionReceipt.receiptId;
       this.setSnapshot({ ...emptySnapshot(), cleanupNotice });
-      return { localDeleted: true, cloudCleanup, cleanupNotice };
+      void this.runCloudCleanupInBackground(deletionReceipt);
+      return { localDeleted: true, cloudCleanup, cleanupNotice, receiptId: deletionReceipt.receiptId };
     } catch (error) {
       if (this.snapshot.activity === "deleting") {
         this.setSnapshot({ ...this.snapshot, activity: null, error: userFacingError(error, "CueBench could not delete this local project.") });
@@ -610,14 +743,96 @@ export class ProjectStore {
     }
   }
 
+  /** Lets a future lifecycle surface retry a retained hosted-cleanup receipt without recreating local project data. */
+  public async retryCloudCleanup(receiptId: string): Promise<CloudCleanupResult> {
+    const setting = (await this.database.settings.toArray()).find((candidate) => {
+      const value = this.deletionReceiptFrom(candidate.value);
+      return value?.receiptId === receiptId;
+    });
+    const receipt = setting === undefined ? null : this.deletionReceiptFrom(setting.value);
+    if (receipt === null) throw new Error("CueBench could not find that local deletion receipt.");
+    this.activeCleanupReceiptId = receipt.receiptId;
+    return this.completeCloudCleanup(receipt);
+  }
+
   /** Cancels stale async continuations and releases the only live local-media URL. */
   public dispose(): void {
     this.invalidateOperations();
     this.pendingBackupImport = null;
+    this.activeCleanupReceiptId = null;
+    this.objectUrlLease?.revokePrepared();
     this.objectUrlLease?.revoke();
     if (this.snapshot.route !== "start" || this.snapshot.sourceObjectUrl !== null || this.snapshot.activity !== null) {
       this.setSnapshot(emptySnapshot());
     }
+  }
+
+  /** Reads the durable aggregate after page commands settle, never serializing an abandoned peer-tab projection. */
+  private async freshProjectForSerialization(expectedProjectId?: string): Promise<{ readonly project: CaptionProject; readonly freshnessNotice: string | null }> {
+    await this.commandQueue;
+    const snapshot = this.snapshot;
+    if (snapshot.project === null || snapshot.mode === null) {
+      throw new Error("CueBench cannot serialize a project before its media is available.");
+    }
+    if (expectedProjectId !== undefined && snapshot.project.projectId !== expectedProjectId) {
+      throw new Error("CueBench project identity changed before serialization. Review the current project and try again.");
+    }
+    if (snapshot.mode !== "durable") return { project: snapshot.project, freshnessNotice: null };
+
+    const canonical = await loadProject(this.database, snapshot.project.projectId);
+    if (canonical === undefined) {
+      throw new Error("CueBench's durable project was removed before it could be serialized.");
+    }
+    const stale = canonical.projectRevision !== snapshot.project.projectRevision
+      || importReplacementHash(canonical) !== importReplacementHash(snapshot.project);
+    if (!stale) return { project: canonical, freshnessNotice: null };
+
+    const freshnessNotice = "This project changed in another browser tab. CueBench refreshed to its durable revision before serialization.";
+    if (this.snapshot.project?.projectId === canonical.projectId && this.snapshot.mode === "durable") {
+      this.setSnapshot({ ...this.snapshot, project: canonical, error: freshnessNotice });
+    }
+    return { project: canonical, freshnessNotice };
+  }
+
+  /** Rechecks the immutable preview target before hashing/relink work and again inside the write transaction. */
+  private async canonicalReplacementForImport(
+    pending: PendingBackupImport,
+    snapshot: ProjectStoreSnapshot,
+  ): Promise<CaptionProject | null> {
+    const expected = pending.replacement;
+    if (expected === null) return null;
+    if (
+      snapshot.project === null
+      || snapshot.mode !== expected.mode
+      || snapshot.project.projectId !== expected.projectId
+    ) {
+      throw new Error("CueBench's replacement project changed before import. Preview the backup again.");
+    }
+    if (expected.mode === "temporary") {
+      if (
+        snapshot.project.projectRevision !== expected.projectRevision
+        || importReplacementHash(snapshot.project) !== expected.projectHash
+      ) {
+        throw new Error("CueBench's replacement project changed before import. Preview the backup again.");
+      }
+      return snapshot.project;
+    }
+    const canonical = await loadProject(this.database, expected.projectId);
+    if (
+      canonical === undefined
+      || canonical.projectRevision !== expected.projectRevision
+      || importReplacementHash(canonical) !== expected.projectHash
+    ) {
+      if (this.snapshot.project?.projectId === expected.projectId) {
+        this.setSnapshot({
+          ...this.snapshot,
+          ...(canonical === undefined ? {} : { project: canonical }),
+          error: "CueBench's replacement project changed, was deleted, or was recreated after this preview. Preview the backup again.",
+        });
+      }
+      throw new Error("CueBench's replacement project changed, was deleted, or was recreated after this preview. Preview the backup again.");
+    }
+    return canonical;
   }
 
   private async chooseStorageMode(pendingUpload: PendingUpload, epoch: number): Promise<void> {
@@ -975,33 +1190,112 @@ export class ProjectStore {
     if (keys.length > 0) await this.database.settings.bulkDelete(keys);
   }
 
-  private async requestCloudCleanup(project: CaptionProject): Promise<CloudCleanupResult> {
+  private newDeletionReceipt(project: CaptionProject): DeletionReceipt {
+    return {
+      receiptId: `delete-${this.createId()}`,
+      projectId: project.projectId,
+      sourceId: project.media.sourceId,
+      activeRunId: project.activeGenerationRun?.runId ?? null,
+      createdAtMs: Date.now(),
+      attempts: 0,
+      state: "pending",
+      message: "Cloud cleanup is pending lifecycle enforcement.",
+    };
+  }
+
+  private deletionReceiptFrom(value: unknown): DeletionReceipt | null {
+    if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
+    const record = value as Readonly<Record<string, unknown>>;
+    if (
+      typeof record.receiptId !== "string"
+      || typeof record.projectId !== "string"
+      || typeof record.sourceId !== "string"
+      || (record.activeRunId !== null && typeof record.activeRunId !== "string")
+      || typeof record.createdAtMs !== "number"
+      || typeof record.attempts !== "number"
+      || (record.state !== "pending" && record.state !== "deleted" && record.state !== "failed")
+      || typeof record.message !== "string"
+    ) return null;
+    return record as unknown as DeletionReceipt;
+  }
+
+  private async runCloudCleanupInBackground(receipt: DeletionReceipt): Promise<void> {
+    try {
+      await this.completeCloudCleanup(receipt);
+    } catch {
+      // Local deletion already completed. Retained receipt metadata makes a later explicit retry possible.
+    }
+  }
+
+  private async completeCloudCleanup(receipt: DeletionReceipt): Promise<CloudCleanupResult> {
+    const result = await this.requestCloudCleanup({
+      projectId: receipt.projectId,
+      sourceId: receipt.sourceId,
+      activeRunId: receipt.activeRunId,
+      cancelActiveWork: true,
+    });
+    const updated: DeletionReceipt = {
+      ...receipt,
+      attempts: receipt.attempts + 1,
+      state: result.status === "deleted" ? "deleted" : result.status === "failed" ? "failed" : "pending",
+      message: result.message,
+    };
+    try {
+      await saveSetting(this.database, deletionReceiptKey(receipt.projectId, receipt.receiptId), updated);
+    } catch {
+      // Do not falsely report a successful hosted cleanup as a durable lifecycle receipt update.
+      return {
+        status: "pending",
+        message: "Cloud cleanup returned a result, but CueBench could not retain its deletion receipt. Cleanup remains pending lifecycle enforcement.",
+      };
+    }
+    if (
+      this.activeCleanupReceiptId === receipt.receiptId
+      && this.snapshot.route === "start"
+      && this.snapshot.project === null
+    ) {
+      this.setSnapshot({
+        ...this.snapshot,
+        cleanupNotice: `Local project copy deleted. ${result.message}`,
+      });
+    }
+    return result;
+  }
+
+  private async requestCloudCleanup(request: CloudCleanupRequest): Promise<CloudCleanupResult> {
     if (this.cloudCleanup === undefined) {
       return {
         status: "pending",
         message: "Cloud cleanup remains pending lifecycle enforcement because no hosted cleanup hook is configured for this browser session.",
       };
     }
-    try {
-      const result = await this.cloudCleanup({
-        projectId: project.projectId,
-        sourceId: project.media.sourceId,
-        activeRunId: project.activeGenerationRun?.runId ?? null,
-        cancelActiveWork: true,
-      });
-      if ((result.status === "deleted" || result.status === "pending") && typeof result.message === "string" && result.message.trim().length > 0) {
-        return result;
-      }
-      return {
+    let timeout: ReturnType<typeof setTimeout> | null = null;
+    const timedOut = new Promise<CloudCleanupResult>((resolve) => {
+      timeout = setTimeout(() => resolve({
         status: "pending",
-        message: "Cloud cleanup returned an incomplete status and remains pending lifecycle enforcement.",
-      };
-    } catch {
-      return {
-        status: "pending",
+        message: "Cloud cleanup did not confirm before the local lifecycle timeout and remains pending lifecycle enforcement.",
+      }), this.cloudCleanupTimeoutMs);
+    });
+    const requested = Promise.resolve()
+      .then(() => this.cloudCleanup!(request))
+      .then((result): CloudCleanupResult => {
+        if (
+          (result.status === "deleted" || result.status === "pending" || result.status === "failed")
+          && typeof result.message === "string"
+          && result.message.trim().length > 0
+        ) return result;
+        return {
+          status: "pending",
+          message: "Cloud cleanup returned an incomplete status and remains pending lifecycle enforcement.",
+        };
+      })
+      .catch((): CloudCleanupResult => ({
+        status: "failed",
         message: "Cloud cleanup could not be confirmed and remains pending lifecycle enforcement.",
-      };
-    }
+      }));
+    const result = await Promise.race([requested, timedOut]);
+    if (timeout !== null) clearTimeout(timeout);
+    return result;
   }
 
   private async persistMode(projectId: string, mode: ProjectMode): Promise<void> {
@@ -1100,7 +1394,13 @@ export class ProjectStore {
 
   private setSnapshot(nextSnapshot: ProjectStoreSnapshot): void {
     this.snapshot = nextSnapshot;
-    for (const listener of this.listeners) listener();
+    for (const listener of this.listeners) {
+      try {
+        listener();
+      } catch {
+        /** A view subscriber must not roll a committed local lifecycle transition back to an obsolete object URL. */
+      }
+    }
   }
 }
 

@@ -1,6 +1,7 @@
 import * as Dialog from "@radix-ui/react-dialog";
 import { useRef, useSyncExternalStore, type ChangeEvent } from "react";
 import { StorageDisclosure } from "./StorageDisclosure";
+import { BackupDialog } from "./BackupDialog";
 import type { ProjectStore } from "./project-store";
 
 export interface ProjectStartProps {
@@ -39,6 +40,7 @@ export function ProjectStart({ store }: ProjectStartProps) {
           <button className="button button--outline" type="button" disabled={busy} onClick={() => uploadInput.current?.click()}>
             Upload local video
           </button>
+          <BackupDialog project={null} manager={store} disabled={busy} />
           <input
             ref={uploadInput}
             id="source-video"

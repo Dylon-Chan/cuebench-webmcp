@@ -84,3 +84,32 @@ test("the mobile workbench keeps one semantic review order from video through Co
   expect(positions.every((entry, index) => index === 0 || entry.top > positions[index - 1]!.top)).toBe(true);
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
 });
+
+test("mobile lifecycle controls keep 44px actions and stack the export form without overflow", async ({ page }) => {
+  await page.setViewportSize({ width: 390, height: 844 });
+  await openWorkbench(page);
+
+  const headerButtons = await page.locator(".header-actions .header-button").evaluateAll((buttons) =>
+    buttons.map((button) => button.getBoundingClientRect().height),
+  );
+  expect(headerButtons.length).toBeGreaterThan(0);
+  expect(headerButtons.every((height) => height >= 44)).toBe(true);
+
+  await page.getByRole("button", { name: "Export tracks" }).click();
+  const dialog = page.getByRole("dialog", { name: "Export track" });
+  await expect(dialog).toBeVisible();
+  const fields = await dialog.locator(".export-dialog__fields > label").evaluateAll((labels) =>
+    labels.map((label) => {
+      const box = label.getBoundingClientRect();
+      return { top: box.top, left: box.left, width: box.width };
+    }),
+  );
+  expect(fields).toHaveLength(3);
+  expect(fields.every((field, index) => index === 0 || field.top > fields[index - 1]!.top)).toBe(true);
+  expect(fields.every((field) => field.width > 300)).toBe(true);
+  const dialogActions = await dialog.locator(".storage-dialog__actions .button").evaluateAll((buttons) =>
+    buttons.map((button) => button.getBoundingClientRect().height),
+  );
+  expect(dialogActions.every((height) => height >= 44)).toBe(true);
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
+});

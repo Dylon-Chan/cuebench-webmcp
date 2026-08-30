@@ -27,6 +27,12 @@ export interface ObjectUrlApi {
   readonly revokeObjectURL: (url: string) => void;
 }
 
+/** A not-yet-live URL that can be abandoned without touching the current preview. */
+export interface PreparedObjectUrl {
+  readonly url: string;
+  readonly revoke: () => void;
+}
+
 const browserObjectUrlApi = (): ObjectUrlApi => {
   if (typeof URL.createObjectURL !== "function" || typeof URL.revokeObjectURL !== "function") {
     throw new LocalMediaError("object-url-unavailable", "This browser cannot safely preview local media.");
@@ -37,6 +43,7 @@ const browserObjectUrlApi = (): ObjectUrlApi => {
 /** Keeps only the active media preview address alive. */
 export class ObjectUrlLease {
   private currentUrl: string | null = null;
+  private readonly preparedUrls = new Set<PreparedObjectUrl>();
 
   public constructor(private readonly api: ObjectUrlApi = browserObjectUrlApi()) {}
 
@@ -47,10 +54,44 @@ export class ObjectUrlLease {
     return nextUrl;
   }
 
+  /**
+   * Creates a candidate URL without revoking the existing one. Callers use it
+   * before an IndexedDB commit so a failed transaction never leaves the old
+   * workbench video pointing at a revoked address.
+   */
+  public prepare(blob: Blob): PreparedObjectUrl {
+    const url = this.api.createObjectURL(blob);
+    const prepared: PreparedObjectUrl = {
+      url,
+      revoke: () => {
+        if (!this.preparedUrls.delete(prepared)) return;
+        this.api.revokeObjectURL(url);
+      },
+    };
+    this.preparedUrls.add(prepared);
+    return prepared;
+  }
+
+  /** Promotes a prepared URL only after durable data has committed. */
+  public adopt(prepared: PreparedObjectUrl): string {
+    if (!this.preparedUrls.delete(prepared)) {
+      throw new LocalMediaError("object-url-unavailable", "CueBench could not adopt the prepared local media preview.");
+    }
+    /** Browser URLs are unique in practice; this guard also keeps a defensive test/double from revoking an address it reissued. */
+    if (this.currentUrl !== prepared.url) this.revoke();
+    this.currentUrl = prepared.url;
+    return prepared.url;
+  }
+
   public revoke(): void {
     if (this.currentUrl === null) return;
     this.api.revokeObjectURL(this.currentUrl);
     this.currentUrl = null;
+  }
+
+  /** Releases pre-commit candidates during unmount/cancellation without touching a current preview. */
+  public revokePrepared(): void {
+    for (const prepared of [...this.preparedUrls]) prepared.revoke();
   }
 
   /** Avoid revoking a newer URL after a stale asynchronous persistence continuation. */
