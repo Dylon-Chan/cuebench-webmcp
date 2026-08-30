@@ -35,7 +35,7 @@ from .models import (
     verify_internal_job,
 )
 from .probe import FFmpegMediaTools, MediaTools, PreparationDeadline, ProbeResult, SafeCommandRunner
-from .scenes import webp_dimensions
+from .scenes import representative_scene_timestamps, webp_dimensions
 from .waveform import build_waveform_pyramid
 
 _SAFE_SEGMENT = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
@@ -43,6 +43,12 @@ _SAFE_SEGMENT = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 
 def _safe_error(code: str, status: int, message: str) -> MediaServiceError:
     return MediaServiceError(code, status, message)
+
+
+def _error_envelope(code: str, message: str) -> dict[str, object]:
+    """A small versioned error contract safe for Worker terminal classification."""
+
+    return {"error": {"version": CONTRACT_VERSION, "code": code, "message": message}}
 
 
 def _validate_private_prefix(prefix: str) -> None:
@@ -502,7 +508,7 @@ class BridgeObjectStore:
                     "content-type": content_type,
                     "content-length": str(len(value)),
                     "if-none-match": "*",
-                    "x-cuebench-sha256": digest,
+                    "x-content-sha256": digest,
                 },
             )
             with response:
@@ -634,7 +640,11 @@ def _validate_probe(probe: ProbeResult, limits: MediaLimits) -> None:
     }
     codecs = supported.get((probe.container.lower(), probe.mime_type.lower()))
     if codecs is None or probe.codec.lower() not in codecs:
-        raise _safe_error("UNSUPPORTED_MEDIA", 415, "CueBench could not prepare this media format.")
+        raise _safe_error(
+            "UNSUPPORTED_MEDIA",
+            415,
+            "CueBench rejected an unsupported media container or video codec.",
+        )
     if probe.duration_ms <= 0 or probe.duration_ms > limits.max_duration_ms:
         raise _safe_error("MEDIA_DURATION_LIMIT", 413, "CueBench rejected media outside its duration limit.")
     if probe.byte_length <= 0 or probe.byte_length > limits.max_input_bytes:
@@ -687,6 +697,8 @@ class MediaPreparer:
                         "thumbnail_height": self._settings.limits.max_thumbnail_height,
                         "thumbnail_total_bytes": self._settings.limits.max_thumbnail_total_bytes,
                         "thumbnail_width": self._settings.limits.max_thumbnail_width,
+                        "scene_count": self._settings.limits.max_scene_count,
+                        "scene_output_bytes": self._settings.limits.max_scene_output_bytes,
                     },
                     "preparation_version": PREPARATION_VERSION,
                     "tools": tool_versions,
@@ -765,17 +777,24 @@ class MediaPreparer:
                 scene_points = self._tools.detect_scenes(
                     input_path,
                     probe.duration_ms,
-                    self._settings.limits.max_thumbnail_count,
+                    self._settings.limits.max_scene_count,
                     deadline,
                 )
                 if any(isinstance(point, bool) or not isinstance(point, int) for point in scene_points):
                     raise _safe_error("PREPARATION_FAILED", 500, "CueBench could not prepare media evidence.")
                 scenes = sorted({point for point in scene_points if 0 <= point < probe.duration_ms})[
-                    : self._settings.limits.max_thumbnail_count
+                    : self._settings.limits.max_scene_count
                 ]
+                if not scenes:
+                    # Static/no-cut media still needs one bounded visual cue.
+                    scenes = [0]
+                thumbnail_points = representative_scene_timestamps(
+                    scenes,
+                    self._settings.limits.max_thumbnail_count,
+                )
                 thumbnails: list[tuple[int, bytes, int, int, str]] = []
                 thumbnail_total_bytes = 0
-                for index, at_ms in enumerate(scenes):
+                for index, at_ms in enumerate(thumbnail_points):
                     deadline.check()
                     thumbnail_path = temporary_root / f"thumbnail-{index}.webp"
                     self._tools.extract_thumbnail(input_path, at_ms, thumbnail_path, deadline)
@@ -875,7 +894,7 @@ class RequestBodyLimitMiddleware:
         content_length = headers.get("content-length")
         if content_length is not None and (not content_length.isdecimal() or int(content_length) > self.maximum_bytes):
             response = JSONResponse(
-                {"error": {"code": "REQUEST_TOO_LARGE", "message": "CueBench rejected an oversized internal request."}},
+                _error_envelope("REQUEST_TOO_LARGE", "CueBench rejected an oversized internal request."),
                 status_code=413,
             )
             await response(scope, receive, send)
@@ -895,14 +914,14 @@ class RequestBodyLimitMiddleware:
             await self.app(scope, bounded_receive, send)
         except _RequestBodyTooLarge:
             response = JSONResponse(
-                {"error": {"code": "REQUEST_TOO_LARGE", "message": "CueBench rejected an oversized internal request."}},
+                _error_envelope("REQUEST_TOO_LARGE", "CueBench rejected an oversized internal request."),
                 status_code=413,
             )
             await response(scope, receive, send)
 
 
 def _error_response(error: MediaServiceError) -> JSONResponse:
-    return JSONResponse({"error": {"code": error.code, "message": error.safe_message}}, status_code=error.status_code)
+    return JSONResponse(_error_envelope(error.code, error.safe_message), status_code=error.status_code)
 
 
 def create_app(
@@ -932,7 +951,7 @@ def create_app(
     @app.exception_handler(RequestValidationError)
     async def validation_error_handler(_: Request, __: RequestValidationError) -> JSONResponse:
         return JSONResponse(
-            {"error": {"code": "INVALID_REQUEST", "message": "CueBench could not read the preparation request."}},
+            _error_envelope("INVALID_REQUEST", "CueBench could not read the preparation request."),
             status_code=422,
         )
 
@@ -966,7 +985,7 @@ def create_app(
 
         if not await run_in_threadpool(ready):
             return JSONResponse(
-                {"error": {"code": "SERVICE_UNAVAILABLE", "message": "CueBench media preparation is unavailable."}},
+                _error_envelope("SERVICE_UNAVAILABLE", "CueBench media preparation is unavailable."),
                 status_code=503,
             )
         return {"status": "ok", "contract_version": CONTRACT_VERSION}
@@ -1045,7 +1064,7 @@ def create_app_from_environment() -> FastAPI:
     runner = SafeCommandRunner(
         executable_paths={"ffmpeg": "/usr/bin/ffmpeg", "ffprobe": "/usr/bin/ffprobe"},
         default_timeout_seconds=settings.limits.command_timeout_seconds,
-        maximum_output_bytes=settings.limits.max_command_output_bytes,
+        maximum_output_bytes=min(settings.limits.max_command_output_bytes, settings.limits.max_scene_output_bytes),
     )
     bridge_url = os.environ.get("CUEBENCH_MEDIA_STORAGE_BRIDGE_URL")
     store: PrivateMediaStore | None = None
@@ -1056,4 +1075,8 @@ def create_app_from_environment() -> FastAPI:
             output_prefix=settings.output_prefix,
             maximum_input_bytes=settings.limits.max_input_bytes,
         )
-    return create_app(settings=settings, tools=FFmpegMediaTools(runner), store=store)
+    return create_app(
+        settings=settings,
+        tools=FFmpegMediaTools(runner, maximum_scene_output_bytes=settings.limits.max_scene_output_bytes),
+        store=store,
+    )

@@ -61,6 +61,8 @@ class FakeMediaTools:
         self.thumbnail = thumbnail or webp()
         self.fail_after_thumbnail = fail_after_thumbnail
         self.normalise_calls = 0
+        self.scene_maximums: list[int] = []
+        self.thumbnail_points: list[int] = []
 
     def probe(self, input_path: Path, deadline: object | None = None) -> ProbeResult:
         del deadline
@@ -88,12 +90,14 @@ class FakeMediaTools:
         self, input_path: Path, duration_ms: int, maximum_count: int, deadline: object | None = None
     ) -> list[int]:
         del input_path, duration_ms, deadline
+        self.scene_maximums.append(maximum_count)
         return list(self.scene_points[:maximum_count])
 
     def extract_thumbnail(
         self, input_path: Path, at_ms: int, output_path: Path, deadline: object | None = None
     ) -> None:
-        del input_path, at_ms, deadline
+        del input_path, deadline
+        self.thumbnail_points.append(at_ms)
         output_path.write_bytes(self.thumbnail)
         if self.fail_after_thumbnail:
             raise RuntimeError("fixture thumbnail failure")
@@ -264,6 +268,38 @@ def test_prepare_bounds_thumbnail_count_dimensions_and_bytes(
     assert "frames" not in result
 
 
+def test_prepare_preserves_full_bounded_scene_evidence_and_selects_representative_thumbnails(
+    prepared_client: tuple[TestClient, MediaJobKeyRing, Path, Path, FakeMediaTools],
+) -> None:
+    client, keys, _, _, tools = prepared_client
+    tools.probe_result = ProbeResult("mp4", "video/mp4", "h264", 10_000, len(b"synthetic CueBench source"))
+    tools.scene_points = (100, 200, 300, 400, 500, 9_000)
+
+    response = client.post("/v1/prepare", json=job_body(keys))
+
+    assert response.status_code == 200
+    result = response.json()
+    assert [item["at_ms"] for item in result["scenes"]] == [100, 200, 300, 400, 500, 9_000]
+    assert len(result["thumbnails"]) == 3
+    assert 9_000 in [item["at_ms"] for item in result["thumbnails"]]
+    assert tools.scene_maximums == [256]
+
+
+def test_prepare_uses_a_zero_millisecond_thumbnail_and_scene_for_static_media(
+    prepared_client: tuple[TestClient, MediaJobKeyRing, Path, Path, FakeMediaTools],
+) -> None:
+    client, keys, _, _, tools = prepared_client
+    tools.scene_points = ()
+
+    response = client.post("/v1/prepare", json=job_body(keys))
+
+    assert response.status_code == 200
+    result = response.json()
+    assert result["scenes"] == [{"at_ms": 0}]
+    assert [item["at_ms"] for item in result["thumbnails"]] == [0]
+    assert tools.thumbnail_points == [0]
+
+
 def test_prepare_rejects_thumbnail_collection_that_exceeds_the_total_byte_budget(tmp_path: Path) -> None:
     input_root = tmp_path / "input"
     output_root = tmp_path / "output"
@@ -315,6 +351,7 @@ def test_prepare_rejects_authoritative_unsupported_or_oversized_media(
     response = client.post("/v1/prepare", json=job_body(keys))
 
     assert response.status_code in {413, 415}
+    assert response.json()["error"]["version"] == 1
     assert response.json()["error"]["code"] == expected_code
 
 
@@ -359,6 +396,24 @@ def test_probe_adapter_returns_the_task_eleven_authoritative_shape(
         "durationMs": 1_200,
         "byteLength": len(b"synthetic CueBench source"),
         "sha256": hashlib.sha256(b"synthetic CueBench source").hexdigest(),
+    }
+
+
+def test_probe_returns_a_small_versioned_terminal_rejection_contract(
+    prepared_client: tuple[TestClient, MediaJobKeyRing, Path, Path, FakeMediaTools],
+) -> None:
+    client, keys, _, _, tools = prepared_client
+    tools.probe_result = ProbeResult("avi", "video/x-msvideo", "h264", 1_200, 1)
+
+    response = client.post("/v1/probe", json=job_body(keys, action="probe"))
+
+    assert response.status_code == 415
+    assert response.json() == {
+        "error": {
+            "version": 1,
+            "code": "UNSUPPORTED_MEDIA",
+            "message": "CueBench rejected an unsupported media container or video codec.",
+        }
     }
 
 
@@ -453,6 +508,29 @@ def test_scene_detection_rejects_truncated_fixed_tool_output(tmp_path: Path) -> 
 
     with pytest.raises(MediaServiceError) as rejected:
         FFmpegMediaTools(TruncatedSceneRunner()).detect_scenes(source, 1_000, 1, PreparationDeadline(1))
+
+    assert rejected.value.code == "UNSUPPORTED_MEDIA"
+
+
+def test_scene_detection_rejects_output_that_exceeds_its_separate_scene_budget(tmp_path: Path) -> None:
+    class OversizedSceneRunner:
+        def run(self, argv: list[str], timeout_seconds: float | None = None) -> CommandResult:
+            del argv, timeout_seconds
+            return CommandResult(
+                returncode=0,
+                stdout=b"",
+                stderr=b"x" * 17,
+                stdout_truncated=False,
+                stderr_truncated=False,
+            )
+
+    source = tmp_path / "source.mp4"
+    source.write_bytes(b"actual bytes")
+
+    with pytest.raises(MediaServiceError) as rejected:
+        FFmpegMediaTools(OversizedSceneRunner(), maximum_scene_output_bytes=16).detect_scenes(
+            source, 1_000, 256, PreparationDeadline(1)
+        )
 
     assert rejected.value.code == "UNSUPPORTED_MEDIA"
 

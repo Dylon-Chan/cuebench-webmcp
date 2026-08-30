@@ -35,6 +35,17 @@ const signing: MediaJobSigningSettings = {
   ttlMs: 10 * 60_000,
 };
 
+const probeInput = () => ({
+  operationId: vectorJob.operationId,
+  operationKey: vectorJob.operationKey,
+  objectKey: vectorJob.objectKey,
+  inputByteLength: vectorJob.inputByteLength,
+  inputContentType: vectorJob.inputContentType,
+  operationReceipt: vectorJob.operationReceipt,
+  receiptExpiresAtMs: vectorJob.receiptExpiresAtMs,
+  idempotencyKey: vectorJob.idempotencyKey,
+});
+
 describe("internal media job adapter", () => {
   it("signs the shared canonical job vector", async () => {
     const token = await signMediaJob(vectorJob, signing.keyRing);
@@ -81,6 +92,31 @@ describe("internal media job adapter", () => {
 
     expect(request?.method).toBe("POST");
     await expect(request?.json()).resolves.toEqual({ job: await signMediaJob(vectorJob, signing.keyRing) });
+  });
+
+  it("classifies a bounded versioned terminal media rejection apart from service unavailability", async () => {
+    const terminal = new MediaProbeServiceBinding(
+      { fetch: async () => new Response(JSON.stringify({
+        error: { version: 1, code: "UNSUPPORTED_MEDIA", message: "untrusted private path must not escape" },
+      }), { status: 415, headers: { "content-type": "application/json" } }) },
+      signing,
+      () => vector.job.issued_at_ms,
+    );
+    const transient = new MediaProbeServiceBinding(
+      { fetch: async () => new Response(JSON.stringify({
+        error: { version: 1, code: "UNSUPPORTED_MEDIA", message: "untrusted private path must not escape" },
+      }), { status: 503, headers: { "content-type": "application/json" } }) },
+      signing,
+      () => vector.job.issued_at_ms,
+    );
+
+    await expect(terminal.probe(probeInput())).rejects.toMatchObject({
+      name: "MediaProbeRejected",
+      code: "UNSUPPORTED_MEDIA",
+      status: 415,
+      terminal: true,
+    });
+    await expect(transient.probe(probeInput())).rejects.not.toMatchObject({ terminal: true });
   });
 
   it("gives Task 13 a server-only prepare adapter with a purpose-bound job and bounded manifest reference", async () => {

@@ -234,8 +234,11 @@ def _integer_size(value: object) -> int:
 class FFmpegMediaTools:
     """The only production adapter permitted to invoke FFprobe and FFmpeg."""
 
-    def __init__(self, runner: CommandRunner) -> None:
+    def __init__(self, runner: CommandRunner, *, maximum_scene_output_bytes: int = 64 * 1024) -> None:
+        if maximum_scene_output_bytes <= 0:
+            raise ValueError("Scene output budget must be positive.")
         self._runner = runner
+        self._maximum_scene_output_bytes = maximum_scene_output_bytes
 
     def _run(self, argv: list[str], deadline: PreparationDeadline | None = None) -> CommandResult:
         timeout = None
@@ -383,7 +386,12 @@ class FFmpegMediaTools:
             raise MediaServiceError("PROCESSING_TIMEOUT", 504, "CueBench's media preparation timed out.") from None
         except CommandExecutionError:
             raise _tool_error() from None
-        if result.stdout_truncated or result.stderr_truncated:
+        if (
+            result.stdout_truncated
+            or result.stderr_truncated
+            or len(result.stdout) > self._maximum_scene_output_bytes
+            or len(result.stderr) > self._maximum_scene_output_bytes
+        ):
             raise _tool_error()
         return parse_scene_timestamps(result.stderr, duration_ms, maximum_count)
 

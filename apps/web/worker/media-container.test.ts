@@ -1,11 +1,16 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
   handleMediaStorageBridge,
   MEDIA_CONTAINER_OUTBOUND_POLICY,
   MEDIA_STORAGE_BRIDGE_HOST,
   type MediaBridgeBucket,
 } from "./media-bridge";
-import { isMediaCapabilityAuthorized, mediaCapabilityFingerprint } from "./media-container";
+import {
+  isMediaCapabilityAuthorized,
+  mediaCapabilityFingerprint,
+  mediaContainerRequestDisposition,
+  settleMediaContainerResponse,
+} from "./media-container";
 import { signMediaJob } from "./probe";
 
 const operationKey = "a".repeat(64);
@@ -80,17 +85,62 @@ const job = async (action: "probe" | "prepare") => signMediaJob({
   expiresAtMs: now + 60_000,
 }, keyRing);
 
-const bridgeRequest = (method: string, key: string, token: string, body?: Uint8Array, headers: HeadersInit = {}): Request => {
-  const init: RequestInit = {
+const bridgeRequest = (method: string, key: string, token: string, body?: BodyInit, headers: HeadersInit = {}): Request => {
+  const init: RequestInit & { duplex?: "half" } = {
     method,
     headers: {
       "x-cuebench-media-job": token,
       ...headers,
     },
   };
-  if (body !== undefined) init.body = body as unknown as BodyInit;
+  if (body !== undefined) {
+    init.body = body;
+    if (body instanceof ReadableStream) init.duplex = "half";
+  }
   return new Request(`http://cuebench-r2.internal/${key}`, init);
 };
+
+class StreamingBridgeBucket implements MediaBridgeBucket {
+  public receivedBytes = 0;
+  public largestChunk = 0;
+  public putCalls = 0;
+  private readonly stored = new Map<string, { readonly size: number; readonly contentType: string; readonly sha256: string }>();
+
+  public async get(): Promise<null> {
+    return null;
+  }
+
+  public async head(key: string) {
+    const value = this.stored.get(key);
+    return value === undefined ? null : {
+      size: value.size,
+      httpMetadata: { contentType: value.contentType },
+      customMetadata: { sha256: value.sha256 },
+    };
+  }
+
+  public async put(key: string, stream: ReadableStream<Uint8Array>, options: Record<string, unknown>) {
+    this.putCalls += 1;
+    if (this.stored.has(key)) return null;
+    const reader = stream.getReader();
+    let size = 0;
+    try {
+      while (true) {
+        const next = await reader.read();
+        if (next.done) break;
+        size += next.value.byteLength;
+        this.receivedBytes += next.value.byteLength;
+        this.largestChunk = Math.max(this.largestChunk, next.value.byteLength);
+      }
+    } finally {
+      reader.releaseLock();
+    }
+    const metadata = options.customMetadata as { readonly sha256: string };
+    const httpMetadata = options.httpMetadata as { readonly contentType: string };
+    this.stored.set(key, { size, sha256: metadata.sha256, contentType: httpMetadata.contentType });
+    return { size, customMetadata: metadata, httpMetadata };
+  }
+}
 
 describe("operation-keyed media Container bridge", () => {
   it("declares a deny-by-default outbound policy with only the private R2 host", () => {
@@ -141,7 +191,7 @@ describe("operation-keyed media Container bridge", () => {
       bridgeRequest("PUT", `${outputPrefix}manifests/${"d".repeat(64)}.json`, token, body, {
         "content-type": "application/json",
         "content-length": String(body.byteLength),
-        "x-cuebench-sha256": await sha256(body),
+        "x-content-sha256": await sha256(body),
         "if-none-match": "*",
       }),
       { PROCESSING_BUCKET: bucket, MEDIA_JOB_HMAC_CURRENT_KEY_ID: keyRing.current.id, MEDIA_JOB_HMAC_CURRENT_KEY: keyRing.current.secret },
@@ -161,7 +211,7 @@ describe("operation-keyed media Container bridge", () => {
       bridgeRequest("PUT", key, token, body, {
         "content-type": "application/json",
         "content-length": String(body.byteLength),
-        "x-cuebench-sha256": digest,
+        "x-content-sha256": digest,
         "if-none-match": "*",
       }),
       { PROCESSING_BUCKET: bucket, MEDIA_JOB_HMAC_CURRENT_KEY_ID: keyRing.current.id, MEDIA_JOB_HMAC_CURRENT_KEY: keyRing.current.secret },
@@ -171,7 +221,7 @@ describe("operation-keyed media Container bridge", () => {
       bridgeRequest("PUT", key, token, body, {
         "content-type": "application/json",
         "content-length": String(body.byteLength),
-        "x-cuebench-sha256": digest,
+        "x-content-sha256": digest,
         "if-none-match": "*",
       }),
       { PROCESSING_BUCKET: bucket, MEDIA_JOB_HMAC_CURRENT_KEY_ID: keyRing.current.id, MEDIA_JOB_HMAC_CURRENT_KEY: keyRing.current.secret },
@@ -181,7 +231,11 @@ describe("operation-keyed media Container bridge", () => {
     expect(first.status).toBe(201);
     expect(repeat.status).toBe(200);
     expect(bucket.puts).toHaveLength(2);
-    expect(bucket.puts[0]?.options).toMatchObject({ onlyIf: expect.any(Headers), customMetadata: { sha256: digest } });
+    expect(bucket.puts[0]?.options).toMatchObject({
+      onlyIf: expect.any(Headers),
+      customMetadata: { sha256: digest },
+      sha256: digest,
+    });
   });
 
   it("allows a deterministic cache-pointer name while still verifying its body hash", async () => {
@@ -195,7 +249,7 @@ describe("operation-keyed media Container bridge", () => {
       bridgeRequest("PUT", `${outputPrefix}indexes/${cacheIdentity}.json`, token, body, {
         "content-type": "application/json",
         "content-length": String(body.byteLength),
-        "x-cuebench-sha256": digest,
+        "x-content-sha256": digest,
         "if-none-match": "*",
       }),
       { PROCESSING_BUCKET: bucket, MEDIA_JOB_HMAC_CURRENT_KEY_ID: keyRing.current.id, MEDIA_JOB_HMAC_CURRENT_KEY: keyRing.current.secret },
@@ -204,6 +258,121 @@ describe("operation-keyed media Container bridge", () => {
 
     expect(response.status).toBe(201);
     expect(bucket.objects.get(`${outputPrefix}indexes/${cacheIdentity}.json`)?.sha256).toBe(digest);
+  });
+
+  it("streams a bounded artifact into R2 without materializing a Worker-sized body", async () => {
+    const bucket = new StreamingBridgeBucket();
+    const token = await job("prepare");
+    const chunkBytes = 1024 * 1024;
+    const chunks = 30;
+    const expectedLength = chunkBytes * chunks;
+    const digest = "f".repeat(64);
+    const key = `${outputPrefix}audio/${digest}.wav`;
+    let emitted = 0;
+    const body = new ReadableStream<Uint8Array>({
+      pull(controller) {
+        if (emitted === chunks) {
+          controller.close();
+          return;
+        }
+        emitted += 1;
+        controller.enqueue(new Uint8Array(chunkBytes));
+      },
+    });
+
+    const response = await handleMediaStorageBridge(
+      bridgeRequest("PUT", key, token, body, {
+        "content-type": "audio/wav",
+        "content-length": String(expectedLength),
+        "x-content-sha256": digest,
+        "if-none-match": "*",
+      }),
+      { PROCESSING_BUCKET: bucket, MEDIA_JOB_HMAC_CURRENT_KEY_ID: keyRing.current.id, MEDIA_JOB_HMAC_CURRENT_KEY: keyRing.current.secret },
+      now + 1,
+    );
+
+    expect(response.status).toBe(201);
+    expect(bucket.putCalls).toBe(1);
+    expect(bucket.receivedBytes).toBe(expectedLength);
+    expect(bucket.largestChunk).toBe(chunkBytes);
+    expect(expectedLength).toBeLessThan(128 * 1024 * 1024);
+  });
+
+  it("rejects missing trusted digest and stream length overrun or underrun before publication", async () => {
+    const token = await job("prepare");
+    const body = new TextEncoder().encode("manifest");
+    const digest = await sha256(body);
+    const key = `${outputPrefix}manifests/${digest}.json`;
+    const env = { MEDIA_JOB_HMAC_CURRENT_KEY_ID: keyRing.current.id, MEDIA_JOB_HMAC_CURRENT_KEY: keyRing.current.secret };
+
+    await expect(handleMediaStorageBridge(
+      bridgeRequest("PUT", key, token, body, {
+        "content-type": "application/json",
+        "content-length": String(body.byteLength),
+        "if-none-match": "*",
+      }),
+      { PROCESSING_BUCKET: new StreamingBridgeBucket(), ...env },
+      now + 1,
+    )).resolves.toMatchObject({ status: 422 });
+    await expect(handleMediaStorageBridge(
+      bridgeRequest("PUT", key, token, body, {
+        "content-type": "application/json",
+        "content-length": String(body.byteLength),
+        "x-content-sha256": "not-a-digest",
+        "if-none-match": "*",
+      }),
+      { PROCESSING_BUCKET: new StreamingBridgeBucket(), ...env },
+      now + 1,
+    )).resolves.toMatchObject({ status: 422 });
+    await expect(handleMediaStorageBridge(
+      bridgeRequest("PUT", key, token, body, {
+        "content-type": "application/json",
+        "content-length": String(body.byteLength - 1),
+        "x-content-sha256": digest,
+        "if-none-match": "*",
+      }),
+      { PROCESSING_BUCKET: new StreamingBridgeBucket(), ...env },
+      now + 1,
+    )).resolves.toMatchObject({ status: 422 });
+    await expect(handleMediaStorageBridge(
+      bridgeRequest("PUT", key, token, body, {
+        "content-type": "application/json",
+        "content-length": String(body.byteLength + 1),
+        "x-content-sha256": digest,
+        "if-none-match": "*",
+      }),
+      { PROCESSING_BUCKET: new StreamingBridgeBucket(), ...env },
+      now + 1,
+    )).resolves.toMatchObject({ status: 422 });
+  });
+
+  it("uses a harmless R2 head for bridge readiness and never creates an object", async () => {
+    const bucket = new FixtureBridgeBucket();
+    const head = vi.spyOn(bucket, "head");
+    const response = await handleMediaStorageBridge(
+      new Request("http://cuebench-r2.internal/healthz", { method: "HEAD" }),
+      { PROCESSING_BUCKET: bucket },
+      now + 1,
+    );
+
+    expect(response.status).toBe(204);
+    expect(head).toHaveBeenCalledWith("__cuebench_health__/readiness");
+    expect(bucket.puts).toHaveLength(0);
+  });
+
+  it("reports unavailable when the harmless readiness head cannot reach R2", async () => {
+    const bucket: MediaBridgeBucket = {
+      get: async () => null,
+      head: async () => { throw new Error("R2 unavailable"); },
+      put: async () => null,
+    };
+    const response = await handleMediaStorageBridge(
+      new Request("http://cuebench-r2.internal/healthz", { method: "HEAD" }),
+      { PROCESSING_BUCKET: bucket },
+      now + 1,
+    );
+
+    expect(response.status).toBe(503);
   });
 
   it("fences bridge access to the exact active capability, not merely its operation key", async () => {
@@ -234,5 +403,44 @@ describe("operation-keyed media Container bridge", () => {
       idempotencyKey: `prepare:${operationKey}`,
       capabilityFingerprint: prepareFingerprint,
     }, now + 1)).toBe(false);
+  });
+
+  it("releases transient Container responses for retry while caching deterministic terminal and successful results", async () => {
+    const token = await job("prepare");
+    const fingerprint = await mediaCapabilityFingerprint(token);
+    const capability = {
+      action: "prepare" as const,
+      operationKey,
+      idempotencyKey: `prepare:${operationKey}`,
+      capabilityFingerprint: fingerprint,
+    };
+    const inFlight = {
+      operationKey,
+      inFlight: { ...capability, expiresAtMs: now + 60_000 },
+      results: {},
+    };
+    const result = (status: number) => ({
+      ...capability,
+      status,
+      contentType: "application/json",
+      body: "{}",
+      expiresAtMs: now + 60_000,
+    });
+
+    expect(mediaContainerRequestDisposition(inFlight, capability, now + 1)).toEqual({ kind: "in-flight" });
+    const transient = settleMediaContainerResponse(inFlight, result(503));
+    expect(transient.inFlight).toBeUndefined();
+    expect(transient.results).toEqual({});
+    expect(mediaContainerRequestDisposition(transient, capability, now + 1)).toEqual({ kind: "new" });
+
+    const terminal = settleMediaContainerResponse(inFlight, result(415));
+    expect(terminal.inFlight).toBeUndefined();
+    expect(mediaContainerRequestDisposition(terminal, capability, now + 1)).toMatchObject({ kind: "cached", result: { status: 415 } });
+
+    const success = settleMediaContainerResponse(inFlight, result(200));
+    expect(mediaContainerRequestDisposition(success, capability, now + 1)).toMatchObject({ kind: "cached", result: { status: 200 } });
+    for (const status of [408, 409, 425, 429, 500]) {
+      expect(settleMediaContainerResponse(inFlight, result(status)).results).toEqual({});
+    }
   });
 });

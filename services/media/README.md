@@ -65,6 +65,19 @@ conditional, hash-verified GET/HEAD/PUT only beneath that job's derived
 `prepared/` prefix. It never offers list or delete. This is the production
 private R2 mount/download-and-publication adapter, not a future no-op.
 
+Prepared writes require an exact content length, fixed artifact MIME type, and
+the Container's trusted `x-content-sha256`. The Worker pipes the request body
+through a bounded counting stream directly to R2 with conditional publication;
+it does not aggregate audio, waveform, thumbnail, or manifest bodies in Worker
+memory. A post-write R2 `head` rechecks length, MIME type, and digest metadata.
+Readiness performs only `head('__cuebench_health__/readiness')`; a missing
+sentinel is healthy and is never created.
+
+The manifest retains every detected scene timestamp within a separate 256-cut,
+64 KiB tool-output safety budget. At most twelve evenly representative WebP
+thumbnails are generated across that full timeline. Static or no-cut media gets
+one 0 ms scene and thumbnail rather than an empty visual-evidence set.
+
 The Worker config supplies the Container Durable Object binding, SQLite
 migration, bounded APAC/basic instance policy, and the R2 binding. In local
 development, mount private media into the two file-system roots instead of

@@ -95,11 +95,6 @@ const mediaOutputKind = (key: string, job: VerifiedMediaJob): MediaOutputKind | 
   return null;
 };
 
-const digest = async (bytes: Uint8Array): Promise<string> => {
-  const value = await crypto.subtle.digest("SHA-256", bytes as unknown as BufferSource);
-  return [...new Uint8Array(value)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
-};
-
 /** Reads a stream with an enforced byte ceiling before it can reach R2 or parser code. */
 export const readBoundedBody = async (body: ReadableStream<Uint8Array> | null, maximumBytes: number): Promise<Uint8Array | null> => {
   if (body === null) return null;
@@ -138,11 +133,36 @@ const responseHeaders = (object: MediaBridgeObject): Headers => {
   return headers;
 };
 
-const objectMatches = (object: MediaBridgeObject, bytes: Uint8Array, sha256: string, contentType: string): boolean => (
-  object.size === bytes.byteLength
+const objectMatches = (object: MediaBridgeObject, expectedLength: number, sha256: string, contentType: string): boolean => (
+  object.size === expectedLength
   && object.customMetadata?.sha256 === sha256
   && object.httpMetadata?.contentType === contentType
 );
+
+class InvalidArtifactStream extends Error {}
+
+/**
+ * Pipes a Python-produced artifact straight into R2 while maintaining only a
+ * counter. R2 receives the exact body stream and verifies the supplied digest;
+ * the Worker never aggregates an artifact in memory.
+ */
+const boundedArtifactStream = (
+  body: ReadableStream<Uint8Array>,
+  expectedLength: number,
+  maximumBytes: number,
+): ReadableStream<Uint8Array> => {
+  let received = 0;
+  return body.pipeThrough(new TransformStream<Uint8Array, Uint8Array>({
+    transform(chunk, controller) {
+      received += chunk.byteLength;
+      if (received > expectedLength || received > maximumBytes) throw new InvalidArtifactStream();
+      controller.enqueue(chunk);
+    },
+    flush() {
+      if (received !== expectedLength) throw new InvalidArtifactStream();
+    },
+  }));
+};
 
 /**
  * The only private-storage endpoint reachable from a Container. It accepts no
@@ -152,7 +172,14 @@ const objectMatches = (object: MediaBridgeObject, bytes: Uint8Array, sha256: str
 export const handleMediaStorageBridge = async (request: Request, env: MediaContainerEnv, nowMs: number = Date.now()): Promise<Response> => {
   const url = new URL(request.url);
   if (url.pathname === MEDIA_STORAGE_HEALTH_PATH) {
-    return request.method === "HEAD" && env.PROCESSING_BUCKET !== undefined ? new Response(null, { status: 204 }) : unavailable();
+    if (request.method !== "HEAD" || env.PROCESSING_BUCKET === undefined) return unavailable();
+    try {
+      // A null result is healthy: the sentinel is deliberately never created.
+      await env.PROCESSING_BUCKET.head("__cuebench_health__/readiness");
+      return new Response(null, { status: 204 });
+    } catch {
+      return unavailable();
+    }
   }
   const bucket = env.PROCESSING_BUCKET;
   const signing = signingFromEnvironment(env);
@@ -188,35 +215,56 @@ export const handleMediaStorageBridge = async (request: Request, env: MediaConta
   if (request.method !== "PUT" || job.action !== "prepare" || output === null) return forbidden();
   if (request.headers.get("if-none-match") !== "*") return forbidden();
   const declaredLength = request.headers.get("content-length");
-  if (declaredLength !== null && (!/^[0-9]+$/.test(declaredLength) || Number(declaredLength) > output.maximumBytes)) return invalidArtifact();
+  if (
+    declaredLength === null
+    || !/^[0-9]+$/.test(declaredLength)
+    || !Number.isSafeInteger(Number(declaredLength))
+    || Number(declaredLength) <= 0
+    || Number(declaredLength) > output.maximumBytes
+  ) return invalidArtifact();
+  const expectedLength = Number(declaredLength);
   if (request.headers.get("content-type")?.toLowerCase() !== output.contentType) return invalidArtifact();
-  const expectedSha256 = request.headers.get("x-cuebench-sha256")?.toLowerCase();
+  // Only the job-authorized Python Container can provide this artifact digest.
+  // R2 receives it as a checksum and the persisted metadata is checked below.
+  const expectedSha256 = request.headers.get("x-content-sha256")?.toLowerCase();
   const expectedKeyHash = key.split("/").at(-1)?.split(".")[0];
   if (
     expectedSha256 === undefined
     || !HASH.test(expectedSha256)
     || (output.contentAddressed && expectedKeyHash !== expectedSha256)
   ) return invalidArtifact();
-  const body = await readBoundedBody(request.body, output.maximumBytes);
-  if (body === null || body.byteLength === 0 || (declaredLength !== null && Number(declaredLength) !== body.byteLength) || await digest(body) !== expectedSha256) return invalidArtifact();
+  if (request.body === null) return invalidArtifact();
   const headers = new Headers({ "if-none-match": "*" });
-  const stored = await bucket.put(key, new ReadableStream<Uint8Array>({ start: (controller) => { controller.enqueue(body); controller.close(); } }), {
-    onlyIf: headers,
-    httpMetadata: { contentType: output.contentType },
-    customMetadata: { sha256: expectedSha256, cuebench_preparation: "1" },
-    sha256: expectedSha256,
-  });
+  let stored: MediaBridgeObject | null;
+  try {
+    stored = await bucket.put(key, boundedArtifactStream(request.body, expectedLength, output.maximumBytes), {
+      onlyIf: headers,
+      httpMetadata: { contentType: output.contentType },
+      customMetadata: { sha256: expectedSha256, cuebench_preparation: "1" },
+      sha256: expectedSha256,
+    });
+  } catch (error) {
+    return error instanceof InvalidArtifactStream ? invalidArtifact() : unavailable();
+  }
   if (stored === null) {
-    const existing = await bucket.head(key);
-    return existing !== null && objectMatches(existing, body, expectedSha256, output.contentType)
-      ? new Response(null, { status: 200, headers: responseHeaders(existing) })
-      : new Response("CueBench could not safely publish this media artifact.", { status: 409 });
+    try {
+      const existing = await bucket.head(key);
+      return existing !== null && objectMatches(existing, expectedLength, expectedSha256, output.contentType)
+        ? new Response(null, { status: 200, headers: responseHeaders(existing) })
+        : new Response("CueBench could not safely publish this media artifact.", { status: 409 });
+    } catch {
+      return unavailable();
+    }
   }
-  const persisted = await bucket.head(key);
-  if (persisted === null || !objectMatches(persisted, body, expectedSha256, output.contentType)) {
-    return new Response("CueBench could not verify this media artifact publication.", { status: 503 });
+  try {
+    const persisted = await bucket.head(key);
+    if (persisted === null || !objectMatches(persisted, expectedLength, expectedSha256, output.contentType)) {
+      return new Response("CueBench could not verify this media artifact publication.", { status: 503 });
+    }
+    return new Response(null, { status: 201, headers: responseHeaders(persisted) });
+  } catch {
+    return unavailable();
   }
-  return new Response(null, { status: 201, headers: responseHeaders(persisted) });
 };
 
 /** Parses the internal POST envelope without buffering an unbounded request. */

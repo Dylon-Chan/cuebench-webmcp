@@ -340,6 +340,10 @@ def job_fingerprint(job: InternalMediaJob) -> str:
 class MediaLimits:
     max_input_bytes: int = 500 * 1024 * 1024
     max_duration_ms: int = 15 * 60 * 1_000
+    # Scene evidence is intentionally wider than the thumbnail cap: the
+    # manifest records every bounded cut while thumbnails are representatives.
+    max_scene_count: int = 256
+    max_scene_output_bytes: int = 64 * 1024
     max_thumbnail_count: int = 12
     max_thumbnail_width: int = 320
     max_thumbnail_height: int = 180
@@ -354,6 +358,9 @@ class MediaLimits:
         if (
             self.max_input_bytes <= 0
             or self.max_duration_ms <= 0
+            or self.max_scene_count <= 0
+            or self.max_scene_output_bytes <= 0
+            or self.max_scene_count < self.max_thumbnail_count
             or self.max_thumbnail_count <= 0
             or self.max_thumbnail_width <= 0
             or self.max_thumbnail_height <= 0

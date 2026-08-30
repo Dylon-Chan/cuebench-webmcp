@@ -4,7 +4,7 @@ import { InMemoryQuotaLedger } from "./quota-ledger";
 import { InMemoryUploadCoordinator, type UploadCoordinatorPort } from "./upload-operations";
 import { redactTelemetryEvent } from "./telemetry";
 import type { WorkerEnv } from "./env";
-import type { MediaProbe } from "./probe";
+import { MediaProbeRejected, type MediaProbe } from "./probe";
 import type { MultipartPrivateObjectStore } from "./uploads";
 
 class FixtureObjectStore implements MultipartPrivateObjectStore {
@@ -735,6 +735,74 @@ describe("CueBench anonymous multipart Worker", () => {
 
     expect(response.status).toBe(409);
     expect(body.error).toEqual(expect.objectContaining({ code: "AUTHORITATIVE_MEDIA_CLEANUP_PENDING", retrySafe: true, stateChanged: true, nextAction: "retry-cleanup" }));
+  });
+
+  it("cleans up a terminal media-probe rejection and never retries that private object", async () => {
+    let calls = 0;
+    const rejectingProbe: MediaProbe = {
+      probe: async () => {
+        calls += 1;
+        throw new MediaProbeRejected("UNSUPPORTED_MEDIA", 415);
+      },
+    };
+    const { app, bucket, workflow } = makeFixture({ probe: rejectingProbe });
+    const session = await issueSession(app);
+    const operation = await requestUpload(app, session);
+    const { uploadCapability, operationReceipt } = await operation.json() as { readonly uploadCapability: string; readonly operationReceipt: string };
+    expect((await app.fetch(partRequest(session, uploadCapability))).status).toBe(201);
+
+    const rejected = await app.fetch(jsonRequest("/api/uploads/operation-fixture/complete", {}, { session, receipt: operationReceipt }));
+    const replay = await app.fetch(jsonRequest("/api/uploads/operation-fixture/complete", {}, { session, receipt: operationReceipt }));
+
+    expect(rejected.status).toBe(422);
+    expect((await rejected.json() as { readonly error: { readonly code: string; readonly retrySafe: boolean; readonly nextAction: string } }).error).toEqual(expect.objectContaining({
+      code: "AUTHORITATIVE_MEDIA_REJECTED",
+      retrySafe: false,
+      nextAction: "start-new-operation",
+    }));
+    expect(replay.status).toBe(409);
+    expect((await replay.json() as { readonly error: { readonly code: string } }).error.code).toBe("UPLOAD_CANCELLED");
+    expect(calls).toBe(1);
+    expect(bucket.deleteCalls).toBe(1);
+    expect(bucket.completed.size).toBe(0);
+    expect(workflow.starts).toHaveLength(0);
+  });
+
+  it("keeps a transient media-probe failure retryable without deleting the private object", async () => {
+    let calls = 0;
+    const flakyProbe: MediaProbe = {
+      probe: async () => {
+        calls += 1;
+        if (calls === 1) throw new Error("temporary media service failure");
+        return {
+          container: "webm",
+          mimeType: "video/webm",
+          codec: "vp9",
+          durationMs: 60_000,
+          byteLength: 5,
+          sha256: "a".repeat(64),
+        };
+      },
+    };
+    const { app, bucket, workflow } = makeFixture({ probe: flakyProbe });
+    const session = await issueSession(app);
+    const operation = await requestUpload(app, session);
+    const { uploadCapability, operationReceipt } = await operation.json() as { readonly uploadCapability: string; readonly operationReceipt: string };
+    expect((await app.fetch(partRequest(session, uploadCapability))).status).toBe(201);
+
+    const unavailable = await app.fetch(jsonRequest("/api/uploads/operation-fixture/complete", {}, { session, receipt: operationReceipt }));
+    const retry = await app.fetch(jsonRequest("/api/uploads/operation-fixture/complete", {}, { session, receipt: operationReceipt }));
+
+    expect(unavailable.status).toBe(503);
+    expect((await unavailable.json() as { readonly error: { readonly code: string; readonly retrySafe: boolean; readonly nextAction: string } }).error).toEqual(expect.objectContaining({
+      code: "MEDIA_PROBE_UNAVAILABLE",
+      retrySafe: true,
+      nextAction: "retry-probe",
+    }));
+    expect(retry.status).toBe(202);
+    expect(calls).toBe(2);
+    expect(bucket.deleteCalls).toBe(0);
+    expect(workflow.starts).toHaveLength(1);
   });
 
   it("reports a truthful retryable quota reconciliation state after authoritative probing has changed lifecycle", async () => {

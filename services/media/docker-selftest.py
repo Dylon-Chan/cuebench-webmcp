@@ -95,7 +95,10 @@ def main() -> None:
             limits=MediaLimits(
                 max_input_bytes=8 * 1024 * 1024,
                 max_duration_ms=5_000,
-                max_thumbnail_count=4,
+                # The deterministic fixture has two high-contrast cuts. Keep
+                # one representative thumbnail to prove scene evidence is not
+                # silently truncated to the thumbnail cap.
+                max_thumbnail_count=1,
                 max_thumbnail_width=320,
                 max_thumbnail_height=180,
                 max_thumbnail_bytes=64 * 1024,
@@ -108,7 +111,8 @@ def main() -> None:
                 executable_paths={"ffmpeg": "/usr/bin/ffmpeg", "ffprobe": "/usr/bin/ffprobe"},
                 default_timeout_seconds=30,
                 maximum_output_bytes=64 * 1024,
-            )
+            ),
+            maximum_scene_output_bytes=settings.limits.max_scene_output_bytes,
         )
         job = InternalMediaJob(
             action="prepare",
@@ -147,6 +151,9 @@ def main() -> None:
 
         thumbnails = result["thumbnails"]
         assert isinstance(thumbnails, list) and thumbnails
+        scenes = result["scenes"]
+        assert isinstance(scenes, list) and len(scenes) > settings.limits.max_thumbnail_count
+        assert len(thumbnails) <= settings.limits.max_thumbnail_count
         assert sum(int(item["byte_length"]) for item in thumbnails) <= settings.limits.max_thumbnail_total_bytes
         for thumbnail in thumbnails:
             value = (output_root / str(thumbnail["key"])).read_bytes()

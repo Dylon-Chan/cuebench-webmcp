@@ -28,6 +28,21 @@ def parse_scene_timestamps(stderr: bytes, duration_ms: int, maximum_count: int) 
     return timestamps
 
 
+def representative_scene_timestamps(timestamps: list[int], maximum_count: int) -> list[int]:
+    """Chooses bounded thumbnails across the full already-bounded scene timeline."""
+
+    if maximum_count <= 0:
+        raise ValueError("Maximum scene thumbnail count must be positive.")
+    if len(timestamps) <= maximum_count:
+        return list(timestamps)
+    if maximum_count == 1:
+        return [timestamps[0]]
+    # Integer interpolation preserves the first and final detected cut, so a
+    # late scene is not silently lost merely because early cuts are denser.
+    positions = [round(index * (len(timestamps) - 1) / (maximum_count - 1)) for index in range(maximum_count)]
+    return [timestamps[position] for position in positions]
+
+
 def webp_dimensions(value: bytes) -> tuple[int, int]:
     """Reads a WebP canvas header without decoding a full frame into memory."""
 

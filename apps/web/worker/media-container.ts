@@ -80,6 +80,56 @@ const cachedResponse = (result: StoredResult): Response => new Response(result.b
   headers: { "content-type": result.contentType },
 });
 
+type MediaContainerRequestDisposition =
+  | { readonly kind: "cached"; readonly result: StoredResult }
+  | { readonly kind: "in-flight" }
+  | { readonly kind: "forbidden" }
+  | { readonly kind: "new" };
+
+const mediaResultKey = (capability: Pick<MediaContainerCapability, "action" | "idempotencyKey">): string => (
+  `${capability.action}:${capability.idempotencyKey}`
+);
+
+/**
+ * Keeps capability-fingerprint fencing for an active Container while allowing
+ * a freshly minted equivalent signed job to read a completed idempotent result.
+ */
+export const mediaContainerRequestDisposition = (
+  prior: MediaContainerState | undefined,
+  capability: MediaContainerCapability,
+  nowMs: number,
+): MediaContainerRequestDisposition => {
+  if (prior !== undefined && prior.operationKey !== capability.operationKey) return { kind: "forbidden" };
+  const cached = prior?.results[mediaResultKey(capability)];
+  if (cached !== undefined && cached.expiresAtMs > nowMs) return { kind: "cached", result: cached };
+  const inFlight = prior?.inFlight;
+  if (inFlight === undefined || inFlight.expiresAtMs <= nowMs) return { kind: "new" };
+  return inFlight.action === capability.action
+    && inFlight.idempotencyKey === capability.idempotencyKey
+    && inFlight.capabilityFingerprint === capability.capabilityFingerprint
+    ? { kind: "in-flight" }
+    : { kind: "forbidden" };
+};
+
+const cacheableTerminalStatus = (status: number): boolean => status >= 400
+  && status < 500
+  && ![408, 409, 425, 429].includes(status);
+
+/**
+ * Persists only a success or an explicitly deterministic client rejection.
+ * Every retryable/network result removes the durable in-flight lease so the
+ * exact idempotency key can make a later attempt without duplicate work.
+ */
+export const settleMediaContainerResponse = (
+  state: MediaContainerState,
+  result: StoredResult,
+): MediaContainerState => ({
+  operationKey: state.operationKey,
+  results: (result.status >= 200 && result.status < 300) || cacheableTerminalStatus(result.status)
+    ? { ...state.results, [mediaResultKey(result)]: result }
+    : state.results,
+});
+
 /**
  * One Durable Object per server-derived operation key serializes work, retains
  * in-flight state across Container restarts, and only delegates after the
@@ -131,17 +181,16 @@ export class MediaPreparationContainer extends Container<MediaContainerEnv> {
     }
     const capabilityFingerprint = await mediaCapabilityFingerprint(envelope.job);
     const prior = await this.durableState.storage.get<MediaContainerState>(stateKey);
-    if (prior !== undefined && prior.operationKey !== job.operationKey) return forbidden();
-    const resultKey = `${job.action}:${job.idempotencyKey}`;
-    const cached = prior?.results[resultKey];
-    if (cached !== undefined && cached.expiresAtMs > Date.now()) return cachedResponse(cached);
-    if (prior?.inFlight !== undefined && prior.inFlight.expiresAtMs > Date.now()) {
-      return prior.inFlight.action === job.action
-        && prior.inFlight.idempotencyKey === job.idempotencyKey
-        && prior.inFlight.capabilityFingerprint === capabilityFingerprint
-        ? new Response("CueBench is already preparing this media evidence.", { status: 409 })
-        : forbidden();
-    }
+    const capability: MediaContainerCapability = {
+      action: job.action,
+      operationKey: job.operationKey,
+      idempotencyKey: job.idempotencyKey,
+      capabilityFingerprint,
+    };
+    const disposition = mediaContainerRequestDisposition(prior, capability, Date.now());
+    if (disposition.kind === "forbidden") return forbidden();
+    if (disposition.kind === "cached") return cachedResponse(disposition.result);
+    if (disposition.kind === "in-flight") return new Response("CueBench is already preparing this media evidence.", { status: 409 });
     const state: MediaContainerState = {
       operationKey: job.operationKey,
       inFlight: {
@@ -168,7 +217,7 @@ export class MediaPreparationContainer extends Container<MediaContainerEnv> {
         body: new TextDecoder().decode(bytes),
         expiresAtMs: job.expiresAtMs,
       };
-      await this.durableState.storage.put(stateKey, { operationKey: job.operationKey, results: { ...(prior?.results ?? {}), [resultKey]: result } } satisfies MediaContainerState);
+      await this.durableState.storage.put(stateKey, settleMediaContainerResponse(state, result));
       return cachedResponse(result);
     } catch {
       await this.durableState.storage.put(stateKey, { operationKey: job.operationKey, results: prior?.results ?? {} } satisfies MediaContainerState);

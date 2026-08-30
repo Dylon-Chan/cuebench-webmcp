@@ -44,6 +44,7 @@ import {
 } from "./upload-operations";
 import {
   MediaContainerProbeService,
+  MediaProbeRejected,
   isSupportedAuthoritativeMedia,
   type MediaProbe,
 } from "./probe";
@@ -1055,7 +1056,40 @@ export const createCueBenchWorker = (env: WorkerEnv, dependencies: WorkerDepende
           receiptExpiresAtMs: receipt.receiptExpiresAtMs,
           idempotencyKey: `probe:${receipt.operationKey}`,
         });
-      } catch {
+      } catch (error) {
+        if (error instanceof MediaProbeRejected) {
+          // A versioned, deterministic 4xx from the private service means
+          // this completed object can never enter a workflow. Cleanup also
+          // releases the operation's pending upload quota and probe lease.
+          await quotaLedger.finalizeSpend({
+            spendKey: `probe:${receipt.operationKey}`,
+            actualCents: 0,
+            nowMs: currentNow,
+            globalSpendLimitCents: settings.quotas.globalSpendLimitCents,
+          }).catch(() => undefined);
+          const cleanup = await cleanupOperation({
+            record,
+            objectStore,
+            coordinator,
+            quotaLedger,
+            nowMs: currentNow,
+            createId: () => createId(dependencies),
+            target: {
+              objectState: "completed",
+              multipartUploadId: record.multipartUploadId,
+              reason: `authoritative-media-${error.code.toLowerCase()}`,
+            },
+          });
+          recordTelemetry(dependencies.telemetry, {
+            stage: "processing",
+            byteSize: receipt.media.byteLength,
+            status: "rejected",
+            errorCode: "AUTHORITATIVE_MEDIA_REJECTED",
+          });
+          return apiError(cleanup.clean ? 422 : 409, cleanup.clean ? "AUTHORITATIVE_MEDIA_REJECTED" : "AUTHORITATIVE_MEDIA_CLEANUP_PENDING", cleanup.clean
+            ? "CueBench's authoritative private-media inspection rejected this file. No workflow was started."
+            : "CueBench rejected this private media and is reconciling deletion. Keep the receipt and retry cleanup.", { stateChanged: true, retrySafe: !cleanup.clean, nextAction: cleanup.clean ? "start-new-operation" : "retry-cleanup" });
+        }
         await coordinator.releaseProbe({ claimId: probeClaim.claim.id, claimGeneration: probeClaim.claim.generation, nowMs: currentNow, note: "media-probe-unavailable" }).catch(() => undefined);
         return apiError(503, "MEDIA_PROBE_UNAVAILABLE", "CueBench could not authoritatively inspect this private media. The private copy remains recoverable only until its disclosed cleanup deadline.", { retrySafe: true, stateChanged: true, nextAction: "retry-probe" });
       }

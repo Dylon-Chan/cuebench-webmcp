@@ -69,8 +69,14 @@ class MinimalTools:
     def extract_thumbnail(
         self, input_path: Path, at_ms: int, output_path: Path, deadline: object | None = None
     ) -> None:
-        del input_path, at_ms, output_path, deadline
-        raise AssertionError("No scene should request a thumbnail")
+        import struct
+
+        del input_path, at_ms, deadline
+        # Static private media still produces one bounded 0ms visual cue.
+        payload = b"\x00\x00\x00\x00" + (0).to_bytes(3, "little") + (0).to_bytes(3, "little")
+        output_path.write_bytes(
+            b"RIFF" + struct.pack("<I", 4 + 8 + len(payload)) + b"WEBPVP8X" + struct.pack("<I", len(payload)) + payload
+        )
 
     def versions(self, deadline: object | None = None) -> dict[str, str]:
         del deadline
@@ -340,7 +346,9 @@ def test_prepare_publishes_only_verified_artifacts_through_the_private_r2_bridge
         headers = {
             "content-type": request.get_header("Content-type"),
             "content-length": str(len(value)),
-            "x-cuebench-sha256": request.get_header("X-cuebench-sha256"),
+            # Worker responses use the bridge's read header; Python writes
+            # the trusted outgoing digest in the distinct content header.
+            "x-cuebench-sha256": request.get_header("X-content-sha256"),
         }
         if key in stored:
             previous, previous_headers = stored[key]
@@ -688,11 +696,19 @@ def test_malformed_json_and_oversized_request_have_sanitized_bounded_errors(
 
     assert malformed.status_code == 422
     assert malformed.json() == {
-        "error": {"code": "INVALID_REQUEST", "message": "CueBench could not read the preparation request."}
+        "error": {
+            "version": 1,
+            "code": "INVALID_REQUEST",
+            "message": "CueBench could not read the preparation request.",
+        }
     }
     assert oversized.status_code == 413
     assert oversized.json() == {
-        "error": {"code": "REQUEST_TOO_LARGE", "message": "CueBench rejected an oversized internal request."}
+        "error": {
+            "version": 1,
+            "code": "REQUEST_TOO_LARGE",
+            "message": "CueBench rejected an oversized internal request.",
+        }
     }
 
 

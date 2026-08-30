@@ -35,6 +35,21 @@ export interface MediaProbeBinding {
   fetch: (request: Request) => Promise<Response>;
 }
 
+export type MediaProbeRejectionCode = "UNSUPPORTED_MEDIA" | "MEDIA_DURATION_LIMIT" | "MEDIA_SIZE_LIMIT" | "INPUT_METADATA_MISMATCH";
+
+/** A deterministic private-media rejection is safe to clean up, unlike a transient service failure. */
+export class MediaProbeRejected extends Error {
+  public readonly terminal = true;
+  public override readonly name = "MediaProbeRejected";
+
+  public constructor(
+    public readonly code: MediaProbeRejectionCode,
+    public readonly status: 413 | 415 | 422,
+  ) {
+    super("CueBench's authoritative media inspection rejected this private file.");
+  }
+}
+
 /** The Worker-only HMAC material used for capabilities sent to the media Container. */
 export interface MediaJobSigningSettings {
   readonly keyRing: HmacKeyRing;
@@ -283,21 +298,31 @@ export class MediaProbeServiceBinding implements MediaProbe {
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ job }),
     }));
-    if (!response.ok) throw new Error("CueBench's authoritative media probe is unavailable.");
-    const value = await response.json() as unknown;
+    if (!response.ok) {
+      const rejection = await terminalProbeRejection(response);
+      if (rejection !== null) throw rejection;
+      throw new Error("CueBench's authoritative media probe is unavailable.");
+    }
+    const value = await readBoundedJson(
+      response,
+      MAX_MEDIA_PROBE_FACTS_BYTES,
+      "CueBench's authoritative media probe returned incomplete facts.",
+    );
     if (!isAuthoritativeMediaFacts(value)) throw new Error("CueBench's authoritative media probe returned incomplete facts.");
     return value;
   }
 }
 
 const MAX_PREPARED_MANIFEST_ENVELOPE_BYTES = 4 * 1024;
+const MAX_MEDIA_PROBE_FACTS_BYTES = 8 * 1024;
+const MAX_MEDIA_PROBE_ERROR_BYTES = 4 * 1024;
 
-const readBoundedJson = async (response: Response, maximumBytes: number): Promise<unknown> => {
+const readBoundedJson = async (response: Response, maximumBytes: number, unavailableMessage: string): Promise<unknown> => {
   const declared = response.headers.get("content-length");
   if (declared !== null && (!/^[0-9]+$/.test(declared) || Number(declared) > maximumBytes)) {
-    throw new Error("CueBench's prepared media manifest is unavailable.");
+    throw new Error(unavailableMessage);
   }
-  if (response.body === null) throw new Error("CueBench's prepared media manifest is unavailable.");
+  if (response.body === null) throw new Error(unavailableMessage);
   const reader = response.body.getReader();
   const chunks: Uint8Array[] = [];
   let byteLength = 0;
@@ -308,7 +333,7 @@ const readBoundedJson = async (response: Response, maximumBytes: number): Promis
       byteLength += next.value.byteLength;
       if (byteLength > maximumBytes) {
         await reader.cancel();
-        throw new Error("CueBench's prepared media manifest is unavailable.");
+        throw new Error(unavailableMessage);
       }
       chunks.push(next.value);
     }
@@ -324,7 +349,39 @@ const readBoundedJson = async (response: Response, maximumBytes: number): Promis
   try {
     return JSON.parse(new TextDecoder().decode(value)) as unknown;
   } catch {
-    throw new Error("CueBench's prepared media manifest is unavailable.");
+    throw new Error(unavailableMessage);
+  }
+};
+
+const terminalProbeRejection = async (response: Response): Promise<MediaProbeRejected | null> => {
+  try {
+    const value = await readBoundedJson(
+      response,
+      MAX_MEDIA_PROBE_ERROR_BYTES,
+      "CueBench's authoritative media probe is unavailable.",
+    );
+    if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
+    const envelope = value as Readonly<Record<string, unknown>>;
+    if (Object.keys(envelope).length !== 1 || typeof envelope.error !== "object" || envelope.error === null || Array.isArray(envelope.error)) return null;
+    const error = envelope.error as Readonly<Record<string, unknown>>;
+    if (
+      Object.keys(error).length !== 3
+      || error.version !== 1
+      || typeof error.code !== "string"
+      || typeof error.message !== "string"
+    ) return null;
+    const terminal = {
+      UNSUPPORTED_MEDIA: 415,
+      MEDIA_DURATION_LIMIT: 413,
+      MEDIA_SIZE_LIMIT: 413,
+      INPUT_METADATA_MISMATCH: 422,
+    } as const;
+    const status = terminal[error.code as keyof typeof terminal];
+    return status === response.status
+      ? new MediaProbeRejected(error.code as MediaProbeRejectionCode, status)
+      : null;
+  } catch {
+    return null;
   }
 };
 
@@ -362,7 +419,11 @@ export class MediaPreparationServiceBinding implements MediaPreparation {
       body: JSON.stringify({ job }),
     }));
     if (!response.ok) throw new Error("CueBench's prepared media manifest is unavailable.");
-    const result = preparedManifest(await readBoundedJson(response, MAX_PREPARED_MANIFEST_ENVELOPE_BYTES), input.operationKey);
+    const result = preparedManifest(await readBoundedJson(
+      response,
+      MAX_PREPARED_MANIFEST_ENVELOPE_BYTES,
+      "CueBench's prepared media manifest is unavailable.",
+    ), input.operationKey);
     if (result === null) throw new Error("CueBench's prepared media manifest is unavailable.");
     return result;
   }
