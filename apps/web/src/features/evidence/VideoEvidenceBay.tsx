@@ -1,5 +1,5 @@
 import type { CaptionProject } from "@cuebench/domain";
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   Timeline,
   type TimelineCommandExecutor,
@@ -15,6 +15,8 @@ export interface VideoEvidenceBayProps {
   readonly onCommand: TimelineCommandExecutor;
   /** Prepared-media evidence is supplied by the project/evidence adapter. */
   readonly evidence: PreparedMediaEvidence;
+  /** Lets adjacent semantic review controls seek the one native media clock. */
+  readonly onSeekReady?: (seekToMediaTime: (mediaTimeMs: number) => void) => void;
 }
 
 /**
@@ -26,12 +28,17 @@ export function VideoEvidenceBay({
   sourceObjectUrl,
   onCommand,
   evidence,
+  onSeekReady,
 }: VideoEvidenceBayProps) {
   const videoRef = useRef<HTMLVideoElement>(null);
   const [isMuted, setIsMuted] = useState(false);
   const [volume, setVolume] = useState(1);
   const [mediaError, setMediaError] = useState<string | null>(null);
   const playhead = usePlayhead(videoRef, { durationMs: project.media.durationMs });
+
+  useEffect(() => {
+    onSeekReady?.(playhead.seekToMediaTime);
+  }, [onSeekReady, playhead.seekToMediaTime]);
 
   const syncNativeAudioState = () => {
     const video = videoRef.current;

@@ -1,5 +1,4 @@
-import * as Tabs from "@radix-ui/react-tabs";
-import { useSyncExternalStore } from "react";
+import { useCallback, useState, useSyncExternalStore } from "react";
 import { Navigate, Route, Routes } from "react-router-dom";
 import type { CaptionProject } from "@cuebench/domain";
 import { VideoEvidenceBay } from "../features/evidence/VideoEvidenceBay";
@@ -8,6 +7,8 @@ import { ProjectStart } from "../features/project/ProjectStart";
 import { StorageDisclosure } from "../features/project/StorageDisclosure";
 import type { ProjectMode, ProjectStore } from "../features/project/project-store";
 import type { SourceProvenance } from "../features/project/source-provenance";
+import { CourtRecord } from "../features/review/CourtRecord";
+import { ReviewDocket } from "../features/review/ReviewDocket";
 
 export interface AppRoutesProps {
   readonly store: ProjectStore;
@@ -33,11 +34,13 @@ interface WorkbenchShellProps {
 }
 
 export function WorkbenchShell({ project, mode, sourceObjectUrl, sourceProvenance, webMcpAvailable, store }: WorkbenchShellProps) {
-  const captionCount = project.captions.order.length;
-  const descriptionCount = project.audioDescriptions.order.length;
   const validationLabel = project.validation.status === "NotRun"
     ? "Validation not run"
     : `${project.validation.blockerCount} blockers · ${project.validation.warningCount} warnings`;
+  const [reviewSeekToMediaTime, setReviewSeekToMediaTime] = useState<(mediaTimeMs: number) => void>(() => () => undefined);
+  const receiveVideoSeek = useCallback((seekToMediaTime: (mediaTimeMs: number) => void) => {
+    setReviewSeekToMediaTime(() => seekToMediaTime);
+  }, []);
 
   return (
     <main className="workbench" aria-label="CueBench workbench">
@@ -74,51 +77,18 @@ export function WorkbenchShell({ project, mode, sourceObjectUrl, sourceProvenanc
           sourceObjectUrl={sourceObjectUrl}
           evidence={projectMediaEvidence(sourceProvenance)}
           onCommand={(command) => store.executeCommand(command)}
+          onSeekReady={receiveVideoSeek}
         />
 
-        <aside className="review-docket" aria-labelledby="review-docket-heading">
-          <div className="region-heading">
-            <div><h2 id="review-docket-heading">Review Docket</h2><p>{captionCount + descriptionCount} review items</p></div>
-            <span className="docket-indicator">Live state</span>
-          </div>
-          <Tabs.Root defaultValue="all">
-            <Tabs.List className="docket-tabs" aria-label="Review item filters">
-              <Tabs.Trigger value="all">All</Tabs.Trigger>
-              <Tabs.Trigger value="proposed">Proposed</Tabs.Trigger>
-              <Tabs.Trigger value="objected">Objected</Tabs.Trigger>
-              <Tabs.Trigger value="sustained">Sustained</Tabs.Trigger>
-            </Tabs.List>
-            <Tabs.Content className="docket-content" value="all">
-              <p className="empty-docket">{captionCount === 0 ? "Caption generation will place proposed cues here for human review." : "Select an item to inspect its evidence and revision."}</p>
-            </Tabs.Content>
-            <Tabs.Content className="docket-content" value="proposed"><p className="empty-docket">No Proposed revisions in this shell state.</p></Tabs.Content>
-            <Tabs.Content className="docket-content" value="objected"><p className="empty-docket">No Objected revisions in this shell state.</p></Tabs.Content>
-            <Tabs.Content className="docket-content" value="sustained"><p className="empty-docket">No Sustained revisions in this shell state.</p></Tabs.Content>
-          </Tabs.Root>
-          <section className="ruling-panel" aria-labelledby="ruling-heading">
-            <div><h3 id="ruling-heading">Human rulings</h3><span>Never delegated to a Browser Agent</span></div>
-            <span id="ruling-unavailable" className="visually-hidden">Rulings activate with Task 9's reviewed item workflow.</span>
-            <p>Rulings activate with Task 9's reviewed item workflow. Human decisions remain unavailable in this shell.</p>
-            <div className="ruling-panel__actions">
-              <button className="button button--object" type="button" aria-label="Object selected revision" aria-describedby="ruling-unavailable" title="Rulings activate with Task 9's reviewed item workflow." disabled>Object</button>
-              <button className="button button--sustain" type="button" aria-label="Sustain selected revision" aria-describedby="ruling-unavailable" title="Rulings activate with Task 9's reviewed item workflow." disabled>Sustain</button>
-            </div>
-          </section>
-          <StorageDisclosure mode={mode} />
-        </aside>
+        <ReviewDocket
+          project={project}
+          onCommand={(command) => store.executeCommand(command)}
+          onSeekToMediaTime={reviewSeekToMediaTime}
+          footer={<StorageDisclosure mode={mode} />}
+        />
       </div>
 
-      <section className="court-record" aria-labelledby="court-record-heading">
-        <div className="region-heading region-heading--compact">
-          <div><h2 id="court-record-heading">Court Record</h2><p>Append-only project provenance</p></div>
-          <span id="record-unavailable" className="visually-hidden">The full Court Record view is not available in this project shell yet.</span>
-          <button className="header-button" type="button" disabled aria-describedby="record-unavailable">Full record (later)</button>
-        </div>
-        <div className="court-record__empty">
-          <span className="record-rule" aria-hidden="true" />
-          <p>{project.courtRecord.length === 0 ? "No project events recorded yet." : `${project.courtRecord.length} recorded actions.`}</p>
-        </div>
-      </section>
+      <CourtRecord project={project} />
     </main>
   );
 }

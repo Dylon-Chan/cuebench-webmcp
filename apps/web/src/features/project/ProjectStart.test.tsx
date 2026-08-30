@@ -303,7 +303,7 @@ describe("ProjectStart", () => {
     expect(screen.getByRole("button", { name: "Object selected revision" })).toBeVisible();
     expect(screen.getByRole("button", { name: "Sustain selected revision" })).toBeVisible();
     expect(screen.getByRole("button", { name: "Object selected revision" })).toBeDisabled();
-    expect(screen.getAllByText(/activate with task 9/i)[0]).toBeVisible();
+    expect(screen.getByText("Human-only")).toBeVisible();
     expect(screen.getByText("Browser Agent tools unavailable")).toBeVisible();
   });
 
