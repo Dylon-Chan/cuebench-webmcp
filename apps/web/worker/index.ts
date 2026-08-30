@@ -49,10 +49,16 @@ import {
   type MediaProbe,
 } from "./probe";
 import { recordTelemetry, type TelemetrySink } from "./telemetry";
+import {
+  createGenerationRoutes,
+  type GenerationRunRecordStore,
+  type GenerationWorkflowControl,
+} from "./generation-routes";
 
 export { QuotaLedger } from "./quota-ledger";
 export { UploadCoordinator } from "./upload-operations";
 export { MediaPreparationContainer } from "./media-container";
+export { CaptionGenerationWorkflow } from "./workflows/generation";
 export {
   MediaContainerPreparationService,
   type MediaPreparation,
@@ -96,6 +102,9 @@ export interface WorkerDependencies {
   readonly objectStore?: MultipartPrivateObjectStore;
   readonly mediaProbe?: MediaProbe;
   readonly workflow?: ProcessingWorkflow;
+  /** Task 13 seams remain private Worker-only ports, never browser bindings. */
+  readonly generationRuns?: GenerationRunRecordStore;
+  readonly generationWorkflow?: GenerationWorkflowControl;
   readonly telemetry?: TelemetrySink;
 }
 
@@ -600,6 +609,14 @@ export const createCueBenchWorker = (env: WorkerEnv, dependencies: WorkerDepende
   });
 
   app.onError(() => apiError(500, "WORKER_UNAVAILABLE", "CueBench could not complete that private processing request. No browser project data changed.", { retrySafe: true, nextAction: "retry" }));
+
+  const generationQuotaLedger = quotaLedgerFor(env, dependencies);
+  app.route("/", createGenerationRoutes(env, {
+    ...(dependencies.clock === undefined ? {} : { clock: dependencies.clock }),
+    ...(generationQuotaLedger === undefined ? {} : { quotaLedger: generationQuotaLedger }),
+    ...(dependencies.generationRuns === undefined ? {} : { runs: dependencies.generationRuns }),
+    ...(dependencies.generationWorkflow === undefined ? {} : { workflow: dependencies.generationWorkflow }),
+  }));
 
   app.get("/api/health", (context) => context.json({ status: "ok" }));
 

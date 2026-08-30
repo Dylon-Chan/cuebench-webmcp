@@ -14,6 +14,7 @@ import {
 } from "@cuebench/domain";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
+  adoptStagedCaptionGenerationResult,
   CueBenchDatabase,
   StorageImmutableWriteError,
   StorageReadValidationError,
@@ -21,10 +22,12 @@ import {
   executePersistentCommand,
   initializeProject,
   loadProject,
+  loadRunReceipt,
   loadSourceMedia,
   saveRunReceipt,
   saveSourceMedia,
 } from "./index";
+import type { StagedGenerationResult } from "@cuebench/contracts";
 import { sha256Hex } from "@cuebench/domain";
 import { normalizeProject, rehydrateProject } from "./database";
 
@@ -1014,5 +1017,72 @@ describe("CueBenchDatabase", () => {
     const cyclic: { version: number; payload: { self?: unknown } } = { version: 1, payload: {} };
     cyclic.payload.self = cyclic;
     await expect(saveRunReceipt(db, "project-1", "run-3", cyclic)).rejects.toThrow();
+  });
+
+  it("adopts a complete staged caption result and its recovery evidence in one expected-revision transaction", async () => {
+    const db = testDatabase();
+    const initial = fixtureProject();
+    await initializeProject(db, initial);
+    const leased = await executePersistentCommand(db, initial.projectId, {
+      type: "StartGenerationRun",
+      actor: { type: "CueBenchAI", id: "cuebench-ai" },
+      runId: "generation-adopt",
+      targetTrack: "Captions",
+      expectedProjectRevision: initial.projectRevision,
+    });
+    await saveRunReceipt(db, initial.projectId, "generation-adopt", {
+      version: 1,
+      payload: { signedGenerationReceipt: "opaque", expiresAtMs: 1_700_086_400_000 },
+    });
+    const staged: StagedGenerationResult = {
+      contractVersion: 1,
+      runId: "generation-adopt",
+      projectId: initial.projectId,
+      targetTrack: "Captions",
+      expectedProjectRevision: leased.project.projectRevision,
+      expectedQualityProfileRevision: leased.project.qualityProfile.revision,
+      createdAtMs: 1_700_000_000_000,
+      expiresAtMs: 1_700_086_400_000,
+      evidence: {
+        contractVersion: 1,
+        runId: "generation-adopt",
+        projectId: initial.projectId,
+        mediaSha256: initial.media.sha256,
+        preparedManifest: { key: "prepared/a/manifests/b.json", sha256: "b".repeat(64) },
+        normalizedAudio: { key: "prepared/a/audio/c.wav", sha256: "c".repeat(64), byteLength: 4, durationMs: 1_000, contentType: "audio/wav" },
+        words: [{ evidenceId: "word-1", sourceWordIndex: 0, startMs: 4_000, endMs: 5_000, text: "Generated", speaker: null, speakerSegmentIds: [] }],
+        uncertaintySpans: [],
+        provenance: [
+          { role: "diarization", model: "gpt-4o-transcribe-diarize", requestHash: "d".repeat(64), responseHash: "e".repeat(64), store: false, requestMetadata: {}, warnings: [] },
+          { role: "word-timestamps", model: "whisper-1", requestHash: "f".repeat(64), responseHash: "1".repeat(64), store: false, requestMetadata: {}, warnings: [] },
+        ],
+      },
+      captions: [{ cueId: "generated-storage", startMs: 4_000, endMs: 5_000, text: "Generated", speaker: null, evidenceIds: ["word-1"] }],
+    };
+    const command = {
+      type: "AdoptCaptionGenerationResult" as const,
+      actor: { type: "CueBenchAI" as const, id: "cuebench-ai" },
+      runId: "generation-adopt",
+      expectedProjectRevision: leased.project.projectRevision,
+      expectedQualityProfileRevision: leased.project.qualityProfile.revision,
+      confirmedProposedReplacement: true,
+      result: staged,
+    };
+    const adopted = await adoptStagedCaptionGenerationResult(db, initial.projectId, command);
+    expect(adopted.error).toBeUndefined();
+    expect(adopted.project.activeGenerationRun).toBeNull();
+    expect(adopted.project.captions.items["generated-storage"]?.current.text).toBe("Generated");
+    const receipt = await loadRunReceipt(db, initial.projectId, "generation-adopt");
+    expect(receipt?.receipt.payload).toMatchObject({
+      stagedGenerationResult: { runId: "generation-adopt" },
+      adoption: { status: "adopted", adoptedProjectRevision: adopted.project.projectRevision },
+    });
+
+    const stale = await adoptStagedCaptionGenerationResult(db, initial.projectId, command);
+    expect(stale.error?.code).toBe("STALE_PROJECT");
+    expect((await loadProject(db, initial.projectId))?.projectRevision).toBe(adopted.project.projectRevision);
+    expect((await loadRunReceipt(db, initial.projectId, "generation-adopt"))?.receipt.payload).toMatchObject({
+      stagedGenerationResult: { runId: "generation-adopt" },
+    });
   });
 });

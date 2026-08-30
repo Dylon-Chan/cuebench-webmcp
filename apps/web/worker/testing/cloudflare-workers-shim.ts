@@ -16,3 +16,16 @@ export class WorkerEntrypoint<Env = unknown> {
     public readonly env: Env,
   ) {}
 }
+
+export class WorkflowEntrypoint<Env = unknown, Input = unknown> {
+  public constructor(
+    public readonly ctx: unknown,
+    protected readonly env: Env,
+  ) {}
+
+  public async run(_event: unknown, _step: unknown): Promise<Input | undefined> {
+    void _event;
+    void _step;
+    return undefined;
+  }
+}

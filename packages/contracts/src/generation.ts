@@ -25,6 +25,118 @@ const GenerationRunBaseSchema = z.object({
 
 const GenerationProgressSchema = z.number().min(0).max(1);
 
+const SafeTimestampSchema = z.number().int().refine(Number.isSafeInteger).nonnegative();
+const Sha256Schema = z.string().regex(/^[0-9a-f]{64}$/i, "Expected a SHA-256 hash.");
+const EvidenceIntervalSchema = z.object({
+  startMs: SafeTimestampSchema,
+  endMs: SafeTimestampSchema,
+}).strict().refine((value) => value.endMs > value.startMs, {
+  message: "Evidence intervals must end after they start.",
+  path: ["endMs"],
+});
+
+/**
+ * Claims signed by the Worker before a browser may poll or request adoption.
+ * The opaque signature travels separately; retaining the claims schema here
+ * gives workflow, browser, and replay code one fail-closed contract.
+ */
+export const GenerationRunReceiptSchema = z.object({
+  contractVersion: ContractVersionSchema,
+  /** Signed-token protocol version, distinct from the public contract version. */
+  version: z.literal(1),
+  type: z.literal("generation-run-receipt"),
+  keyId: IdentifierSchema,
+  runId: IdentifierSchema,
+  projectId: IdentifierSchema,
+  targetTrack: z.literal("Captions"),
+  expectedProjectRevision: ProjectRevisionSchema,
+  expectedQualityProfileRevision: ProjectRevisionSchema,
+  mediaSha256: Sha256Schema,
+  operationId: IdentifierSchema,
+  operationKey: z.string().regex(/^[0-9a-f]{64}$/),
+  objectKey: z.string().min(1).max(1_000),
+  issuedAtMs: SafeTimestampSchema,
+  expiresAtMs: SafeTimestampSchema,
+}).strict().refine((value) => value.expiresAtMs > value.issuedAtMs, {
+  message: "Generation receipts must expire after they are issued.",
+  path: ["expiresAtMs"],
+});
+
+export const CaptionEvidenceWordSchema = EvidenceIntervalSchema.extend({
+  evidenceId: IdentifierSchema,
+  text: z.string().trim().min(1).max(1_000),
+  speaker: z.string().trim().min(1).max(200).nullable(),
+  speakerSegmentIds: z.array(IdentifierSchema).max(32),
+  sourceWordIndex: z.number().int().nonnegative(),
+}).strict();
+
+export const UncertaintySpanSchema = EvidenceIntervalSchema.extend({
+  uncertaintyId: IdentifierSchema,
+  reason: z.enum(["speaker-conflict", "speaker-gap", "text-conflict", "timestamp-gap"]),
+  evidenceIds: z.array(IdentifierSchema).min(1).max(64),
+}).strict();
+
+export const GenerationProviderProvenanceSchema = z.object({
+  role: z.enum(["diarization", "word-timestamps", "reconciliation"]),
+  model: z.string().trim().min(1).max(200),
+  requestHash: Sha256Schema,
+  responseHash: Sha256Schema,
+  store: z.boolean(),
+  requestMetadata: z.record(z.string(), z.string().trim().max(500)).default({}),
+  warnings: z.array(z.string().trim().min(1).max(500)).max(32).default([]),
+}).strict();
+
+/** Private, evidence-first package that enables a human to inspect every staged cue. */
+export const CaptionEvidenceBundleSchema = z.object({
+  contractVersion: ContractVersionSchema,
+  runId: IdentifierSchema,
+  projectId: IdentifierSchema,
+  mediaSha256: Sha256Schema,
+  preparedManifest: z.object({ key: z.string().min(1).max(1_000), sha256: Sha256Schema }).strict(),
+  normalizedAudio: z.object({
+    key: z.string().min(1).max(1_000),
+    sha256: Sha256Schema,
+    byteLength: z.number().int().positive(),
+    durationMs: SafeTimestampSchema,
+    contentType: z.string().trim().min(1).max(200),
+  }).strict(),
+  words: z.array(CaptionEvidenceWordSchema).max(100_000),
+  uncertaintySpans: z.array(UncertaintySpanSchema).max(10_000),
+  provenance: z.array(GenerationProviderProvenanceSchema).min(2).max(8),
+}).strict();
+
+export const StagedCaptionCueSchema = EvidenceIntervalSchema.extend({
+  cueId: IdentifierSchema,
+  text: z.string().trim().min(1).max(1_000),
+  speaker: z.string().trim().min(1).max(200).nullable(),
+  evidenceIds: z.array(IdentifierSchema).min(1).max(128),
+}).strict();
+
+/**
+ * A complete result is written only after every stage succeeds. It remains
+ * private and recoverable until the browser performs its expected-revision
+ * adoption transaction.
+ */
+export const StagedGenerationResultSchema = z.object({
+  contractVersion: ContractVersionSchema,
+  runId: IdentifierSchema,
+  projectId: IdentifierSchema,
+  targetTrack: z.literal("Captions"),
+  expectedProjectRevision: ProjectRevisionSchema,
+  expectedQualityProfileRevision: ProjectRevisionSchema,
+  evidence: CaptionEvidenceBundleSchema,
+  captions: z.array(StagedCaptionCueSchema).max(20_000),
+  createdAtMs: SafeTimestampSchema,
+  expiresAtMs: SafeTimestampSchema,
+}).strict().superRefine((value, context) => {
+  if (value.expiresAtMs <= value.createdAtMs || value.expiresAtMs - value.createdAtMs > 24 * 60 * 60 * 1_000) {
+    context.addIssue({ code: "custom", message: "Staged generation results must retain private artifacts for no more than 24 hours.", path: ["expiresAtMs"] });
+  }
+  if (value.evidence.runId !== value.runId || value.evidence.projectId !== value.projectId) {
+    context.addIssue({ code: "custom", message: "Evidence must bind to the staged generation result." });
+  }
+});
+
 const NeutralGenerationRunBaseSchema = GenerationRunBaseSchema.extend({
   targetTrack: GenerationTargetTrackSchema,
 });
@@ -111,3 +223,10 @@ export type GenerationTargetTrack = z.infer<
   typeof GenerationTargetTrackSchema
 >;
 export type GenerationRunStatus = z.infer<typeof GenerationRunStatusSchema>;
+export type GenerationRunReceipt = z.infer<typeof GenerationRunReceiptSchema>;
+export type CaptionEvidenceWord = z.infer<typeof CaptionEvidenceWordSchema>;
+export type UncertaintySpan = z.infer<typeof UncertaintySpanSchema>;
+export type GenerationProviderProvenance = z.infer<typeof GenerationProviderProvenanceSchema>;
+export type CaptionEvidenceBundle = z.infer<typeof CaptionEvidenceBundleSchema>;
+export type StagedCaptionCue = z.infer<typeof StagedCaptionCueSchema>;
+export type StagedGenerationResult = z.infer<typeof StagedGenerationResultSchema>;

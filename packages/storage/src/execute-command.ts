@@ -1,9 +1,12 @@
+import { StagedGenerationResultSchema } from "@cuebench/contracts";
 import { applyCommand, domainError, type CaptionProject, type CommandResult, type DomainCommand } from "@cuebench/domain";
 import {
   appendAcceptedProjectInTransaction,
   CueBenchDatabase,
   loadProjectInTransaction,
+  runReceiptKey,
   StorageStaleWriteError,
+  validateRunReceiptRow,
   type WriteProjectOptions,
 } from "./database";
 
@@ -56,6 +59,90 @@ export const executePersistentCommand = async (
         project: projectReadForCas,
         events: [],
         error: domainError("STALE_PROJECT", "The project changed in another browser context."),
+      };
+    }
+    throw error;
+  }
+};
+
+/**
+ * The final caption adoption is intentionally a separate, explicit helper:
+ * it includes the signed recovery receipt in the same IndexedDB transaction
+ * as the expected-revision domain transition. A stale compare-and-swap leaves
+ * the evidence package intact and therefore recoverable for the Human.
+ */
+export const adoptStagedCaptionGenerationResult = async (
+  db: CueBenchDatabase,
+  projectId: string,
+  command: Extract<DomainCommand, { readonly type: "AdoptCaptionGenerationResult" }>,
+  options: WriteProjectOptions = {},
+): Promise<CommandResult> => {
+  let projectReadForCas: CaptionProject | undefined;
+  try {
+    return await db.transaction(
+      "rw",
+      [
+        db.projectHeaders,
+        db.items,
+        db.revisions,
+        db.findings,
+        db.evidence,
+        db.courtRecord,
+        db.certifications,
+        db.runReceipts,
+      ],
+      async () => {
+        const project = await loadProjectInTransaction(db, projectId);
+        if (project === undefined) throw new PersistentProjectNotFoundError(projectId);
+        projectReadForCas = project;
+        const receipt = await db.runReceipts.get(runReceiptKey(projectId, command.runId));
+        if (receipt === undefined) {
+          return {
+            project,
+            events: [],
+            error: domainError("RECOVERY_ARTIFACT_EXPIRED", "CueBench cannot adopt a run whose signed recovery receipt was not durably saved."),
+          };
+        }
+        const payload = receipt.receipt.payload;
+        if (typeof payload !== "object" || payload === null || Array.isArray(payload)) {
+          return {
+            project,
+            events: [],
+            error: domainError("RECOVERY_ARTIFACT_EXPIRED", "CueBench cannot safely attach staged evidence to this recovery receipt."),
+          };
+        }
+        const parsedResult = StagedGenerationResultSchema.safeParse(command.result);
+        if (!parsedResult.success) {
+          return {
+            project,
+            events: [],
+            error: domainError("INVALID_ARGUMENT", "CueBench cannot adopt an invalid staged caption result."),
+          };
+        }
+        const result = applyCommand(project, { ...command, result: parsedResult.data });
+        if (result.error !== undefined) return result;
+        await appendAcceptedProjectInTransaction(db, project, result.project, options);
+        await db.runReceipts.put(validateRunReceiptRow({
+          ...receipt,
+          receipt: {
+            version: 1,
+            payload: {
+              ...payload,
+              stagedGenerationResult: parsedResult.data,
+              adoption: { status: "adopted", adoptedProjectRevision: result.project.projectRevision },
+            },
+          },
+          savedAtMs: Date.now(),
+        }));
+        return result;
+      },
+    );
+  } catch (error) {
+    if (error instanceof StorageStaleWriteError && projectReadForCas !== undefined) {
+      return {
+        project: projectReadForCas,
+        events: [],
+        error: domainError("STALE_PROJECT", "The project changed in another browser context. The staged result remains recoverable."),
       };
     }
     throw error;

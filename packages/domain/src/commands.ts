@@ -1,4 +1,4 @@
-import type { Actor, GenerationTargetTrack } from "@cuebench/contracts";
+import type { Actor, GenerationTargetTrack, StagedGenerationResult } from "@cuebench/contracts";
 import type { AudioDescriptionBeatRevision, CaptionCueRevision } from "./model";
 
 interface CommandBase {
@@ -149,5 +149,17 @@ export type DomainCommand =
       readonly type: "StartGenerationRun";
       readonly runId: string;
       readonly targetTrack: GenerationTargetTrack;
+    })
+  | (CommandBase & {
+      /**
+       * Commits one complete, already-evidenced caption run. The browser
+       * performs this inside its receipt/evidence transaction after a Human
+       * explicitly confirms any replacement of existing Proposed work.
+       */
+      readonly type: "AdoptCaptionGenerationResult";
+      readonly runId: string;
+      readonly expectedQualityProfileRevision: number;
+      readonly confirmedProposedReplacement: boolean;
+      readonly result: StagedGenerationResult;
     })
   | (CommandBase & { readonly type: "ReleaseGenerationRun"; readonly runId: string });

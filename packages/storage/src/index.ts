@@ -21,7 +21,11 @@ export type {
   VersionedRunReceipt,
 } from "./database";
 export type { ProjectStorageEstimate } from "./media-store";
-export { executePersistentCommand, PersistentProjectNotFoundError } from "./execute-command";
+export {
+  adoptStagedCaptionGenerationResult,
+  executePersistentCommand,
+  PersistentProjectNotFoundError,
+} from "./execute-command";
 export * from "./media-store";
 export {
   describeImportedProject,

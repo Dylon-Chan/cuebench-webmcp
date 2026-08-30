@@ -15,6 +15,13 @@
       "bucket_name": "cuebench-processing-local"
     }
   ],
+  "workflows": [
+    {
+      "name": "cuebench-caption-generation",
+      "binding": "PROCESSING_WORKFLOW",
+      "class_name": "CaptionGenerationWorkflow"
+    }
+  ],
   "durable_objects": {
     "bindings": [
       {
@@ -75,6 +82,9 @@
     "MAX_PENDING_IP_OPERATIONS": "8",
     "GLOBAL_SPEND_LIMIT_CENTS": "10000",
     "GLOBAL_SPEND_BREAKER_OPEN": "false",
+    "CUEBENCH_OPENAI_MODE": "fixture",
+    "CUEBENCH_RECONCILIATION_MODEL": "gpt-5.6-terra",
+    "GENERATION_RUN_TTL_SECONDS": "86400",
     "MAX_WORKFLOW_PROVIDER_COST_CENTS": "100",
     "MAX_MEDIA_PROBE_COST_CENTS": "1",
     "TURNSTILE_VERIFY_URL": "https://challenges.cloudflare.com/turnstile/v0/siteverify",

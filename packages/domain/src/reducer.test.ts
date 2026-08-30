@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import type { StagedGenerationResult } from "@cuebench/contracts";
 import { applyCommand, createProject, type CaptionProject, type DomainCommand } from "./index";
 import { fixtureProject } from "../test/fixtures";
 
@@ -142,6 +143,67 @@ describe("domain reducer", () => {
       expectedProjectRevision: 2,
     });
     expect(profile.error?.code).toBe("TARGET_TRACK_LEASE_CONFLICT");
+  });
+
+  it("requires confirmation to replace Proposed cues, preserves Sustained cues, and releases only the matching caption lease", () => {
+    const leased = applyCommand(fixtureProject({ cueState: "Sustained" }), {
+      type: "StartGenerationRun",
+      actor: { type: "CueBenchAI", id: "cuebench-ai" },
+      runId: "run-adopt-1",
+      targetTrack: "Captions",
+      expectedProjectRevision: 1,
+    }).project;
+    const staged: StagedGenerationResult = {
+      contractVersion: 1,
+      runId: "run-adopt-1",
+      projectId: leased.projectId,
+      targetTrack: "Captions",
+      expectedProjectRevision: leased.projectRevision,
+      expectedQualityProfileRevision: leased.qualityProfile.revision,
+      createdAtMs: 1_700_000_000_000,
+      expiresAtMs: 1_700_086_400_000,
+      evidence: {
+        contractVersion: 1,
+        runId: "run-adopt-1",
+        projectId: leased.projectId,
+        mediaSha256: leased.media.sha256,
+        preparedManifest: { key: "prepared/a/manifests/b.json", sha256: "b".repeat(64) },
+        normalizedAudio: { key: "prepared/a/audio/c.wav", sha256: "c".repeat(64), byteLength: 4, durationMs: 1_000, contentType: "audio/wav" },
+        words: [{ evidenceId: "word-1", sourceWordIndex: 0, startMs: 6_000, endMs: 7_000, text: "Generated", speaker: "Teacher", speakerSegmentIds: ["speaker-1"] }],
+        uncertaintySpans: [],
+        provenance: [
+          { role: "diarization", model: "gpt-4o-transcribe-diarize", requestHash: "d".repeat(64), responseHash: "e".repeat(64), store: false, requestMetadata: {}, warnings: [] },
+          { role: "word-timestamps", model: "whisper-1", requestHash: "f".repeat(64), responseHash: "1".repeat(64), store: false, requestMetadata: {}, warnings: [] },
+        ],
+      },
+      captions: [{ cueId: "generated-1", startMs: 6_000, endMs: 7_000, text: "Generated", speaker: "Teacher", evidenceIds: ["word-1"] }],
+    };
+    const rejected = applyCommand(leased, {
+      type: "AdoptCaptionGenerationResult",
+      actor: { type: "CueBenchAI", id: "cuebench-ai" },
+      runId: "run-adopt-1",
+      expectedProjectRevision: leased.projectRevision,
+      expectedQualityProfileRevision: leased.qualityProfile.revision,
+      confirmedProposedReplacement: false,
+      result: staged,
+    });
+    expect(rejected.error?.code).toBe("CONFIRMATION_DECLINED");
+
+    const adopted = applyCommand(leased, {
+      type: "AdoptCaptionGenerationResult",
+      actor: { type: "CueBenchAI", id: "cuebench-ai" },
+      runId: "run-adopt-1",
+      expectedProjectRevision: leased.projectRevision,
+      expectedQualityProfileRevision: leased.qualityProfile.revision,
+      confirmedProposedReplacement: true,
+      result: staged,
+    });
+    expect(adopted.error).toBeUndefined();
+    expect(adopted.project.activeGenerationRun).toBeNull();
+    expect(adopted.project.captions.items.c05?.current.state).toBe("Sustained");
+    expect(adopted.project.captions.items.c06?.mergedIntoItemId).toBe("generated-1");
+    expect(adopted.project.captions.order).toContain("c05");
+    expect(adopted.project.captions.order).toContain("generated-1");
   });
 
   it("stales validation and certification after semantic timing changes without losing historic certification", () => {

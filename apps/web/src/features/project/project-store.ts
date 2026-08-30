@@ -15,13 +15,16 @@ import {
 } from "@cuebench/domain";
 import {
   CueBenchDatabase,
+  adoptStagedCaptionGenerationResult as adoptPersistedCaptionGenerationResult,
   describeImportedProject,
   executePersistentCommand,
   initializeProject,
   loadProject,
   loadProjectInTransaction,
+  loadRunReceipt,
   loadSetting,
   loadSourceMedia,
+  saveRunReceipt,
   saveSetting,
   sourceBlobKey,
   type SourceBlobRow,
@@ -138,6 +141,10 @@ export interface ProjectStoreOptions {
   /** Test seam for proving that a stale restore cannot replace a newer operation. */
   readonly beforeRestoreLoad?: () => Promise<void>;
 }
+
+export type CaptionGenerationAdoptionCommand = Extract<DomainCommand, {
+  readonly type: "AdoptCaptionGenerationResult";
+}>;
 
 const metadataReserveBytes = 16 * 1024 * 1024;
 const defaultCreateId = (): string => globalThis.crypto.randomUUID();
@@ -395,6 +402,68 @@ export class ProjectStore {
     const queued = this.commandQueue.then(execute, execute);
     this.commandQueue = queued.then(() => undefined, () => undefined);
     return queued;
+  }
+
+  /**
+   * Caption evidence adoption additionally updates the locally persisted
+   * signed run receipt. Keeping that work here prevents a React component
+   * from accidentally splitting the expected-revision CAS across writes.
+   */
+  public adoptStagedCaptionGenerationResult(command: CaptionGenerationAdoptionCommand): Promise<CommandResult> {
+    const execute = async (): Promise<CommandResult> => {
+      const snapshot = this.snapshot;
+      if (snapshot.project === null || snapshot.mode === null) {
+        throw new Error("CueBench cannot adopt caption evidence before its project is available.");
+      }
+      if (snapshot.activity !== null) {
+        throw new Error("CueBench cannot adopt caption evidence while another local operation is in progress.");
+      }
+      if (snapshot.mode !== "durable") {
+        throw new Error("CueBench needs durable browser storage before it can retain a recoverable caption-generation receipt.");
+      }
+      const projectId = snapshot.project.projectId;
+      try {
+        const result = await adoptPersistedCaptionGenerationResult(this.database, projectId, command);
+        if (this.snapshot.project?.projectId === projectId) {
+          this.setSnapshot({
+            ...this.snapshot,
+            project: result.project,
+            error: result.error?.message ?? null,
+          });
+        }
+        return result;
+      } catch (error) {
+        if (this.snapshot.project?.projectId === projectId) {
+          this.setSnapshot({ ...this.snapshot, error: userFacingError(error, "CueBench could not adopt the staged caption evidence.") });
+        }
+        throw error;
+      }
+    };
+    const queued = this.commandQueue.then(execute, execute);
+    this.commandQueue = queued.then(() => undefined, () => undefined);
+    return queued;
+  }
+
+  /** Persist the opaque signed recovery receipt before a browser polls it. */
+  public persistCaptionGenerationReceipt(runId: string, receipt: unknown): Promise<void> {
+    const persist = async (): Promise<void> => {
+      const snapshot = this.snapshot;
+      if (snapshot.project === null || snapshot.mode !== "durable") {
+        throw new Error("CueBench needs durable browser storage before it can retain a recoverable caption-generation receipt.");
+      }
+      await saveRunReceipt(this.database, snapshot.project.projectId, runId, { version: 1, payload: receipt });
+    };
+    const queued = this.commandQueue.then(persist, persist);
+    this.commandQueue = queued.then(() => undefined, () => undefined);
+    return queued;
+  }
+
+  /** Reads only the recovery receipt belonging to the currently visible project. */
+  public async loadCaptionGenerationReceipt(runId: string): Promise<unknown | null> {
+    const snapshot = this.snapshot;
+    if (snapshot.project === null || snapshot.mode !== "durable") return null;
+    const row = await loadRunReceipt(this.database, snapshot.project.projectId, runId);
+    return row?.receipt.version === 1 ? row.receipt.payload : null;
   }
 
   /** Produces a portable manifest only; source video remains in browser storage and is never serialized. */

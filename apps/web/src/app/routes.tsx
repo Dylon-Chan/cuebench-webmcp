@@ -14,6 +14,7 @@ import { HostedProcessingPanel } from "../features/project/HostedProcessingPanel
 import { ProjectStart } from "../features/project/ProjectStart";
 import { StorageDisclosure } from "../features/project/StorageDisclosure";
 import type { ProjectMode, ProjectStore } from "../features/project/project-store";
+import { GenerationStatus } from "../features/generation/GenerationStatus";
 import type { SourceProvenance } from "../features/project/source-provenance";
 import { CourtRecord } from "../features/review/CourtRecord";
 import { ReviewDocket, ReviewSelectionSummary } from "../features/review/ReviewDocket";
@@ -149,6 +150,7 @@ export function WorkbenchShell({ project, mode, sourceObjectUrl, sourceProvenanc
           durationMs={project.media.durationMs}
           sourceObjectUrl={sourceObjectUrl}
         />
+        <GenerationStatus project={project} store={store} />
       </div>
     </main>
   );

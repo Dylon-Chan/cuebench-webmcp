@@ -280,6 +280,99 @@ export const applyCommand = (project: CaptionProject, command: DomainCommand): C
     const activeGenerationRun: GenerationLease = { runId: command.runId, targetTrack: command.targetTrack, actor: clone(command.actor) };
     return commit(project, command, { activeGenerationRun });
   }
+  if (command.type === "AdoptCaptionGenerationResult") {
+    if (command.actor.type !== "CueBenchAI") return fail(project, "INVALID_ARGUMENT", "Only CueBench AI may adopt its complete caption generation result.");
+    if (project.activeGenerationRun?.runId !== command.runId || project.activeGenerationRun.targetTrack !== "Captions") {
+      return fail(project, "STALE_RUN", "The matching caption generation run is no longer active.");
+    }
+    if (command.expectedQualityProfileRevision !== project.qualityProfile.revision
+      || command.result.expectedQualityProfileRevision !== project.qualityProfile.revision) {
+      return fail(project, "STALE_PROJECT", "The Quality Profile changed after caption generation started.");
+    }
+    if (
+      command.result.runId !== command.runId
+      || command.result.projectId !== project.projectId
+      || command.result.targetTrack !== "Captions"
+      || command.result.expectedProjectRevision !== command.expectedProjectRevision
+      || command.result.evidence.projectId !== project.projectId
+      || command.result.evidence.runId !== command.runId
+      || command.result.evidence.mediaSha256.toLowerCase() !== project.media.sha256.toLowerCase()
+    ) return fail(project, "MEDIA_HASH_MISMATCH", "The staged evidence does not bind to this exact project media and revision.");
+
+    const existingProposed = Object.values(project.captions.items)
+      .filter((item) => item.mergedIntoItemId === null && item.current.state === "Proposed");
+    if (existingProposed.length > 0 && !command.confirmedProposedReplacement) {
+      return fail(project, "CONFIRMATION_DECLINED", "Replacing existing Proposed captions requires visible human confirmation.");
+    }
+    const globallyKnownIds = new Set([
+      ...Object.keys(project.captions.items),
+      ...Object.keys(project.audioDescriptions.items),
+      ...Object.keys(project.audioDescriptionGaps),
+    ]);
+    const generatedIds = new Set<string>();
+    for (const cue of command.result.captions) {
+      if (
+        !cue.cueId.trim()
+        || cue.cueId.length > 200
+        || globallyKnownIds.has(cue.cueId)
+        || generatedIds.has(cue.cueId)
+        || !hasValidTime(project, cue.startMs, cue.endMs)
+        || !cue.text.trim()
+        || cue.evidenceIds.length === 0
+      ) return fail(project, "INVALID_ARGUMENT", "The staged caption result contains an invalid or conflicting proposal.");
+      generatedIds.add(cue.cueId);
+    }
+    const firstGeneratedId = command.result.captions[0]?.cueId;
+    if (existingProposed.length > 0 && firstGeneratedId === undefined) {
+      return fail(project, "INVALID_ARGUMENT", "An empty staged result cannot replace existing Proposed captions.");
+    }
+    const generatedItems: Readonly<Record<string, CaptionCue>> = Object.fromEntries(command.result.captions.map((cue) => {
+      const current: CaptionCueRevision = {
+        itemId: cue.cueId,
+        kind: "CaptionCue",
+        itemRevision: 1,
+        state: "Proposed",
+        startMs: cue.startMs,
+        endMs: cue.endMs,
+        text: cue.text,
+        speaker: cue.speaker,
+        actor: clone(command.actor),
+        cause: "AdoptCaptionGenerationResult",
+        parentItemRevision: null,
+      };
+      const item: CaptionCue = { itemId: cue.cueId, kind: "CaptionCue", revisions: [current], current, mergedIntoItemId: null };
+      return [cue.cueId, item];
+    }));
+    const replacedItems = firstGeneratedId === undefined ? project.captions.items : Object.fromEntries(Object.entries(project.captions.items).map(([itemId, item]) => [
+      itemId,
+      existingProposed.some((candidate) => candidate.itemId === itemId)
+        ? { ...item, mergedIntoItemId: firstGeneratedId }
+        : item,
+    ]));
+    const generatedEvidence = command.result.captions.map((cue, index) => ({
+      evidenceId: `generation-${command.runId}-${index + 1}`,
+      projectId: project.projectId,
+      mediaSha256: project.media.sha256.toLowerCase(),
+      itemId: cue.cueId,
+      itemRevision: 1,
+    }));
+    if (
+      generatedEvidence.some((entry) => entry.evidenceId.length > 200)
+      || generatedEvidence.some((entry) => project.evidence.some((existing) => existing.evidenceId === entry.evidenceId))
+    ) return fail(project, "INVALID_ARGUMENT", "The staged caption evidence conflicts with project evidence.");
+    const firstGenerated = firstGeneratedId === undefined ? undefined : generatedItems[firstGeneratedId];
+    return commit(project, command, {
+      captions: {
+        ...project.captions,
+        order: [...project.captions.order.filter((itemId) => !existingProposed.some((item) => item.itemId === itemId)), ...command.result.captions.map((cue) => cue.cueId)],
+        items: { ...replacedItems, ...generatedItems },
+      },
+      evidence: [...project.evidence, ...generatedEvidence],
+      activeGenerationRun: null,
+      ...(firstGenerated === undefined ? {} : { selectedItem: selectFor(firstGenerated) }),
+      ...withStaleArtifacts(project),
+    }, firstGeneratedId);
+  }
   if (command.type === "ReleaseGenerationRun") {
     if (project.activeGenerationRun?.runId !== command.runId) return fail(project, "STALE_RUN", "The generation run is no longer active.");
     if (command.actor.type !== "System" && command.actor.type !== "CueBenchAI") return fail(project, "INVALID_ARGUMENT", "Only CueBench AI or System may release a generation run.");

@@ -15,6 +15,8 @@ export interface ProcessingWorkflowBinding {
   /** `Workflow.get(id)` returns an instance whose status must then be queried. */
   get?: (id: string) => Promise<{
     readonly status: () => Promise<{ readonly status: ProcessingWorkflowInstanceStatus }>;
+    /** Events are Worker-internal control messages, never browser callable. */
+    readonly sendEvent?: (input: { readonly type: string; readonly payload: unknown }) => Promise<void>;
   }>;
 }
 
@@ -45,6 +47,13 @@ export interface WorkerEnv {
   readonly MAX_PENDING_IP_OPERATIONS?: string;
   readonly GLOBAL_SPEND_LIMIT_CENTS?: string;
   readonly GLOBAL_SPEND_BREAKER_OPEN?: string;
+  /** Fixture is the safe default; live requires this explicit server-only opt-in. */
+  readonly CUEBENCH_OPENAI_MODE?: "fixture" | "live" | string;
+  readonly OPENAI_API_KEY?: string;
+  readonly OPENAI_BASE_URL?: string;
+  /** Defaults in the provider adapter, but can be pinned explicitly per deployment. */
+  readonly CUEBENCH_RECONCILIATION_MODEL?: string;
+  readonly GENERATION_RUN_TTL_SECONDS?: string;
   /** Conservative per-operation reservations before external providers run. */
   readonly MAX_WORKFLOW_PROVIDER_COST_CENTS?: string;
   readonly MAX_MEDIA_PROBE_COST_CENTS?: string;

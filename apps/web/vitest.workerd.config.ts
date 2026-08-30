@@ -7,6 +7,7 @@ const workerOptions = {
     QuotaLedger: "DurableObject",
     UploadCoordinator: "DurableObject",
     MediaPreparationContainer: "DurableObject",
+    CaptionGenerationWorkflow: "WorkflowEntrypoint",
   },
   // Fixture-only local bindings. Production values remain Wrangler secrets and are ignored by git.
   miniflare: {

@@ -10,6 +10,7 @@ import {
   ContractVersionSchema,
   ExpectedProjectRevisionSchema,
   ExpectedRevisionSchema,
+  GenerationRunReceiptSchema,
   GenerationRunStatusSchema,
   GenerationTargetTrackSchema,
   IdentifierSchema,
@@ -638,6 +639,31 @@ describe("generation status contracts", () => {
         ),
       }).success,
     ).toBe(false);
+  });
+});
+
+describe("signed generation receipt contract", () => {
+  it("requires the Worker-signed receipt claims that bind profile, media, and recovery expiry", () => {
+    const receipt = {
+      contractVersion: 1,
+      version: 1,
+      type: "generation-run-receipt",
+      keyId: "v1",
+      runId: "run-1",
+      projectId: "project-1",
+      targetTrack: "Captions",
+      expectedProjectRevision: 3,
+      expectedQualityProfileRevision: 2,
+      mediaSha256: SHA_256,
+      operationId: "operation-1",
+      operationKey: "b".repeat(64),
+      objectKey: "processing/private-operation",
+      issuedAtMs: 1_700_000_000_000,
+      expiresAtMs: 1_700_086_400_000,
+    };
+    expect(GenerationRunReceiptSchema.safeParse(receipt).success).toBe(true);
+    expect(GenerationRunReceiptSchema.safeParse({ ...receipt, type: "cuebench-generation-run" }).success).toBe(false);
+    expect(GenerationRunReceiptSchema.safeParse({ ...receipt, mediaSha256: "not-a-digest" }).success).toBe(false);
   });
 });
 

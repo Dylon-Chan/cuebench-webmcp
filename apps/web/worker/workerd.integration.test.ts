@@ -2,6 +2,13 @@
 
 import { SELF, env, runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
+import {
+  issueGenerationRunReceipt,
+  R2GenerationRunRecordStore,
+  verifyGenerationRunReceipt,
+  type GenerationRunRecord,
+} from "./generation-routes";
+import { resolveWorkerSettings } from "./env";
 import { issueAnonymousSession } from "./session";
 import { verifyUploadReceipt } from "./uploads";
 
@@ -26,6 +33,104 @@ const post = (path: string, body: unknown, anonymousSession: string): Request =>
 });
 
 describe("workerd hosted upload boundary", () => {
+  it("binds the caption-generation Workflow in actual workerd and leaves it dormant until an internal start event", async () => {
+    const workflow = env.PROCESSING_WORKFLOW as unknown as {
+      readonly create: (input: { readonly id: string; readonly params: { readonly receipt: string; readonly objectKey: string } }) => Promise<{
+      readonly id: string;
+      readonly status: () => Promise<{ readonly status: string }>;
+      }>;
+    };
+    const id = `caption-generation-workerd-${Date.now()}`;
+    const instance = await workflow.create({
+      id,
+      params: { receipt: "deliberately-unverified-upload-receipt", objectKey: "processing/workerd-contract" },
+    });
+    expect(instance.id).toBe(id);
+    // The first Workflow action is waitForEvent. This proves no preparation
+    // or provider work starts merely because an instance was created. Let the
+    // isolated Miniflare test runtime dispose this intentionally waiting
+    // instance; aborting a wait emits an engine-level diagnostic in workerd.
+    expect(["queued", "running", "waiting"]).toContain((await instance.status()).status);
+  });
+
+  it("uses real R2 conditional writes so a stale workflow snapshot cannot resurrect a cancelled caption run", async () => {
+    const settings = resolveWorkerSettings(env);
+    const currentNow = Date.now();
+    const operationKey = "a".repeat(64);
+    const runId = `generation-cas-${currentNow}`;
+    const receipt = await issueGenerationRunReceipt({
+      runId,
+      projectId: "workerd-generation-project",
+      targetTrack: "Captions",
+      expectedProjectRevision: 2,
+      expectedQualityProfileRevision: 1,
+      mediaSha256: "b".repeat(64),
+      operationId: "workerd-generation-operation",
+      operationKey,
+      objectKey: `processing/${operationKey}`,
+      issuedAtMs: currentNow,
+      expiresAtMs: currentNow + 60_000,
+    }, settings);
+    const claims = await verifyGenerationRunReceipt(receipt, settings, currentNow);
+    const queued = {
+      contractVersion: 1 as const,
+      runId,
+      projectId: claims.projectId,
+      targetTrack: "Captions" as const,
+      expectedProjectRevision: claims.expectedProjectRevision,
+      stage: "Queued" as const,
+    };
+    const store = new R2GenerationRunRecordStore(env.PROCESSING_BUCKET);
+    const initial: GenerationRunRecord = {
+      version: 1,
+      receipt,
+      claims,
+      status: queued,
+      cancelled: false,
+      dispatched: true,
+      updatedAtMs: currentNow,
+    };
+    await store.save(initial);
+    const staleWorkerSnapshot = await store.load(claims);
+    if (staleWorkerSnapshot === null) throw new Error("expected a private generation record in R2");
+    const transcribing = { ...queued, stage: "Transcribing" as const, progress: 0 };
+    // The Workflow may checkpoint before the POST handler's dispatch-flag
+    // write resumes. That stale route snapshot must rebase, not erase this.
+    await store.save({
+      ...staleWorkerSnapshot,
+      status: transcribing,
+      workflowState: {
+        request: { runId, projectId: claims.projectId },
+        stageHistory: [queued, transcribing],
+        cancelled: false,
+        diarization: { persisted: true },
+      },
+      updatedAtMs: currentNow + 1,
+    });
+    await store.save({ ...staleWorkerSnapshot, dispatched: true, updatedAtMs: currentNow + 2 });
+    await expect(store.load(claims)).resolves.toMatchObject({
+      dispatched: true,
+      status: { stage: "Transcribing" },
+      workflowState: { diarization: { persisted: true } },
+    });
+    await store.save({
+      ...staleWorkerSnapshot,
+      cancelled: true,
+      status: { ...queued, stage: "Cancelled" },
+      updatedAtMs: currentNow + 3,
+    });
+    await store.save({
+      ...staleWorkerSnapshot,
+      status: { ...queued, stage: "AwaitingAdoption" },
+      updatedAtMs: currentNow + 4,
+    });
+    await expect(store.load(claims)).resolves.toMatchObject({
+      cancelled: true,
+      status: { stage: "Cancelled" },
+    });
+    await env.PROCESSING_BUCKET.delete(`prepared/${operationKey}/generation-runs/${runId}.json`);
+  });
+
   it("serializes duplicate operation creation in a real Durable Object, uses actual R2 multipart replay, and sets security headers", async () => {
     const anonymousSession = await session();
     const request = () => post("/api/uploads", {
