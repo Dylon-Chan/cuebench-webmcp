@@ -10,6 +10,7 @@ import { ProfileProposalDialog, builtInProfileProposal } from "../features/expor
 import { ValidationPanel } from "../features/export/ValidationPanel";
 import { BackupDialog } from "../features/project/BackupDialog";
 import { DeleteProjectDialog } from "../features/project/DeleteProjectDialog";
+import { HostedProcessingPanel } from "../features/project/HostedProcessingPanel";
 import { ProjectStart } from "../features/project/ProjectStart";
 import { StorageDisclosure } from "../features/project/StorageDisclosure";
 import type { ProjectMode, ProjectStore } from "../features/project/project-store";
@@ -143,6 +144,11 @@ export function WorkbenchShell({ project, mode, sourceObjectUrl, sourceProvenanc
           {...(readNativePlayheadMs === null ? {} : { onReadNativePlayheadMs: readNativePlayheadMs })}
         />
         <CourtRecord project={project} onSelectItem={(itemId) => requestReviewItemNavigation(itemId, `Court Record item ${itemId.toUpperCase()}`)} onFocusItemRevision={requestReviewItemRevisionFocus} />
+        <HostedProcessingPanel
+          projectId={project.projectId}
+          durationMs={project.media.durationMs}
+          sourceObjectUrl={sourceObjectUrl}
+        />
       </div>
     </main>
   );

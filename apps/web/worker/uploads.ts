@@ -3,36 +3,52 @@ import type { WorkerSettings } from "./env";
 import { signOpaqueToken, verifyOpaqueToken, type SignedTokenFields } from "./session";
 
 export interface UploadMediaMetadata {
+  /** Browser-provided planning metadata. It is never used to authorize processing. */
   readonly byteLength: number;
   readonly durationMs: number;
   readonly contentType: string;
 }
 
-export interface UploadCapabilityClaims extends SignedTokenFields {
-  readonly type: "upload-capability";
+interface UploadOperationTokenFields {
   readonly sessionId: string;
   readonly sessionKey: string;
+  readonly ipKey: string;
   readonly operationId: string;
   readonly operationKey: string;
   readonly projectKey: string;
+  readonly reservationKey: string;
   readonly objectKey: string;
+  readonly metadataHash: string;
   readonly media: UploadMediaMetadata;
+  readonly partSize: number;
+  readonly partCount: number;
   readonly receiptExpiresAtMs: number;
 }
 
-export interface UploadReceiptClaims extends Omit<UploadCapabilityClaims, "type"> {
+export interface UploadCapabilityClaims extends SignedTokenFields, UploadOperationTokenFields {
+  readonly type: "upload-capability";
+}
+
+/** Stable, opaque operation recovery token. It is intentionally not an R2 URL. */
+export interface UploadReceiptClaims extends SignedTokenFields, UploadOperationTokenFields {
   readonly type: "upload-receipt";
 }
 
-export interface StoredPrivateObject {
-  readonly byteLength: number;
-  readonly contentType: string;
-  readonly customMetadata: Readonly<Record<string, string>>;
+export interface UploadPartReceiptClaims extends SignedTokenFields {
+  readonly type: "upload-part-receipt";
+  readonly sessionId: string;
+  readonly operationId: string;
+  readonly operationKey: string;
+  readonly partNumber: number;
+  readonly etag: string;
 }
 
-export interface PrivateObjectStore {
-  put: (key: string, body: ArrayBuffer, options: { readonly contentType: string; readonly customMetadata: Readonly<Record<string, string>> }) => Promise<void>;
-  head: (key: string) => Promise<StoredPrivateObject | null>;
+/** The only object-store surface exposed to the upload routes. */
+export interface MultipartPrivateObjectStore {
+  createMultipart: (key: string, options: { readonly contentType: string; readonly customMetadata: Readonly<Record<string, string>> }) => Promise<{ readonly uploadId: string }>;
+  uploadPart: (input: { readonly key: string; readonly uploadId: string; readonly partNumber: number; readonly body: ArrayBuffer }) => Promise<{ readonly etag: string }>;
+  completeMultipart: (input: { readonly key: string; readonly uploadId: string; readonly parts: ReadonlyArray<{ readonly partNumber: number; readonly etag: string }> }) => Promise<void>;
+  abortMultipart: (input: { readonly key: string; readonly uploadId: string }) => Promise<void>;
   delete: (key: string) => Promise<void>;
 }
 
@@ -48,7 +64,7 @@ export class UploadValidationError extends Error {
 
 const supportedVideoType = (contentType: string): boolean => contentType.startsWith("video/");
 
-const normaliseContentType = (value: string): string => value.split(";", 1)[0]?.trim().toLowerCase() ?? "";
+export const normaliseContentType = (value: string): string => value.split(";", 1)[0]?.trim().toLowerCase() ?? "";
 
 export const validateUploadMetadata = (input: UploadMediaMetadata, settings: Pick<WorkerSettings, "maxUploadBytes" | "maxUploadDurationMs">): UploadMediaMetadata => {
   const contentType = normaliseContentType(input.contentType);
@@ -70,29 +86,30 @@ export const validateUploadMetadata = (input: UploadMediaMetadata, settings: Pic
   return { ...input, contentType };
 };
 
-export const issueUploadCapability = async (input: {
-  readonly sessionId: string;
-  readonly sessionKey: string;
-  readonly operationId: string;
-  readonly operationKey: string;
-  readonly projectKey: string;
-  readonly media: UploadMediaMetadata;
-  readonly nowMs: number;
+export interface UploadOperationAuthorization extends UploadOperationTokenFields {
+  readonly issuedAtMs: number;
+}
+
+export const issueUploadCapability = async (input: UploadOperationAuthorization & {
   readonly expiresAtMs: number;
-  readonly receiptExpiresAtMs: number;
   readonly settings: Pick<WorkerSettings, "keyRing">;
 }): Promise<string> => signOpaqueToken<UploadCapabilityClaims>({
   type: "upload-capability",
   sessionId: input.sessionId,
   sessionKey: input.sessionKey,
+  ipKey: input.ipKey,
   operationId: input.operationId,
   operationKey: input.operationKey,
   projectKey: input.projectKey,
-  objectKey: `processing/${input.sessionKey}/${input.operationKey}`,
+  reservationKey: input.reservationKey,
+  objectKey: input.objectKey,
+  metadataHash: input.metadataHash,
   media: input.media,
-  issuedAtMs: input.nowMs,
-  expiresAtMs: input.expiresAtMs,
+  partSize: input.partSize,
+  partCount: input.partCount,
   receiptExpiresAtMs: input.receiptExpiresAtMs,
+  issuedAtMs: input.issuedAtMs,
+  expiresAtMs: input.expiresAtMs,
 }, input.settings.keyRing);
 
 export const verifyUploadCapability = (token: string, settings: Pick<WorkerSettings, "keyRing">, nowMs: number): Promise<UploadCapabilityClaims> => verifyOpaqueToken<UploadCapabilityClaims>(
@@ -102,11 +119,27 @@ export const verifyUploadCapability = (token: string, settings: Pick<WorkerSetti
   "upload-capability",
 );
 
-export const issueUploadReceipt = (capability: UploadCapabilityClaims, settings: Pick<WorkerSettings, "keyRing">): Promise<string> => signOpaqueToken<UploadReceiptClaims>({
-  ...capability,
+/** Issuing from the persisted creation timestamp makes retries return byte-for-byte the same receipt. */
+export const issueUploadReceipt = (input: UploadOperationAuthorization & {
+  readonly settings: Pick<WorkerSettings, "keyRing">;
+}): Promise<string> => signOpaqueToken<UploadReceiptClaims>({
   type: "upload-receipt",
-  expiresAtMs: capability.receiptExpiresAtMs,
-}, settings.keyRing);
+  sessionId: input.sessionId,
+  sessionKey: input.sessionKey,
+  ipKey: input.ipKey,
+  operationId: input.operationId,
+  operationKey: input.operationKey,
+  projectKey: input.projectKey,
+  reservationKey: input.reservationKey,
+  objectKey: input.objectKey,
+  metadataHash: input.metadataHash,
+  media: input.media,
+  partSize: input.partSize,
+  partCount: input.partCount,
+  receiptExpiresAtMs: input.receiptExpiresAtMs,
+  issuedAtMs: input.issuedAtMs,
+  expiresAtMs: input.receiptExpiresAtMs,
+}, input.settings.keyRing);
 
 export const verifyUploadReceipt = (token: string, settings: Pick<WorkerSettings, "keyRing">, nowMs: number): Promise<UploadReceiptClaims> => verifyOpaqueToken<UploadReceiptClaims>(
   token,
@@ -115,45 +148,102 @@ export const verifyUploadReceipt = (token: string, settings: Pick<WorkerSettings
   "upload-receipt",
 );
 
-/** Reads media into a bounded request-local buffer so a failed byte check cannot create an R2 object. */
-export const readExactUploadBody = async (request: Request, expectedByteLength: number, maximumByteLength: number): Promise<ArrayBuffer> => {
-  if (request.body === null) throw new UploadValidationError("BODY_SIZE", "CueBench did not receive the selected media bytes.");
-  const body = await request.arrayBuffer();
-  if (body.byteLength > maximumByteLength || body.byteLength !== expectedByteLength) {
-    throw new UploadValidationError("BODY_SIZE", "CueBench could not verify the uploaded media size. No processing copy was stored.");
-  }
-  return body;
-};
+export const issueUploadPartReceipt = (input: {
+  readonly sessionId: string;
+  readonly operationId: string;
+  readonly operationKey: string;
+  readonly partNumber: number;
+  readonly etag: string;
+  readonly issuedAtMs: number;
+  readonly expiresAtMs: number;
+  readonly settings: Pick<WorkerSettings, "keyRing">;
+}): Promise<string> => signOpaqueToken<UploadPartReceiptClaims>({
+  type: "upload-part-receipt",
+  sessionId: input.sessionId,
+  operationId: input.operationId,
+  operationKey: input.operationKey,
+  partNumber: input.partNumber,
+  etag: input.etag,
+  issuedAtMs: input.issuedAtMs,
+  expiresAtMs: input.expiresAtMs,
+}, input.settings.keyRing);
+
+export const verifyUploadPartReceipt = (token: string, settings: Pick<WorkerSettings, "keyRing">, nowMs: number): Promise<UploadPartReceiptClaims> => verifyOpaqueToken<UploadPartReceiptClaims>(
+  token,
+  settings.keyRing,
+  nowMs,
+  "upload-part-receipt",
+);
 
 export const privateObjectMetadata = (claims: Pick<UploadCapabilityClaims, "operationKey" | "sessionKey">): Readonly<Record<string, string>> => ({
   operation: claims.operationKey,
   owner: claims.sessionKey,
 });
 
-export const isAuthoritativePrivateObject = (object: StoredPrivateObject | null, claims: Pick<UploadCapabilityClaims, "media" | "operationKey" | "sessionKey">): boolean => object !== null
-  && object.byteLength === claims.media.byteLength
-  && normaliseContentType(object.contentType) === claims.media.contentType
-  && object.customMetadata.operation === claims.operationKey
-  && object.customMetadata.owner === claims.sessionKey;
+/**
+ * Reads exactly one bounded multipart chunk. The route claims the part before
+ * calling this function; this is the only materialization point for upload bytes.
+ */
+export const readExactUploadPart = async (request: Request, expectedByteLength: number, maximumPartByteLength: number): Promise<ArrayBuffer> => {
+  if (request.body === null) throw new UploadValidationError("BODY_SIZE", "CueBench did not receive this private upload part.");
+  const declaredLength = request.headers.get("content-length");
+  if (declaredLength !== null && Number(declaredLength) !== expectedByteLength) {
+    throw new UploadValidationError("BODY_SIZE", "CueBench could not verify this private upload part size.");
+  }
+  if (!Number.isSafeInteger(expectedByteLength) || expectedByteLength <= 0 || expectedByteLength > maximumPartByteLength) {
+    throw new UploadValidationError("BODY_SIZE", "CueBench rejected an invalid private upload part boundary.");
+  }
+  const reader = request.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let byteLength = 0;
+  try {
+    while (true) {
+      const next = await reader.read();
+      if (next.done) break;
+      byteLength += next.value.byteLength;
+      if (byteLength > maximumPartByteLength || byteLength > expectedByteLength) {
+        await reader.cancel();
+        throw new UploadValidationError("BODY_SIZE", "CueBench could not verify this private upload part size.");
+      }
+      chunks.push(next.value);
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  if (byteLength !== expectedByteLength) {
+    throw new UploadValidationError("BODY_SIZE", "CueBench could not verify this private upload part size.");
+  }
+  const bytes = new Uint8Array(byteLength);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
+};
 
-export class R2PrivateObjectStore implements PrivateObjectStore {
+export class R2PrivateObjectStore implements MultipartPrivateObjectStore {
   public constructor(private readonly bucket: R2Bucket) {}
 
-  public async put(key: string, body: ArrayBuffer, options: { readonly contentType: string; readonly customMetadata: Readonly<Record<string, string>> }): Promise<void> {
-    await this.bucket.put(key, body, {
+  public async createMultipart(key: string, options: { readonly contentType: string; readonly customMetadata: Readonly<Record<string, string>> }): Promise<{ readonly uploadId: string }> {
+    const upload = await this.bucket.createMultipartUpload(key, {
       httpMetadata: { contentType: options.contentType },
       customMetadata: { ...options.customMetadata },
     });
+    return { uploadId: upload.uploadId };
   }
 
-  public async head(key: string): Promise<StoredPrivateObject | null> {
-    const object = await this.bucket.head(key);
-    if (object === null) return null;
-    return {
-      byteLength: object.size,
-      contentType: object.httpMetadata?.contentType ?? "",
-      customMetadata: object.customMetadata ?? {},
-    };
+  public async uploadPart(input: { readonly key: string; readonly uploadId: string; readonly partNumber: number; readonly body: ArrayBuffer }): Promise<{ readonly etag: string }> {
+    const part = await this.bucket.resumeMultipartUpload(input.key, input.uploadId).uploadPart(input.partNumber, input.body);
+    return { etag: part.etag };
+  }
+
+  public async completeMultipart(input: { readonly key: string; readonly uploadId: string; readonly parts: ReadonlyArray<{ readonly partNumber: number; readonly etag: string }> }): Promise<void> {
+    await this.bucket.resumeMultipartUpload(input.key, input.uploadId).complete(input.parts.map((part) => ({ partNumber: part.partNumber, etag: part.etag })));
+  }
+
+  public async abortMultipart(input: { readonly key: string; readonly uploadId: string }): Promise<void> {
+    await this.bucket.resumeMultipartUpload(input.key, input.uploadId).abort();
   }
 
   public delete(key: string): Promise<void> {

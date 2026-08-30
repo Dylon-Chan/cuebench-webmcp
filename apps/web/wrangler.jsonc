@@ -2,7 +2,7 @@
   "$schema": "./node_modules/wrangler/config-schema.json",
   "name": "cuebench-web",
   "main": "worker/index.ts",
-  "compatibility_date": "2026-08-30",
+  "compatibility_date": "2026-08-22",
   "compatibility_flags": ["nodejs_compat"],
   "assets": {
     "directory": "./dist",
@@ -20,6 +20,10 @@
       {
         "name": "QUOTA_LEDGER",
         "class_name": "QuotaLedger"
+      },
+      {
+        "name": "UPLOAD_COORDINATOR",
+        "class_name": "UploadCoordinator"
       }
     ]
   },
@@ -27,6 +31,10 @@
     {
       "tag": "v1",
       "new_sqlite_classes": ["QuotaLedger"]
+    },
+    {
+      "tag": "v2",
+      "new_sqlite_classes": ["UploadCoordinator"]
     }
   ],
   "vars": {
@@ -38,8 +46,15 @@
     "MAX_IP_MEDIA_MINUTES": "90",
     "MAX_SESSION_GENERATIONS": "6",
     "MAX_SESSION_TTS": "50",
+    "MAX_IP_GENERATIONS": "18",
+    "MAX_IP_TTS": "150",
+    "MAX_PENDING_SESSION_BYTES": "524288000",
+    "MAX_PENDING_IP_BYTES": "1048576000",
+    "MAX_PENDING_SESSION_OPERATIONS": "2",
+    "MAX_PENDING_IP_OPERATIONS": "8",
     "GLOBAL_SPEND_LIMIT_CENTS": "10000",
     "GLOBAL_SPEND_BREAKER_OPEN": "false",
-    "TURNSTILE_VERIFY_URL": "https://challenges.cloudflare.com/turnstile/v0/siteverify"
+    "TURNSTILE_VERIFY_URL": "https://challenges.cloudflare.com/turnstile/v0/siteverify",
+    "TURNSTILE_EXPECTED_ACTION": "cuebench-upload"
   }
 }

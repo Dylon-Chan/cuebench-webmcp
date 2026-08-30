@@ -9,32 +9,61 @@ import {
   DurableObjectQuotaLedger,
   saltedLedgerKey,
   type QuotaLedgerPort,
+  type QuotaRejectionCode,
 } from "./quota-ledger";
 import {
   SignedTokenError,
   issueAnonymousSession,
   verifyAnonymousSession,
+  type AnonymousSessionClaims,
 } from "./session";
 import {
   R2PrivateObjectStore,
   UploadValidationError,
-  isAuthoritativePrivateObject,
   issueUploadCapability,
+  issueUploadPartReceipt,
   issueUploadReceipt,
-  privateObjectMetadata,
-  readExactUploadBody,
+  normaliseContentType,
+  readExactUploadPart,
   validateUploadMetadata,
   verifyUploadCapability,
   verifyUploadReceipt,
-  type PrivateObjectStore,
+  type MultipartPrivateObjectStore,
+  type UploadOperationAuthorization,
+  type UploadCapabilityClaims,
   type UploadMediaMetadata,
+  type UploadReceiptClaims,
 } from "./uploads";
+import {
+  DurableObjectUploadCoordinator,
+  type UploadCoordinatorPort,
+  type UploadOperationRecord,
+  type UploadOperationState,
+} from "./upload-operations";
+import {
+  MediaProbeServiceBinding,
+  isSupportedAuthoritativeMedia,
+  type MediaProbe,
+} from "./probe";
 import { recordTelemetry, type TelemetrySink } from "./telemetry";
 
 export { QuotaLedger } from "./quota-ledger";
+export { UploadCoordinator } from "./upload-operations";
+
+export interface TurnstileVerification {
+  readonly success: boolean;
+  readonly hostname?: string;
+  readonly action?: string;
+}
 
 export interface TurnstileVerifier {
-  verify: (input: { readonly token: string; readonly ip: string }) => Promise<boolean>;
+  verify: (input: {
+    readonly token: string;
+    readonly ip: string;
+    readonly idempotencyKey: string;
+    readonly expectedHostname: string;
+    readonly expectedAction: string;
+  }) => Promise<TurnstileVerification>;
 }
 
 export interface ProcessingWorkflow {
@@ -46,27 +75,44 @@ export interface WorkerDependencies {
   readonly createId?: () => string;
   readonly verifyTurnstile?: TurnstileVerifier["verify"];
   readonly quotaLedger?: QuotaLedgerPort;
-  readonly objectStore?: PrivateObjectStore;
+  /** Fixture-only single-operation coordinator. Production selects one DO per salted operation key. */
+  readonly uploadCoordinator?: UploadCoordinatorPort;
+  readonly objectStore?: MultipartPrivateObjectStore;
+  readonly mediaProbe?: MediaProbe;
   readonly workflow?: ProcessingWorkflow;
   readonly telemetry?: TelemetrySink;
 }
 
 type WorkerBindings = { readonly Bindings: WorkerEnv };
+type NextAction = "retry" | "resume-upload" | "retry-probe" | "retry-completion" | "retry-cleanup" | "start-new-operation" | "wait-for-status" | "complete-turnstile";
 
-const apiError = (status: number, code: string, message: string): Response => Response.json({
-  error: { code, message },
+interface StructuredErrorOptions {
+  readonly retrySafe?: boolean;
+  readonly stateChanged?: boolean;
+  readonly nextAction?: NextAction;
+}
+
+const apiError = (status: number, code: string, message: string, options: StructuredErrorOptions = {}): Response => Response.json({
+  error: {
+    version: 1,
+    code,
+    message,
+    retrySafe: options.retrySafe ?? false,
+    stateChanged: options.stateChanged ?? false,
+    nextAction: options.nextAction ?? "start-new-operation",
+  },
 }, { status });
 
 const securityHeaders = (headers: Headers): void => {
-  headers.set("content-security-policy", "default-src 'self'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'; object-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; media-src 'self' blob:; connect-src 'self' https://challenges.cloudflare.com");
+  headers.set("content-security-policy", "default-src 'self'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'; object-src 'none'; script-src 'self' https://challenges.cloudflare.com; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; media-src 'self' blob:; connect-src 'self' https://challenges.cloudflare.com; frame-src 'self' https://challenges.cloudflare.com");
   headers.set("referrer-policy", "no-referrer");
   headers.set("x-content-type-options", "nosniff");
   headers.set("permissions-policy", "camera=(), microphone=(), geolocation=(), payment=(), usb=()");
 };
 
-const clientIp = (request: Request): string => request.headers.get("cf-connecting-ip")
-  ?? request.headers.get("x-forwarded-for")?.split(",", 1)[0]?.trim()
-  ?? "unknown";
+// Cloudflare injects CF-Connecting-IP at the edge. A caller-controlled forwarding
+// header must never choose the identity used for quota or upload ownership.
+const clientIp = (request: Request): string => request.headers.get("cf-connecting-ip") ?? "unknown";
 
 const bearerToken = (request: Request): string | null => {
   const value = request.headers.get("authorization");
@@ -107,19 +153,42 @@ const uploadRequest = (value: unknown): {
   };
 };
 
-const turnstileVerifier = (settings: Pick<WorkerSettings, "turnstileSecret" | "turnstileVerifyUrl">): TurnstileVerifier["verify"] => async ({ token, ip }) => {
-  const body = new URLSearchParams({ secret: settings.turnstileSecret, response: token, remoteip: ip });
+const sessionRequest = (value: unknown): { readonly token: string; readonly idempotencyKey: string } | null => {
+  const record = asRecord(value);
+  if (record === null || typeof record.turnstileToken !== "string" || !opaqueId(record.idempotencyKey)) return null;
+  const token = record.turnstileToken.trim();
+  return token.length === 0 ? null : { token, idempotencyKey: record.idempotencyKey };
+};
+
+const partNumber = (value: string): number | null => /^[1-9][0-9]{0,5}$/.test(value) && Number.isSafeInteger(Number(value))
+  ? Number(value)
+  : null;
+
+const now = (dependency: WorkerDependencies): number => dependency.clock?.() ?? Date.now();
+const createId = (dependency: WorkerDependencies): string => dependency.createId?.() ?? globalThis.crypto.randomUUID();
+
+const turnstileVerifier = (settings: Pick<WorkerSettings, "turnstileSecret" | "turnstileVerifyUrl">): TurnstileVerifier["verify"] => async (input) => {
+  const body = new URLSearchParams({
+    secret: settings.turnstileSecret,
+    response: input.token,
+    remoteip: input.ip,
+    idempotency_key: input.idempotencyKey,
+  });
   try {
     const response = await fetch(settings.turnstileVerifyUrl, {
       method: "POST",
       headers: { "content-type": "application/x-www-form-urlencoded" },
       body,
     });
-    if (!response.ok) return false;
-    const result = await response.json() as { readonly success?: unknown };
-    return result.success === true;
+    if (!response.ok) return { success: false };
+    const result = await response.json() as { readonly success?: unknown; readonly hostname?: unknown; readonly action?: unknown };
+    return {
+      success: result.success === true,
+      ...(typeof result.hostname === "string" ? { hostname: result.hostname } : {}),
+      ...(typeof result.action === "string" ? { action: result.action } : {}),
+    };
   } catch {
-    return false;
+    return { success: false };
   }
 };
 
@@ -128,30 +197,204 @@ const workerWorkflow = (binding: WorkerEnv["PROCESSING_WORKFLOW"] | undefined): 
   return {
     start: async ({ receipt, objectKey }) => {
       const operationSuffix = objectKey.split("/").at(-1) ?? "operation";
-      await binding.create({
-        id: `cuebench-${operationSuffix}`,
-        params: { receipt, objectKey },
-      });
+      // The deterministic id is the exactly-once boundary when this call is retried by infrastructure.
+      await binding.create({ id: `cuebench-${operationSuffix}`, params: { receipt, objectKey } });
     },
   };
 };
 
 const tokenFailure = (error: unknown): Response => {
-  if (!(error instanceof SignedTokenError)) return apiError(401, "SESSION_INVALID", "CueBench could not verify this anonymous session.");
-  if (error.code === "expired") return apiError(401, "SESSION_EXPIRED", "This anonymous CueBench session has expired. Complete Turnstile again to continue.");
-  return apiError(401, "SESSION_INVALID", "CueBench could not verify this anonymous session.");
+  if (!(error instanceof SignedTokenError)) return apiError(401, "SESSION_INVALID", "CueBench could not verify this anonymous session.", { nextAction: "complete-turnstile" });
+  if (error.code === "expired") return apiError(401, "SESSION_EXPIRED", "This anonymous CueBench session or recovery receipt has expired.", { nextAction: "complete-turnstile" });
+  return apiError(401, "SESSION_INVALID", "CueBench could not verify this anonymous session.", { nextAction: "complete-turnstile" });
 };
 
-const quotaFailure = (code: string): Response => code === "DUPLICATE_OPERATION"
-  ? apiError(409, code, "This anonymous upload operation already exists. Start a new operation instead of creating another private copy.")
-  : code === "GLOBAL_BREAKER"
-    ? apiError(429, code, "CueBench processing is temporarily unavailable while its public-use spend limit is active.")
-    : apiError(429, code, "This anonymous session has reached its processing quota. Try again after the quota window resets.");
+const quotaFailure = (code: QuotaRejectionCode): Response => {
+  if (code === "GLOBAL_BREAKER") return apiError(429, code, "CueBench processing is temporarily unavailable while its public-use spend limit is active.", { retrySafe: true, nextAction: "retry" });
+  if (code === "PENDING_SESSION_LIMIT" || code === "PENDING_IP_LIMIT") {
+    return apiError(429, code, "CueBench already has the maximum number of private uploads reserved for this anonymous session or network. Cancel an unfinished upload or retry after its lease expires.", { retrySafe: true, nextAction: "resume-upload" });
+  }
+  if (code === "SESSION_QUOTA" || code === "IP_QUOTA") {
+    return apiError(429, code, "CueBench's completed private-processing quota has been reached for this anonymous session or network.", { retrySafe: true, nextAction: "retry" });
+  }
+  return apiError(409, code, "CueBench could not find the pending private-upload reservation. Start a new upload operation.", { nextAction: "start-new-operation" });
+};
 
-const now = (dependency: WorkerDependencies): number => dependency.clock?.() ?? Date.now();
-const createId = (dependency: WorkerDependencies): string => dependency.createId?.() ?? globalThis.crypto.randomUUID();
+const uploadCoordinatorFor = (env: WorkerEnv, dependencies: WorkerDependencies, operationKey: string): UploadCoordinatorPort | undefined => dependencies.uploadCoordinator ?? (env.UPLOAD_COORDINATOR === undefined
+  ? undefined
+  : new DurableObjectUploadCoordinator(env.UPLOAD_COORDINATOR as unknown as ConstructorParameters<typeof DurableObjectUploadCoordinator>[0], operationKey));
 
-/** Creates the same-origin Hono API. Tests inject fixture-only verification, storage, and workflow adapters. */
+const quotaLedgerFor = (env: WorkerEnv, dependencies: WorkerDependencies): QuotaLedgerPort | undefined => dependencies.quotaLedger ?? (env.QUOTA_LEDGER === undefined
+  ? undefined
+  : new DurableObjectQuotaLedger(env.QUOTA_LEDGER as unknown as ConstructorParameters<typeof DurableObjectQuotaLedger>[0]));
+
+const objectStoreFor = (env: WorkerEnv, dependencies: WorkerDependencies): MultipartPrivateObjectStore | undefined => dependencies.objectStore ?? (env.PROCESSING_BUCKET === undefined
+  ? undefined
+  : new R2PrivateObjectStore(env.PROCESSING_BUCKET));
+
+const probeFor = (env: WorkerEnv, dependencies: WorkerDependencies): MediaProbe | undefined => dependencies.mediaProbe ?? (env.MEDIA_PROBE === undefined
+  ? undefined
+  : new MediaProbeServiceBinding(env.MEDIA_PROBE));
+
+interface DerivedOperation {
+  readonly sessionKey: string;
+  readonly ipKey: string;
+  readonly operationKey: string;
+  readonly projectKey: string;
+  readonly reservationKey: string;
+  readonly metadataHash: string;
+  readonly objectKey: string;
+  readonly partCount: number;
+  readonly expiresAtMs: number;
+}
+
+const deriveOperation = async (settings: WorkerSettings, session: AnonymousSessionClaims, ip: string, input: { readonly projectId: string; readonly operationId: string; readonly media: UploadMediaMetadata }, currentNow: number): Promise<DerivedOperation> => {
+  const partCount = Math.ceil(input.media.byteLength / settings.partSizeBytes);
+  const operationSource = `${session.sessionId}:${input.operationId}`;
+  const metadataSource = JSON.stringify({ projectId: input.projectId, media: input.media, partSize: settings.partSizeBytes, partCount });
+  const [sessionKey, ipKey, operationKey, projectKey, reservationKey, metadataHash] = await Promise.all([
+    saltedLedgerKey(settings.quotaSalt, "session", session.sessionId),
+    saltedLedgerKey(settings.quotaSalt, "network", ip),
+    saltedLedgerKey(settings.quotaSalt, "operation", operationSource),
+    saltedLedgerKey(settings.quotaSalt, "project", input.projectId),
+    saltedLedgerKey(settings.quotaSalt, "reservation", operationSource),
+    saltedLedgerKey(settings.quotaSalt, "metadata", metadataSource),
+  ]);
+  return {
+    sessionKey,
+    ipKey,
+    operationKey,
+    projectKey,
+    reservationKey,
+    metadataHash,
+    objectKey: `processing/${sessionKey}/${operationKey}`,
+    partCount,
+    expiresAtMs: Math.min(session.expiresAtMs, currentNow + settings.recoveryTtlMs),
+  };
+};
+
+type OperationAuthorizationFields = Pick<UploadOperationAuthorization, "sessionKey" | "ipKey" | "reservationKey" | "metadataHash" | "objectKey" | "media" | "partSize" | "partCount" | "receiptExpiresAtMs">;
+
+const recordMatchesReceipt = (record: UploadOperationRecord | null, receipt: OperationAuthorizationFields): record is UploadOperationRecord => record !== null
+  && record.ownerSessionKey === receipt.sessionKey
+  && record.ownerIpKey === receipt.ipKey
+  && record.reservationKey === receipt.reservationKey
+  && record.metadataHash === receipt.metadataHash
+  && record.objectKey === receipt.objectKey
+  && record.byteLength === receipt.media.byteLength
+  && record.partSize === receipt.partSize
+  && record.partCount === receipt.partCount
+  && record.receiptExpiresAtMs === receipt.receiptExpiresAtMs;
+
+const recordMatchesCapability = (record: UploadOperationRecord | null, capability: UploadCapabilityClaims): record is UploadOperationRecord => recordMatchesReceipt(record, capability);
+
+const operationAuthorization = (input: {
+  readonly sessionId: string;
+  readonly media: UploadMediaMetadata;
+  readonly operationId: string;
+  readonly sessionKey: string;
+  readonly ipKey: string;
+  readonly operationKey: string;
+  readonly projectKey: string;
+  readonly reservationKey: string;
+  readonly metadataHash: string;
+  readonly objectKey: string;
+  readonly partSize: number;
+  readonly partCount: number;
+  readonly issuedAtMs: number;
+  readonly receiptExpiresAtMs: number;
+}) => input;
+
+const receiptFromRecord = (sessionId: string, input: { readonly operationId: string; readonly media: UploadMediaMetadata }, derived: DerivedOperation, record: UploadOperationRecord) => operationAuthorization({
+  sessionId,
+  media: input.media,
+  operationId: input.operationId,
+  sessionKey: derived.sessionKey,
+  ipKey: derived.ipKey,
+  operationKey: derived.operationKey,
+  projectKey: derived.projectKey,
+  reservationKey: derived.reservationKey,
+  metadataHash: derived.metadataHash,
+  objectKey: derived.objectKey,
+  partSize: record.partSize,
+  partCount: record.partCount,
+  issuedAtMs: record.createdAtMs,
+  receiptExpiresAtMs: record.receiptExpiresAtMs,
+});
+
+const capabilityFromReceipt = (receipt: UploadOperationAuthorization, currentNow: number, settings: WorkerSettings): Promise<string> => issueUploadCapability({
+  ...receipt,
+  issuedAtMs: currentNow,
+  expiresAtMs: Math.min(receipt.receiptExpiresAtMs, currentNow + settings.uploadCapabilityTtlMs),
+  settings,
+});
+
+const operationResponse = async (input: {
+  readonly receipt: UploadOperationAuthorization;
+  readonly settings: WorkerSettings;
+  readonly currentNow: number;
+  readonly state: UploadOperationState;
+  readonly parts: Readonly<Record<string, { readonly partNumber: number }>>;
+  readonly status: 200 | 201;
+}) => {
+  const [operationReceipt, uploadCapability] = await Promise.all([
+    issueUploadReceipt({ ...input.receipt, settings: input.settings }),
+    capabilityFromReceipt(input.receipt, input.currentNow, input.settings),
+  ]);
+  return {
+    body: {
+      operationReceipt,
+      uploadCapability,
+      capabilityExpiresAtMs: Math.min(input.receipt.receiptExpiresAtMs, input.currentNow + input.settings.uploadCapabilityTtlMs),
+      partSize: input.receipt.partSize,
+      partCount: input.receipt.partCount,
+      uploadedPartNumbers: Object.values(input.parts).map((part) => part.partNumber).sort((a, b) => a - b),
+      status: input.state,
+    },
+    status: input.status,
+  };
+};
+
+const partExpectedBytes = (record: UploadOperationRecord, part: number): number => part === record.partCount
+  ? record.byteLength - record.partSize * (record.partCount - 1)
+  : record.partSize;
+
+const sortedParts = (record: UploadOperationRecord): ReadonlyArray<{ readonly partNumber: number; readonly etag: string }> => Object.values(record.parts)
+  .sort((left, right) => left.partNumber - right.partNumber)
+  .map((part) => ({ partNumber: part.partNumber, etag: part.etag }));
+
+const cleanupOperation = async (input: {
+  readonly record: UploadOperationRecord;
+  readonly objectStore: MultipartPrivateObjectStore;
+  readonly coordinator: UploadCoordinatorPort;
+  readonly quotaLedger: QuotaLedgerPort;
+  readonly nowMs: number;
+  readonly objectState: "multipart" | "completed" | "uncertain";
+}): Promise<{ readonly clean: boolean }> => {
+  let cleanupFailed = false;
+  if (input.objectState === "multipart" || input.objectState === "uncertain") {
+    try {
+      if (input.record.multipartUploadId !== null) {
+        await input.objectStore.abortMultipart({ key: input.record.objectKey, uploadId: input.record.multipartUploadId });
+      }
+    } catch {
+      cleanupFailed = true;
+    }
+  }
+  if (input.objectState === "completed" || input.objectState === "uncertain") {
+    try {
+      await input.objectStore.delete(input.record.objectKey);
+    } catch {
+      cleanupFailed = true;
+    }
+  }
+  // Pending quota is always released on cancellation/permanent rejection. Cleanup failure is retained as an explicit state.
+  await input.quotaLedger.releaseUploadReservation({ reservationKey: input.record.reservationKey, nowMs: input.nowMs }).catch(() => undefined);
+  await input.coordinator.markCancelled(cleanupFailed, input.nowMs).catch(() => undefined);
+  return { clean: !cleanupFailed };
+};
+
+/** Creates the same-origin Hono API. Tests inject fixture-only verification, storage, probe, and workflow adapters. */
 export const createCueBenchWorker = (env: WorkerEnv, dependencies: WorkerDependencies = {}) => {
   const app = new Hono<WorkerBindings>();
 
@@ -161,7 +404,7 @@ export const createCueBenchWorker = (env: WorkerEnv, dependencies: WorkerDepende
     securityHeaders(context.res.headers);
   });
 
-  app.onError(() => apiError(500, "WORKER_UNAVAILABLE", "CueBench could not complete that private processing request. No local project data changed."));
+  app.onError(() => apiError(500, "WORKER_UNAVAILABLE", "CueBench could not complete that private processing request. No browser project data changed.", { retrySafe: true, nextAction: "retry" }));
 
   app.get("/api/health", (context) => context.json({ status: "ok" }));
 
@@ -172,19 +415,23 @@ export const createCueBenchWorker = (env: WorkerEnv, dependencies: WorkerDepende
       settings = resolveWorkerSettings(env);
     } catch (error) {
       return error instanceof WorkerConfigurationError
-        ? apiError(503, "CONFIGURATION_UNAVAILABLE", "CueBench processing is not configured for this environment.")
-        : apiError(503, "CONFIGURATION_UNAVAILABLE", "CueBench processing is not configured for this environment.");
+        ? apiError(503, "CONFIGURATION_UNAVAILABLE", "CueBench processing is not configured for this environment.", { retrySafe: true, nextAction: "retry" })
+        : apiError(503, "CONFIGURATION_UNAVAILABLE", "CueBench processing is not configured for this environment.", { retrySafe: true, nextAction: "retry" });
     }
-    const body = asRecord(await context.req.json<unknown>().catch(() => null));
-    const token = body?.turnstileToken;
-    if (typeof token !== "string" || token.trim().length === 0) {
-      return apiError(400, "TURNSTILE_REQUIRED", "Complete the anti-abuse verification before starting anonymous processing.");
-    }
+    const input = sessionRequest(await context.req.json<unknown>().catch(() => null));
+    if (input === null) return apiError(400, "TURNSTILE_REQUIRED", "Complete the anti-abuse verification before starting anonymous processing.", { nextAction: "complete-turnstile" });
     const ip = clientIp(context.req.raw);
-    const accepted = await (dependencies.verifyTurnstile ?? turnstileVerifier(settings))({ token, ip });
-    if (!accepted) {
+    const expectedHostname = settings.turnstileExpectedHostname ?? new URL(context.req.raw.url).hostname;
+    const verification = await (dependencies.verifyTurnstile ?? turnstileVerifier(settings))({
+      token: input.token,
+      ip,
+      idempotencyKey: input.idempotencyKey,
+      expectedHostname,
+      expectedAction: settings.turnstileExpectedAction,
+    });
+    if (verification.success !== true || verification.hostname !== expectedHostname || verification.action !== settings.turnstileExpectedAction) {
       recordTelemetry(dependencies.telemetry, { stage: "session", status: "rejected", errorCode: "TURNSTILE_REJECTED" });
-      return apiError(403, "TURNSTILE_REJECTED", "CueBench could not verify the anti-abuse check. No anonymous session was created.");
+      return apiError(403, "TURNSTILE_REJECTED", "CueBench could not verify the anti-abuse check for this site and action. No anonymous session was created.", { nextAction: "complete-turnstile" });
     }
     const expiresAtMs = currentNow + settings.sessionTtlMs;
     const session = await issueAnonymousSession({
@@ -203,88 +450,115 @@ export const createCueBenchWorker = (env: WorkerEnv, dependencies: WorkerDepende
     try {
       settings = resolveWorkerSettings(env);
     } catch {
-      return apiError(503, "CONFIGURATION_UNAVAILABLE", "CueBench processing is not configured for this environment.");
+      return apiError(503, "CONFIGURATION_UNAVAILABLE", "CueBench processing is not configured for this environment.", { retrySafe: true, nextAction: "retry" });
     }
-    const token = bearerToken(context.req.raw);
-    if (token === null) return apiError(401, "SESSION_REQUIRED", "Start an anonymous CueBench session before requesting a private upload.");
-    let session;
+    const sessionToken = bearerToken(context.req.raw);
+    if (sessionToken === null) return apiError(401, "SESSION_REQUIRED", "Start an anonymous CueBench session before requesting a private upload.", { nextAction: "complete-turnstile" });
+    let session: AnonymousSessionClaims;
     try {
-      session = await verifyAnonymousSession(token, settings.keyRing, currentNow);
+      session = await verifyAnonymousSession(sessionToken, settings.keyRing, currentNow);
     } catch (error) {
       return tokenFailure(error);
     }
     const input = uploadRequest(await context.req.json<unknown>().catch(() => null));
-    if (input === null) return apiError(400, "UPLOAD_REQUEST_INVALID", "CueBench could not read the requested private upload operation.");
+    if (input === null) return apiError(400, "UPLOAD_REQUEST_INVALID", "CueBench could not read the requested private upload operation.", { nextAction: "start-new-operation" });
     if (!input.disclosureAccepted) {
-      return apiError(428, "DISCLOSURE_REQUIRED", "Accept the temporary cloud-processing disclosure before CueBench uploads a private processing copy.");
+      return apiError(428, "DISCLOSURE_REQUIRED", "Accept the temporary cloud-processing disclosure before CueBench uploads a private processing copy.", { nextAction: "resume-upload" });
     }
     let media: UploadMediaMetadata;
     try {
       media = validateUploadMetadata(input.media, settings);
     } catch (error) {
-      const message = error instanceof UploadValidationError ? error.message : "CueBench could not validate the selected video.";
-      recordTelemetry(dependencies.telemetry, { stage: "upload", status: "rejected", errorCode: error instanceof UploadValidationError ? error.code : "UPLOAD_METADATA_INVALID" });
-      return apiError(422, error instanceof UploadValidationError ? error.code : "UPLOAD_METADATA_INVALID", message);
+      const code = error instanceof UploadValidationError ? error.code : "UPLOAD_METADATA_INVALID";
+      recordTelemetry(dependencies.telemetry, { stage: "upload", status: "rejected", errorCode: code });
+      return apiError(422, code, error instanceof UploadValidationError ? error.message : "CueBench could not validate the selected video.", { nextAction: "start-new-operation" });
     }
-    const quotaLedger = dependencies.quotaLedger ?? (env.QUOTA_LEDGER === undefined
-      ? undefined
-      : new DurableObjectQuotaLedger(env.QUOTA_LEDGER as unknown as ConstructorParameters<typeof DurableObjectQuotaLedger>[0]));
-    if (quotaLedger === undefined) return apiError(503, "QUOTA_UNAVAILABLE", "CueBench cannot safely enforce anonymous processing limits right now.");
     const ip = clientIp(context.req.raw);
-    const [sessionKey, ipKey, operationKey, projectKey] = await Promise.all([
-      saltedLedgerKey(settings.quotaSalt, "session", session.sessionId),
-      saltedLedgerKey(settings.quotaSalt, "network", ip),
-      saltedLedgerKey(settings.quotaSalt, "operation", `${session.sessionId}:${input.operationId}`),
-      saltedLedgerKey(settings.quotaSalt, "project", input.projectId),
-    ]);
-    if (settings.globalSpendBreakerOpen) {
-      recordTelemetry(dependencies.telemetry, { stage: "upload", durationMs: media.durationMs, byteSize: media.byteLength, status: "rejected", errorCode: "GLOBAL_BREAKER" });
-      return quotaFailure("GLOBAL_BREAKER");
+    const derived = await deriveOperation(settings, session, ip, { ...input, media }, currentNow);
+    const quotaLedger = quotaLedgerFor(env, dependencies);
+    const coordinator = uploadCoordinatorFor(env, dependencies, derived.operationKey);
+    const objectStore = objectStoreFor(env, dependencies);
+    if (quotaLedger === undefined || coordinator === undefined || objectStore === undefined) {
+      return apiError(503, "UPLOAD_UNAVAILABLE", "CueBench cannot safely reserve and store a private processing copy right now.", { retrySafe: true, nextAction: "retry" });
     }
     const reservation = await quotaLedger.reserveUpload({
-      sessionKey,
-      ipKey,
-      operationKey,
-      mediaMinutes: Math.ceil(media.durationMs / 60_000),
+      sessionKey: derived.sessionKey,
+      ipKey: derived.ipKey,
+      reservationKey: derived.reservationKey,
+      byteLength: media.byteLength,
       nowMs: currentNow,
-      expiresAtMs: session.expiresAtMs,
+      expiresAtMs: derived.expiresAtMs,
       quotas: settings.quotas,
-    });
+    }).catch(() => null);
+    if (reservation === null) return apiError(503, "QUOTA_UNAVAILABLE", "CueBench cannot safely enforce anonymous processing limits right now.", { retrySafe: true, nextAction: "retry" });
     if (!reservation.accepted) {
       recordTelemetry(dependencies.telemetry, { stage: "upload", durationMs: media.durationMs, byteSize: media.byteLength, status: "rejected", errorCode: reservation.code });
       return quotaFailure(reservation.code);
     }
-    const uploadCapability = await issueUploadCapability({
-      sessionId: session.sessionId,
-      sessionKey,
-      operationId: input.operationId,
-      operationKey,
-      projectKey,
-      media,
+    const begin = await coordinator.begin({
+      ownerSessionKey: derived.sessionKey,
+      ownerIpKey: derived.ipKey,
+      metadataHash: derived.metadataHash,
+      reservationKey: derived.reservationKey,
+      objectKey: derived.objectKey,
+      byteLength: media.byteLength,
+      partSize: settings.partSizeBytes,
+      partCount: derived.partCount,
       nowMs: currentNow,
-      expiresAtMs: Math.min(session.expiresAtMs, currentNow + settings.uploadCapabilityTtlMs),
-      receiptExpiresAtMs: currentNow + settings.recoveryTtlMs,
-      settings,
-    });
-    recordTelemetry(dependencies.telemetry, { stage: "upload", durationMs: media.durationMs, byteSize: media.byteLength, status: "accepted" });
-    return context.json({ uploadCapability, expiresAtMs: Math.min(session.expiresAtMs, currentNow + settings.uploadCapabilityTtlMs) }, 201);
+      expiresAtMs: derived.expiresAtMs,
+      receiptExpiresAtMs: derived.expiresAtMs,
+    }).catch(() => null);
+    if (begin === null) return apiError(503, "UPLOAD_COORDINATION_UNAVAILABLE", "CueBench could not safely coordinate this private upload.", { retrySafe: true, nextAction: "retry" });
+    if (begin.kind === "conflict") {
+      return apiError(409, "IDEMPOTENCY_CONFLICT", "This upload operation id was already used with different private media metadata. Start a new operation id.", { nextAction: "start-new-operation" });
+    }
+    let record = begin.record;
+    if (begin.kind === "created") {
+      try {
+        const multipart = await objectStore.createMultipart(record.objectKey, {
+          contentType: media.contentType,
+          customMetadata: { operation: record.objectKey.split("/").at(-1) ?? "", owner: record.ownerSessionKey },
+        });
+        record = await coordinator.attachMultipart({ uploadId: multipart.uploadId, nowMs: currentNow }) ?? record;
+      } catch {
+        await quotaLedger.releaseUploadReservation({ reservationKey: derived.reservationKey, nowMs: currentNow }).catch(() => undefined);
+        await coordinator.markCancelled(false, currentNow).catch(() => undefined);
+        return apiError(502, "MULTIPART_CREATE_FAILED", "CueBench could not create the private multipart upload. No private object was retained.", { retrySafe: true, stateChanged: true, nextAction: "start-new-operation" });
+      }
+      if (record.state !== "pending" || record.multipartUploadId === null) {
+        return apiError(503, "MULTIPART_CREATE_RECONCILIATION_REQUIRED", "CueBench created a private upload lease but could not persist its multipart state. Keep the recovery receipt and retry status; no second multipart upload will be created.", { retrySafe: true, stateChanged: true, nextAction: "wait-for-status" });
+      }
+    }
+    if (record.state === "creating") {
+      // A concurrent duplicate observes the immutable operation immediately;
+      // it never opens a second R2 multipart upload while creation is in flight.
+      const receipt = receiptFromRecord(session.sessionId, { operationId: input.operationId, media }, derived, record);
+      const response = await operationResponse({ receipt, settings, currentNow, state: record.state, parts: record.parts, status: 200 });
+      return context.json(response.body, response.status);
+    }
+    const receipt = receiptFromRecord(session.sessionId, { operationId: input.operationId, media }, derived, record);
+    const response = await operationResponse({ receipt, settings, currentNow, state: record.state, parts: record.parts, status: begin.kind === "created" ? 201 : 200 });
+    recordTelemetry(dependencies.telemetry, { stage: "upload", durationMs: media.durationMs, byteSize: media.byteLength, status: begin.kind === "created" ? "accepted" : "resumed" });
+    return context.json(response.body, response.status);
   });
 
-  app.put("/api/uploads/:operationId", async (context) => {
+  app.put("/api/uploads/:operationId/parts/:partNumber", async (context) => {
     const currentNow = now(dependencies);
     let settings: WorkerSettings;
     try {
       settings = resolveWorkerSettings(env);
     } catch {
-      return apiError(503, "CONFIGURATION_UNAVAILABLE", "CueBench processing is not configured for this environment.");
+      return apiError(503, "CONFIGURATION_UNAVAILABLE", "CueBench processing is not configured for this environment.", { retrySafe: true, nextAction: "retry" });
     }
     const operationId = context.req.param("operationId");
-    if (!opaqueId(operationId)) return apiError(400, "OPERATION_INVALID", "CueBench could not read this private upload operation.");
+    const requestedPart = partNumber(context.req.param("partNumber"));
     const sessionToken = bearerToken(context.req.raw);
     const capabilityToken = context.req.header("x-cuebench-upload-capability");
-    if (sessionToken === null || capabilityToken === undefined) return apiError(401, "UPLOAD_CAPABILITY_REQUIRED", "CueBench needs the anonymous session and private upload capability.");
-    let session;
-    let capability;
+    if (!opaqueId(operationId) || requestedPart === null || sessionToken === null || capabilityToken === undefined) {
+      return apiError(401, "UPLOAD_CAPABILITY_REQUIRED", "CueBench needs the anonymous session and private multipart capability.", { nextAction: "resume-upload" });
+    }
+    let session: AnonymousSessionClaims;
+    let capability: UploadCapabilityClaims;
     try {
       [session, capability] = await Promise.all([
         verifyAnonymousSession(sessionToken, settings.keyRing, currentNow),
@@ -293,53 +567,92 @@ export const createCueBenchWorker = (env: WorkerEnv, dependencies: WorkerDepende
     } catch (error) {
       return tokenFailure(error);
     }
-    if (capability.sessionId !== session.sessionId || capability.operationId !== operationId) {
-      return apiError(403, "UPLOAD_OWNERSHIP_MISMATCH", "This private upload capability belongs to a different anonymous session or operation.");
+    const ipKey = await saltedLedgerKey(settings.quotaSalt, "network", clientIp(context.req.raw));
+    if (capability.sessionId !== session.sessionId || capability.operationId !== operationId || capability.ipKey !== ipKey) {
+      return apiError(403, "UPLOAD_OWNERSHIP_MISMATCH", "This private multipart capability belongs to a different anonymous session, network, or operation.", { nextAction: "start-new-operation" });
     }
-    const quotaLedger = dependencies.quotaLedger ?? (env.QUOTA_LEDGER === undefined
-      ? undefined
-      : new DurableObjectQuotaLedger(env.QUOTA_LEDGER as unknown as ConstructorParameters<typeof DurableObjectQuotaLedger>[0]));
-    const objectStore = dependencies.objectStore ?? (env.PROCESSING_BUCKET === undefined ? undefined : new R2PrivateObjectStore(env.PROCESSING_BUCKET));
-    if (quotaLedger === undefined || objectStore === undefined) return apiError(503, "UPLOAD_UNAVAILABLE", "CueBench cannot safely store a private processing copy right now.");
-    const state = await quotaLedger.operationState({ sessionKey: capability.sessionKey, operationKey: capability.operationKey, nowMs: currentNow });
-    if (state === "cleaned") return apiError(410, "UPLOAD_CLEANED", "This private processing copy was already deleted.");
-    if (state === "missing") return apiError(409, "UPLOAD_UNKNOWN", "CueBench could not find this private upload operation. Start again.");
-    const receipt = await issueUploadReceipt(capability, settings);
-    if (state === "uploaded") return context.json({ receipt }, 200);
-    if (state === "uploading") return apiError(409, "UPLOAD_IN_PROGRESS", "CueBench is already writing this private processing copy. Wait for that request instead of creating another copy.");
-    const declaredContentType = context.req.header("content-type")?.split(";", 1)[0]?.trim().toLowerCase() ?? "";
-    if (declaredContentType !== capability.media.contentType) {
-      return apiError(422, "CONTENT_TYPE_MISMATCH", "CueBench could not verify the selected video's media type. No processing copy was stored.");
+    if (normaliseContentType(context.req.header("content-type") ?? "") !== capability.media.contentType) {
+      return apiError(422, "CONTENT_TYPE_MISMATCH", "CueBench could not verify this private upload part's media type. No part was stored.", { nextAction: "resume-upload" });
     }
+    const coordinator = uploadCoordinatorFor(env, dependencies, capability.operationKey);
+    const objectStore = objectStoreFor(env, dependencies);
+    if (coordinator === undefined || objectStore === undefined) return apiError(503, "UPLOAD_UNAVAILABLE", "CueBench cannot safely store this private multipart chunk right now.", { retrySafe: true, nextAction: "retry" });
+    const record = await coordinator.get(currentNow).catch(() => null);
+    if (!recordMatchesCapability(record, capability)) return apiError(409, "UPLOAD_UNKNOWN", "CueBench could not find this private upload operation. Start a new operation.", { nextAction: "start-new-operation" });
+    if (record.multipartUploadId === null || requestedPart > record.partCount) return apiError(409, "UPLOAD_STATE_CHANGED", "CueBench cannot accept this multipart chunk in the operation's current state.", { retrySafe: true, nextAction: "wait-for-status" });
+    // The serial DO lease is acquired before any body byte is read.
+    const claim = await coordinator.claimPart({ partNumber: requestedPart, nowMs: currentNow, leaseMs: settings.partLeaseMs, createId: () => createId(dependencies) }).catch(() => null);
+    if (claim === null) return apiError(503, "PART_COORDINATION_UNAVAILABLE", "CueBench could not safely claim this private multipart chunk.", { retrySafe: true, nextAction: "retry" });
+    const existingPartResponse = async (part: { readonly partNumber: number; readonly etag: string }, status: 200 | 201): Promise<Response> => context.json({
+      partReceipt: await issueUploadPartReceipt({
+        sessionId: capability.sessionId,
+        operationId,
+        operationKey: capability.operationKey,
+        partNumber: part.partNumber,
+        etag: part.etag,
+        issuedAtMs: record.createdAtMs,
+        expiresAtMs: record.receiptExpiresAtMs,
+        settings,
+      }),
+      partNumber: part.partNumber,
+      status: claim.record.state,
+    }, status);
+    if (claim.kind === "uploaded") return existingPartResponse(claim.part, 200);
+    if (claim.kind === "in-progress") return apiError(409, "PART_IN_PROGRESS", "CueBench is already receiving this private multipart chunk. Wait for its receipt, then retry status.", { retrySafe: true, nextAction: "wait-for-status" });
+    if (claim.kind === "unavailable") return apiError(409, "PART_STATE_UNAVAILABLE", "CueBench cannot accept this private multipart chunk in the operation's current state.", { retrySafe: true, nextAction: "wait-for-status" });
+    const expectedBytes = partExpectedBytes(record, requestedPart);
     let body: ArrayBuffer;
     try {
-      body = await readExactUploadBody(context.req.raw, capability.media.byteLength, settings.maxUploadBytes);
+      body = await readExactUploadPart(context.req.raw, expectedBytes, settings.partSizeBytes);
     } catch (error) {
-      const message = error instanceof UploadValidationError ? error.message : "CueBench could not verify the selected media bytes.";
-      return apiError(422, error instanceof UploadValidationError ? error.code : "BODY_SIZE", message);
+      await coordinator.releasePart({ partNumber: requestedPart, claimId: claim.claimId, nowMs: currentNow }).catch(() => undefined);
+      return apiError(422, error instanceof UploadValidationError ? error.code : "BODY_SIZE", error instanceof UploadValidationError ? error.message : "CueBench could not verify this private upload part size.", { retrySafe: true, nextAction: "resume-upload" });
     }
-    const claim = await quotaLedger.claimUpload({ sessionKey: capability.sessionKey, operationKey: capability.operationKey, nowMs: currentNow });
-    if (claim === "uploaded") return context.json({ receipt }, 200);
-    if (claim === "cleaned") return apiError(410, "UPLOAD_CLEANED", "This private processing copy was already deleted.");
-    if (claim === "missing") return apiError(409, "UPLOAD_UNKNOWN", "CueBench could not find this private upload operation. Start again.");
-    if (claim === "uploading") return apiError(409, "UPLOAD_IN_PROGRESS", "CueBench is already writing this private processing copy. Wait for that request instead of creating another copy.");
+    let uploaded: { readonly etag: string };
     try {
-      await objectStore.put(capability.objectKey, body, {
-        contentType: capability.media.contentType,
-        customMetadata: privateObjectMetadata(capability),
-      });
+      uploaded = await objectStore.uploadPart({ key: record.objectKey, uploadId: record.multipartUploadId, partNumber: requestedPart, body });
     } catch {
-      await quotaLedger.releaseUpload({ sessionKey: capability.sessionKey, operationKey: capability.operationKey, nowMs: currentNow });
-      return apiError(502, "UPLOAD_STORAGE_FAILED", "CueBench could not complete the private upload. Retry the same operation while its capability is valid.");
+      await coordinator.releasePart({ partNumber: requestedPart, claimId: claim.claimId, nowMs: currentNow }).catch(() => undefined);
+      return apiError(502, "PART_STORAGE_FAILED", "CueBench could not store this private multipart chunk. Retry the same part while its upload lease is active.", { retrySafe: true, nextAction: "resume-upload" });
     }
-    const marked = await quotaLedger.markUploaded({ sessionKey: capability.sessionKey, operationKey: capability.operationKey, nowMs: currentNow });
-    if (!marked) {
-      await objectStore.delete(capability.objectKey);
-      await quotaLedger.releaseUpload({ sessionKey: capability.sessionKey, operationKey: capability.operationKey, nowMs: currentNow });
-      return apiError(409, "UPLOAD_STATE_CHANGED", "CueBench could not safely complete this private upload. No processing copy was retained.");
+    const marked = await coordinator.recordPart({ partNumber: requestedPart, claimId: claim.claimId, etag: uploaded.etag, byteLength: body.byteLength, nowMs: currentNow }).catch(() => null);
+    if (marked === null) {
+      return apiError(503, "PART_RECONCILIATION_REQUIRED", "CueBench stored a private multipart chunk but could not persist its receipt. Retry the same part after its short lease expires; no whole file is retained in Worker memory.", { retrySafe: true, stateChanged: true, nextAction: "wait-for-status" });
     }
-    recordTelemetry(dependencies.telemetry, { stage: "upload", durationMs: capability.media.durationMs, byteSize: capability.media.byteLength, status: "uploaded" });
-    return context.json({ receipt }, 201);
+    recordTelemetry(dependencies.telemetry, { stage: "upload", byteSize: body.byteLength, status: "part-uploaded" });
+    return existingPartResponse({ partNumber: requestedPart, etag: uploaded.etag }, 201);
+  });
+
+  app.get("/api/uploads/:operationId", async (context) => {
+    const currentNow = now(dependencies);
+    let settings: WorkerSettings;
+    try {
+      settings = resolveWorkerSettings(env);
+    } catch {
+      return apiError(503, "CONFIGURATION_UNAVAILABLE", "CueBench processing is not configured for this environment.", { retrySafe: true, nextAction: "retry" });
+    }
+    const operationId = context.req.param("operationId");
+    const sessionToken = bearerToken(context.req.raw);
+    const receiptToken = context.req.header("x-cuebench-operation-receipt");
+    if (!opaqueId(operationId) || sessionToken === null || receiptToken === undefined) return apiError(401, "UPLOAD_RECEIPT_REQUIRED", "CueBench needs the anonymous session and signed operation receipt.", { nextAction: "resume-upload" });
+    let session: AnonymousSessionClaims;
+    let receipt: UploadReceiptClaims;
+    try {
+      [session, receipt] = await Promise.all([
+        verifyAnonymousSession(sessionToken, settings.keyRing, currentNow),
+        verifyUploadReceipt(receiptToken, settings, currentNow),
+      ]);
+    } catch (error) {
+      return tokenFailure(error);
+    }
+    const ipKey = await saltedLedgerKey(settings.quotaSalt, "network", clientIp(context.req.raw));
+    if (receipt.sessionId !== session.sessionId || receipt.operationId !== operationId || receipt.ipKey !== ipKey) return apiError(403, "UPLOAD_OWNERSHIP_MISMATCH", "This private upload receipt belongs to a different anonymous session, network, or operation.", { nextAction: "start-new-operation" });
+    const coordinator = uploadCoordinatorFor(env, dependencies, receipt.operationKey);
+    if (coordinator === undefined) return apiError(503, "UPLOAD_COORDINATION_UNAVAILABLE", "CueBench cannot safely read this private upload's resumable state right now.", { retrySafe: true, nextAction: "retry" });
+    const record = await coordinator.get(currentNow).catch(() => null);
+    if (!recordMatchesReceipt(record, receipt)) return apiError(410, "UPLOAD_EXPIRED", "This private upload operation is no longer available. Start a new operation.", { nextAction: "start-new-operation" });
+    const response = await operationResponse({ receipt, settings, currentNow, state: record.state, parts: record.parts, status: 200 });
+    return context.json(response.body);
   });
 
   app.post("/api/uploads/:operationId/complete", async (context) => {
@@ -348,36 +661,108 @@ export const createCueBenchWorker = (env: WorkerEnv, dependencies: WorkerDepende
     try {
       settings = resolveWorkerSettings(env);
     } catch {
-      return apiError(503, "CONFIGURATION_UNAVAILABLE", "CueBench processing is not configured for this environment.");
+      return apiError(503, "CONFIGURATION_UNAVAILABLE", "CueBench processing is not configured for this environment.", { retrySafe: true, nextAction: "retry" });
     }
     const operationId = context.req.param("operationId");
     const sessionToken = bearerToken(context.req.raw);
-    const receipt = context.req.header("x-cuebench-operation-receipt");
-    if (!opaqueId(operationId) || sessionToken === null || receipt === undefined) return apiError(401, "UPLOAD_RECEIPT_REQUIRED", "CueBench needs the anonymous session and signed upload receipt.");
-    let session;
-    let claims;
+    const receiptToken = context.req.header("x-cuebench-operation-receipt");
+    if (!opaqueId(operationId) || sessionToken === null || receiptToken === undefined) return apiError(401, "UPLOAD_RECEIPT_REQUIRED", "CueBench needs the anonymous session and signed operation receipt.", { nextAction: "resume-upload" });
+    let session: AnonymousSessionClaims;
+    let receipt: UploadReceiptClaims;
     try {
-      [session, claims] = await Promise.all([
+      [session, receipt] = await Promise.all([
         verifyAnonymousSession(sessionToken, settings.keyRing, currentNow),
-        verifyUploadReceipt(receipt, settings, currentNow),
+        verifyUploadReceipt(receiptToken, settings, currentNow),
       ]);
     } catch (error) {
       return tokenFailure(error);
     }
-    if (claims.sessionId !== session.sessionId || claims.operationId !== operationId) {
-      return apiError(403, "UPLOAD_OWNERSHIP_MISMATCH", "This signed upload receipt belongs to a different anonymous session or operation.");
+    const ipKey = await saltedLedgerKey(settings.quotaSalt, "network", clientIp(context.req.raw));
+    if (receipt.sessionId !== session.sessionId || receipt.operationId !== operationId || receipt.ipKey !== ipKey) return apiError(403, "UPLOAD_OWNERSHIP_MISMATCH", "This signed private-upload receipt belongs to a different anonymous session, network, or operation.", { nextAction: "start-new-operation" });
+    const coordinator = uploadCoordinatorFor(env, dependencies, receipt.operationKey);
+    const objectStore = objectStoreFor(env, dependencies);
+    const quotaLedger = quotaLedgerFor(env, dependencies);
+    if (coordinator === undefined || objectStore === undefined || quotaLedger === undefined) return apiError(503, "PROCESSING_UNAVAILABLE", "CueBench cannot safely complete private processing right now.", { retrySafe: true, nextAction: "retry" });
+    let record = await coordinator.get(currentNow).catch(() => null);
+    if (!recordMatchesReceipt(record, receipt)) return apiError(410, "UPLOAD_EXPIRED", "This private upload operation is no longer available. Start a new operation.", { nextAction: "start-new-operation" });
+    if (record.state === "queued" || record.state === "completed") return context.json({ operationReceipt: receiptToken, status: record.state }, 200);
+    if (record.state === "workflow-starting") return apiError(409, "WORKFLOW_RECONCILIATION_REQUIRED", "CueBench has already issued the deterministic workflow start for this private upload and is reconciling its result. Do not start another workflow.", { retrySafe: true, nextAction: "wait-for-status" });
+    if (record.state === "cleanup-pending" || record.state === "cancelled") return apiError(409, "UPLOAD_CLEANUP_PENDING", "CueBench is reconciling deletion of this private processing copy. Keep the receipt and retry cleanup status.", { retrySafe: true, nextAction: "retry-cleanup" });
+    if (record.state === "pending" || record.state === "creating") return apiError(409, "UPLOAD_INCOMPLETE", "Upload every bounded private multipart chunk before requesting authoritative processing.", { retrySafe: true, nextAction: "resume-upload" });
+    if (record.multipartUploadId === null) return apiError(409, "UPLOAD_STATE_CHANGED", "CueBench cannot complete this private upload in its current state.", { retrySafe: true, nextAction: "wait-for-status" });
+
+    if (record.state === "uploaded" || record.state === "failed-retryable") {
+      const completion = await coordinator.beginCompletion(currentNow).catch(() => null);
+      if (completion === null) return apiError(503, "COMPLETE_COORDINATION_UNAVAILABLE", "CueBench could not safely claim this private completion.", { retrySafe: true, nextAction: "retry" });
+      record = completion.record;
+      if (completion.kind === "claimed") {
+        try {
+          await objectStore.completeMultipart({ key: record.objectKey, uploadId: record.multipartUploadId!, parts: sortedParts(record) });
+          record = await coordinator.markProbing(currentNow) ?? record;
+        } catch {
+          await coordinator.markRetryableFailure("multipart-complete", currentNow).catch(() => undefined);
+          return apiError(502, "COMPLETE_RECONCILIATION_REQUIRED", "CueBench could not confirm multipart completion. The private operation remains recoverable; retry the same completion receipt rather than starting another upload.", { retrySafe: true, stateChanged: true, nextAction: "retry-completion" });
+        }
+      }
     }
-    const objectStore = dependencies.objectStore ?? (env.PROCESSING_BUCKET === undefined ? undefined : new R2PrivateObjectStore(env.PROCESSING_BUCKET));
+    // `probing` is deliberately retained on probe failure. Browser/R2 metadata never starts a workflow.
+    record = await coordinator.get(currentNow).catch(() => null);
+    if (!recordMatchesReceipt(record, receipt)) return apiError(503, "PROCESSING_RECONCILIATION_REQUIRED", "CueBench could not reconcile this private operation after multipart completion.", { retrySafe: true, nextAction: "wait-for-status" });
+    if (record.state === "completing") return apiError(503, "COMPLETE_RECONCILIATION_REQUIRED", "CueBench is reconciling multipart completion for this private operation. Retry the same receipt; do not create another upload.", { retrySafe: true, nextAction: "retry-completion" });
+    if (record.state !== "probing" && record.state !== "ready") return apiError(409, "UPLOAD_STATE_CHANGED", "CueBench cannot authoritatively validate this private upload in its current state.", { retrySafe: true, nextAction: "wait-for-status" });
+
+    if (record.state === "probing") {
+      const probe = probeFor(env, dependencies);
+      if (probe === undefined) return apiError(503, "MEDIA_PROBE_UNAVAILABLE", "CueBench cannot authoritatively inspect this private media yet. The upload remains recoverable and no workflow was started.", { retrySafe: true, nextAction: "retry-probe" });
+      let facts;
+      try {
+        facts = await probe.probe({ objectKey: receipt.objectKey, operationReceipt: receiptToken });
+      } catch {
+        return apiError(503, "MEDIA_PROBE_UNAVAILABLE", "CueBench cannot authoritatively inspect this private media yet. The upload remains recoverable and no workflow was started.", { retrySafe: true, nextAction: "retry-probe" });
+      }
+      const factsMatch = facts.byteLength === receipt.media.byteLength && facts.mimeType === receipt.media.contentType;
+      if (!factsMatch || !isSupportedAuthoritativeMedia(facts, { maxBytes: settings.maxUploadBytes, maxDurationMs: settings.maxUploadDurationMs })) {
+        const cleanup = await cleanupOperation({ record, objectStore, coordinator, quotaLedger, nowMs: currentNow, objectState: "completed" });
+        recordTelemetry(dependencies.telemetry, { stage: "processing", byteSize: receipt.media.byteLength, status: "rejected", errorCode: "AUTHORITATIVE_MEDIA_REJECTED" });
+        return apiError(cleanup.clean ? 422 : 409, cleanup.clean ? "AUTHORITATIVE_MEDIA_REJECTED" : "AUTHORITATIVE_MEDIA_CLEANUP_PENDING", cleanup.clean
+          ? "CueBench's authoritative private-media inspection rejected this file. No workflow was started."
+          : "CueBench rejected this private media and is reconciling deletion. Keep the receipt and retry cleanup.", { stateChanged: true, retrySafe: !cleanup.clean, nextAction: cleanup.clean ? "start-new-operation" : "retry-cleanup" });
+      }
+      const committed = await quotaLedger.commitMedia({
+        reservationKey: receipt.reservationKey,
+        actualByteLength: facts.byteLength,
+        actualDurationMs: facts.durationMs,
+        nowMs: currentNow,
+        quotas: settings.quotas,
+      }).catch(() => null);
+      if (committed === null) return apiError(503, "QUOTA_RECONCILIATION_REQUIRED", "CueBench verified the private media but could not atomically reconcile anonymous quota. No workflow was started; retry the same receipt.", { retrySafe: true, nextAction: "retry-probe" });
+      if (!committed.accepted) {
+        const cleanup = await cleanupOperation({ record, objectStore, coordinator, quotaLedger, nowMs: currentNow, objectState: "completed" });
+        return cleanup.clean
+          ? quotaFailure(committed.code)
+          : apiError(409, "QUOTA_REJECTED_CLEANUP_PENDING", "CueBench rejected private processing under the authoritative quota but is reconciling deletion. Keep the receipt and retry cleanup.", { retrySafe: true, stateChanged: true, nextAction: "retry-cleanup" });
+      }
+      record = await coordinator.markReady(currentNow).catch(() => null);
+      if (!recordMatchesReceipt(record, receipt)) return apiError(503, "PROCESSING_RECONCILIATION_REQUIRED", "CueBench committed authoritative quota but could not persist the next private-processing state. Retry the same receipt; no workflow was started.", { retrySafe: true, nextAction: "retry-probe" });
+    }
+
     const workflow = dependencies.workflow ?? workerWorkflow(env.PROCESSING_WORKFLOW);
-    if (objectStore === undefined || workflow === undefined) return apiError(503, "PROCESSING_UNAVAILABLE", "CueBench cannot start private processing right now.");
-    const object = await objectStore.head(claims.objectKey);
-    if (!isAuthoritativePrivateObject(object, claims)) {
-      recordTelemetry(dependencies.telemetry, { stage: "processing", durationMs: claims.media.durationMs, byteSize: claims.media.byteLength, status: "rejected", errorCode: "AUTHORITATIVE_METADATA_MISMATCH" });
-      return apiError(409, "AUTHORITATIVE_METADATA_MISMATCH", "CueBench could not verify the private processing copy before work started. No workflow was started.");
+    if (workflow === undefined) return apiError(503, "PROCESSING_UNAVAILABLE", "CueBench cannot start private processing right now. The authoritatively verified upload remains recoverable.", { retrySafe: true, nextAction: "retry" });
+    const workflowClaim = await coordinator.claimWorkflowStart(currentNow).catch(() => null);
+    if (workflowClaim === null) return apiError(503, "WORKFLOW_COORDINATION_UNAVAILABLE", "CueBench could not safely claim this private workflow start.", { retrySafe: true, nextAction: "retry" });
+    if (workflowClaim.kind === "status") {
+      if (workflowClaim.record.state === "queued" || workflowClaim.record.state === "completed") return context.json({ operationReceipt: receiptToken, status: workflowClaim.record.state }, 200);
+      return apiError(409, "WORKFLOW_RECONCILIATION_REQUIRED", "CueBench is reconciling the deterministic workflow start for this private upload. Do not start another workflow.", { retrySafe: true, nextAction: "wait-for-status" });
     }
-    await workflow.start({ receipt, objectKey: claims.objectKey });
-    recordTelemetry(dependencies.telemetry, { stage: "processing", durationMs: claims.media.durationMs, byteSize: claims.media.byteLength, status: "queued" });
-    return context.json({ receipt, status: "queued" }, 202);
+    try {
+      await workflow.start({ receipt: receiptToken, objectKey: receipt.objectKey });
+    } catch {
+      return apiError(503, "WORKFLOW_RECONCILIATION_REQUIRED", "CueBench issued a deterministic workflow start but could not confirm it. Keep this receipt; do not start another workflow.", { retrySafe: true, stateChanged: true, nextAction: "wait-for-status" });
+    }
+    const queued = await coordinator.markQueued(currentNow).catch(() => null);
+    if (!recordMatchesReceipt(queued, receipt)) return apiError(503, "WORKFLOW_RECONCILIATION_REQUIRED", "CueBench started the deterministic private workflow but could not persist its receipt status. Keep this receipt; do not start another workflow.", { retrySafe: true, stateChanged: true, nextAction: "wait-for-status" });
+    recordTelemetry(dependencies.telemetry, { stage: "processing", durationMs: receipt.media.durationMs, byteSize: receipt.media.byteLength, status: "queued" });
+    return context.json({ operationReceipt: receiptToken, status: "queued" }, 202);
   });
 
   app.delete("/api/uploads/:operationId", async (context) => {
@@ -386,39 +771,52 @@ export const createCueBenchWorker = (env: WorkerEnv, dependencies: WorkerDepende
     try {
       settings = resolveWorkerSettings(env);
     } catch {
-      return apiError(503, "CONFIGURATION_UNAVAILABLE", "CueBench processing is not configured for this environment.");
+      return apiError(503, "CONFIGURATION_UNAVAILABLE", "CueBench processing is not configured for this environment.", { retrySafe: true, nextAction: "retry" });
     }
     const operationId = context.req.param("operationId");
     const sessionToken = bearerToken(context.req.raw);
-    const receipt = context.req.header("x-cuebench-operation-receipt");
-    if (!opaqueId(operationId) || sessionToken === null || receipt === undefined) return apiError(401, "UPLOAD_RECEIPT_REQUIRED", "CueBench needs the anonymous session and signed upload receipt.");
-    let session;
-    let claims;
+    const receiptToken = context.req.header("x-cuebench-operation-receipt");
+    if (!opaqueId(operationId) || sessionToken === null || receiptToken === undefined) return apiError(401, "UPLOAD_RECEIPT_REQUIRED", "CueBench needs the anonymous session and signed operation receipt.", { nextAction: "resume-upload" });
+    let session: AnonymousSessionClaims;
+    let receipt: UploadReceiptClaims;
     try {
-      [session, claims] = await Promise.all([
+      [session, receipt] = await Promise.all([
         verifyAnonymousSession(sessionToken, settings.keyRing, currentNow),
-        verifyUploadReceipt(receipt, settings, currentNow),
+        verifyUploadReceipt(receiptToken, settings, currentNow),
       ]);
     } catch (error) {
       return tokenFailure(error);
     }
-    if (claims.sessionId !== session.sessionId || claims.operationId !== operationId) {
-      return apiError(403, "UPLOAD_OWNERSHIP_MISMATCH", "This signed upload receipt belongs to a different anonymous session or operation.");
-    }
-    const quotaLedger = dependencies.quotaLedger ?? (env.QUOTA_LEDGER === undefined
-      ? undefined
-      : new DurableObjectQuotaLedger(env.QUOTA_LEDGER as unknown as ConstructorParameters<typeof DurableObjectQuotaLedger>[0]));
-    const objectStore = dependencies.objectStore ?? (env.PROCESSING_BUCKET === undefined ? undefined : new R2PrivateObjectStore(env.PROCESSING_BUCKET));
-    if (quotaLedger === undefined || objectStore === undefined) return apiError(503, "CLEANUP_UNAVAILABLE", "CueBench could not request immediate private-copy cleanup right now.");
-    await objectStore.delete(claims.objectKey);
-    await quotaLedger.markCleaned({ sessionKey: claims.sessionKey, operationKey: claims.operationKey, nowMs: currentNow });
-    recordTelemetry(dependencies.telemetry, { stage: "cleanup", durationMs: claims.media.durationMs, byteSize: claims.media.byteLength, status: "deleted" });
+    const ipKey = await saltedLedgerKey(settings.quotaSalt, "network", clientIp(context.req.raw));
+    if (receipt.sessionId !== session.sessionId || receipt.operationId !== operationId || receipt.ipKey !== ipKey) return apiError(403, "UPLOAD_OWNERSHIP_MISMATCH", "This private upload receipt belongs to a different anonymous session, network, or operation.", { nextAction: "start-new-operation" });
+    const coordinator = uploadCoordinatorFor(env, dependencies, receipt.operationKey);
+    const objectStore = objectStoreFor(env, dependencies);
+    const quotaLedger = quotaLedgerFor(env, dependencies);
+    if (coordinator === undefined || objectStore === undefined || quotaLedger === undefined) return apiError(503, "CLEANUP_UNAVAILABLE", "CueBench could not request immediate private-copy cleanup right now.", { retrySafe: true, nextAction: "retry-cleanup" });
+    const record = await coordinator.get(currentNow).catch(() => null);
+    if (!recordMatchesReceipt(record, receipt)) return apiError(410, "UPLOAD_EXPIRED", "This private upload operation is no longer available. Start a new operation.", { nextAction: "start-new-operation" });
+    if (record.state === "queued" || record.state === "completed" || record.state === "workflow-starting") return apiError(409, "PROCESSING_ALREADY_STARTED", "CueBench cannot cancel this private copy because deterministic processing has already started.", { nextAction: "wait-for-status" });
+    if (record.state === "cancelled") return new Response(null, { status: 204 });
+    const cleanup = await cleanupOperation({
+      record,
+      objectStore,
+      coordinator,
+      quotaLedger,
+      nowMs: currentNow,
+      objectState: record.state === "probing" || record.state === "ready"
+        ? "completed"
+        : record.state === "failed-retryable" || record.state === "completing"
+          ? "uncertain"
+          : "multipart",
+    });
+    if (!cleanup.clean) return apiError(409, "CLEANUP_RECONCILIATION_REQUIRED", "CueBench released the pending quota but could not confirm private-copy deletion. Keep the receipt and retry cleanup.", { retrySafe: true, stateChanged: true, nextAction: "retry-cleanup" });
+    recordTelemetry(dependencies.telemetry, { stage: "cleanup", byteSize: receipt.media.byteLength, status: "deleted" });
     return new Response(null, { status: 204 });
   });
 
   app.notFound(async (context) => {
     if (env.ASSETS !== undefined && context.req.method === "GET") return env.ASSETS.fetch(context.req.raw);
-    return apiError(404, "NOT_FOUND", "CueBench could not find that route.");
+    return apiError(404, "NOT_FOUND", "CueBench could not find that route.", { nextAction: "start-new-operation" });
   });
 
   return app;

@@ -1,47 +1,81 @@
 import { QUOTA_WINDOW_MS, type AnonymousQuotaLimits } from "./env";
 
-export type QuotaRejectionCode = "DUPLICATE_OPERATION" | "SESSION_QUOTA" | "IP_QUOTA" | "GLOBAL_BREAKER";
-export type UploadOperationState = "missing" | "issued" | "uploading" | "uploaded" | "cleaned";
-export type UploadClaimResult = "claimed" | "missing" | "uploading" | "uploaded" | "cleaned";
+export type QuotaRejectionCode =
+  | "PENDING_SESSION_LIMIT"
+  | "PENDING_IP_LIMIT"
+  | "SESSION_QUOTA"
+  | "IP_QUOTA"
+  | "GLOBAL_BREAKER"
+  | "RESERVATION_MISSING";
 
 export interface UploadReservation {
-  /** All identifiers are already salted one-way digests before this boundary. */
+  /** Every identity has already been salted before it reaches Durable Object storage. */
   readonly sessionKey: string;
   readonly ipKey: string;
-  readonly operationKey: string;
-  readonly mediaMinutes: number;
+  readonly reservationKey: string;
+  readonly byteLength: number;
   readonly nowMs: number;
   readonly expiresAtMs: number;
   readonly quotas: AnonymousQuotaLimits;
 }
 
+export interface ActualMediaUsage {
+  readonly reservationKey: string;
+  readonly actualByteLength: number;
+  readonly actualDurationMs: number;
+  readonly nowMs: number;
+  readonly quotas: AnonymousQuotaLimits;
+}
+
+export interface UsageReservation {
+  readonly sessionKey: string;
+  readonly ipKey: string;
+  readonly usageKey: string;
+  readonly nowMs: number;
+  readonly quotas: AnonymousQuotaLimits;
+}
+
 export type UploadReservationResult =
-  | { readonly accepted: true }
+  | { readonly accepted: true; readonly existing: boolean }
   | { readonly accepted: false; readonly code: QuotaRejectionCode };
+
+export type CommitMediaResult =
+  | { readonly accepted: true; readonly committedMinutes: number }
+  | { readonly accepted: false; readonly code: QuotaRejectionCode; readonly releasedPending: boolean };
 
 export interface QuotaLedgerPort {
   reserveUpload: (input: UploadReservation) => Promise<UploadReservationResult>;
-  operationState: (input: { readonly sessionKey: string; readonly operationKey: string; readonly nowMs: number }) => Promise<UploadOperationState>;
-  /** Atomically moves an issued operation into the single-writer upload state. */
-  claimUpload: (input: { readonly sessionKey: string; readonly operationKey: string; readonly nowMs: number }) => Promise<UploadClaimResult>;
-  markUploaded: (input: { readonly sessionKey: string; readonly operationKey: string; readonly nowMs: number }) => Promise<boolean>;
-  releaseUpload: (input: { readonly sessionKey: string; readonly operationKey: string; readonly nowMs: number }) => Promise<boolean>;
-  markCleaned: (input: { readonly sessionKey: string; readonly operationKey: string; readonly nowMs: number }) => Promise<boolean>;
-  recordGeneration: (input: { readonly sessionKey: string; readonly nowMs: number; readonly quotas: AnonymousQuotaLimits }) => Promise<boolean>;
-  recordTts: (input: { readonly sessionKey: string; readonly nowMs: number; readonly quotas: AnonymousQuotaLimits }) => Promise<boolean>;
-}
-
-interface IdempotencyMarker {
-  readonly expiresAtMs: number;
-  readonly state: Exclude<UploadOperationState, "missing">;
+  releaseUploadReservation: (input: { readonly reservationKey: string; readonly nowMs: number }) => Promise<boolean>;
+  commitMedia: (input: ActualMediaUsage) => Promise<CommitMediaResult>;
+  reserveGeneration: (input: UsageReservation) => Promise<boolean>;
+  reserveTts: (input: UsageReservation) => Promise<boolean>;
+  recordSpend: (input: { readonly cents: number; readonly nowMs: number; readonly globalSpendLimitCents: number }) => Promise<{ readonly breakerOpen: boolean; readonly spendCents: number }>;
 }
 
 interface CounterBucket {
   readonly expiresAtMs: number;
-  readonly mediaMinutes: number;
+  readonly committedMediaMinutes: number;
   readonly generationCount: number;
   readonly ttsCount: number;
-  readonly operations: Readonly<Record<string, IdempotencyMarker>>;
+  readonly pendingBytes: number;
+  readonly pendingOperations: number;
+}
+
+interface PendingReservation {
+  readonly sessionKey: string;
+  readonly ipKey: string;
+  readonly byteLength: number;
+  readonly expiresAtMs: number;
+}
+
+interface UsageMarker {
+  readonly type: "generation" | "tts";
+  readonly expiresAtMs: number;
+}
+
+interface MediaCommitMarker {
+  readonly expiresAtMs: number;
+  readonly result: CommitMediaResult;
 }
 
 interface GlobalSpendState {
@@ -53,6 +87,9 @@ interface GlobalSpendState {
 interface LedgerState {
   readonly sessions: Readonly<Record<string, CounterBucket>>;
   readonly networks: Readonly<Record<string, CounterBucket>>;
+  readonly reservations: Readonly<Record<string, PendingReservation>>;
+  readonly mediaCommitMarkers: Readonly<Record<string, MediaCommitMarker>>;
+  readonly usageMarkers: Readonly<Record<string, UsageMarker>>;
   readonly global: GlobalSpendState;
 }
 
@@ -65,171 +102,202 @@ export interface DurableObjectStateLike {
   readonly storage: LedgerStorage;
 }
 
+const stateKey = "cuebench-anonymous-quota-ledger-v2";
+
 const emptyBucket = (expiresAtMs: number): CounterBucket => ({
   expiresAtMs,
-  mediaMinutes: 0,
+  committedMediaMinutes: 0,
   generationCount: 0,
   ttsCount: 0,
-  operations: {},
+  pendingBytes: 0,
+  pendingOperations: 0,
 });
 
 const emptyState = (nowMs: number): LedgerState => ({
   sessions: {},
   networks: {},
+  reservations: {},
+  mediaCommitMarkers: {},
+  usageMarkers: {},
   global: { expiresAtMs: nowMs + QUOTA_WINDOW_MS, spendCents: 0, breakerOpen: false },
 });
 
-const activeBucket = (bucket: CounterBucket | undefined, nowMs: number, expiresAtMs: number): CounterBucket => {
-  if (bucket === undefined || bucket.expiresAtMs <= nowMs) return emptyBucket(expiresAtMs);
-  const operations = Object.fromEntries(Object.entries(bucket.operations).filter(([, marker]) => marker.expiresAtMs > nowMs));
-  return { ...bucket, operations };
+const activeBucket = (bucket: CounterBucket | undefined, nowMs: number): CounterBucket | null => bucket === undefined || bucket.expiresAtMs <= nowMs
+  ? null
+  : { ...bucket, pendingBytes: 0, pendingOperations: 0 };
+
+const addPending = (buckets: Readonly<Record<string, CounterBucket>>, key: string, byteLength: number, expiresAtMs: number): Readonly<Record<string, CounterBucket>> => {
+  const bucket = buckets[key] ?? emptyBucket(expiresAtMs);
+  return {
+    ...buckets,
+    [key]: {
+      ...bucket,
+      expiresAtMs: Math.max(bucket.expiresAtMs, expiresAtMs),
+      pendingBytes: bucket.pendingBytes + byteLength,
+      pendingOperations: bucket.pendingOperations + 1,
+    },
+  };
 };
 
+/** Rebuilds pending counters from the only persisted reservation records, safely releasing expired leases. */
 const normaliseState = (input: LedgerState | undefined, nowMs: number): LedgerState => {
   const state = input ?? emptyState(nowMs);
-  const sessions = Object.fromEntries(Object.entries(state.sessions)
-    .filter(([, bucket]) => bucket.expiresAtMs > nowMs)
-    .map(([key, bucket]) => [key, activeBucket(bucket, nowMs, bucket.expiresAtMs)]));
-  const networks = Object.fromEntries(Object.entries(state.networks)
-    .filter(([, bucket]) => bucket.expiresAtMs > nowMs)
-    .map(([key, bucket]) => [key, activeBucket(bucket, nowMs, bucket.expiresAtMs)]));
+  let sessions = Object.fromEntries(Object.entries(state.sessions)
+    .map(([key, bucket]) => [key, activeBucket(bucket, nowMs)] as const)
+    .filter((entry): entry is readonly [string, CounterBucket] => entry[1] !== null));
+  let networks = Object.fromEntries(Object.entries(state.networks)
+    .map(([key, bucket]) => [key, activeBucket(bucket, nowMs)] as const)
+    .filter((entry): entry is readonly [string, CounterBucket] => entry[1] !== null));
+  const reservations = Object.fromEntries(Object.entries(state.reservations).filter(([, reservation]) => reservation.expiresAtMs > nowMs));
+  for (const reservation of Object.values(reservations)) {
+    sessions = addPending(sessions, reservation.sessionKey, reservation.byteLength, reservation.expiresAtMs);
+    networks = addPending(networks, reservation.ipKey, reservation.byteLength, reservation.expiresAtMs);
+  }
   return {
     sessions,
     networks,
+    reservations,
+    mediaCommitMarkers: Object.fromEntries(Object.entries(state.mediaCommitMarkers ?? {}).filter(([, marker]) => marker.expiresAtMs > nowMs)),
+    usageMarkers: Object.fromEntries(Object.entries(state.usageMarkers).filter(([, marker]) => marker.expiresAtMs > nowMs)),
     global: state.global.expiresAtMs > nowMs
       ? state.global
       : { expiresAtMs: nowMs + QUOTA_WINDOW_MS, spendCents: 0, breakerOpen: false },
   };
 };
 
-const withOperation = (bucket: CounterBucket, operationKey: string, marker: IdempotencyMarker): CounterBucket => ({
-  ...bucket,
-  operations: { ...bucket.operations, [operationKey]: marker },
+const replaceBucket = (state: LedgerState, scope: "sessions" | "networks", key: string, bucket: CounterBucket): LedgerState => ({
+  ...state,
+  [scope]: { ...state[scope], [key]: bucket },
 });
 
-const nextState = (state: LedgerState, input: UploadReservation): { readonly state: LedgerState; readonly result: UploadReservationResult } => {
-  const session = activeBucket(state.sessions[input.sessionKey], input.nowMs, input.expiresAtMs);
-  const network = activeBucket(state.networks[input.ipKey], input.nowMs, input.nowMs + QUOTA_WINDOW_MS);
-  if (session.operations[input.operationKey] !== undefined) {
-    return { state, result: { accepted: false, code: "DUPLICATE_OPERATION" } };
-  }
+const reserveUpload = (state: LedgerState, input: UploadReservation): { readonly state: LedgerState; readonly result: UploadReservationResult } => {
+  const existing = state.reservations[input.reservationKey];
+  if (existing !== undefined) return { state, result: { accepted: true, existing: true } };
   if (state.global.breakerOpen || state.global.spendCents >= input.quotas.globalSpendLimitCents) {
     return { state, result: { accepted: false, code: "GLOBAL_BREAKER" } };
   }
-  if (session.mediaMinutes + input.mediaMinutes > input.quotas.sessionMediaMinutes) {
-    return { state, result: { accepted: false, code: "SESSION_QUOTA" } };
+  const session = state.sessions[input.sessionKey] ?? emptyBucket(input.expiresAtMs);
+  const network = state.networks[input.ipKey] ?? emptyBucket(input.nowMs + QUOTA_WINDOW_MS);
+  if (session.pendingOperations + 1 > input.quotas.pendingSessionOperations || session.pendingBytes + input.byteLength > input.quotas.pendingSessionBytes) {
+    return { state, result: { accepted: false, code: "PENDING_SESSION_LIMIT" } };
   }
-  if (network.mediaMinutes + input.mediaMinutes > input.quotas.ipMediaMinutes) {
-    return { state, result: { accepted: false, code: "IP_QUOTA" } };
+  if (network.pendingOperations + 1 > input.quotas.pendingIpOperations || network.pendingBytes + input.byteLength > input.quotas.pendingIpBytes) {
+    return { state, result: { accepted: false, code: "PENDING_IP_LIMIT" } };
   }
-  const marker = { expiresAtMs: Math.min(input.expiresAtMs, input.nowMs + QUOTA_WINDOW_MS), state: "issued" as const };
-  return {
-    state: {
-      ...state,
-      sessions: {
-        ...state.sessions,
-        [input.sessionKey]: withOperation({ ...session, mediaMinutes: session.mediaMinutes + input.mediaMinutes }, input.operationKey, marker),
-      },
-      networks: {
-        ...state.networks,
-        [input.ipKey]: { ...network, mediaMinutes: network.mediaMinutes + input.mediaMinutes },
+  const next = normaliseState({
+    ...state,
+    reservations: {
+      ...state.reservations,
+      [input.reservationKey]: {
+        sessionKey: input.sessionKey,
+        ipKey: input.ipKey,
+        byteLength: input.byteLength,
+        expiresAtMs: Math.min(input.expiresAtMs, input.nowMs + QUOTA_WINDOW_MS),
       },
     },
-    result: { accepted: true },
-  };
+  }, input.nowMs);
+  return { state: next, result: { accepted: true, existing: false } };
 };
 
-const operationState = (state: LedgerState, sessionKey: string, operationKey: string): UploadOperationState => state.sessions[sessionKey]?.operations[operationKey]?.state ?? "missing";
-
-const claimUpload = (state: LedgerState, input: { readonly sessionKey: string; readonly operationKey: string; readonly nowMs: number }): { readonly state: LedgerState; readonly result: UploadClaimResult } => {
-  const session = state.sessions[input.sessionKey];
-  const marker = session?.operations[input.operationKey];
-  if (session === undefined || marker === undefined || marker.expiresAtMs <= input.nowMs) return { state, result: "missing" };
-  if (marker.state !== "issued") return { state, result: marker.state };
-  return {
-    state: {
-      ...state,
-      sessions: {
-        ...state.sessions,
-        [input.sessionKey]: withOperation(session, input.operationKey, { ...marker, state: "uploading" }),
-      },
-    },
-    result: "claimed",
-  };
+const releaseUploadReservation = (state: LedgerState, reservationKey: string, nowMs: number): { readonly state: LedgerState; readonly released: boolean } => {
+  if (state.reservations[reservationKey] === undefined) return { state, released: false };
+  const reservations = Object.fromEntries(Object.entries(state.reservations).filter(([key]) => key !== reservationKey));
+  return { state: normaliseState({ ...state, reservations }, nowMs), released: true };
 };
 
-const markUploaded = (state: LedgerState, input: { readonly sessionKey: string; readonly operationKey: string; readonly nowMs: number }): { readonly state: LedgerState; readonly changed: boolean } => {
-  const session = state.sessions[input.sessionKey];
-  const marker = session?.operations[input.operationKey];
-  if (session === undefined || marker === undefined || marker.expiresAtMs <= input.nowMs) return { state, changed: false };
-  if (marker.state === "uploaded") return { state, changed: true };
-  if (marker.state !== "uploading") return { state, changed: false };
-  return {
-    state: {
-      ...state,
-      sessions: {
-        ...state.sessions,
-        [input.sessionKey]: withOperation(session, input.operationKey, { ...marker, state: "uploaded" }),
-      },
-    },
-    changed: true,
-  };
-};
-
-const releaseUpload = (state: LedgerState, input: { readonly sessionKey: string; readonly operationKey: string; readonly nowMs: number }): { readonly state: LedgerState; readonly changed: boolean } => {
-  const session = state.sessions[input.sessionKey];
-  const marker = session?.operations[input.operationKey];
-  if (session === undefined || marker === undefined || marker.expiresAtMs <= input.nowMs || marker.state !== "uploading") {
-    return { state, changed: false };
+const commitMedia = (state: LedgerState, input: ActualMediaUsage): { readonly state: LedgerState; readonly result: CommitMediaResult } => {
+  const marker = state.mediaCommitMarkers[input.reservationKey];
+  if (marker !== undefined) return { state, result: marker.result };
+  const reservation = state.reservations[input.reservationKey];
+  if (reservation === undefined) return { state, result: { accepted: false, code: "RESERVATION_MISSING", releasedPending: false } };
+  const released = releaseUploadReservation(state, input.reservationKey, input.nowMs);
+  const withoutPending = released.state;
+  if (withoutPending.global.breakerOpen || withoutPending.global.spendCents >= input.quotas.globalSpendLimitCents) {
+    const result: CommitMediaResult = { accepted: false, code: "GLOBAL_BREAKER", releasedPending: true };
+    return { state: { ...withoutPending, mediaCommitMarkers: { ...withoutPending.mediaCommitMarkers, [input.reservationKey]: { expiresAtMs: input.nowMs + QUOTA_WINDOW_MS, result } } }, result };
   }
-  return {
-    state: {
-      ...state,
-      sessions: {
-        ...state.sessions,
-        [input.sessionKey]: withOperation(session, input.operationKey, { ...marker, state: "issued" }),
-      },
-    },
-    changed: true,
-  };
+  const session = withoutPending.sessions[reservation.sessionKey] ?? emptyBucket(input.nowMs + QUOTA_WINDOW_MS);
+  const network = withoutPending.networks[reservation.ipKey] ?? emptyBucket(input.nowMs + QUOTA_WINDOW_MS);
+  const minutes = Math.ceil(input.actualDurationMs / 60_000);
+  if (!Number.isSafeInteger(input.actualByteLength) || input.actualByteLength <= 0 || !Number.isSafeInteger(input.actualDurationMs) || input.actualDurationMs <= 0) {
+    const result: CommitMediaResult = { accepted: false, code: "RESERVATION_MISSING", releasedPending: true };
+    return { state: { ...withoutPending, mediaCommitMarkers: { ...withoutPending.mediaCommitMarkers, [input.reservationKey]: { expiresAtMs: input.nowMs + QUOTA_WINDOW_MS, result } } }, result };
+  }
+  if (session.committedMediaMinutes + minutes > input.quotas.sessionMediaMinutes) {
+    const result: CommitMediaResult = { accepted: false, code: "SESSION_QUOTA", releasedPending: true };
+    return { state: { ...withoutPending, mediaCommitMarkers: { ...withoutPending.mediaCommitMarkers, [input.reservationKey]: { expiresAtMs: input.nowMs + QUOTA_WINDOW_MS, result } } }, result };
+  }
+  if (network.committedMediaMinutes + minutes > input.quotas.ipMediaMinutes) {
+    const result: CommitMediaResult = { accepted: false, code: "IP_QUOTA", releasedPending: true };
+    return { state: { ...withoutPending, mediaCommitMarkers: { ...withoutPending.mediaCommitMarkers, [input.reservationKey]: { expiresAtMs: input.nowMs + QUOTA_WINDOW_MS, result } } }, result };
+  }
+  let next = replaceBucket(withoutPending, "sessions", reservation.sessionKey, { ...session, committedMediaMinutes: session.committedMediaMinutes + minutes });
+  next = replaceBucket(next, "networks", reservation.ipKey, { ...network, committedMediaMinutes: network.committedMediaMinutes + minutes });
+  const result: CommitMediaResult = { accepted: true, committedMinutes: minutes };
+  return { state: { ...next, mediaCommitMarkers: { ...next.mediaCommitMarkers, [input.reservationKey]: { expiresAtMs: input.nowMs + QUOTA_WINDOW_MS, result } } }, result };
 };
 
-const markCleaned = (state: LedgerState, input: { readonly sessionKey: string; readonly operationKey: string; readonly nowMs: number }): { readonly state: LedgerState; readonly changed: boolean } => {
-  const session = state.sessions[input.sessionKey];
-  const marker = session?.operations[input.operationKey];
-  if (session === undefined || marker === undefined || marker.expiresAtMs <= input.nowMs) return { state, changed: false };
-  if (marker.state === "cleaned") return { state, changed: true };
+const reserveUsage = (state: LedgerState, input: UsageReservation, type: "generation" | "tts"): { readonly state: LedgerState; readonly accepted: boolean } => {
+  if (state.usageMarkers[input.usageKey] !== undefined) return { state, accepted: true };
+  if (state.global.breakerOpen || state.global.spendCents >= input.quotas.globalSpendLimitCents) return { state, accepted: false };
+  const session = state.sessions[input.sessionKey] ?? emptyBucket(input.nowMs + QUOTA_WINDOW_MS);
+  const network = state.networks[input.ipKey] ?? emptyBucket(input.nowMs + QUOTA_WINDOW_MS);
+  const field = type === "generation" ? "generationCount" : "ttsCount";
+  const sessionLimit = type === "generation" ? input.quotas.sessionGenerations : input.quotas.sessionTts;
+  const ipLimit = type === "generation" ? input.quotas.ipGenerations : input.quotas.ipTts;
+  if (session[field] >= sessionLimit || network[field] >= ipLimit) return { state, accepted: false };
+  let next = replaceBucket(state, "sessions", input.sessionKey, { ...session, [field]: session[field] + 1 });
+  next = replaceBucket(next, "networks", input.ipKey, { ...network, [field]: network[field] + 1 });
   return {
     state: {
-      ...state,
-      sessions: {
-        ...state.sessions,
-        [input.sessionKey]: withOperation(session, input.operationKey, { ...marker, state: "cleaned" }),
-      },
-    },
-    changed: true,
-  };
-};
-
-const incrementCounter = (state: LedgerState, input: { readonly sessionKey: string; readonly nowMs: number; readonly quotas: AnonymousQuotaLimits }, counter: "generationCount" | "ttsCount"): { readonly state: LedgerState; readonly accepted: boolean } => {
-  const session = activeBucket(state.sessions[input.sessionKey], input.nowMs, input.nowMs + QUOTA_WINDOW_MS);
-  const limit = counter === "generationCount" ? input.quotas.sessionGenerations : input.quotas.sessionTts;
-  if (session[counter] >= limit) return { state, accepted: false };
-  return {
-    state: {
-      ...state,
-      sessions: {
-        ...state.sessions,
-        [input.sessionKey]: { ...session, [counter]: session[counter] + 1 },
+      ...next,
+      usageMarkers: {
+        ...next.usageMarkers,
+        [input.usageKey]: { type, expiresAtMs: input.nowMs + QUOTA_WINDOW_MS },
       },
     },
     accepted: true,
   };
 };
 
-const stateKey = "cuebench-anonymous-quota-ledger-v1";
+const recordSpend = (state: LedgerState, cents: number, limit: number): { readonly state: LedgerState; readonly result: { readonly breakerOpen: boolean; readonly spendCents: number } } => {
+  const safeCents = Number.isSafeInteger(cents) && cents >= 0 ? cents : 0;
+  const spendCents = state.global.spendCents + safeCents;
+  const breakerOpen = state.global.breakerOpen || spendCents >= limit;
+  const next = { ...state, global: { ...state.global, spendCents, breakerOpen } };
+  return { state: next, result: { breakerOpen, spendCents } };
+};
 
-/** Durable Object storage contains only salted keys, counters, expiry buckets, and global spend state. */
+type LedgerAction =
+  | { readonly type: "reserve-upload"; readonly nowMs: number; readonly input: UploadReservation }
+  | { readonly type: "release-upload"; readonly nowMs: number; readonly reservationKey: string }
+  | { readonly type: "commit-media"; readonly nowMs: number; readonly input: ActualMediaUsage }
+  | { readonly type: "reserve-generation" | "reserve-tts"; readonly nowMs: number; readonly input: UsageReservation }
+  | { readonly type: "record-spend"; readonly nowMs: number; readonly cents: number; readonly limit: number };
+
+const applyAction = (state: LedgerState, action: LedgerAction): { readonly state: LedgerState; readonly value: unknown } => {
+  if (action.type === "reserve-upload") {
+    const applied = reserveUpload(state, action.input);
+    return { state: applied.state, value: applied.result };
+  }
+  if (action.type === "release-upload") {
+    const applied = releaseUploadReservation(state, action.reservationKey, action.nowMs);
+    return { state: applied.state, value: { released: applied.released } };
+  }
+  if (action.type === "commit-media") {
+    const applied = commitMedia(state, action.input);
+    return { state: applied.state, value: applied.result };
+  }
+  if (action.type === "reserve-generation" || action.type === "reserve-tts") {
+    const applied = reserveUsage(state, action.input, action.type === "reserve-generation" ? "generation" : "tts");
+    return { state: applied.state, value: { accepted: applied.accepted } };
+  }
+  if (action.type !== "record-spend") return { state, value: null };
+  const applied = recordSpend(state, action.cents, action.limit);
+  return { state: applied.state, value: applied.result };
+};
+
+/** Durable Object storage contains only salted keys, numeric counters, bounded pending leases, expiry, and spend state. */
 export class QuotaLedger {
   public constructor(private readonly state: DurableObjectStateLike) {}
 
@@ -248,48 +316,7 @@ export class QuotaLedger {
   }
 }
 
-type LedgerAction =
-  | { readonly type: "reserve-upload"; readonly nowMs: number; readonly input: UploadReservation }
-  | { readonly type: "operation-state"; readonly nowMs: number; readonly input: { readonly sessionKey: string; readonly operationKey: string } }
-  | { readonly type: "claim-upload" | "mark-uploaded" | "release-upload" | "mark-cleaned"; readonly nowMs: number; readonly input: { readonly sessionKey: string; readonly operationKey: string } }
-  | { readonly type: "record-generation" | "record-tts"; readonly nowMs: number; readonly input: { readonly sessionKey: string; readonly quotas: AnonymousQuotaLimits } };
-
-const applyAction = (state: LedgerState, action: LedgerAction): { readonly state: LedgerState; readonly value: unknown } => {
-  if (action.type === "reserve-upload") {
-    const applied = nextState(state, action.input);
-    return { state: applied.state, value: applied.result };
-  }
-  if (action.type === "operation-state") {
-    return { state, value: { state: operationState(state, action.input.sessionKey, action.input.operationKey) } };
-  }
-  if (action.type === "claim-upload") {
-    const applied = claimUpload(state, { ...action.input, nowMs: action.nowMs });
-    return { state: applied.state, value: { result: applied.result } };
-  }
-  if (action.type === "mark-uploaded") {
-    const applied = markUploaded(state, { ...action.input, nowMs: action.nowMs });
-    return { state: applied.state, value: { changed: applied.changed } };
-  }
-  if (action.type === "release-upload") {
-    const applied = releaseUpload(state, { ...action.input, nowMs: action.nowMs });
-    return { state: applied.state, value: { changed: applied.changed } };
-  }
-  if (action.type === "mark-cleaned") {
-    const applied = markCleaned(state, { ...action.input, nowMs: action.nowMs });
-    return { state: applied.state, value: { changed: applied.changed } };
-  }
-  if (action.type === "record-generation" || action.type === "record-tts") {
-    const applied = incrementCounter(
-      state,
-      { ...action.input, nowMs: action.nowMs },
-      action.type === "record-generation" ? "generationCount" : "ttsCount",
-    );
-    return { state: applied.state, value: { accepted: applied.accepted } };
-  }
-  return { state, value: { error: "unknown-action" } };
-};
-
-/** Fixture adapter used by local tests; it has the same no-content state shape as the Durable Object. */
+/** Deterministic local adapter for unit tests; it never retains media or project content. */
 export class InMemoryQuotaLedger implements QuotaLedgerPort {
   private state: LedgerState;
 
@@ -304,58 +331,20 @@ export class InMemoryQuotaLedger implements QuotaLedgerPort {
     };
   }
 
-  public async reserveUpload(input: UploadReservation): Promise<UploadReservationResult> {
-    this.state = normaliseState(this.state, input.nowMs);
-    const applied = nextState(this.state, input);
+  private apply(action: LedgerAction): unknown {
+    this.state = normaliseState(this.state, action.nowMs);
+    const applied = applyAction(this.state, action);
     this.state = applied.state;
-    return applied.result;
+    return applied.value;
   }
 
-  public async operationState(input: { readonly sessionKey: string; readonly operationKey: string; readonly nowMs: number }): Promise<UploadOperationState> {
-    this.state = normaliseState(this.state, input.nowMs);
-    return operationState(this.state, input.sessionKey, input.operationKey);
-  }
-
-  public async claimUpload(input: { readonly sessionKey: string; readonly operationKey: string; readonly nowMs: number }): Promise<UploadClaimResult> {
-    this.state = normaliseState(this.state, input.nowMs);
-    const applied = claimUpload(this.state, input);
-    this.state = applied.state;
-    return applied.result;
-  }
-
-  public async markUploaded(input: { readonly sessionKey: string; readonly operationKey: string; readonly nowMs: number }): Promise<boolean> {
-    this.state = normaliseState(this.state, input.nowMs);
-    const applied = markUploaded(this.state, input);
-    this.state = applied.state;
-    return applied.changed;
-  }
-
-  public async releaseUpload(input: { readonly sessionKey: string; readonly operationKey: string; readonly nowMs: number }): Promise<boolean> {
-    this.state = normaliseState(this.state, input.nowMs);
-    const applied = releaseUpload(this.state, input);
-    this.state = applied.state;
-    return applied.changed;
-  }
-
-  public async markCleaned(input: { readonly sessionKey: string; readonly operationKey: string; readonly nowMs: number }): Promise<boolean> {
-    this.state = normaliseState(this.state, input.nowMs);
-    const applied = markCleaned(this.state, input);
-    this.state = applied.state;
-    return applied.changed;
-  }
-
-  public async recordGeneration(input: { readonly sessionKey: string; readonly nowMs: number; readonly quotas: AnonymousQuotaLimits }): Promise<boolean> {
-    this.state = normaliseState(this.state, input.nowMs);
-    const applied = incrementCounter(this.state, input, "generationCount");
-    this.state = applied.state;
-    return applied.accepted;
-  }
-
-  public async recordTts(input: { readonly sessionKey: string; readonly nowMs: number; readonly quotas: AnonymousQuotaLimits }): Promise<boolean> {
-    this.state = normaliseState(this.state, input.nowMs);
-    const applied = incrementCounter(this.state, input, "ttsCount");
-    this.state = applied.state;
-    return applied.accepted;
+  public reserveUpload(input: UploadReservation): Promise<UploadReservationResult> { return Promise.resolve(this.apply({ type: "reserve-upload", nowMs: input.nowMs, input }) as UploadReservationResult); }
+  public releaseUploadReservation(input: { readonly reservationKey: string; readonly nowMs: number }): Promise<boolean> { return Promise.resolve((this.apply({ type: "release-upload", ...input }) as { readonly released: boolean }).released); }
+  public commitMedia(input: ActualMediaUsage): Promise<CommitMediaResult> { return Promise.resolve(this.apply({ type: "commit-media", nowMs: input.nowMs, input }) as CommitMediaResult); }
+  public reserveGeneration(input: UsageReservation): Promise<boolean> { return Promise.resolve((this.apply({ type: "reserve-generation", nowMs: input.nowMs, input }) as { readonly accepted: boolean }).accepted); }
+  public reserveTts(input: UsageReservation): Promise<boolean> { return Promise.resolve((this.apply({ type: "reserve-tts", nowMs: input.nowMs, input }) as { readonly accepted: boolean }).accepted); }
+  public recordSpend(input: { readonly cents: number; readonly nowMs: number; readonly globalSpendLimitCents: number }): Promise<{ readonly breakerOpen: boolean; readonly spendCents: number }> {
+    return Promise.resolve(this.apply({ type: "record-spend", nowMs: input.nowMs, cents: input.cents, limit: input.globalSpendLimitCents }) as { readonly breakerOpen: boolean; readonly spendCents: number });
   }
 }
 
@@ -363,8 +352,7 @@ export class DurableObjectQuotaLedger implements QuotaLedgerPort {
   public constructor(private readonly namespace: { readonly idFromName: (name: string) => unknown; readonly get: (id: unknown) => { fetch: (request: Request) => Promise<Response> } }) {}
 
   private async call<Value>(action: LedgerAction): Promise<Value> {
-    const stub = this.namespace.get(this.namespace.idFromName("cuebench-anonymous-quota-ledger-v1"));
-    const response = await stub.fetch(new Request("https://quota-ledger.internal/", {
+    const response = await this.namespace.get(this.namespace.idFromName("cuebench-anonymous-quota-ledger-v2")).fetch(new Request("https://quota-ledger.internal/", {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify(action),
@@ -373,41 +361,17 @@ export class DurableObjectQuotaLedger implements QuotaLedgerPort {
     return response.json() as Promise<Value>;
   }
 
-  public async reserveUpload(input: UploadReservation): Promise<UploadReservationResult> {
-    return this.call<UploadReservationResult>({ type: "reserve-upload", nowMs: input.nowMs, input });
-  }
-
-  public async operationState(input: { readonly sessionKey: string; readonly operationKey: string; readonly nowMs: number }): Promise<UploadOperationState> {
-    const result = await this.call<{ readonly state: UploadOperationState }>({ type: "operation-state", nowMs: input.nowMs, input });
-    return result.state;
-  }
-
-  public async claimUpload(input: { readonly sessionKey: string; readonly operationKey: string; readonly nowMs: number }): Promise<UploadClaimResult> {
-    return (await this.call<{ readonly result: UploadClaimResult }>({ type: "claim-upload", nowMs: input.nowMs, input })).result;
-  }
-
-  public async markUploaded(input: { readonly sessionKey: string; readonly operationKey: string; readonly nowMs: number }): Promise<boolean> {
-    return (await this.call<{ readonly changed: boolean }>({ type: "mark-uploaded", nowMs: input.nowMs, input })).changed;
-  }
-
-  public async releaseUpload(input: { readonly sessionKey: string; readonly operationKey: string; readonly nowMs: number }): Promise<boolean> {
-    return (await this.call<{ readonly changed: boolean }>({ type: "release-upload", nowMs: input.nowMs, input })).changed;
-  }
-
-  public async markCleaned(input: { readonly sessionKey: string; readonly operationKey: string; readonly nowMs: number }): Promise<boolean> {
-    return (await this.call<{ readonly changed: boolean }>({ type: "mark-cleaned", nowMs: input.nowMs, input })).changed;
-  }
-
-  public async recordGeneration(input: { readonly sessionKey: string; readonly nowMs: number; readonly quotas: AnonymousQuotaLimits }): Promise<boolean> {
-    return (await this.call<{ readonly accepted: boolean }>({ type: "record-generation", nowMs: input.nowMs, input })).accepted;
-  }
-
-  public async recordTts(input: { readonly sessionKey: string; readonly nowMs: number; readonly quotas: AnonymousQuotaLimits }): Promise<boolean> {
-    return (await this.call<{ readonly accepted: boolean }>({ type: "record-tts", nowMs: input.nowMs, input })).accepted;
+  public reserveUpload(input: UploadReservation): Promise<UploadReservationResult> { return this.call({ type: "reserve-upload", nowMs: input.nowMs, input }); }
+  public async releaseUploadReservation(input: { readonly reservationKey: string; readonly nowMs: number }): Promise<boolean> { return (await this.call<{ readonly released: boolean }>({ type: "release-upload", ...input })).released; }
+  public commitMedia(input: ActualMediaUsage): Promise<CommitMediaResult> { return this.call({ type: "commit-media", nowMs: input.nowMs, input }); }
+  public async reserveGeneration(input: UsageReservation): Promise<boolean> { return (await this.call<{ readonly accepted: boolean }>({ type: "reserve-generation", nowMs: input.nowMs, input })).accepted; }
+  public async reserveTts(input: UsageReservation): Promise<boolean> { return (await this.call<{ readonly accepted: boolean }>({ type: "reserve-tts", nowMs: input.nowMs, input })).accepted; }
+  public recordSpend(input: { readonly cents: number; readonly nowMs: number; readonly globalSpendLimitCents: number }): Promise<{ readonly breakerOpen: boolean; readonly spendCents: number }> {
+    return this.call({ type: "record-spend", nowMs: input.nowMs, cents: input.cents, limit: input.globalSpendLimitCents });
   }
 }
 
-/** Produces a one-way, scoped identifier before any quota data is persisted. */
+/** Produces a one-way, scoped identifier before any quota state is persisted. */
 export const saltedLedgerKey = async (salt: string, scope: string, rawValue: string): Promise<string> => {
   const digest = await globalThis.crypto.subtle.digest("SHA-256", new TextEncoder().encode(`${salt}\u0000${scope}\u0000${rawValue}`));
   return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
