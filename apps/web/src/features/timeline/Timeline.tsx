@@ -46,6 +46,10 @@ export interface TimelineProps {
   /** A deterministic test and embed seam; production measures its own container. */
   readonly viewportWidth?: number;
   readonly onSelectionChange?: (itemId: string) => void;
+  /** Lets a review owner guard cross-surface selection before the timeline mutates it. */
+  readonly onRequestItemNavigation?: (itemId: string, sourceLabel: string) => void;
+  /** A visible draft elsewhere owns the review authority boundary. */
+  readonly reviewDraftActive?: boolean;
 }
 
 interface TimelineViewport {
@@ -161,6 +165,8 @@ export function Timeline({
   peakPyramid,
   viewportWidth,
   onSelectionChange,
+  onRequestItemNavigation,
+  reviewDraftActive = false,
 }: TimelineProps) {
   const surfaceRef = useRef<HTMLDivElement>(null);
   const itemButtonRefs = useRef(new Map<string, HTMLButtonElement>());
@@ -240,6 +246,10 @@ export function Timeline({
 
   const selectItem = useCallback((item: TimelineLaneItem) => {
     if (commandPendingRef.current) return;
+    if (onRequestItemNavigation !== undefined) {
+      onRequestItemNavigation(item.itemId, `timeline ${item.kind === "CaptionCue" ? "caption" : "audio-description"} ${item.itemId.toUpperCase()}`);
+      return;
+    }
     const command: DomainCommand = {
       type: "SelectItem",
       actor,
@@ -256,7 +266,7 @@ export function Timeline({
       onSelectionChange?.(canonicalItem.itemId);
       setFocusAfterAcceptedItemId(canonicalItem.itemId);
     })();
-  }, [actor, executeTimelineCommand, onSelectionChange, project.projectRevision, seekToMediaTime]);
+  }, [actor, executeTimelineCommand, onRequestItemNavigation, onSelectionChange, project.projectRevision, seekToMediaTime]);
 
   const commitPreview = useCallback(() => {
     if (commandPendingRef.current) return;
@@ -467,7 +477,7 @@ export function Timeline({
           transform={transform}
           selectedItemId={selectedItemId}
           editPreview={editPreview}
-          interactionDisabled={isCommandPending}
+          interactionDisabled={isCommandPending || reviewDraftActive}
           onActivate={selectItem}
           onRegisterItemButton={registerItemButton}
           onPointerDown={onPointerDown}
@@ -482,7 +492,7 @@ export function Timeline({
           transform={transform}
           selectedItemId={selectedItemId}
           editPreview={editPreview}
-          interactionDisabled={isCommandPending}
+          interactionDisabled={isCommandPending || reviewDraftActive}
           onActivate={selectItem}
           onRegisterItemButton={registerItemButton}
           onPointerDown={onPointerDown}
@@ -504,7 +514,7 @@ export function Timeline({
                 style={{ left: `${transform.msToX(item.current.startMs)}px` }}
                 onClick={() => selectItem(item)}
                 aria-label={`${finding.severity} finding for ${item.itemId}: ${finding.message}`}
-                disabled={isCommandPending}
+                disabled={isCommandPending || reviewDraftActive}
               >
                 {finding.severity === "blocker" ? "Blocking finding" : "Warning finding"}
               </button>
@@ -533,6 +543,7 @@ export function Timeline({
         />
         <p>Use the cue and audio-description controls above to select or adjust timing. Arrow keys adjust the focused boundary; release the key to commit once.</p>
       </div>
+      {reviewDraftActive ? <p className="timeline-command-feedback" role="status" aria-live="polite">Save, discard, or cancel the visible review draft before selecting or adjusting another timeline item.</p> : null}
       {previewLabel === null ? null : <p className="timeline-preview-feedback" data-testid="timeline-preview-feedback" role="status" aria-live="polite">{previewLabel}</p>}
       {acceptedFeedback === null ? null : <p className="timeline-accepted-feedback" data-testid="timeline-accepted-feedback" role="status" aria-live="polite">{acceptedFeedback}</p>}
       {commandFeedback === null ? null : <p className="timeline-command-feedback" role="alert">{commandFeedback}</p>}

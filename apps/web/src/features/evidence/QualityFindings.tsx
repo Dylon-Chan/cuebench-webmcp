@@ -1,10 +1,11 @@
 import type { CaptionProject, QualityFinding } from "@cuebench/domain";
-import type { ReviewableItem } from "../review/review-utils";
-import { findingTargetsItem } from "../review/review-utils";
+import type { ReviewIndexes, ReviewableItem } from "../review/review-utils";
+import { findingsForItem, indexReviewData } from "../review/review-utils";
 
 export interface QualityFindingsProps {
   readonly project: CaptionProject;
   readonly item?: ReviewableItem | null;
+  readonly indexes?: ReviewIndexes;
   readonly onFocusFinding: (finding: QualityFinding) => void;
   readonly disabled?: boolean;
 }
@@ -15,8 +16,11 @@ const findingScope = (finding: QualityFinding): string => {
   return `${finding.target.first.itemId.toUpperCase()} r${finding.target.first.itemRevision} + ${finding.target.second.itemId.toUpperCase()} r${finding.target.second.itemRevision}`;
 };
 
-export function QualityFindings({ project, item = null, onFocusFinding, disabled = false }: QualityFindingsProps) {
-  const findings = (project.validationRun?.findings ?? []).filter((finding) => item === null || findingTargetsItem(finding, item));
+export function QualityFindings({ project, item = null, indexes, onFocusFinding, disabled = false }: QualityFindingsProps) {
+  const resolvedIndexes = indexes ?? indexReviewData(project);
+  const findings = item === null
+    ? project.validationRun?.findings ?? []
+    : findingsForItem(resolvedIndexes, item.itemId);
   const validationMessage = project.validation.status === "NotRun"
     ? "No validation run has been recorded."
     : project.validation.status === "Stale"

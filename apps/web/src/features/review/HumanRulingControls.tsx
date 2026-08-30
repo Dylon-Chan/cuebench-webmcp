@@ -8,6 +8,10 @@ export interface HumanRulingControlsProps {
   readonly item: ReviewableItem | null;
   readonly projectRevision: number;
   readonly isCommandPending: boolean;
+  /** The draft lives in ReviewDocket, which is the authority boundary. */
+  readonly hasUnsavedDraft: boolean;
+  /** Kept inside the modal so a failed command remains perceivable while it stays open. */
+  readonly commandError: string | null;
   readonly onExecuteCommand: (command: DomainCommand, acceptedMessage: string) => Promise<CommandResult | null>;
 }
 
@@ -19,6 +23,8 @@ export function HumanRulingControls({
   item,
   projectRevision,
   isCommandPending,
+  hasUnsavedDraft,
+  commandError,
   onExecuteCommand,
 }: HumanRulingControlsProps) {
   const [objectOpen, setObjectOpen] = useState(false);
@@ -40,7 +46,7 @@ export function HumanRulingControls({
       expectedProjectRevision: projectRevision,
       reason: reason.trim(),
     }, `Objected ${label} as a Human ruling.`);
-    if (result?.error === undefined) setObjectOpen(false);
+    if (result !== null && result.error === undefined) setObjectOpen(false);
   };
 
   const sustain = () => {
@@ -62,13 +68,15 @@ export function HumanRulingControls({
       </div>
       {item === null ? (
         <p>Select an item before issuing a ruling.</p>
+      ) : hasUnsavedDraft ? (
+        <p id="ruling-draft-guard">Save or discard the draft before a human ruling. Rulings always bind the displayed saved revision.</p>
       ) : (
         <p>Object records a reason. Sustain accepts this exact revision and records Human attribution.</p>
       )}
       <div className="ruling-panel__actions">
         <Dialog.Root open={objectOpen} onOpenChange={setObjectOpen}>
           <Dialog.Trigger asChild>
-            <button className="button button--object" type="button" disabled={item === null || isCommandPending} aria-label="Object selected revision">Object</button>
+            <button className="button button--object" type="button" disabled={item === null || isCommandPending || hasUnsavedDraft} aria-label="Object selected revision" aria-describedby={hasUnsavedDraft ? "ruling-draft-guard" : undefined}>Object</button>
           </Dialog.Trigger>
           <Dialog.Portal>
             <Dialog.Overlay className="dialog-overlay" />
@@ -87,6 +95,7 @@ export function HumanRulingControls({
                   />
                 </label>
               )}
+              {commandError === null ? null : <p className="review-command-feedback" role="alert">{commandError}</p>}
               <div className="storage-dialog__actions">
                 <Dialog.Close className="button button--outline" type="button">Cancel</Dialog.Close>
                 <button className="button button--object" type="button" disabled={isCommandPending || !reason.trim()} onClick={() => void object()}>Confirm objection</button>
@@ -97,8 +106,9 @@ export function HumanRulingControls({
         <button
           className="button button--sustain"
           type="button"
-          disabled={item === null || isCommandPending || item.current.state === "Sustained"}
+          disabled={item === null || isCommandPending || hasUnsavedDraft || item.current.state === "Sustained"}
           aria-label="Sustain selected revision"
+          aria-describedby={hasUnsavedDraft ? "ruling-draft-guard" : undefined}
           onClick={sustain}
         >
           {item?.current.state === "Sustained" ? "Sustained" : "Sustain"}

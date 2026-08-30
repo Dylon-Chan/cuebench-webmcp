@@ -1,4 +1,4 @@
-import { useCallback, useState, useSyncExternalStore } from "react";
+import { useCallback, useRef, useState, useSyncExternalStore } from "react";
 import { Navigate, Route, Routes } from "react-router-dom";
 import type { CaptionProject } from "@cuebench/domain";
 import { VideoEvidenceBay } from "../features/evidence/VideoEvidenceBay";
@@ -8,7 +8,7 @@ import { StorageDisclosure } from "../features/project/StorageDisclosure";
 import type { ProjectMode, ProjectStore } from "../features/project/project-store";
 import type { SourceProvenance } from "../features/project/source-provenance";
 import { CourtRecord } from "../features/review/CourtRecord";
-import { ReviewDocket } from "../features/review/ReviewDocket";
+import { ReviewDocket, ReviewSelectionSummary } from "../features/review/ReviewDocket";
 
 export interface AppRoutesProps {
   readonly store: ProjectStore;
@@ -38,8 +38,20 @@ export function WorkbenchShell({ project, mode, sourceObjectUrl, sourceProvenanc
     ? "Validation not run"
     : `${project.validation.blockerCount} blockers · ${project.validation.warningCount} warnings`;
   const [reviewSeekToMediaTime, setReviewSeekToMediaTime] = useState<(mediaTimeMs: number) => void>(() => () => undefined);
+  const [readNativePlayheadMs, setReadNativePlayheadMs] = useState<(() => number) | null>(null);
+  const [reviewDraftActive, setReviewDraftActive] = useState(false);
+  const reviewItemNavigationRef = useRef<(itemId: string, sourceLabel: string) => void>(() => undefined);
   const receiveVideoSeek = useCallback((seekToMediaTime: (mediaTimeMs: number) => void) => {
     setReviewSeekToMediaTime(() => seekToMediaTime);
+  }, []);
+  const receiveNativePlayhead = useCallback((readMediaTimeMs: () => number) => {
+    setReadNativePlayheadMs(() => readMediaTimeMs);
+  }, []);
+  const receiveReviewItemNavigation = useCallback((navigate: (itemId: string, sourceLabel: string) => void) => {
+    reviewItemNavigationRef.current = navigate;
+  }, []);
+  const requestReviewItemNavigation = useCallback((itemId: string, sourceLabel: string) => {
+    reviewItemNavigationRef.current(itemId, sourceLabel);
   }, []);
 
   return (
@@ -78,6 +90,10 @@ export function WorkbenchShell({ project, mode, sourceObjectUrl, sourceProvenanc
           evidence={projectMediaEvidence(sourceProvenance)}
           onCommand={(command) => store.executeCommand(command)}
           onSeekReady={receiveVideoSeek}
+          onPlayheadReady={receiveNativePlayhead}
+          onRequestItemNavigation={requestReviewItemNavigation}
+          reviewDraftActive={reviewDraftActive}
+          reviewSummary={<ReviewSelectionSummary project={project} />}
         />
 
         <ReviewDocket
@@ -85,10 +101,12 @@ export function WorkbenchShell({ project, mode, sourceObjectUrl, sourceProvenanc
           onCommand={(command) => store.executeCommand(command)}
           onSeekToMediaTime={reviewSeekToMediaTime}
           footer={<StorageDisclosure mode={mode} />}
+          onRegisterItemNavigation={receiveReviewItemNavigation}
+          onDraftStateChange={setReviewDraftActive}
+          {...(readNativePlayheadMs === null ? {} : { onReadNativePlayheadMs: readNativePlayheadMs })}
         />
+        <CourtRecord project={project} onSelectItem={(itemId) => requestReviewItemNavigation(itemId, `Court Record item ${itemId.toUpperCase()}`)} />
       </div>
-
-      <CourtRecord project={project} />
     </main>
   );
 }

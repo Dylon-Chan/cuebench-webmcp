@@ -54,3 +54,33 @@ test("the hardened timeline stays evidence-led in the first desktop viewport and
   await expect(page.getByRole("slider", { name: "Seek source media" })).toBeVisible();
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
 });
+
+test("the mobile workbench keeps one semantic review order from video through Court Record", async ({ page }) => {
+  await page.setViewportSize({ width: 390, height: 844 });
+  await openWorkbench(page);
+
+  const summary = page.locator(".review-selection-summary");
+  await expect(summary).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Selected review item" })).toBeVisible();
+
+  const positions = await page.evaluate(() => [
+    ".specimen-view",
+    ".review-selection-summary",
+    ".timeline-shell",
+    ".review-docket",
+    ".court-record",
+  ].map((selector) => {
+    const element = document.querySelector<HTMLElement>(selector);
+    if (element === null) throw new Error(`Missing ${selector}.`);
+    return { selector, top: element.getBoundingClientRect().top };
+  }));
+  expect(positions.map((entry) => entry.selector)).toEqual([
+    ".specimen-view",
+    ".review-selection-summary",
+    ".timeline-shell",
+    ".review-docket",
+    ".court-record",
+  ]);
+  expect(positions.every((entry, index) => index === 0 || entry.top > positions[index - 1]!.top)).toBe(true);
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
+});

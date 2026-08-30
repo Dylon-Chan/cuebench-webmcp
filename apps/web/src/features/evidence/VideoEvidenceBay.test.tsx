@@ -85,4 +85,24 @@ describe("VideoEvidenceBay", () => {
     expect(projectMediaEvidence({ sourceKind: "bundled-fixture", audioPresence: "absent" }).audioState).toBe("no-audio");
     expect(projectMediaEvidence({ sourceKind: "uploaded", audioPresence: "unknown" }).audioState).toBe("pending");
   });
+
+  it("exposes the one native video clock for a semantic split control", () => {
+    const onPlayheadReady = vi.fn();
+    const project = evidenceProject();
+    render(
+      <VideoEvidenceBay
+        project={project}
+        sourceObjectUrl="blob:cuebench:source"
+        evidence={{ audioState: "pending", peakPyramid: null }}
+        onCommand={acceptedCommand(project)}
+        onPlayheadReady={onPlayheadReady}
+      />,
+    );
+    const video = screen.getByLabelText("Verified local source media") as HTMLVideoElement;
+    Object.defineProperty(video, "currentTime", { configurable: true, value: 12.345 });
+
+    const readNativePlayhead = onPlayheadReady.mock.calls[0]?.[0] as (() => number) | undefined;
+    expect(readNativePlayhead).toBeTypeOf("function");
+    expect(readNativePlayhead?.()).toBe(12_345);
+  });
 });

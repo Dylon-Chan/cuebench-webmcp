@@ -1,10 +1,11 @@
 import type { CaptionProject } from "@cuebench/domain";
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
 import {
   Timeline,
   type TimelineCommandExecutor,
 } from "../timeline/Timeline";
 import { formatMediaTime } from "../timeline/time-transform";
+import { clampMediaTime } from "../timeline/time-transform";
 import { usePlayhead } from "../timeline/use-playhead";
 import type { PreparedMediaEvidence } from "./project-media-evidence";
 
@@ -17,6 +18,14 @@ export interface VideoEvidenceBayProps {
   readonly evidence: PreparedMediaEvidence;
   /** Lets adjacent semantic review controls seek the one native media clock. */
   readonly onSeekReady?: (seekToMediaTime: (mediaTimeMs: number) => void) => void;
+  /** Provides a direct native-clock read for a caption split point. */
+  readonly onPlayheadReady?: (readMediaTimeMs: () => number) => void;
+  /** Routes timeline selection through the review draft authority boundary. */
+  readonly onRequestItemNavigation?: (itemId: string, sourceLabel: string) => void;
+  /** Prevents a different timeline item from replacing a visible dirty review draft. */
+  readonly reviewDraftActive?: boolean;
+  /** Kept as one semantic summary, placed between video and timeline on narrow screens. */
+  readonly reviewSummary?: ReactNode;
 }
 
 /**
@@ -29,16 +38,28 @@ export function VideoEvidenceBay({
   onCommand,
   evidence,
   onSeekReady,
+  onPlayheadReady,
+  onRequestItemNavigation,
+  reviewDraftActive = false,
+  reviewSummary,
 }: VideoEvidenceBayProps) {
   const videoRef = useRef<HTMLVideoElement>(null);
   const [isMuted, setIsMuted] = useState(false);
   const [volume, setVolume] = useState(1);
   const [mediaError, setMediaError] = useState<string | null>(null);
   const playhead = usePlayhead(videoRef, { durationMs: project.media.durationMs });
+  const readNativePlayhead = useCallback(() => clampMediaTime(
+    (videoRef.current?.currentTime ?? 0) * 1_000,
+    project.media.durationMs,
+  ), [project.media.durationMs]);
 
   useEffect(() => {
     onSeekReady?.(playhead.seekToMediaTime);
   }, [onSeekReady, playhead.seekToMediaTime]);
+
+  useEffect(() => {
+    onPlayheadReady?.(readNativePlayhead);
+  }, [onPlayheadReady, readNativePlayhead]);
 
   const syncNativeAudioState = () => {
     const video = videoRef.current;
@@ -118,11 +139,14 @@ export function VideoEvidenceBay({
         <span className="transport-note">Native video time drives every timeline lane.</span>
       </div>
       {mediaError === null ? null : <p className="form-error" role="alert">{mediaError}</p>}
+      {reviewSummary}
       <Timeline
         project={project}
         playheadMs={playhead.mediaTimeMs}
         seekToMediaTime={playhead.seekToMediaTime}
         onCommand={onCommand}
+        {...(onRequestItemNavigation === undefined ? {} : { onRequestItemNavigation })}
+        reviewDraftActive={reviewDraftActive}
         peakPyramid={evidence.audioState === "ready" ? evidence.peakPyramid : null}
       />
       <p className="timeline-evidence-status" data-testid="media-evidence-status" role="status" aria-live="polite">{peakStatusMessage}</p>

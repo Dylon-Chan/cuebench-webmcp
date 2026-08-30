@@ -104,6 +104,16 @@ const renderTimeline = (overrides: Partial<React.ComponentProps<typeof Timeline>
 };
 
 describe("Timeline", () => {
+  it("delegates item selection to a review authority when one owns a dirty draft", () => {
+    const onRequestItemNavigation = vi.fn();
+    const { onCommand } = renderTimeline({ onRequestItemNavigation });
+
+    fireEvent.click(screen.getByRole("button", { name: /caption c01: dr\. nguyen introduces/i }));
+
+    expect(onRequestItemNavigation).toHaveBeenCalledWith("c01", "timeline caption C01");
+    expect(onCommand).not.toHaveBeenCalled();
+  });
+
   it("keeps cue selection and video seeking on the same Media Time after the canonical command accepts", async () => {
     const { onCommand, seekToMediaTime } = renderTimeline();
 
