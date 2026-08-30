@@ -3,6 +3,13 @@ import { Navigate, Route, Routes } from "react-router-dom";
 import type { CaptionProject } from "@cuebench/domain";
 import { VideoEvidenceBay } from "../features/evidence/VideoEvidenceBay";
 import { projectMediaEvidence } from "../features/evidence/project-media-evidence";
+import { CertificationReview } from "../features/export/CertificationReview";
+import { ExportDialog } from "../features/export/ExportDialog";
+import { ImpactSummaryPanel } from "../features/export/ImpactSummaryPanel";
+import { ProfileProposalDialog } from "../features/export/ProfileProposalDialog";
+import { ValidationPanel } from "../features/export/ValidationPanel";
+import { BackupDialog } from "../features/project/BackupDialog";
+import { DeleteProjectDialog } from "../features/project/DeleteProjectDialog";
 import { ProjectStart } from "../features/project/ProjectStart";
 import { StorageDisclosure } from "../features/project/StorageDisclosure";
 import type { ProjectMode, ProjectStore } from "../features/project/project-store";
@@ -90,10 +97,12 @@ export function WorkbenchShell({ project, mode, sourceObjectUrl, sourceProvenanc
           <span><b>WebMCP</b>{webMcpAvailable ? "Page API available" : "Tools unavailable"}</span>
         </div>
         <div className="header-actions">
-          <span id="settings-unavailable" className="visually-hidden">Settings are not available in this project shell yet.</span>
-          <span id="export-unavailable" className="visually-hidden">Export is available after the export workflow is added.</span>
-          <button className="header-button" type="button" disabled aria-describedby="settings-unavailable">Settings (later)</button>
-          <button className="header-button" type="button" disabled aria-describedby="export-unavailable">Export (later)</button>
+          <ValidationPanel project={project} onCommand={(command) => store.executeCommand(command)} />
+          <ProfileProposalDialog project={project} onCommand={(command) => store.executeCommand(command)} />
+          <CertificationReview project={project} onCommand={(command) => store.executeCommand(command)} />
+          <ExportDialog project={project} onCommand={(command) => store.executeCommand(command)} />
+          <BackupDialog project={project} manager={store} />
+          <DeleteProjectDialog project={project} onDelete={() => store.deleteCurrentProject()} />
         </div>
       </header>
 
@@ -115,7 +124,10 @@ export function WorkbenchShell({ project, mode, sourceObjectUrl, sourceProvenanc
           project={project}
           onCommand={(command) => store.executeCommand(command)}
           onSeekToMediaTime={reviewSeekToMediaTime}
-          footer={<StorageDisclosure mode={mode} />}
+          footer={<>
+            <ImpactSummaryPanel project={project} compact />
+            <StorageDisclosure mode={mode} />
+          </>}
           onRegisterItemNavigation={receiveReviewItemNavigation}
           onRegisterItemRevisionFocus={receiveReviewItemRevisionFocus}
           onRegisterCanonicalTimelineEdit={receiveReviewTimelineRebase}

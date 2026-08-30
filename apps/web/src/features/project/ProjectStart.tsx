@@ -52,6 +52,7 @@ export function ProjectStart({ store }: ProjectStartProps) {
         </div>
         {busy ? <p className="form-status" role="status" aria-live="polite">{busyMessage}</p> : null}
         {snapshot.error === null ? null : <p className="form-error" role="alert">{snapshot.error}</p>}
+        {snapshot.cleanupNotice === null ? null : <p className="form-status" role="status" aria-live="polite">{snapshot.cleanupNotice}</p>}
         <StorageDisclosure mode={null} />
         <p className="project-start__limits">Video limits: 500 MB and 15 minutes. No account is required.</p>
       </section>
