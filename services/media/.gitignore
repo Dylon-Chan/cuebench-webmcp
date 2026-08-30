@@ -1,0 +1,12 @@
+.venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+__pycache__/
+*.py[cod]
+
+# Private local mounts and generated preparation evidence never belong in git.
+/local-media/
+/prepared/
+*.wav
+*.webp

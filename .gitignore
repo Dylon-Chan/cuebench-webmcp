@@ -10,5 +10,7 @@ dist/
 .dev.vars.*
 .env
 .env.*
+# direnv may hold private Worker-to-Container media HMAC material during local runs.
+.envrc
 test-results/
 coverage/

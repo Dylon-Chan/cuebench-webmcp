@@ -191,9 +191,14 @@ const makeFixture = (options: {
   const bucket = options.bucket ?? new FixtureObjectStore();
   const ledger = options.ledger ?? new InMemoryQuotaLedger();
   const workflow = options.workflow ?? new FixtureWorkflow();
+  const mediaFixtureEnv: Partial<WorkerEnv> = options.probe === undefined ? {} : {
+    MEDIA_JOB_HMAC_CURRENT_KEY_ID: "media-fixture-current",
+    MEDIA_JOB_HMAC_CURRENT_KEY: "media-fixture-current-secret-with-at-least-32-bytes",
+    MEDIA_PROBE: { fetch: async () => new Response("fixture media binding") },
+  };
   let identifier = 0;
   return {
-    app: createCueBenchWorker(workerEnv(options.env), {
+    app: createCueBenchWorker(workerEnv({ ...mediaFixtureEnv, ...options.env }), {
       clock: options.clock ?? (() => options.now ?? 1_700_000_000_000),
       createId: () => `fixture-${++identifier}`,
       verifyTurnstile: options.verifyTurnstile ?? (async () => options.turnstile ?? { success: true, hostname: "cuebench.test", action: "cuebench-upload" }),
@@ -566,6 +571,110 @@ describe("CueBench anonymous multipart Worker", () => {
     expect(bucket.completeCalls).toBe(0);
     expect(bucket.completed.size).toBe(0);
     expect(workflow.starts).toHaveLength(0);
+  });
+
+  it("fails closed when a media binding exists but its dedicated signing key is absent", async () => {
+    let bindingCalls = 0;
+    const { app, bucket, workflow } = makeFixture({
+      env: {
+        MEDIA_PROBE: {
+          fetch: async () => {
+            bindingCalls += 1;
+            return new Response("unexpected");
+          },
+        },
+      },
+    });
+    const session = await issueSession(app);
+    const operation = await requestUpload(app, session);
+    const { uploadCapability, operationReceipt } = await operation.json() as { readonly uploadCapability: string; readonly operationReceipt: string };
+    expect((await app.fetch(partRequest(session, uploadCapability))).status).toBe(201);
+
+    const response = await app.fetch(jsonRequest("/api/uploads/operation-fixture/complete", {}, { session, receipt: operationReceipt }));
+
+    expect(response.status).toBe(503);
+    expect((await response.json() as { readonly error: { readonly code: string } }).error.code).toBe("MEDIA_PROBE_UNAVAILABLE");
+    expect(bindingCalls).toBe(0);
+    expect(bucket.completeCalls).toBe(0);
+    expect(workflow.starts).toHaveLength(0);
+  });
+
+  it("does not allow an injected probe adapter to bypass an absent private media binding", async () => {
+    let probeCalls = 0;
+    const injectedProbe: MediaProbe = {
+      probe: async () => {
+        probeCalls += 1;
+        return {
+          container: "webm",
+          mimeType: "video/webm",
+          codec: "vp9",
+          durationMs: 60_000,
+          byteLength: 5,
+          sha256: "a".repeat(64),
+        };
+      },
+    };
+    const { app, bucket, workflow } = makeFixture({
+      probe: injectedProbe,
+      env: { MEDIA_PROBE: undefined as never },
+    });
+    const session = await issueSession(app);
+    const operation = await requestUpload(app, session);
+    const { uploadCapability, operationReceipt } = await operation.json() as { readonly uploadCapability: string; readonly operationReceipt: string };
+    expect((await app.fetch(partRequest(session, uploadCapability))).status).toBe(201);
+
+    const response = await app.fetch(jsonRequest("/api/uploads/operation-fixture/complete", {}, { session, receipt: operationReceipt }));
+
+    expect(response.status).toBe(503);
+    expect((await response.json() as { readonly error: { readonly code: string } }).error.code).toBe("MEDIA_PROBE_UNAVAILABLE");
+    expect(probeCalls).toBe(0);
+    expect(bucket.completeCalls).toBe(0);
+    expect(workflow.starts).toHaveLength(0);
+  });
+
+  it("mints a signed media job for the production binding after receipt verification", async () => {
+    let mediaRequest: Request | undefined;
+    const { app, workflow } = makeFixture({
+      env: {
+        MEDIA_JOB_HMAC_CURRENT_KEY_ID: "media-current",
+        MEDIA_JOB_HMAC_CURRENT_KEY: "media-job-current-secret-with-at-least-32-bytes",
+        MEDIA_PROBE: {
+          fetch: async (request) => {
+            mediaRequest = request;
+            return new Response(JSON.stringify({
+              container: "webm",
+              mimeType: "video/webm",
+              codec: "vp9",
+              durationMs: 60_000,
+              byteLength: 5,
+              sha256: "a".repeat(64),
+            }));
+          },
+        },
+      },
+    });
+    const session = await issueSession(app);
+    const operation = await requestUpload(app, session);
+    const { uploadCapability, operationReceipt } = await operation.json() as { readonly uploadCapability: string; readonly operationReceipt: string };
+    expect((await app.fetch(partRequest(session, uploadCapability))).status).toBe(201);
+
+    const response = await app.fetch(jsonRequest("/api/uploads/operation-fixture/complete", {}, { session, receipt: operationReceipt }));
+    const body = await mediaRequest?.json() as { readonly job: string };
+    const [encoded] = body.job.split(".");
+    const payload = JSON.parse(new TextDecoder().decode(Uint8Array.from(atob(encoded!), (character) => character.charCodeAt(0)))) as Record<string, unknown>;
+
+    expect(response.status).toBe(202);
+    expect(Object.keys(body)).toEqual(["job"]);
+    expect(payload).toMatchObject({
+      contract_version: 1,
+      idempotency_key: expect.stringMatching(/^probe:[a-f0-9]{64}$/),
+      input_key: expect.stringMatching(/^processing\/[a-f0-9]{64}\/[a-f0-9]{64}$/),
+      output_prefix: expect.stringMatching(/^prepared\/[a-f0-9]{64}\/$/),
+      receipt_sha256: expect.stringMatching(/^[a-f0-9]{64}$/),
+      type: "cuebench-media-job",
+    });
+    expect(JSON.stringify(body)).not.toContain(operationReceipt);
+    expect(workflow.starts).toHaveLength(1);
   });
 
   it("deletes an ambiguously completed private object when the media probe disappears before reconciliation", async () => {

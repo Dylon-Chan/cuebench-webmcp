@@ -31,4 +31,32 @@ describe("Worker cryptographic configuration", () => {
     expect(settings.keyRing.current.id).toBe("current");
     expect(settings.keyRing.previous).toEqual({ id: "previous", secret: previousSecret });
   });
+
+  it("treats a missing dedicated media-job key as unavailable and rejects partial rotation configuration", () => {
+    expect(resolveWorkerSettings(env()).mediaJobSigning).toBeUndefined();
+    expect(() => resolveWorkerSettings(env({ MEDIA_JOB_HMAC_CURRENT_KEY_ID: "media-current" }))).toThrow(/MEDIA_JOB_HMAC_CURRENT_KEY/i);
+    expect(() => resolveWorkerSettings(env({
+      MEDIA_JOB_HMAC_CURRENT_KEY_ID: "media-current",
+      MEDIA_JOB_HMAC_CURRENT_KEY: "media-job-current-secret-with-at-least-32-bytes",
+      MEDIA_JOB_HMAC_PREVIOUS_KEY_ID: "media-previous",
+    }))).toThrow(/previous media-job HMAC key/i);
+  });
+
+  it("parses a dedicated rotating media-job key ring without reusing session signing material", () => {
+    const settings = resolveWorkerSettings(env({
+      MEDIA_JOB_HMAC_CURRENT_KEY_ID: "media-current",
+      MEDIA_JOB_HMAC_CURRENT_KEY: "media-job-current-secret-with-at-least-32-bytes",
+      MEDIA_JOB_HMAC_PREVIOUS_KEY_ID: "media-previous",
+      MEDIA_JOB_HMAC_PREVIOUS_KEY: "media-job-previous-secret-with-at-least-32-bytes",
+      MEDIA_JOB_TTL_SECONDS: "600",
+    }));
+
+    expect(settings.mediaJobSigning).toEqual({
+      keyRing: {
+        current: { id: "media-current", secret: "media-job-current-secret-with-at-least-32-bytes" },
+        previous: { id: "media-previous", secret: "media-job-previous-secret-with-at-least-32-bytes" },
+      },
+      ttlMs: 600_000,
+    });
+  });
 });

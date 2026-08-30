@@ -1,6 +1,6 @@
 import type { DurableObjectNamespace, R2Bucket } from "@cloudflare/workers-types";
 import type { HmacKeyRing } from "./session";
-import type { MediaProbeBinding } from "./probe";
+import type { MediaJobSigningSettings, MediaProbeBinding } from "./probe";
 
 export const MAX_UPLOAD_BYTES = 500 * 1024 * 1024;
 export const MAX_UPLOAD_DURATION_MS = 15 * 60 * 1_000;
@@ -23,6 +23,12 @@ export interface WorkerEnv {
   readonly SESSION_HMAC_CURRENT_KEY: string;
   readonly SESSION_HMAC_PREVIOUS_KEY_ID?: string;
   readonly SESSION_HMAC_PREVIOUS_KEY?: string;
+  /** Dedicated internal capability key; never exposed to browser code or Wrangler vars. */
+  readonly MEDIA_JOB_HMAC_CURRENT_KEY_ID?: string;
+  readonly MEDIA_JOB_HMAC_CURRENT_KEY?: string;
+  readonly MEDIA_JOB_HMAC_PREVIOUS_KEY_ID?: string;
+  readonly MEDIA_JOB_HMAC_PREVIOUS_KEY?: string;
+  readonly MEDIA_JOB_TTL_SECONDS?: string;
   readonly QUOTA_SALT: string;
   readonly SESSION_TTL_SECONDS?: string;
   readonly UPLOAD_CAPABILITY_TTL_SECONDS?: string;
@@ -70,6 +76,8 @@ export interface AnonymousQuotaLimits {
 
 export interface WorkerSettings {
   readonly keyRing: HmacKeyRing;
+  /** Omitted only when the private media binding is intentionally unavailable. */
+  readonly mediaJobSigning?: MediaJobSigningSettings;
   readonly quotaSalt: string;
   readonly sessionTtlMs: number;
   readonly uploadCapabilityTtlMs: number;
@@ -129,6 +137,32 @@ const boundedInt = (value: string | undefined, fallback: number, name: string, m
 
 const truthy = (value: string | undefined): boolean => value === "true";
 
+const optionalMediaJobSigning = (env: WorkerEnv): MediaJobSigningSettings | undefined => {
+  const currentId = env.MEDIA_JOB_HMAC_CURRENT_KEY_ID?.trim() || undefined;
+  const currentSecret = env.MEDIA_JOB_HMAC_CURRENT_KEY === undefined || env.MEDIA_JOB_HMAC_CURRENT_KEY.trim().length === 0
+    ? undefined
+    : strongSecret(env.MEDIA_JOB_HMAC_CURRENT_KEY, "MEDIA_JOB_HMAC_CURRENT_KEY");
+  const previousId = env.MEDIA_JOB_HMAC_PREVIOUS_KEY_ID?.trim() || undefined;
+  const previousSecret = env.MEDIA_JOB_HMAC_PREVIOUS_KEY === undefined || env.MEDIA_JOB_HMAC_PREVIOUS_KEY.trim().length === 0
+    ? undefined
+    : strongSecret(env.MEDIA_JOB_HMAC_PREVIOUS_KEY, "MEDIA_JOB_HMAC_PREVIOUS_KEY");
+  if (currentId === undefined && currentSecret === undefined && previousId === undefined && previousSecret === undefined) return undefined;
+  if (currentId === undefined || currentSecret === undefined) {
+    throw new WorkerConfigurationError("MEDIA_JOB_HMAC_CURRENT_KEY_ID and MEDIA_JOB_HMAC_CURRENT_KEY must be configured together.");
+  }
+  if ((previousId === undefined) !== (previousSecret === undefined)) {
+    throw new WorkerConfigurationError("The previous media-job HMAC key id and secret must be configured together.");
+  }
+  if (previousId === currentId) throw new WorkerConfigurationError("Media-job HMAC key ids must be distinct during rotation.");
+  return {
+    keyRing: {
+      current: { id: currentId, secret: currentSecret },
+      ...(previousId === undefined || previousSecret === undefined ? {} : { previous: { id: previousId, secret: previousSecret } }),
+    },
+    ttlMs: boundedInt(env.MEDIA_JOB_TTL_SECONDS, 10 * 60, "MEDIA_JOB_TTL_SECONDS", 60, 15 * 60) * 1_000,
+  };
+};
+
 /** Parses no secret values into responses; invalid configuration fails closed at the API boundary. */
 export const resolveWorkerSettings = (env: WorkerEnv): WorkerSettings => {
   // Identifiers are normalized; cryptographic material below is deliberately
@@ -146,11 +180,13 @@ export const resolveWorkerSettings = (env: WorkerEnv): WorkerSettings => {
   const sessionTtlSeconds = boundedInt(env.SESSION_TTL_SECONDS, 24 * 60 * 60, "SESSION_TTL_SECONDS", 60, 24 * 60 * 60);
   const capabilityTtlSeconds = boundedInt(env.UPLOAD_CAPABILITY_TTL_SECONDS, 10 * 60, "UPLOAD_CAPABILITY_TTL_SECONDS", 60, 60 * 60);
   const recoveryTtlSeconds = boundedInt(env.RECOVERY_TTL_SECONDS, 24 * 60 * 60, "RECOVERY_TTL_SECONDS", 60, 24 * 60 * 60);
+  const mediaJobSigning = optionalMediaJobSigning(env);
   return {
     keyRing: {
       current: { id: currentId, secret: currentSecret },
       ...(previousId === undefined || previousSecret === undefined ? {} : { previous: { id: previousId, secret: previousSecret } }),
     },
+    ...(mediaJobSigning === undefined ? {} : { mediaJobSigning }),
     quotaSalt: strongSecret(env.QUOTA_SALT, "QUOTA_SALT"),
     sessionTtlMs: sessionTtlSeconds * 1_000,
     uploadCapabilityTtlMs: capabilityTtlSeconds * 1_000,

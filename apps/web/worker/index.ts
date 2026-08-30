@@ -367,9 +367,17 @@ const objectStoreFor = (env: WorkerEnv, dependencies: WorkerDependencies): Multi
   ? undefined
   : new R2PrivateObjectStore(env.PROCESSING_BUCKET));
 
-const probeFor = (env: WorkerEnv, dependencies: WorkerDependencies): MediaProbe | undefined => dependencies.mediaProbe ?? (env.MEDIA_PROBE === undefined
-  ? undefined
-  : new MediaProbeServiceBinding(env.MEDIA_PROBE));
+const probeFor = (
+  env: WorkerEnv,
+  settings: WorkerSettings,
+  dependencies: WorkerDependencies,
+  currentNow: number,
+): MediaProbe | undefined => {
+  // Even fixture adapters must not bypass the production authority boundary:
+  // neither an unbound service nor a missing dedicated media key may complete R2.
+  if (env.MEDIA_PROBE === undefined || settings.mediaJobSigning === undefined) return undefined;
+  return dependencies.mediaProbe ?? new MediaProbeServiceBinding(env.MEDIA_PROBE, settings.mediaJobSigning, () => currentNow);
+};
 
 interface DerivedOperation {
   readonly sessionKey: string;
@@ -936,7 +944,7 @@ export const createCueBenchWorker = (env: WorkerEnv, dependencies: WorkerDepende
     // Refuse unavailable authoritative inspection before completing the R2
     // multipart object. This prevents a completed private copy from being
     // retained solely because the future media-probe service is absent.
-    const probe = probeFor(env, dependencies);
+    const probe = probeFor(env, settings, dependencies, currentNow);
     if ((record.state === "uploaded" || record.state === "failed-retryable" || record.state === "completing") && probe === undefined) {
       const cleanup = await cleanupOperation({
         record,
@@ -1027,7 +1035,14 @@ export const createCueBenchWorker = (env: WorkerEnv, dependencies: WorkerDepende
       }
       let facts;
       try {
-        facts = await probe.probe({ objectKey: receipt.objectKey, operationReceipt: receiptToken, idempotencyKey: `probe:${receipt.operationKey}` });
+        facts = await probe.probe({
+          operationId: receipt.operationId,
+          operationKey: receipt.operationKey,
+          objectKey: receipt.objectKey,
+          operationReceipt: receiptToken,
+          receiptExpiresAtMs: receipt.receiptExpiresAtMs,
+          idempotencyKey: `probe:${receipt.operationKey}`,
+        });
       } catch {
         await coordinator.releaseProbe({ claimId: probeClaim.claim.id, claimGeneration: probeClaim.claim.generation, nowMs: currentNow, note: "media-probe-unavailable" }).catch(() => undefined);
         return apiError(503, "MEDIA_PROBE_UNAVAILABLE", "CueBench could not authoritatively inspect this private media. The private copy remains recoverable only until its disclosed cleanup deadline.", { retrySafe: true, stateChanged: true, nextAction: "retry-probe" });
