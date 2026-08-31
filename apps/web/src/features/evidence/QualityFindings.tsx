@@ -13,6 +13,7 @@ export interface QualityFindingsProps {
 const findingScope = (finding: QualityFinding): string => {
   if (finding.target.type === "project") return "Project";
   if (finding.target.type === "item") return `${finding.target.itemId.toUpperCase()} r${finding.target.itemRevision}`;
+  if (finding.target.type === "extended-description-requirement") return `Extended description ${finding.target.requirementId.toUpperCase()}`;
   return `${finding.target.first.itemId.toUpperCase()} r${finding.target.first.itemRevision} + ${finding.target.second.itemId.toUpperCase()} r${finding.target.second.itemRevision}`;
 };
 
@@ -48,7 +49,7 @@ export function QualityFindings({ project, item = null, indexes, onFocusFinding,
               <button
                 type="button"
                 onClick={() => onFocusFinding(finding)}
-                disabled={disabled || finding.target.type === "project"}
+                disabled={disabled || finding.target.type === "project" || finding.target.type === "extended-description-requirement"}
                 aria-label={`Focus finding ${finding.findingId}: ${finding.message}`}
               >
                 Focus

@@ -2,6 +2,7 @@ import type { CaptionProject, DomainCommand, QualityFinding } from "@cuebench/do
 import { EvidenceInspector, type EvidenceContentResolver } from "../evidence/EvidenceInspector";
 import { QualityFindings } from "../evidence/QualityFindings";
 import { RevisionHistory } from "./RevisionHistory";
+import { NarrationPreview, type NarrationPreviewGateway } from "./NarrationPreview";
 import type { ReviewDraft, ReviewIndexes, ReviewableItem } from "./review-utils";
 import {
   evidenceForItem,
@@ -35,6 +36,8 @@ export interface SelectedItemPanelProps {
   readonly onReadNativePlayheadMs?: () => number;
   readonly evidenceContentResolver?: EvidenceContentResolver;
   readonly focusedRevision?: number;
+  /** Optional hosted endpoint adapter. Its absence leaves normal human review fully usable. */
+  readonly narrationPreviewGateway?: NarrationPreviewGateway;
 }
 
 const updateDraft = <Key extends keyof ReviewDraft>(
@@ -72,6 +75,7 @@ export function SelectedItemPanel({
   onReadNativePlayheadMs,
   evidenceContentResolver,
   focusedRevision,
+  narrationPreviewGateway,
 }: SelectedItemPanelProps) {
   if (item === null) {
     return (
@@ -287,6 +291,14 @@ export function SelectedItemPanel({
         {...(evidenceContentResolver === undefined ? {} : { contentResolver: evidenceContentResolver })}
         onFocusEvidence={(evidenceId) => onFocusEvidence(item, evidenceId)}
       />
+      {item.kind !== "AudioDescriptionBeat" || narrationPreviewGateway === undefined ? null : (
+        <NarrationPreview
+          projectId={project.projectId}
+          beat={item}
+          gateway={narrationPreviewGateway}
+          disabled={isCommandPending || staleDraft || draftIsDirty}
+        />
+      )}
       <RevisionHistory project={project} item={item} evidence={evidence} {...(focusedRevision === undefined ? {} : { focusedRevision })} onFocusEvidence={(evidenceId) => onFocusEvidence(item, evidenceId)} />
     </section>
   );

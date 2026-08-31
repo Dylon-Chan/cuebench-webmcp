@@ -395,7 +395,9 @@ describe("Backup, relink, and deletion human workflows", () => {
     await saveNarrationBlob(database, liveProject.projectId, {
       beatId: "ad01",
       itemRevision: 1,
+      cacheKey: "a".repeat(64),
       blob: new Blob(["narration"], { type: "audio/mpeg" }),
+      measuredDurationMs: 1_000,
     });
 
     render(<DeleteProjectDialog project={liveProject} onDelete={() => store.deleteCurrentProject()} />);

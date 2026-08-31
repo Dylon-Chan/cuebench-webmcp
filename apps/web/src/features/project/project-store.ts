@@ -15,12 +15,14 @@ import {
 } from "@cuebench/domain";
 import {
   CueBenchDatabase,
+  adoptStagedAudioDescriptionGenerationResult as adoptPersistedAudioDescriptionGenerationResult,
   adoptStagedCaptionGenerationResult as adoptPersistedCaptionGenerationResult,
   describeImportedProject,
   executePersistentCommand,
   initializeProject,
   loadProject,
   loadProjectInTransaction,
+  loadNarrationBlob,
   loadRunReceipt,
   listRunReceipts,
   loadSetting,
@@ -28,10 +30,20 @@ import {
   releaseRunReceiptReservation,
   reserveRunReceiptSlot,
   saveRunReceipt,
+  saveNarrationBlob,
   saveSetting,
+  settleExpiredAudioDescriptionGenerationReceipt as settlePersistedExpiredAudioDescriptionGenerationReceipt,
   sourceBlobKey,
   type SourceBlobRow,
 } from "@cuebench/storage";
+import {
+  createNarrationPreviewGateway,
+  type NarrationPreviewAuthorization,
+} from "../review/narration-preview-client";
+import type {
+  NarrationPreviewGateway,
+  NarrationPreviewRequest,
+} from "../review/NarrationPreview";
 import {
   BUNDLED_SAMPLE_DURATION_MS,
   createBundledSampleFile,
@@ -53,6 +65,7 @@ import {
   uploadedSourceProvenance,
   type SourceProvenance,
 } from "./source-provenance";
+import { loadPersistedCloudUpload } from "./cloud-upload";
 
 export type ProjectMode = "durable" | "temporary";
 export type ProjectRoute = "start" | "temporary-choice" | "workbench";
@@ -147,6 +160,10 @@ export interface ProjectStoreOptions {
 
 export type CaptionGenerationAdoptionCommand = Extract<DomainCommand, {
   readonly type: "AdoptCaptionGenerationResult";
+}>;
+
+export type AudioDescriptionGenerationAdoptionCommand = Extract<DomainCommand, {
+  readonly type: "AdoptAudioDescriptionGenerationResult";
 }>;
 
 const metadataReserveBytes = 16 * 1024 * 1024;
@@ -286,6 +303,7 @@ export class ProjectStore {
   private activeCleanupReceiptId: string | null = null;
   /** One browser store never sends overlapping hosted-cleanup requests for the same retained receipt. */
   private readonly cleanupOperations = new Map<string, Promise<CloudCleanupResult>>();
+  private narrationPreviewGatewayInstance: NarrationPreviewGateway | null = null;
   private operationEpoch = 0;
   /** Keeps page-originated domain writes ordered just like the durable CAS boundary. */
   private commandQueue: Promise<void> = Promise.resolve();
@@ -335,6 +353,23 @@ export class ProjectStore {
       });
       return value.capability;
     });
+  };
+
+  /**
+   * A stable browser-only gateway for disposable narration audio. It delegates
+   * identity and stale-revision checks back to this canonical ProjectStore,
+   * while the Worker remains the only OpenAI credential holder.
+   */
+  public getNarrationPreviewGateway = (): NarrationPreviewGateway => {
+    if (this.narrationPreviewGatewayInstance !== null) return this.narrationPreviewGatewayInstance;
+    this.narrationPreviewGatewayInstance = createNarrationPreviewGateway({
+      resolveAuthorization: async (projectId) => this.narrationPreviewAuthorization(projectId),
+      cache: {
+        load: async (input) => this.loadNarrationPreview(input),
+        save: async (input) => this.saveNarrationPreview(input),
+      },
+    });
+    return this.narrationPreviewGatewayInstance;
   };
 
   public subscribe = (listener: () => void): (() => void) => {
@@ -511,6 +546,46 @@ export class ProjectStore {
     return queued;
   }
 
+  /**
+   * Keeps target-aware AD adoption and its opaque cleanup receipt in one
+   * IndexedDB transaction. Human certification remains a separate UI-only
+   * decision; this only stages CueBench-AI Proposed beats and requirements.
+   */
+  public adoptStagedAudioDescriptionGenerationResult(command: AudioDescriptionGenerationAdoptionCommand): Promise<CommandResult> {
+    const execute = async (): Promise<CommandResult> => {
+      const snapshot = this.snapshot;
+      if (snapshot.project === null || snapshot.mode === null) {
+        throw new Error("CueBench cannot adopt audio-description evidence before its project is available.");
+      }
+      if (snapshot.activity !== null) {
+        throw new Error("CueBench cannot adopt audio-description evidence while another local operation is in progress.");
+      }
+      if (snapshot.mode !== "durable") {
+        throw new Error("CueBench needs durable browser storage before it can retain a recoverable audio-description generation receipt.");
+      }
+      const projectId = snapshot.project.projectId;
+      try {
+        const result = await adoptPersistedAudioDescriptionGenerationResult(this.database, projectId, command);
+        if (this.snapshot.project?.projectId === projectId) {
+          this.setSnapshot({
+            ...this.snapshot,
+            project: result.project,
+            error: result.error?.message ?? null,
+          });
+        }
+        return result;
+      } catch (error) {
+        if (this.snapshot.project?.projectId === projectId) {
+          this.setSnapshot({ ...this.snapshot, error: userFacingError(error, "CueBench could not adopt the staged audio-description evidence.") });
+        }
+        throw error;
+      }
+    };
+    const queued = this.commandQueue.then(execute, execute);
+    this.commandQueue = queued.then(() => undefined, () => undefined);
+    return queued;
+  }
+
   /** Persist the opaque signed recovery receipt before a browser polls it. */
   public persistCaptionGenerationReceipt(runId: string, receipt: unknown): Promise<void> {
     const persist = async (): Promise<void> => {
@@ -564,6 +639,58 @@ export class ProjectStore {
     const snapshot = this.snapshot;
     if (snapshot.project === null || snapshot.mode !== "durable") return [];
     return (await listRunReceipts(this.database, snapshot.project.projectId)).map((row) => row.runId);
+  }
+
+  /**
+   * AD receipts use the same project-scoped browser table as caption receipts,
+   * but retain a distinct public surface so callers cannot accidentally treat
+   * an AD capability as a caption capability. The opaque row is shared only at
+   * this storage boundary; each client validates its own signed receipt shape.
+   */
+  public persistAudioDescriptionGenerationReceipt(runId: string, receipt: unknown): Promise<void> {
+    return this.persistCaptionGenerationReceipt(runId, receipt);
+  }
+
+  /** Reserve an AD write-ahead receipt slot before a potentially billable dispatch. */
+  public reserveAudioDescriptionGenerationReceipt(runId: string): Promise<void> {
+    return this.reserveCaptionGenerationReceipt(runId);
+  }
+
+  /** Release only an unfulfilled AD receipt reservation. */
+  public releaseAudioDescriptionGenerationReceiptReservation(runId: string): Promise<void> {
+    return this.releaseCaptionGenerationReceiptReservation(runId);
+  }
+
+  /** Reads a project-scoped opaque AD recovery receipt. */
+  public loadAudioDescriptionGenerationReceipt(runId: string): Promise<unknown | null> {
+    return this.loadCaptionGenerationReceipt(runId);
+  }
+
+  /**
+   * An expired signed AD receipt cannot authenticate remote cleanup, but its
+   * matching local target lease still must not strand the project. Keeping
+   * the release command and receipt lifecycle marker in one IndexedDB
+   * transaction prevents a crash between those two durable facts.
+   */
+  public settleExpiredAudioDescriptionGenerationReceipt(runId: string): Promise<unknown | null> {
+    const settle = async (): Promise<unknown | null> => {
+      const snapshot = this.snapshot;
+      if (snapshot.project === null || snapshot.mode !== "durable") return null;
+      const projectId = snapshot.project.projectId;
+      const result = await settlePersistedExpiredAudioDescriptionGenerationReceipt(this.database, projectId, runId);
+      if (this.snapshot.project?.projectId === projectId) {
+        this.setSnapshot({ ...this.snapshot, project: result.project, error: null });
+      }
+      return result.receipt;
+    };
+    const queued = this.commandQueue.then(settle, settle);
+    this.commandQueue = queued.then(() => undefined, () => undefined);
+    return queued;
+  }
+
+  /** Lists opaque receipt ids for AD terminal-cleanup recovery after reload. */
+  public listAudioDescriptionGenerationReceiptRunIds(): Promise<readonly string[]> {
+    return this.listCaptionGenerationReceiptRunIds();
   }
 
   /** Produces a portable manifest only; source video remains in browser storage and is never serialized. */
@@ -1402,6 +1529,82 @@ export class ProjectStore {
         ))
       ));
     if (keys.length > 0) await this.database.settings.bulkDelete(keys);
+  }
+
+  /** Reads the durable authority at the cache boundary, not a stale React projection. */
+  private async currentNarrationProject(projectId: string, waitForQueuedCommands = true): Promise<CaptionProject> {
+    const snapshot = this.snapshot;
+    if (
+      snapshot.project === null
+      || snapshot.mode !== "durable"
+      || snapshot.project.projectId !== projectId
+      || snapshot.activity !== null
+    ) {
+      throw new Error("CueBench narration preview is available only for the current durable browser project.");
+    }
+    // `saveNarrationPreview` itself is serialized through this queue. Awaiting
+    // the queue from inside that queued task would await the task currently
+    // being resolved, so it explicitly opts out after its turn begins.
+    if (waitForQueuedCommands) await this.commandQueue;
+    const project = await loadProject(this.database, projectId);
+    if (project === undefined || this.snapshot.project?.projectId !== projectId || this.snapshot.mode !== "durable" || this.snapshot.activity !== null) {
+      throw new Error("CueBench's narration-preview project changed while the request was pending. Select the current beat and try again.");
+    }
+    return project;
+  }
+
+  private assertCurrentNarrationBeat(project: CaptionProject, input: Pick<NarrationPreviewRequest, "beatId" | "itemRevision" | "text">): void {
+    const beat = project.audioDescriptions.items[input.beatId];
+    if (
+      beat === undefined
+      || beat.current.itemRevision !== input.itemRevision
+      || beat.current.description.trim() !== input.text
+    ) {
+      throw new Error("This audio-description beat changed while CueBench was preparing its narration preview. Generate a preview for the current revision instead.");
+    }
+  }
+
+  private async narrationPreviewAuthorization(projectId: string): Promise<NarrationPreviewAuthorization> {
+    const project = await this.currentNarrationProject(projectId);
+    const owner = await this.getCloudProjectOwnerCapability(projectId);
+    if (owner === null) throw new Error("CueBench needs the durable browser-project owner identity before narration preview can start.");
+    const recovery = loadPersistedCloudUpload(
+      projectId,
+      { sha256: project.media.sha256, durationMs: project.media.durationMs },
+      undefined,
+      owner,
+    );
+    if (recovery?.session === undefined || (recovery.sessionExpiresAtMs ?? 0) <= Date.now()) {
+      throw new Error("Complete or refresh the anti-abuse verification in Optional cloud processing before CueBench can request a hosted narration preview.");
+    }
+    return { session: recovery.session, projectOwnerCapability: owner };
+  }
+
+  private async loadNarrationPreview(input: Pick<NarrationPreviewRequest, "projectId" | "cacheKey">) {
+    const snapshot = this.snapshot;
+    if (snapshot.project?.projectId !== input.projectId || snapshot.mode !== "durable" || snapshot.activity !== null) return undefined;
+    const row = await loadNarrationBlob(this.database, input.projectId, input.cacheKey);
+    return row === undefined
+      ? undefined
+      : { blob: row.blob, contentType: row.contentType, measuredDurationMs: row.measuredDurationMs };
+  }
+
+  private saveNarrationPreview(input: NarrationPreviewRequest & { readonly blob: Blob; readonly contentType: string; readonly measuredDurationMs: number }): Promise<void> {
+    const save = async (): Promise<void> => {
+      const project = await this.currentNarrationProject(input.projectId, false);
+      this.assertCurrentNarrationBeat(project, input);
+      await saveNarrationBlob(this.database, input.projectId, {
+        beatId: input.beatId,
+        itemRevision: input.itemRevision,
+        cacheKey: input.cacheKey,
+        blob: input.blob,
+        contentType: input.contentType,
+        measuredDurationMs: input.measuredDurationMs,
+      });
+    };
+    const queued = this.commandQueue.then(save, save);
+    this.commandQueue = queued.then(() => undefined, () => undefined);
+    return queued;
   }
 
   private newDeletionReceipt(project: CaptionProject): DeletionReceipt {

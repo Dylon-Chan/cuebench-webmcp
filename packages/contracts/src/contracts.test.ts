@@ -2,6 +2,8 @@ import { describe, expect, expectTypeOf, it } from "vitest";
 import { z } from "zod";
 import {
   ActorSchema,
+  AudioDescriptionGenerationRunReceiptSchema,
+  CaptionEvidenceProjectionSchema,
   AudioDescriptionBeatSnapshotSchema,
   AudioDescriptionTrackSnapshotSchema,
   CaptionCueSnapshotSchema,
@@ -30,6 +32,7 @@ import {
   TrackPageSchema,
   TrackSnapshotSchema,
   ToolErrorSchema,
+  StagedAudioDescriptionGenerationResultSchema,
   type ToolSuccess,
   ToolSuccessSchema,
   ValidationSnapshotSchema,
@@ -669,6 +672,149 @@ describe("signed generation receipt contract", () => {
     expect(GenerationRunReceiptSchema.safeParse(receipt).success).toBe(true);
     expect(GenerationRunReceiptSchema.safeParse({ ...receipt, type: "cuebench-generation-run" }).success).toBe(false);
     expect(GenerationRunReceiptSchema.safeParse({ ...receipt, mediaSha256: "not-a-digest" }).success).toBe(false);
+  });
+});
+
+describe("signed audio-description generation contracts", () => {
+  const projection = {
+    contractVersion: 1,
+    projectId: "project-1",
+    expectedProjectRevision: 3,
+    expectedQualityProfileRevision: 2,
+    mediaSha256: SHA_256,
+    localEvidencePackageIds: ["generation-caption-run-1"],
+    captions: [{
+      itemId: "c01",
+      itemRevision: 2,
+      state: "Sustained",
+      startMs: 1_000,
+      endMs: 2_000,
+      text: "A scientist points to the energy diagram.",
+      evidenceIds: ["word-1"],
+    }],
+    evidence: [{
+      evidenceId: "word-1",
+      itemId: "c01",
+      itemRevision: 2,
+      startMs: 1_000,
+      endMs: 1_500,
+    }],
+  } as const;
+
+  it("binds a bounded caption-evidence projection into an AD receipt and staged result", () => {
+    expect(CaptionEvidenceProjectionSchema.safeParse(projection).success).toBe(true);
+    const receipt = {
+      contractVersion: 1,
+      version: 1,
+      type: "audio-description-generation-run-receipt",
+      keyId: "v1",
+      runId: "ad-run-1",
+      projectId: "project-1",
+      targetTrack: "AudioDescriptions",
+      expectedProjectRevision: 3,
+      expectedQualityProfileRevision: 2,
+      mediaSha256: SHA_256,
+      captionEvidenceHash: "b".repeat(64),
+      sessionKey: "c".repeat(64),
+      ownerKey: "d".repeat(64),
+      projectKey: "e".repeat(64),
+      sourceByteLength: 5,
+      sourceDurationMs: 60_000,
+      operationId: "operation-1",
+      operationKey: "f".repeat(64),
+      objectKey: "processing/private-operation",
+      issuedAtMs: 1_700_000_000_000,
+      expiresAtMs: 1_700_086_400_000,
+    } as const;
+    expect(AudioDescriptionGenerationRunReceiptSchema.safeParse(receipt).success).toBe(true);
+    expect(AudioDescriptionGenerationRunReceiptSchema.safeParse({ ...receipt, targetTrack: "Captions" }).success).toBe(false);
+
+    const staged = {
+      contractVersion: 1,
+      runId: "ad-run-1",
+      projectId: "project-1",
+      targetTrack: "AudioDescriptions",
+      expectedProjectRevision: 3,
+      expectedQualityProfileRevision: 2,
+      mediaSha256: SHA_256,
+      captionEvidenceHash: "b".repeat(64),
+      evidence: {
+        contractVersion: 1,
+        runId: "ad-run-1",
+        projectId: "project-1",
+        mediaSha256: SHA_256,
+        captionEvidenceHash: "b".repeat(64),
+        preparedManifest: { key: "prepared/a/manifests/b.json", sha256: "b".repeat(64) },
+        frames: [{ evidenceId: "frame-1", atMs: 3_000, sha256: "c".repeat(64), mimeType: "image/webp" }],
+        sceneBoundaries: [3_000],
+        provenance: [{
+          role: "audio-description",
+          model: "gpt-5.6-terra",
+          requestHash: "d".repeat(64),
+          responseHash: "e".repeat(64),
+          store: false,
+          requestMetadata: {},
+          warnings: [],
+        }],
+      },
+      audioDescriptions: [{
+        beatId: "ad-run-1-1",
+        startMs: 3_000,
+        endMs: 4_500,
+        description: "A descending energy curve fills the projection.",
+        evidenceIds: ["frame-1"],
+      }],
+      extendedDescriptionRequirements: [{
+        requirementId: "edr-ad-run-1-1",
+        text: "A detailed molecular animation appears.",
+        rationale: "The animation cannot fit without covering dialogue.",
+        evidenceIds: ["frame-1"],
+        reason: "no-compatible-speech-gap",
+      }],
+      createdAtMs: 1_700_000_000_000,
+      expiresAtMs: 1_700_086_400_000,
+    } as const;
+    expect(StagedAudioDescriptionGenerationResultSchema.safeParse(staged).success).toBe(true);
+    // A bounded immutable frame can legitimately support two distinct beats
+    // in one proposal. The domain retains the shared citation rather than
+    // requiring an unbounded duplicate thumbnail per beat.
+    expect(StagedAudioDescriptionGenerationResultSchema.safeParse({
+      ...staged,
+      audioDescriptions: [
+        ...staged.audioDescriptions,
+        {
+          beatId: "ad-run-1-2",
+          startMs: 5_000,
+          endMs: 6_500,
+          description: "The same curve highlights the activation barrier.",
+          evidenceIds: ["frame-1"],
+        },
+      ],
+    }).success).toBe(true);
+    expect(StagedAudioDescriptionGenerationResultSchema.safeParse({ ...staged, captionEvidenceHash: "not-a-hash" }).success).toBe(false);
+  });
+
+  it("rejects an evidence projection whose links do not resolve to its bounded caption context", () => {
+    expect(CaptionEvidenceProjectionSchema.safeParse({
+      ...projection,
+      evidence: [{ ...projection.evidence[0], itemId: "c99" }],
+    }).success).toBe(false);
+  });
+
+  it("keeps manual captions in the dialogue fence even when they have no retained word evidence", () => {
+    const manualCaption = {
+      itemId: "c02",
+      itemRevision: 1,
+      state: "Sustained" as const,
+      startMs: 2_100,
+      endMs: 3_100,
+      text: "Dr. Nguyen continues the explanation.",
+      evidenceIds: [],
+    };
+    expect(CaptionEvidenceProjectionSchema.safeParse({
+      ...projection,
+      captions: [...projection.captions, manualCaption],
+    }).success).toBe(true);
   });
 });
 

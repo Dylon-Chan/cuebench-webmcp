@@ -2,6 +2,7 @@ import type {
   Actor,
   CertificationSnapshot,
   GenerationTargetTrack,
+  LocalAudioDescriptionEvidencePackage,
   LocalCaptionEvidencePackage,
   MediaSourceSnapshot,
   ProjectItemKind,
@@ -50,6 +51,8 @@ export interface AudioDescriptionBeat {
   readonly kind: "AudioDescriptionBeat";
   readonly revisions: readonly AudioDescriptionBeatRevision[];
   readonly current: AudioDescriptionBeatRevision;
+  /** A replaced AI draft remains auditable but must never render/export again. */
+  readonly supersededByRunId: string | null;
 }
 
 export interface CaptionTrack {
@@ -151,18 +154,54 @@ export interface GenerationLease {
    * Optional only for legacy persisted leases. Those leases can be released,
    * but never adopted because they lack a trustworthy base state.
    */
-  readonly base?: {
-    readonly expectedProjectRevision: number;
-    readonly mediaSha256: string;
-    readonly qualityProfileRevision: number;
-    readonly captionOrder: readonly ItemId[];
-    readonly captionItems: readonly {
-      readonly itemId: ItemId;
-      readonly itemRevision: number;
-      readonly state: ReviewState;
-      readonly mergedIntoItemId: ItemId | null;
-    }[];
-  };
+  readonly base?: GenerationLeaseBase;
+}
+
+/** Caption and AD bases deliberately have no overlapping track-only fields. */
+export interface CaptionGenerationLeaseBase {
+  readonly targetTrack: "Captions";
+  readonly expectedProjectRevision: number;
+  readonly mediaSha256: string;
+  readonly qualityProfileRevision: number;
+  readonly captionOrder: readonly ItemId[];
+  readonly captionItems: readonly {
+    readonly itemId: ItemId;
+    readonly itemRevision: number;
+    readonly state: ReviewState;
+    readonly mergedIntoItemId: ItemId | null;
+  }[];
+}
+
+export interface AudioDescriptionGenerationLeaseBase {
+  readonly targetTrack: "AudioDescriptions";
+  readonly expectedProjectRevision: number;
+  readonly mediaSha256: string;
+  readonly qualityProfileRevision: number;
+  /** Canonical hash of the exact bounded retained-caption projection. */
+  readonly captionEvidenceHash: string;
+  readonly captionEvidencePackageIds: readonly string[];
+  readonly audioDescriptionOrder: readonly ItemId[];
+  readonly audioDescriptionRequirementIds: readonly string[];
+  readonly audioDescriptionItems: readonly {
+    readonly itemId: ItemId;
+    readonly itemRevision: number;
+    readonly state: ReviewState;
+    readonly supersededByRunId: string | null;
+  }[];
+}
+
+export type GenerationLeaseBase = CaptionGenerationLeaseBase | AudioDescriptionGenerationLeaseBase;
+
+/** A model suggestion that needs extended human-authored treatment. */
+export interface AudioDescriptionRequirement {
+  readonly requirementId: string;
+  readonly runId: string;
+  /** Review context only; validation never treats this as a fact about media. */
+  readonly text: string;
+  readonly rationale: string;
+  readonly evidenceIds: readonly string[];
+  readonly reason: "no-compatible-speech-gap" | "requires-human-judgment" | "insufficient-visual-evidence";
+  readonly createdAtMs: number;
 }
 
 export interface DomainEvent {
@@ -206,8 +245,12 @@ export interface CaptionProject {
   readonly evidence: readonly EvidenceProvenance[];
   /** Bounded adopted transcript evidence, included in local backup and review. */
   readonly localEvidencePackages: readonly LocalCaptionEvidencePackage[];
+  /** Compact adopted visual evidence; never includes source media or narration preview audio. */
+  readonly localAudioDescriptionEvidencePackages: readonly LocalAudioDescriptionEvidencePackage[];
   readonly captions: CaptionTrack;
   readonly audioDescriptions: AudioDescriptionTrack;
+  /** Deterministic review findings for model-suggested extended descriptions. */
+  readonly audioDescriptionRequirements: Readonly<Record<string, AudioDescriptionRequirement>>;
   readonly audioDescriptionGaps: Readonly<Record<string, AudioDescriptionGap>>;
   readonly selectedItem: Selection | null;
   readonly validation: ValidationSnapshot;
@@ -238,6 +281,7 @@ export interface CreateProjectInput {
   readonly audioDescriptionGaps?: readonly AudioDescriptionGap[];
   readonly evidence?: readonly EvidenceProvenance[];
   readonly localEvidencePackages?: readonly LocalCaptionEvidencePackage[];
+  readonly localAudioDescriptionEvidencePackages?: readonly LocalAudioDescriptionEvidencePackage[];
 }
 
 const initialValidation = (): ValidationSnapshot => ({
@@ -356,6 +400,7 @@ export const createProject = (input: CreateProjectInput): CaptionProject => {
       kind: "AudioDescriptionBeat",
       revisions: [revision],
       current: revision,
+      supersededByRunId: null,
     };
     audioDescriptionOrder.push(revision.itemId);
   }
@@ -373,12 +418,14 @@ export const createProject = (input: CreateProjectInput): CaptionProject => {
     media: clone(input.media),
     evidence: clone(input.evidence ?? []),
     localEvidencePackages: clone(input.localEvidencePackages ?? []),
+    localAudioDescriptionEvidencePackages: clone(input.localAudioDescriptionEvidencePackages ?? []),
     captions: { kind: "Captions", order: captionOrder, items: captions },
     audioDescriptions: {
       kind: "AudioDescriptions",
       order: audioDescriptionOrder,
       items: audioDescriptions,
     },
+    audioDescriptionRequirements: {},
     audioDescriptionGaps,
     selectedItem: null,
     validation: initialValidation(),

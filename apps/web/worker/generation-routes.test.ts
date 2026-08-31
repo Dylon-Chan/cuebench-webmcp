@@ -578,9 +578,9 @@ describe("generation routes", () => {
       // This deliberately tiny fixture models the same-run recovery path; the
       // CAS behavior itself is exercised against both the in-memory store and
       // real R2 below.
-      acquireActiveLease: async ({ sessionKey, projectKey, operationKey, runId, expiresAtMs, nowMs }) => ({
+      acquireActiveLease: async ({ sessionKey, projectKey, operationKey, runId, targetTrack, expiresAtMs, nowMs }) => ({
         kind: "acquired",
-        lease: { version: 1, sessionKey, projectKey, operationKey, runId, state: "active", expiresAtMs, updatedAtMs: nowMs },
+        lease: { version: 1, sessionKey, projectKey, operationKey, runId, targetTrack, state: "active", expiresAtMs, updatedAtMs: nowMs },
       }),
       releaseActiveLease: async () => undefined,
     };

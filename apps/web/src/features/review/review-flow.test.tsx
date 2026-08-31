@@ -11,6 +11,7 @@ import {
 import { useRef, useState } from "react";
 import { describe, expect, it, vi } from "vitest";
 import { CourtRecord } from "./CourtRecord";
+import type { NarrationPreviewGateway } from "./NarrationPreview";
 import { createDocketWindowLayout, ReviewDocket } from "./ReviewDocket";
 import { orderedReviewItems } from "./review-utils";
 import type { EvidenceContentResolver } from "../evidence/EvidenceInspector";
@@ -159,9 +160,10 @@ interface ReviewHarnessProps {
     acceptProject: (project: CaptionProject) => void,
   ) => void;
   readonly commandOverride?: (command: DomainCommand, result: CommandResult) => CommandResult;
+  readonly narrationPreviewGateway?: NarrationPreviewGateway;
 }
 
-function ReviewHarness({ initialProject = reviewProject(), onSeek = vi.fn(), onCommand, onReadNativePlayheadMs, evidenceContentResolver, onTimelineRebaseReady, commandOverride }: ReviewHarnessProps) {
+function ReviewHarness({ initialProject = reviewProject(), onSeek = vi.fn(), onCommand, onReadNativePlayheadMs, evidenceContentResolver, onTimelineRebaseReady, commandOverride, narrationPreviewGateway }: ReviewHarnessProps) {
   const [project, setProject] = useState(initialProject);
   const projectRef = useRef(initialProject);
   const reviewNavigationRef = useRef<(itemId: string, sourceLabel: string) => void>(() => undefined);
@@ -191,6 +193,7 @@ function ReviewHarness({ initialProject = reviewProject(), onSeek = vi.fn(), onC
         onRegisterCanonicalTimelineEdit={(rebase) => onTimelineRebaseReady?.(rebase, (nextProject) => { projectRef.current = nextProject; setProject(nextProject); })}
         {...(evidenceContentResolver === undefined ? {} : { evidenceContentResolver })}
         {...(onReadNativePlayheadMs === undefined ? {} : { onReadNativePlayheadMs })}
+        {...(narrationPreviewGateway === undefined ? {} : { narrationPreviewGateway })}
       />
       <CourtRecord project={project} onSelectItem={(itemId) => reviewNavigationRef.current(itemId, `Court Record item ${itemId.toUpperCase()}`)} onFocusItemRevision={(itemId, itemRevision) => reviewRevisionFocusRef.current(itemId, itemRevision, `Court Record ${itemId.toUpperCase()} r${itemRevision}`)} />
     </>
@@ -324,6 +327,37 @@ describe("Review docket human-authority flow", () => {
     expect(screen.getByLabelText("End time for Caption C01")).toHaveAttribute("type", "number");
     expect(screen.getByRole("button", { name: "Apply timing for Caption C01" })).toBeVisible();
     expect(screen.getByRole("button", { name: "Seek Caption C01 in source video" })).toBeVisible();
+  });
+
+  it("offers narration only for a selected AD beat and disables its generated preview while a human draft is unsaved", () => {
+    const base = reviewProject();
+    const adSelected = applyCommand(base, {
+      type: "SelectItem",
+      actor: human,
+      itemId: "ad01",
+      expectedItemRevision: 1,
+      expectedProjectRevision: base.projectRevision,
+    }).project;
+    const narrationPreviewGateway: NarrationPreviewGateway = {
+      loadCached: vi.fn(async () => undefined),
+      saveCached: vi.fn(async () => undefined),
+      synthesize: vi.fn(async () => { throw new Error("The disabled control must not synthesize."); }),
+      measureDurationMs: vi.fn(async () => 1_000),
+      createObjectUrl: vi.fn(() => "blob:cuebench:test"),
+      revokeObjectUrl: vi.fn(),
+    };
+    render(<ReviewHarness initialProject={adSelected} narrationPreviewGateway={narrationPreviewGateway} />);
+
+    const preview = screen.getByRole("region", { name: "Narration preview" });
+    expect(within(preview).getByText(/not certification evidence/i)).toBeVisible();
+    expect(within(preview).getByRole("button", { name: "Generate narration preview" })).toBeEnabled();
+
+    fireEvent.change(screen.getByLabelText("Audio-description text for AD01"), {
+      target: { value: "A revised energy curve fills the screen." },
+    });
+
+    expect(within(preview).getByRole("button", { name: "Generate narration preview" })).toBeDisabled();
+    expect(narrationPreviewGateway.synthesize).not.toHaveBeenCalled();
   });
 
   it("announces stale conflicts through an assertive live region without pretending a failed ruling succeeded", async () => {

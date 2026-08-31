@@ -8,6 +8,7 @@ const workerOptions = {
     UploadCoordinator: "DurableObject",
     MediaPreparationContainer: "DurableObject",
     CaptionGenerationWorkflow: "WorkflowEntrypoint",
+    AudioDescriptionGenerationWorkflow: "WorkflowEntrypoint",
   },
   // Fixture-only local bindings. Production values remain Wrangler secrets and are ignored by git.
   miniflare: {

@@ -1,4 +1,4 @@
-import { useCallback, useRef, useState, useSyncExternalStore } from "react";
+import { useCallback, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import { Navigate, Route, Routes } from "react-router-dom";
 import type { CaptionProject } from "@cuebench/domain";
 import { VideoEvidenceBay } from "../features/evidence/VideoEvidenceBay";
@@ -16,6 +16,7 @@ import { ProjectStart } from "../features/project/ProjectStart";
 import { StorageDisclosure } from "../features/project/StorageDisclosure";
 import type { ProjectMode, ProjectStore } from "../features/project/project-store";
 import { GenerationStatus } from "../features/generation/GenerationStatus";
+import { AdGenerationStatus } from "../features/generation/AdGenerationStatus";
 import type { SourceProvenance } from "../features/project/source-provenance";
 import { CourtRecord } from "../features/review/CourtRecord";
 import { ReviewDocket, ReviewSelectionSummary } from "../features/review/ReviewDocket";
@@ -50,6 +51,16 @@ export function WorkbenchShell({ project, mode, sourceObjectUrl, sourceProvenanc
   const [reviewSeekToMediaTime, setReviewSeekToMediaTime] = useState<(mediaTimeMs: number) => void>(() => () => undefined);
   const [readNativePlayheadMs, setReadNativePlayheadMs] = useState<(() => number) | null>(null);
   const [reviewDraftActive, setReviewDraftActive] = useState(false);
+  const narrationPreviewGateway = useMemo(() => {
+    if (mode !== "durable") return undefined;
+    try {
+      return store.getNarrationPreviewGateway();
+    } catch {
+      // Browsers without safe Blob URL support retain the complete human
+      // review workflow; the endpoint is deliberately not approximated.
+      return undefined;
+    }
+  }, [mode, store]);
   const reviewItemNavigationRef = useRef<(itemId: string, sourceLabel: string) => void>(() => undefined);
   const reviewItemRevisionFocusRef = useRef<(itemId: string, itemRevision: number, sourceLabel: string) => void>(() => undefined);
   const reviewTimelineRebaseRef = useRef<(itemId: string, previousItemRevision: number, project: CaptionProject) => void>(() => undefined);
@@ -145,6 +156,7 @@ export function WorkbenchShell({ project, mode, sourceObjectUrl, sourceProvenanc
           onDraftStateChange={setReviewDraftActive}
           evidenceContentResolver={projectLocalEvidenceContentResolver(project)}
           {...(readNativePlayheadMs === null ? {} : { onReadNativePlayheadMs: readNativePlayheadMs })}
+          {...(narrationPreviewGateway === undefined ? {} : { narrationPreviewGateway })}
         />
         <CourtRecord project={project} onSelectItem={(itemId) => requestReviewItemNavigation(itemId, `Court Record item ${itemId.toUpperCase()}`)} onFocusItemRevision={requestReviewItemRevisionFocus} />
         <HostedProcessingPanel
@@ -155,6 +167,7 @@ export function WorkbenchShell({ project, mode, sourceObjectUrl, sourceProvenanc
           resolveProjectOwnerCapability={store.getCloudProjectOwnerCapability}
         />
         <GenerationStatus project={project} store={store} />
+        <AdGenerationStatus project={project} store={store} />
       </div>
     </main>
   );

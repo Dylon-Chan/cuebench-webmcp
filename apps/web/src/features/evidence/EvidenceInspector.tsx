@@ -17,7 +17,8 @@ import {
  */
 export interface LocalEvidenceWindow {
   readonly evidenceId: string;
-  readonly source: "LocalEvidencePackage";
+  /** Caption word evidence and adopted visual-frame evidence remain distinct. */
+  readonly source: "LocalEvidencePackage" | "LocalAudioDescriptionEvidencePackage";
   readonly label: string;
   readonly startMs: number;
   readonly endMs: number;
@@ -143,7 +144,7 @@ export const resolveValidatedEvidenceWindow = (
   }
   const window = candidate as Partial<LocalEvidenceWindow>;
   const valid = window.evidenceId === evidence.evidenceId
-    && window.source === "LocalEvidencePackage"
+    && (window.source === "LocalEvidencePackage" || window.source === "LocalAudioDescriptionEvidencePackage")
     && typeof window.label === "string" && window.label.trim().length > 0
     && isInteger(window.startMs) && isInteger(window.endMs)
     && window.startMs >= 0 && window.startMs < window.endMs && window.endMs <= project.media.durationMs

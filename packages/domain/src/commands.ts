@@ -1,4 +1,9 @@
-import type { Actor, GenerationTargetTrack, StagedGenerationResult } from "@cuebench/contracts";
+import type {
+  Actor,
+  GenerationTargetTrack,
+  StagedAudioDescriptionGenerationResult,
+  StagedGenerationResult,
+} from "@cuebench/contracts";
 import type { AudioDescriptionBeatRevision, CaptionCueRevision } from "./model";
 
 interface CommandBase {
@@ -161,5 +166,16 @@ export type DomainCommand =
       readonly expectedQualityProfileRevision: number;
       readonly confirmedProposedReplacement: boolean;
       readonly result: StagedGenerationResult;
+    })
+  | (CommandBase & {
+      /**
+       * Commits a visual AD proposal only after a Human explicitly confirms
+       * replacement of replaceable CueBench-AI Proposed beats.
+       */
+      readonly type: "AdoptAudioDescriptionGenerationResult";
+      readonly runId: string;
+      readonly expectedQualityProfileRevision: number;
+      readonly confirmedProposedReplacement: boolean;
+      readonly result: StagedAudioDescriptionGenerationResult;
     })
   | (CommandBase & { readonly type: "ReleaseGenerationRun"; readonly runId: string });

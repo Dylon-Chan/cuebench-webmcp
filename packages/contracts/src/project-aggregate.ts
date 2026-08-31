@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { LocalCaptionEvidencePackageSchema } from "./generation";
+import { LocalAudioDescriptionEvidencePackageSchema, LocalCaptionEvidencePackageSchema } from "./generation";
 
 /**
  * Strict wire schema for a complete CueBench project aggregate. It is shared
@@ -106,6 +106,17 @@ const audioDescription = z.object({
   kind: z.literal("AudioDescriptionBeat"),
   revisions: z.array(audioDescriptionRevision).min(1),
   current: audioDescriptionRevision,
+  /** Defaults solely to import older projects; every new beat writes it explicitly. */
+  supersededByRunId: identifier.nullable().default(null),
+}).strict();
+const audioDescriptionRequirement = z.object({
+  requirementId: identifier,
+  runId: identifier,
+  text: boundedText(2_000),
+  rationale: boundedText(2_000),
+  evidenceIds: z.array(identifier).min(1).max(128),
+  reason: z.enum(["no-compatible-speech-gap", "requires-human-judgment", "insufficient-visual-evidence"]),
+  createdAtMs: nonNegativeInteger,
 }).strict();
 const gap = z.object({
   gapId: identifier,
@@ -130,6 +141,12 @@ const findingTarget = z.discriminatedUnion("type", [
     first: z.object({ kind: z.enum(["CaptionCue", "AudioDescriptionBeat"]), itemId: identifier, itemRevision: positiveInteger }).strict(),
     second: z.object({ kind: z.enum(["CaptionCue", "AudioDescriptionBeat"]), itemId: identifier, itemRevision: positiveInteger }).strict(),
   }).strict(),
+  z.object({
+    type: z.literal("extended-description-requirement"),
+    projectId: identifier,
+    projectRevision: positiveInteger,
+    requirementId: identifier,
+  }).strict(),
 ]);
 const finding = z.object({
   id: identifier,
@@ -151,6 +168,7 @@ const validationInputItem = z.object({
   text: z.string(),
   speaker: z.string().nullable(),
   mergedIntoItemId: identifier.nullable().optional(),
+  supersededByRunId: identifier.nullable().optional(),
 }).strict().refine((value) => value.endMs > value.startMs, {
   message: "Validation input item must end after it starts.",
   path: ["endMs"],
@@ -163,6 +181,11 @@ const validationInput = z.object({
   qualityProfile: profile,
   captions: z.object({ order: z.array(identifier), items: z.array(validationInputItem) }).strict(),
   audioDescriptions: z.object({ order: z.array(identifier), items: z.array(validationInputItem) }).strict(),
+  audioDescriptionRequirements: z.array(z.object({
+    requirementId: identifier,
+    evidenceIds: z.array(identifier).min(1).max(128),
+    reason: z.enum(["no-compatible-speech-gap", "requires-human-judgment", "insufficient-visual-evidence"]),
+  }).strict()).optional(),
   audioDescriptionGaps: z.array(gap),
 }).strict();
 const validationRun = z.object({
@@ -215,22 +238,57 @@ const projectCertification = z.object({
   validationRun,
   warningWaivers: z.array(warningWaiver),
 }).strict();
+const captionGenerationLeaseBase = z.object({
+  targetTrack: z.literal("Captions"),
+  expectedProjectRevision: positiveInteger,
+  mediaSha256: sha256,
+  qualityProfileRevision: positiveInteger,
+  captionOrder: z.array(identifier),
+  captionItems: z.array(z.object({
+    itemId: identifier,
+    itemRevision: positiveInteger,
+    state: reviewState,
+    mergedIntoItemId: identifier.nullable(),
+  }).strict()),
+}).strict();
+const legacyCaptionGenerationLeaseBase = z.object({
+  expectedProjectRevision: positiveInteger,
+  mediaSha256: sha256,
+  qualityProfileRevision: positiveInteger,
+  captionOrder: z.array(identifier),
+  captionItems: z.array(z.object({
+    itemId: identifier,
+    itemRevision: positiveInteger,
+    state: reviewState,
+    mergedIntoItemId: identifier.nullable(),
+  }).strict()),
+}).strict().transform((value) => ({ ...value, targetTrack: "Captions" as const }));
+const audioDescriptionGenerationLeaseBase = z.object({
+  targetTrack: z.literal("AudioDescriptions"),
+  expectedProjectRevision: positiveInteger,
+  mediaSha256: sha256,
+  qualityProfileRevision: positiveInteger,
+  captionEvidenceHash: sha256,
+  captionEvidencePackageIds: z.array(identifier).min(1).max(4),
+  audioDescriptionOrder: z.array(identifier),
+  audioDescriptionRequirementIds: z.array(identifier),
+  audioDescriptionItems: z.array(z.object({
+    itemId: identifier,
+    itemRevision: positiveInteger,
+    state: reviewState,
+    supersededByRunId: identifier.nullable(),
+  }).strict()),
+}).strict();
+const generationLeaseBase = z.union([
+  captionGenerationLeaseBase,
+  audioDescriptionGenerationLeaseBase,
+  legacyCaptionGenerationLeaseBase,
+]);
 const generationLease = z.object({
   runId: identifier,
   targetTrack: z.enum(["Captions", "AudioDescriptions"]),
   actor,
-  base: z.object({
-    expectedProjectRevision: positiveInteger,
-    mediaSha256: sha256,
-    qualityProfileRevision: positiveInteger,
-    captionOrder: z.array(identifier),
-    captionItems: z.array(z.object({
-      itemId: identifier,
-      itemRevision: positiveInteger,
-      state: reviewState,
-      mergedIntoItemId: identifier.nullable(),
-    }).strict()),
-  }).strict().optional(),
+  base: generationLeaseBase.optional(),
 }).strict();
 const courtEvent = z.object({
   eventId: identifier,
@@ -265,6 +323,7 @@ export const CaptionProjectAggregateSchema = z.object({
   media,
   evidence: z.array(evidence),
   localEvidencePackages: z.array(LocalCaptionEvidencePackageSchema).max(4).default([]),
+  localAudioDescriptionEvidencePackages: z.array(LocalAudioDescriptionEvidencePackageSchema).max(4).default([]),
   captions: z.object({
     kind: z.literal("Captions"),
     order: z.array(identifier),
@@ -275,6 +334,7 @@ export const CaptionProjectAggregateSchema = z.object({
     order: z.array(identifier),
     items: z.record(z.string(), audioDescription),
   }).strict(),
+  audioDescriptionRequirements: z.record(z.string(), audioDescriptionRequirement).default({}),
   audioDescriptionGaps: z.record(z.string(), gap),
   selectedItem: selection.nullable(),
   validation,

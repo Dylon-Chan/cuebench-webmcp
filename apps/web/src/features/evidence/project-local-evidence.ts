@@ -60,6 +60,47 @@ export const projectLocalEvidenceContentResolver = (project: CaptionProject): Ev
         provenance: entry.evidence.provenance as readonly GenerationProviderProvenance[],
       };
     }
+
+    // AD packages intentionally retain only bounded visual-frame facts and
+    // provider provenance—not a frame blob or the source video. Resolve the
+    // exact adopted binding so the review UI can explain why a beat exists
+    // after the Worker/R2 staging artifacts have been deleted.
+    for (const entry of project.localAudioDescriptionEvidencePackages) {
+      if (
+        entry.projectId !== project.projectId
+        || entry.mediaSha256.toLowerCase() !== project.media.sha256.toLowerCase()
+      ) continue;
+      const binding = entry.beatBindings.find((candidate) => (
+        candidate.itemId === provenance.itemId
+        && candidate.itemRevision === provenance.itemRevision
+        && candidate.evidenceIds.includes(provenance.evidenceId)
+      ));
+      if (binding === undefined) continue;
+      const frame = entry.evidence.frames.find((candidate) => candidate.evidenceId === provenance.evidenceId);
+      if (frame === undefined) continue;
+      // A retained frame is a point fact. Give focus/navigation a one-
+      // millisecond bounded window around it without pretending that pixels
+      // or a video segment were retained in portable project state.
+      const startMs = Math.max(0, frame.atMs - 1);
+      const endMs = Math.min(project.media.durationMs, Math.max(frame.atMs + 1, startMs + 1));
+      if (endMs <= startMs) continue;
+      return {
+        evidenceId: provenance.evidenceId,
+        source: "LocalAudioDescriptionEvidencePackage",
+        label: `Visual frame at ${frame.atMs} ms`,
+        startMs,
+        endMs,
+        projectId: project.projectId,
+        mediaSha256: project.media.sha256,
+        itemId: binding.itemId,
+        itemRevision: binding.itemRevision,
+        stagedOutputSha256: entry.outputSha256 ?? null,
+        sourceText: null,
+        speakerEvidence: [],
+        uncertainty: [],
+        provenance: entry.evidence.provenance as readonly GenerationProviderProvenance[],
+      };
+    }
     return null;
   },
 });

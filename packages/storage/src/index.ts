@@ -22,9 +22,11 @@ export type {
 } from "./database";
 export type { ProjectStorageEstimate } from "./media-store";
 export {
+  adoptStagedAudioDescriptionGenerationResult,
   adoptStagedCaptionGenerationResult,
   executePersistentCommand,
   PersistentProjectNotFoundError,
+  settleExpiredAudioDescriptionGenerationReceipt,
 } from "./execute-command";
 export * from "./media-store";
 export {

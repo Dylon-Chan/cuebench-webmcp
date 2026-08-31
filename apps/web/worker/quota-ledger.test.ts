@@ -189,6 +189,22 @@ describe("anonymous quota reservation ledger", () => {
     expect(await ledger.reserveTts({ sessionKey: "salted-b", ipKey: "other-salted-ip", usageKey: "tts-after-breaker", nowMs: 1_007, quotas: limits })).toBe(false);
   });
 
+  it("reports whether an idempotent TTS reservation was newly charged or an existing hold", async () => {
+    const ledger = new InMemoryQuotaLedger();
+    const limits = quotas({ sessionTts: 1, ipTts: 1 });
+    const reservation = {
+      sessionKey: "salted-session",
+      ipKey: "salted-ip",
+      usageKey: "tts:stable-operation",
+      nowMs: 1_000,
+      quotas: limits,
+    } as const;
+
+    await expect(ledger.reserveTtsOutcome(reservation)).resolves.toEqual({ accepted: true, existing: false });
+    await expect(ledger.reserveTtsOutcome({ ...reservation, nowMs: 1_001 })).resolves.toEqual({ accepted: true, existing: true });
+    await expect(ledger.reserveTtsOutcome({ ...reservation, usageKey: "tts:another-operation", nowMs: 1_002 })).resolves.toEqual({ accepted: false, existing: false });
+  });
+
   it("holds a nonzero conservative provider maximum before work and settles the idempotent spend key later", async () => {
     const ledger = new InMemoryQuotaLedger();
 

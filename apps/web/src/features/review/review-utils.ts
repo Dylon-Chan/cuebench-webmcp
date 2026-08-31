@@ -251,6 +251,12 @@ export const indexReviewData = (project: CaptionProject): ReviewIndexes => {
       appendIndexed(findingsByItem, finding.target.itemId, finding);
       continue;
     }
+    if (finding.target.type === "extended-description-requirement") {
+      // An EDR is a deterministic project-level review obligation with links
+      // to retained visual evidence, not a claim about one editable beat.
+      projectFindings.push(finding);
+      continue;
+    }
     appendIndexed(findingsByItem, finding.target.first.itemId, finding);
     if (finding.target.second.itemId !== finding.target.first.itemId) {
       appendIndexed(findingsByItem, finding.target.second.itemId, finding);

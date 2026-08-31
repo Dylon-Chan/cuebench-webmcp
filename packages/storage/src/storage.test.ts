@@ -4,6 +4,7 @@ import Dexie from "dexie";
 import {
   applyCommand,
   buildImpactSummary,
+  captionEvidenceProjectionForAudioDescription,
   canonicalHash,
   createProject,
   intermediateCertificationSnapshotHashFor,
@@ -14,6 +15,7 @@ import {
 } from "@cuebench/domain";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
+  adoptStagedAudioDescriptionGenerationResult,
   adoptStagedCaptionGenerationResult,
   CueBenchDatabase,
   DEXIE_DATABASE_VERSION,
@@ -26,11 +28,18 @@ import {
   loadRunReceipt,
   listRunReceipts,
   loadSourceMedia,
+  loadNarrationBlob,
   reserveRunReceiptSlot,
+  saveNarrationBlob,
   saveRunReceipt,
   saveSourceMedia,
+  settleExpiredAudioDescriptionGenerationReceipt,
 } from "./index";
-import type { StagedGenerationResult } from "@cuebench/contracts";
+import type {
+  LocalCaptionEvidencePackage,
+  StagedAudioDescriptionGenerationResult,
+  StagedGenerationResult,
+} from "@cuebench/contracts";
 import { sha256Hex } from "@cuebench/domain";
 import { normalizeProject, rehydrateProject } from "./database";
 
@@ -81,6 +90,110 @@ const fixtureProject = (): CaptionProject => createProject({
     cause: "fixture",
   }],
 });
+
+const audioDescriptionAdoptionFixture = (): CaptionProject => {
+  const project = createProject({
+    projectId: "ad-adoption-project",
+    title: "Audio-description adoption storage fixture",
+    media: { sourceId: "media-ad", sha256: "a".repeat(64), durationMs: 30_000, relinkState: "Linked" },
+    captions: [{
+      kind: "CaptionCue",
+      itemId: "c01",
+      state: "Sustained",
+      startMs: 1_000,
+      endMs: 3_000,
+      text: "The lecturer introduces the energy diagram.",
+      speaker: "Teacher",
+      actor: { type: "Human", id: "teacher" },
+      cause: "fixture",
+    }],
+    audioDescriptions: [{
+      kind: "AudioDescriptionBeat",
+      itemId: "ad-ai",
+      state: "Proposed",
+      startMs: 4_000,
+      endMs: 5_000,
+      description: "An early automated description.",
+      actor: { type: "CueBenchAI", id: "cuebench-ai" },
+      cause: "fixture",
+    }],
+    evidence: [{
+      evidenceId: "word-1",
+      projectId: "ad-adoption-project",
+      mediaSha256: "a".repeat(64),
+      itemId: "c01",
+      itemRevision: 1,
+    }],
+  });
+  const localEvidence: LocalCaptionEvidencePackage = {
+    packageId: "caption-evidence-run-1",
+    runId: "caption-run-1",
+    projectId: project.projectId,
+    mediaSha256: project.media.sha256,
+    expectedProjectRevision: project.projectRevision,
+    expectedQualityProfileRevision: project.qualityProfile.revision,
+    retainedAtMs: 1_700_000_000_000,
+    evidence: {
+      contractVersion: 1,
+      runId: "caption-run-1",
+      projectId: project.projectId,
+      mediaSha256: project.media.sha256,
+      preparedManifest: { key: "prepared/a/manifests/b.json", sha256: "b".repeat(64) },
+      normalizedAudio: { key: "prepared/a/audio/c.wav", sha256: "c".repeat(64), byteLength: 4, durationMs: 30_000, contentType: "audio/wav" },
+      words: [{ evidenceId: "word-1", sourceWordIndex: 0, startMs: 1_000, endMs: 1_500, text: "The", speaker: "Teacher", speakerSegmentIds: ["speaker-1"] }],
+      speakerSegments: [{ id: "speaker-1", startMs: 1_000, endMs: 1_500, speaker: "Teacher", text: "The" }],
+      uncertaintySpans: [],
+      provenance: [
+        { role: "diarization", model: "fixture", requestHash: "d".repeat(64), responseHash: "e".repeat(64), store: false, requestMetadata: {}, warnings: [] },
+        { role: "word-timestamps", model: "fixture", requestHash: "f".repeat(64), responseHash: "1".repeat(64), store: false, requestMetadata: {}, warnings: [] },
+      ],
+    },
+    cueBindings: [{ cueId: "c01", itemId: "c01", itemRevision: 1, evidenceIds: ["word-1"] }],
+  };
+  return { ...project, localEvidencePackages: [localEvidence] };
+};
+
+const stagedAudioDescriptionResult = (project: CaptionProject): StagedAudioDescriptionGenerationResult => {
+  const projection = captionEvidenceProjectionForAudioDescription(project);
+  if (projection === null) throw new Error("Fixture must retain caption evidence before AD staging.");
+  return {
+    contractVersion: 1,
+    runId: "ad-run-1",
+    projectId: project.projectId,
+    targetTrack: "AudioDescriptions",
+    expectedProjectRevision: project.projectRevision,
+    expectedQualityProfileRevision: project.qualityProfile.revision,
+    mediaSha256: project.media.sha256,
+    captionEvidenceHash: projection.hash,
+    evidence: {
+      contractVersion: 1,
+      runId: "ad-run-1",
+      projectId: project.projectId,
+      mediaSha256: project.media.sha256,
+      captionEvidenceHash: projection.hash,
+      preparedManifest: { key: "prepared/a/manifests/b.json", sha256: "b".repeat(64) },
+      frames: [{ evidenceId: "frame-1", atMs: 12_000, sha256: "c".repeat(64), mimeType: "image/webp" }],
+      sceneBoundaries: [12_000],
+      provenance: [{ role: "audio-description", model: "fixture", requestHash: "d".repeat(64), responseHash: "e".repeat(64), store: false, requestMetadata: {}, warnings: [] }],
+    },
+    audioDescriptions: [{
+      beatId: "ad-generated-1",
+      startMs: 12_000,
+      endMs: 13_500,
+      description: "A descending energy curve fills the screen.",
+      evidenceIds: ["frame-1"],
+    }],
+    extendedDescriptionRequirements: [{
+      requirementId: "edr-ad-run-1-1",
+      text: "A detailed molecular animation appears.",
+      rationale: "It cannot fit in any dialogue-free gap.",
+      evidenceIds: ["frame-1"],
+      reason: "no-compatible-speech-gap",
+    }],
+    createdAtMs: 1_700_000_000_000,
+    expiresAtMs: 1_700_086_400_000,
+  };
+};
 
 const humanSustainCommand = () => ({
   type: "SustainItem" as const,
@@ -143,6 +256,248 @@ const certifiedFixtureProject = (
 };
 
 describe("CueBenchDatabase", () => {
+  it("atomically adopts a staged AD result and leaves a durable cleanup acknowledgement marker", async () => {
+    const db = testDatabase();
+    const initial = audioDescriptionAdoptionFixture();
+    await initializeProject(db, initial);
+    const leased = await executePersistentCommand(db, initial.projectId, {
+      type: "StartGenerationRun",
+      actor: { type: "CueBenchAI", id: "cuebench-ai" },
+      runId: "ad-run-1",
+      targetTrack: "AudioDescriptions",
+      expectedProjectRevision: initial.projectRevision,
+    });
+    expect(leased.error).toBeUndefined();
+    await saveRunReceipt(db, initial.projectId, "ad-run-1", {
+      version: 1,
+      payload: { opaque: "signed-ad-recovery-receipt" },
+    });
+    const staged = stagedAudioDescriptionResult(leased.project);
+
+    const adopted = await adoptStagedAudioDescriptionGenerationResult(db, initial.projectId, {
+      type: "AdoptAudioDescriptionGenerationResult",
+      actor: { type: "CueBenchAI", id: "cuebench-ai" },
+      runId: "ad-run-1",
+      expectedProjectRevision: leased.project.projectRevision,
+      expectedQualityProfileRevision: leased.project.qualityProfile.revision,
+      confirmedProposedReplacement: true,
+      result: staged,
+    });
+
+    expect(adopted.error).toBeUndefined();
+    expect(adopted.project.audioDescriptions.items["ad-ai"]?.supersededByRunId).toBe("ad-run-1");
+    expect(adopted.project.audioDescriptions.items["ad-generated-1"]?.current.state).toBe("Proposed");
+    const receipt = await loadRunReceipt(db, initial.projectId, "ad-run-1");
+    expect(receipt?.receipt.payload).toMatchObject({
+      adoption: {
+        status: "adopted",
+        adoptedProjectRevision: adopted.project.projectRevision,
+        localEvidencePackageId: "audio-description-ad-run-1",
+        cleanupAcknowledgement: "pending",
+      },
+    });
+  });
+
+  it("persists AD evidence bindings through a human ruling and removes visual provenance after media relink", async () => {
+    const db = testDatabase();
+    const initial = audioDescriptionAdoptionFixture();
+    await initializeProject(db, initial);
+    const leased = await executePersistentCommand(db, initial.projectId, {
+      type: "StartGenerationRun",
+      actor: { type: "CueBenchAI", id: "cuebench-ai" },
+      runId: "ad-run-1",
+      targetTrack: "AudioDescriptions",
+      expectedProjectRevision: initial.projectRevision,
+    });
+    await saveRunReceipt(db, initial.projectId, "ad-run-1", {
+      version: 1,
+      payload: { version: 1, runId: "ad-run-1", projectId: initial.projectId },
+    });
+    const adopted = await adoptStagedAudioDescriptionGenerationResult(db, initial.projectId, {
+      type: "AdoptAudioDescriptionGenerationResult",
+      actor: { type: "CueBenchAI", id: "cuebench-ai" },
+      runId: "ad-run-1",
+      expectedProjectRevision: leased.project.projectRevision,
+      expectedQualityProfileRevision: leased.project.qualityProfile.revision,
+      confirmedProposedReplacement: true,
+      result: stagedAudioDescriptionResult(leased.project),
+    });
+    expect(adopted.error).toBeUndefined();
+    const sustained = await executePersistentCommand(db, initial.projectId, {
+      type: "SustainItem",
+      actor: { type: "Human", id: "teacher" },
+      itemId: "ad-generated-1",
+      expectedItemRevision: 1,
+      expectedProjectRevision: adopted.project.projectRevision,
+    });
+    expect(sustained.project.localAudioDescriptionEvidencePackages[0]?.beatBindings).toEqual(expect.arrayContaining([
+      expect.objectContaining({ itemId: "ad-generated-1", itemRevision: 2 }),
+    ]));
+    const relinked = await executePersistentCommand(db, initial.projectId, {
+      type: "RelinkMedia",
+      actor: { type: "Human", id: "teacher" },
+      expectedProjectRevision: sustained.project.projectRevision,
+      media: { sourceId: "replacement-media", sha256: "b".repeat(64), durationMs: 30_000 },
+    });
+    expect(relinked.error).toBeUndefined();
+    const restored = await loadProject(db, initial.projectId);
+    expect(restored?.localAudioDescriptionEvidencePackages).toEqual([]);
+    expect(restored?.audioDescriptionRequirements).toEqual({});
+    expect(restored?.evidence).toContainEqual(expect.objectContaining({
+      evidenceId: "frame-1",
+      mediaSha256: "a".repeat(64),
+    }));
+  });
+
+  it("atomically releases an expired AD target lease and retains lifecycle-pending recovery truth", async () => {
+    const db = testDatabase();
+    const initial = audioDescriptionAdoptionFixture();
+    await initializeProject(db, initial);
+    const leased = await executePersistentCommand(db, initial.projectId, {
+      type: "StartGenerationRun",
+      actor: { type: "CueBenchAI", id: "cuebench-ai" },
+      runId: "ad-expired-run",
+      targetTrack: "AudioDescriptions",
+      expectedProjectRevision: initial.projectRevision,
+    });
+    expect(leased.error).toBeUndefined();
+    await saveRunReceipt(db, initial.projectId, "ad-expired-run", {
+      version: 1,
+      payload: {
+        version: 1,
+        runId: "ad-expired-run",
+        projectId: initial.projectId,
+        cancellationRequested: { status: "requested" },
+      },
+    });
+
+    const settled = await settleExpiredAudioDescriptionGenerationReceipt(db, initial.projectId, "ad-expired-run");
+    expect(settled.project.activeGenerationRun).toBeNull();
+    expect(settled.receipt).toMatchObject({
+      expirySettlement: {
+        state: "lifecycle-pending",
+        disposition: "cancellation-unconfirmed",
+        localLeaseRelease: "released",
+      },
+    });
+    const afterFirst = await loadProject(db, initial.projectId);
+    const persisted = await loadRunReceipt(db, initial.projectId, "ad-expired-run");
+    expect(afterFirst?.activeGenerationRun).toBeNull();
+    expect(persisted?.receipt.payload).toMatchObject({
+      expirySettlement: { state: "lifecycle-pending", localLeaseRelease: "released" },
+    });
+
+    // Simulates a reload after the first transaction committed: it cannot
+    // recreate a lease or downgrade the lifecycle-pending receipt.
+    const recovered = await settleExpiredAudioDescriptionGenerationReceipt(db, initial.projectId, "ad-expired-run");
+    expect(recovered.project.projectRevision).toBe(afterFirst?.projectRevision);
+    expect(recovered.receipt).toMatchObject({
+      expirySettlement: { state: "lifecycle-pending", localLeaseRelease: "released" },
+    });
+  });
+
+  it("round-trips compact adopted AD evidence, requirements, and superseded draft provenance", async () => {
+    const db = testDatabase();
+    const initial = fixtureProject();
+    const priorDraft = initial.audioDescriptions.items.ad01;
+    if (priorDraft === undefined) throw new Error("Fixture AD beat is missing.");
+    const project: CaptionProject = {
+      ...initial,
+      evidence: [{
+        evidenceId: "frame-1",
+        projectId: initial.projectId,
+        mediaSha256: initial.media.sha256,
+        itemId: "ad01",
+        itemRevision: 1,
+      }],
+      audioDescriptions: {
+        ...initial.audioDescriptions,
+        order: [],
+        items: {
+          ad01: { ...priorDraft, supersededByRunId: "ad-run-1" },
+        },
+      },
+      audioDescriptionRequirements: {
+        "edr-1": {
+          requirementId: "edr-1",
+          runId: "ad-run-1",
+          text: "A detailed diagram needs human-authored extended description.",
+          rationale: "No compatible dialogue-free gap is available.",
+          evidenceIds: ["frame-1"],
+          reason: "no-compatible-speech-gap",
+          createdAtMs: 1_700_000_000_000,
+        },
+      },
+      localAudioDescriptionEvidencePackages: [{
+        packageId: "ad-evidence-1",
+        runId: "ad-run-1",
+        projectId: initial.projectId,
+        mediaSha256: initial.media.sha256,
+        expectedProjectRevision: initial.projectRevision,
+        expectedQualityProfileRevision: initial.qualityProfile.revision,
+        captionEvidenceHash: "b".repeat(64),
+        retainedAtMs: 1_700_000_000_000,
+        evidence: {
+          contractVersion: 1,
+          runId: "ad-run-1",
+          projectId: initial.projectId,
+          mediaSha256: initial.media.sha256,
+          captionEvidenceHash: "b".repeat(64),
+          preparedManifest: { key: "prepared/a/manifests/b.json", sha256: "c".repeat(64) },
+          frames: [{ evidenceId: "frame-1", atMs: 6_500, sha256: "d".repeat(64), mimeType: "image/webp" }],
+          sceneBoundaries: [6_500],
+          provenance: [{
+            role: "audio-description",
+            model: "fixture",
+            requestHash: "e".repeat(64),
+            responseHash: "f".repeat(64),
+            store: false,
+            requestMetadata: {},
+            warnings: [],
+          }],
+        },
+        beatBindings: [{ beatId: "ad01", itemId: "ad01", itemRevision: 1, evidenceIds: ["frame-1"] }],
+        requirementBindings: [{ requirementId: "edr-1", evidenceIds: ["frame-1"] }],
+      }],
+    };
+
+    await initializeProject(db, project);
+    const restored = await loadProject(db, project.projectId);
+
+    expect(restored?.audioDescriptions.order).toEqual([]);
+    expect(restored?.audioDescriptions.items.ad01?.supersededByRunId).toBe("ad-run-1");
+    expect(restored?.audioDescriptionRequirements["edr-1"]?.evidenceIds).toEqual(["frame-1"]);
+    expect(restored?.localAudioDescriptionEvidencePackages).toMatchObject([{
+      packageId: "ad-evidence-1",
+      evidence: { frames: [{ evidenceId: "frame-1" }] },
+    }]);
+  });
+
+  it("caches narration audio by a full-input deterministic key and retains its measured duration", async () => {
+    const db = testDatabase();
+    const cacheKey = "d".repeat(64);
+
+    await saveNarrationBlob(db, "project-1", {
+      beatId: "ad01",
+      itemRevision: 2,
+      cacheKey,
+      blob: new Blob(["narration"], { type: "audio/wav" }),
+      contentType: "audio/wav",
+      measuredDurationMs: 1_750,
+    });
+
+    const cached = await loadNarrationBlob(db, "project-1", cacheKey);
+    expect(cached).toMatchObject({
+      key: expect.any(String),
+      beatId: "ad01",
+      itemRevision: 2,
+      cacheKey,
+      measuredDurationMs: 1_750,
+      contentType: "audio/wav",
+    });
+    await expect(loadNarrationBlob(db, "project-1", "e".repeat(64))).resolves.toBeUndefined();
+  });
+
   it("persists append-only validation and actual export round-trip history for the Impact Summary", async () => {
     const db = testDatabase();
     const initial = fixtureProject();

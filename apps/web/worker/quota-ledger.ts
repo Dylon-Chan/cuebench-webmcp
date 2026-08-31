@@ -96,6 +96,15 @@ export type UploadReservationResult =
   | { readonly accepted: true; readonly existing: boolean }
   | { readonly accepted: false; readonly code: QuotaRejectionCode };
 
+/**
+ * Preserves the idempotency provenance a billable caller needs. A boolean
+ * alone cannot tell a fresh provider call from an already-reserved operation.
+ */
+export interface UsageReservationOutcome {
+  readonly accepted: boolean;
+  readonly existing: boolean;
+}
+
 export type CommitMediaResult =
   | { readonly accepted: true; readonly committedMinutes: number }
   | { readonly accepted: false; readonly code: QuotaRejectionCode; readonly releasedPending: boolean };
@@ -106,6 +115,7 @@ export interface QuotaLedgerPort {
   commitMedia: (input: ActualMediaUsage) => Promise<CommitMediaResult>;
   reserveGeneration: (input: UsageReservation) => Promise<boolean>;
   reserveTts: (input: UsageReservation) => Promise<boolean>;
+  reserveTtsOutcome: (input: UsageReservation) => Promise<UsageReservationOutcome>;
   reserveSpend: (input: SpendReservation) => Promise<SpendReservationResult>;
   finalizeSpend: (input: SpendFinalization) => Promise<{ readonly persisted: boolean; readonly breakerOpen: boolean; readonly spendCents: number }>;
   setManualBreaker: (input: ManualBreakerSetting) => Promise<boolean>;
@@ -337,15 +347,15 @@ const commitMedia = (state: LedgerState, input: ActualMediaUsage): { readonly st
   return { state: { ...next, mediaCommitMarkers: { ...next.mediaCommitMarkers, [input.reservationKey]: { expiresAtMs: input.nowMs + QUOTA_WINDOW_MS, result } } }, result };
 };
 
-const reserveUsage = (state: LedgerState, input: UsageReservation, type: "generation" | "tts"): { readonly state: LedgerState; readonly accepted: boolean } => {
-  if (state.usageMarkers[input.usageKey] !== undefined) return { state, accepted: true };
-  if (isGlobalBreakerOpen(state, input.quotas.globalSpendLimitCents)) return { state, accepted: false };
+const reserveUsage = (state: LedgerState, input: UsageReservation, type: "generation" | "tts"): { readonly state: LedgerState; readonly accepted: boolean; readonly existing: boolean } => {
+  if (state.usageMarkers[input.usageKey] !== undefined) return { state, accepted: true, existing: true };
+  if (isGlobalBreakerOpen(state, input.quotas.globalSpendLimitCents)) return { state, accepted: false, existing: false };
   const session = state.sessions[input.sessionKey] ?? emptyBucket(input.nowMs + QUOTA_WINDOW_MS);
   const network = state.networks[input.ipKey] ?? emptyBucket(input.nowMs + QUOTA_WINDOW_MS);
   const field = type === "generation" ? "generationCount" : "ttsCount";
   const sessionLimit = type === "generation" ? input.quotas.sessionGenerations : input.quotas.sessionTts;
   const ipLimit = type === "generation" ? input.quotas.ipGenerations : input.quotas.ipTts;
-  if (session[field] >= sessionLimit || network[field] >= ipLimit) return { state, accepted: false };
+  if (session[field] >= sessionLimit || network[field] >= ipLimit) return { state, accepted: false, existing: false };
   let next = replaceBucket(state, "sessions", input.sessionKey, { ...session, [field]: session[field] + 1 });
   next = replaceBucket(next, "networks", input.ipKey, { ...network, [field]: network[field] + 1 });
   return {
@@ -357,6 +367,7 @@ const reserveUsage = (state: LedgerState, input: UsageReservation, type: "genera
       },
     },
     accepted: true,
+    existing: false,
   };
 };
 
@@ -503,7 +514,7 @@ const applyAction = (state: LedgerState, action: LedgerAction): { readonly state
   }
   if (action.type === "reserve-generation" || action.type === "reserve-tts") {
     const applied = reserveUsage(state, action.input, action.type === "reserve-generation" ? "generation" : "tts");
-    return { state: applied.state, value: { accepted: applied.accepted } };
+    return { state: applied.state, value: { accepted: applied.accepted, existing: applied.existing } };
   }
   if (action.type === "record-spend") {
     const applied = recordSpend(state, action.input);
@@ -582,8 +593,9 @@ export class InMemoryQuotaLedger implements QuotaLedgerPort {
   public reserveUpload(input: UploadReservation): Promise<UploadReservationResult> { return Promise.resolve(this.apply({ type: "reserve-upload", nowMs: input.nowMs, input }) as UploadReservationResult); }
   public releaseUploadReservation(input: { readonly reservationKey: string; readonly nowMs: number }): Promise<boolean> { return Promise.resolve((this.apply({ type: "release-upload", ...input }) as { readonly released: boolean }).released); }
   public commitMedia(input: ActualMediaUsage): Promise<CommitMediaResult> { return Promise.resolve(this.apply({ type: "commit-media", nowMs: input.nowMs, input }) as CommitMediaResult); }
-  public reserveGeneration(input: UsageReservation): Promise<boolean> { return Promise.resolve((this.apply({ type: "reserve-generation", nowMs: input.nowMs, input }) as { readonly accepted: boolean }).accepted); }
-  public reserveTts(input: UsageReservation): Promise<boolean> { return Promise.resolve((this.apply({ type: "reserve-tts", nowMs: input.nowMs, input }) as { readonly accepted: boolean }).accepted); }
+  public reserveGeneration(input: UsageReservation): Promise<boolean> { return Promise.resolve((this.apply({ type: "reserve-generation", nowMs: input.nowMs, input }) as UsageReservationOutcome).accepted); }
+  public reserveTts(input: UsageReservation): Promise<boolean> { return Promise.resolve((this.apply({ type: "reserve-tts", nowMs: input.nowMs, input }) as UsageReservationOutcome).accepted); }
+  public reserveTtsOutcome(input: UsageReservation): Promise<UsageReservationOutcome> { return Promise.resolve(this.apply({ type: "reserve-tts", nowMs: input.nowMs, input }) as UsageReservationOutcome); }
   public reserveSpend(input: SpendReservation): Promise<SpendReservationResult> { return Promise.resolve(this.apply({ type: "reserve-spend", nowMs: input.nowMs, input }) as SpendReservationResult); }
   public finalizeSpend(input: SpendFinalization): Promise<{ readonly persisted: boolean; readonly breakerOpen: boolean; readonly spendCents: number }> {
     return Promise.resolve(this.apply({ type: "finalize-spend", nowMs: input.nowMs, input }) as { readonly persisted: boolean; readonly breakerOpen: boolean; readonly spendCents: number });
@@ -624,6 +636,7 @@ export class DurableObjectQuotaLedger implements QuotaLedgerPort {
   public commitMedia(input: ActualMediaUsage): Promise<CommitMediaResult> { return this.call({ type: "commit-media", nowMs: input.nowMs, input }); }
   public async reserveGeneration(input: UsageReservation): Promise<boolean> { return (await this.call<{ readonly accepted: boolean }>({ type: "reserve-generation", nowMs: input.nowMs, input })).accepted; }
   public async reserveTts(input: UsageReservation): Promise<boolean> { return (await this.call<{ readonly accepted: boolean }>({ type: "reserve-tts", nowMs: input.nowMs, input })).accepted; }
+  public reserveTtsOutcome(input: UsageReservation): Promise<UsageReservationOutcome> { return this.call({ type: "reserve-tts", nowMs: input.nowMs, input }); }
   public reserveSpend(input: SpendReservation): Promise<SpendReservationResult> { return this.call({ type: "reserve-spend", nowMs: input.nowMs, input }); }
   public finalizeSpend(input: SpendFinalization): Promise<{ readonly persisted: boolean; readonly breakerOpen: boolean; readonly spendCents: number }> { return this.call({ type: "finalize-spend", nowMs: input.nowMs, input }); }
   public async setManualBreaker(input: ManualBreakerSetting): Promise<boolean> { return (await this.call<{ readonly open: boolean }>({ type: "set-manual-breaker", nowMs: input.nowMs, input })).open; }

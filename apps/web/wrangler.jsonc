@@ -20,6 +20,11 @@
       "name": "cuebench-caption-generation",
       "binding": "PROCESSING_WORKFLOW",
       "class_name": "CaptionGenerationWorkflow"
+    },
+    {
+      "name": "cuebench-audio-description-generation",
+      "binding": "AUDIO_DESCRIPTION_PROCESSING_WORKFLOW",
+      "class_name": "AudioDescriptionGenerationWorkflow"
     }
   ],
   "durable_objects": {

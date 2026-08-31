@@ -329,9 +329,16 @@ describe("domain reducer properties", () => {
         const leased = applyCommand(project, {
           type: "StartGenerationRun", actor: { type: "CueBenchAI", id: "cuebench-ai" }, runId: "run", targetTrack,
           expectedProjectRevision: 1,
-        }).project;
+        });
+        // AD generation now has a deliberately stronger precondition: a
+        // retained caption-evidence projection must exist before visual work
+        // can begin. The dedicated AD adoption suite covers that path.
+        if (targetTrack === "AudioDescriptions") {
+          expect(leased.error?.code).toBe("INVALID_ARGUMENT");
+          return;
+        }
         const itemId = targetTrack === "Captions" ? "c05" : "ad01";
-        const mutation = applyCommand(leased, {
+        const mutation = applyCommand(leased.project, {
           type: "MarkItemAgentReady", actor: { type: "BrowserAgent", id: "browser-agent" }, itemId,
           expectedItemRevision: 1, expectedProjectRevision: 2,
         });

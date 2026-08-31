@@ -36,6 +36,12 @@ export type QualityFindingTarget =
         readonly itemId: string;
         readonly itemRevision: number;
       };
+    }
+  | {
+      readonly type: "extended-description-requirement";
+      readonly projectId: string;
+      readonly projectRevision: number;
+      readonly requirementId: string;
     };
 
 export interface QualityFinding {
@@ -58,6 +64,7 @@ export interface ValidationInputItem {
   readonly text: string;
   readonly speaker: string | null;
   readonly mergedIntoItemId?: string | null;
+  readonly supersededByRunId?: string | null;
 }
 
 export interface ValidationInputEvidence {
@@ -93,6 +100,11 @@ export interface ValidationInputSnapshot {
     readonly order: readonly string[];
     readonly items: readonly ValidationInputItem[];
   };
+  readonly audioDescriptionRequirements?: readonly {
+    readonly requirementId: string;
+    readonly evidenceIds: readonly string[];
+    readonly reason: string;
+  }[];
   readonly audioDescriptionGaps: readonly {
     readonly gapId: string;
     readonly gapRevision: number;
@@ -130,6 +142,7 @@ const liveCaptionItems = (project: CaptionProject): readonly CaptionCue[] =>
 
 const liveAudioDescriptionItems = (project: CaptionProject): readonly AudioDescriptionBeat[] =>
   Object.values(project.audioDescriptions.items)
+    .filter((item) => item.supersededByRunId === null)
     .sort((left, right) => compareText(left.itemId, right.itemId));
 
 const temporalItems = <Item extends CaptionCue | AudioDescriptionBeat>(items: readonly Item[]): readonly Item[] =>
@@ -162,7 +175,7 @@ const orderedLiveAudioDescriptionItems = (project: CaptionProject): readonly Aud
   const ordered: AudioDescriptionBeat[] = [];
   for (const itemId of project.audioDescriptions.order) {
     const item = project.audioDescriptions.items[itemId];
-    if (item !== undefined && !seen.has(itemId)) {
+    if (item !== undefined && item.supersededByRunId === null && !seen.has(itemId)) {
       seen.add(itemId);
       ordered.push(item);
     }
@@ -191,6 +204,7 @@ const inputAudioDescriptionItem = (item: AudioDescriptionBeat): ValidationInputI
   endMs: item.current.endMs,
   text: item.current.description,
   speaker: null,
+  ...(item.supersededByRunId === null ? {} : { supersededByRunId: item.supersededByRunId }),
 });
 
 export const buildValidationInput = (project: CaptionProject): ValidationInputSnapshot => ({
@@ -223,6 +237,15 @@ export const buildValidationInput = (project: CaptionProject): ValidationInputSn
       .sort((left, right) => compareText(left.itemId, right.itemId))
       .map(inputAudioDescriptionItem),
   },
+  ...(Object.keys(project.audioDescriptionRequirements).length === 0 ? {} : {
+    audioDescriptionRequirements: Object.values(project.audioDescriptionRequirements)
+      .sort((left, right) => compareText(left.requirementId, right.requirementId))
+      .map((requirement) => ({
+        requirementId: requirement.requirementId,
+        evidenceIds: [...requirement.evidenceIds].sort(compareText),
+        reason: requirement.reason,
+      })),
+  }),
   audioDescriptionGaps: Object.values(project.audioDescriptionGaps)
     .sort((left, right) => compareText(left.gapId, right.gapId))
     .map((gap) => ({ ...gap })),
@@ -239,6 +262,7 @@ export const semanticValidationInput = (input: ValidationInputSnapshot) => ({
   qualityProfile: input.qualityProfile,
   captions: input.captions,
   audioDescriptions: input.audioDescriptions,
+  ...(input.audioDescriptionRequirements === undefined ? {} : { audioDescriptionRequirements: input.audioDescriptionRequirements }),
   audioDescriptionGaps: input.audioDescriptionGaps,
 });
 
@@ -286,6 +310,9 @@ const targetParts = (target: QualityFindingTarget): readonly string[] => {
   }
   if (target.type === "item") {
     return ["target", "item", target.kind, target.itemId, String(target.itemRevision)];
+  }
+  if (target.type === "extended-description-requirement") {
+    return ["target", "extended-description-requirement", target.projectId, String(target.projectRevision), target.requirementId];
   }
   return [
     "target",
@@ -339,6 +366,16 @@ export const findingIdentityFor = (finding: Pick<QualityFinding, "ruleId" | "tar
       "item",
       target.kind,
       target.itemId,
+    ]);
+  }
+  if (target.type === "extended-description-requirement") {
+    return tupleHash("cuebench.finding-identity.v1", [
+      "rule",
+      finding.ruleId,
+      "target",
+      "extended-description-requirement",
+      target.projectId,
+      target.requirementId,
     ]);
   }
   const pair = [target.first, target.second]
@@ -453,7 +490,7 @@ export const validateProject = (project: CaptionProject): ValidationRun => {
     "audio-description",
     project.audioDescriptions.order,
     (itemId) => project.audioDescriptions.items[itemId],
-    () => true,
+    (item) => item.kind !== "AudioDescriptionBeat" || item.supersededByRunId === null,
     audioDescriptionItems,
   );
 
@@ -603,6 +640,30 @@ export const validateProject = (project: CaptionProject): ValidationRun => {
     }
   }
 
+  for (const requirement of Object.values(project.audioDescriptionRequirements)
+    .sort((left, right) => compareText(left.requirementId, right.requirementId))) {
+    const target: QualityFindingTarget = {
+      type: "extended-description-requirement",
+      projectId: project.projectId,
+      projectRevision: project.projectRevision,
+      requirementId: requirement.requirementId,
+    };
+    const allEvidenceCurrent = requirement.evidenceIds.length > 0 && requirement.evidenceIds.every((evidenceId) => (
+      project.evidence.some((evidence) => (
+        evidence.evidenceId === evidenceId
+        && evidence.projectId === project.projectId
+        && evidence.mediaSha256.toLowerCase() === project.media.sha256.toLowerCase()
+      ))
+    ));
+    if (!allEvidenceCurrent) {
+      add("audio-description.extended-requirement-evidence", "blocker", "An extended-description review requirement no longer has current evidence provenance.", target);
+    } else {
+      // This intentionally does not repeat model-provided text or rationale.
+      // It is a deterministic review prompt, not an asserted visual truth.
+      add("audio-description.extended-requirement", "warning", "An audio-description proposal needs human review for an extended description; inspect its retained evidence before deciding.", target);
+    }
+  }
+
   findings.sort((left, right) => compareText(left.findingId, right.findingId));
   const blockers = findings.filter((finding) => finding.severity === "blocker");
   const warnings = findings.filter((finding) => finding.severity === "warning");
@@ -680,6 +741,7 @@ const projectFromValidationInput = (input: ValidationInputSnapshot): CaptionProj
       kind: "AudioDescriptionBeat",
       revisions: [revision],
       current: revision,
+      supersededByRunId: item.supersededByRunId ?? null,
     };
   }
   for (const gap of input.audioDescriptionGaps) {
@@ -696,8 +758,21 @@ const projectFromValidationInput = (input: ValidationInputSnapshot): CaptionProj
     media: { ...input.media } as CaptionProject["media"],
     evidence: input.evidence.map((evidence) => ({ ...evidence })),
     localEvidencePackages: [],
+    localAudioDescriptionEvidencePackages: [],
     captions: { kind: "Captions", order: [...input.captions.order], items: captions },
     audioDescriptions: { kind: "AudioDescriptions", order: [...input.audioDescriptions.order], items: audioDescriptions },
+    audioDescriptionRequirements: Object.fromEntries((input.audioDescriptionRequirements ?? []).map((requirement) => [
+      requirement.requirementId,
+      {
+        requirementId: requirement.requirementId,
+        runId: "validation-input",
+        text: "Retained extended-description review context.",
+        rationale: "Reconstructed for deterministic validation.",
+        evidenceIds: [...requirement.evidenceIds],
+        reason: requirement.reason as CaptionProject["audioDescriptionRequirements"][string]["reason"],
+        createdAtMs: 0,
+      },
+    ])),
     audioDescriptionGaps: gaps,
     selectedItem: null,
     validation: { status: "NotRun", blockerCount: 0, warningCount: 0 },

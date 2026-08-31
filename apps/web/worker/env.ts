@@ -59,6 +59,10 @@ export interface WorkerEnv {
   /** Conservative per-operation reservations before external providers run. */
   readonly MAX_WORKFLOW_PROVIDER_COST_CENTS?: string;
   readonly MAX_MEDIA_PROBE_COST_CENTS?: string;
+  /** Separate conservative hold for one bounded narration-preview request. */
+  readonly MAX_TTS_PROVIDER_COST_CENTS?: string;
+  /** Conservative, per-window hold before an AD Responses API request. */
+  readonly MAX_AUDIO_DESCRIPTION_PROVIDER_COST_CENTS?: string;
   readonly TURNSTILE_SECRET: string;
   readonly TURNSTILE_VERIFY_URL?: string;
   readonly TURNSTILE_EXPECTED_HOSTNAME?: string;
@@ -67,6 +71,8 @@ export interface WorkerEnv {
   readonly QUOTA_LEDGER?: DurableObjectNamespace;
   readonly UPLOAD_COORDINATOR?: DurableObjectNamespace;
   readonly PROCESSING_WORKFLOW?: ProcessingWorkflowBinding;
+  /** Separate deterministic Workflow class for bounded audio-description runs. */
+  readonly AUDIO_DESCRIPTION_PROCESSING_WORKFLOW?: ProcessingWorkflowBinding;
   /** Operation-keyed Cloudflare Container Durable Object, never browser reachable. */
   readonly MEDIA_PREPARER?: DurableObjectNamespace;
   readonly ASSETS?: { fetch: (request: Request) => Promise<Response> };
@@ -102,6 +108,8 @@ export interface WorkerSettings {
   readonly globalSpendBreakerOpen: boolean;
   readonly maxWorkflowProviderCostCents: number;
   readonly maxMediaProbeCostCents: number;
+  readonly maxTtsProviderCostCents: number;
+  readonly maxAudioDescriptionProviderCostCents: number;
   readonly turnstileSecret: string;
   readonly turnstileVerifyUrl: string;
   /** An explicit production host override; otherwise the Worker verifies its own request host. */
@@ -225,6 +233,10 @@ export const resolveWorkerSettings = (env: WorkerEnv): WorkerSettings => {
     // provider call. The workflow may settle authoritative usage later.
     maxWorkflowProviderCostCents: boundedInt(env.MAX_WORKFLOW_PROVIDER_COST_CENTS, 100, "MAX_WORKFLOW_PROVIDER_COST_CENTS", 1, 1_000_000_000),
     maxMediaProbeCostCents: boundedInt(env.MAX_MEDIA_PROBE_COST_CENTS, 1, "MAX_MEDIA_PROBE_COST_CENTS", 1, 1_000_000_000),
+    // The deployment can tighten this from real provider cost telemetry. It
+    // is held before TTS and never silently replayed after ambiguity.
+    maxTtsProviderCostCents: boundedInt(env.MAX_TTS_PROVIDER_COST_CENTS, 10, "MAX_TTS_PROVIDER_COST_CENTS", 1, 1_000_000_000),
+    maxAudioDescriptionProviderCostCents: boundedInt(env.MAX_AUDIO_DESCRIPTION_PROVIDER_COST_CENTS, 100, "MAX_AUDIO_DESCRIPTION_PROVIDER_COST_CENTS", 1, 1_000_000_000),
     turnstileSecret: strongSecret(env.TURNSTILE_SECRET, "TURNSTILE_SECRET"),
     turnstileVerifyUrl: env.TURNSTILE_VERIFY_URL?.trim() || "https://challenges.cloudflare.com/turnstile/v0/siteverify",
     ...(env.TURNSTILE_EXPECTED_HOSTNAME?.trim()

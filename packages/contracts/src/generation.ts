@@ -34,6 +34,17 @@ const Sha256Schema = z.string().regex(/^[0-9a-f]{64}$/i, "Expected a SHA-256 has
  */
 export const MAX_LOCAL_CAPTION_EVIDENCE_WORDS = 2_700;
 export const MAX_LOCAL_CAPTION_CUES = 500;
+/** The AD run is deliberately smaller than caption generation: it is a bounded visual-review pass. */
+export const MAX_STAGED_AUDIO_DESCRIPTIONS = 256;
+/**
+ * A provider sees at most twelve frames in one bounded visual-analysis
+ * window. A staged review can cite the bounded union across windows, so its
+ * retention cap is deliberately larger while remaining beneath the portable
+ * project envelope.
+ */
+export const MAX_STAGED_AUDIO_DESCRIPTION_FRAMES = 256;
+export const MAX_STAGED_EXTENDED_DESCRIPTION_REQUIREMENTS = 64;
+export const MAX_LOCAL_AUDIO_DESCRIPTION_EVIDENCE_PACKAGES = 4;
 /** At most four historical packages are retained, but their transcript budget is shared. */
 export const MAX_LOCAL_CAPTION_EVIDENCE_PACKAGES = 4;
 /**
@@ -118,6 +129,98 @@ export const GenerationRunReceiptSchema = z.object({
   path: ["expiresAtMs"],
 });
 
+/**
+ * A compact, browser-derived caption/evidence snapshot that an AD run may
+ * rely on. It has no provider transcript body: it binds only captions and
+ * evidence the human has already retained in the canonical project.
+ */
+export const CaptionEvidenceProjectionSchema = z.object({
+  contractVersion: ContractVersionSchema,
+  projectId: IdentifierSchema,
+  expectedProjectRevision: ProjectRevisionSchema,
+  expectedQualityProfileRevision: ProjectRevisionSchema,
+  mediaSha256: Sha256Schema,
+  localEvidencePackageIds: z.array(IdentifierSchema).min(1).max(MAX_LOCAL_CAPTION_EVIDENCE_PACKAGES),
+  captions: z.array(EvidenceIntervalSchema.extend({
+    itemId: IdentifierSchema,
+    itemRevision: z.number().int().positive(),
+    state: z.enum(["Proposed", "AgentReady", "Objected", "Sustained"]),
+    text: z.string().trim().min(1).max(1_000),
+    /**
+     * Every live caption fences dialogue, including a human-authored cue that
+     * predates retained word evidence. Such cues deliberately carry no word
+     * links; `localEvidencePackageIds` remains the separate run precondition.
+     */
+    evidenceIds: z.array(IdentifierSchema).max(128),
+  }).strict()).min(1).max(MAX_LOCAL_CAPTION_CUES),
+  evidence: z.array(EvidenceIntervalSchema.extend({
+    evidenceId: IdentifierSchema,
+    itemId: IdentifierSchema,
+    itemRevision: z.number().int().positive(),
+  }).strict()).max(MAX_LOCAL_CAPTION_EVIDENCE_WORDS),
+}).strict().superRefine((value, context) => {
+  const captionById = new Map(value.captions.map((caption) => [caption.itemId, caption]));
+  if (captionById.size !== value.captions.length) {
+    context.addIssue({ code: "custom", message: "Caption-evidence projections must not repeat caption items.", path: ["captions"] });
+  }
+  if (new Set(value.localEvidencePackageIds).size !== value.localEvidencePackageIds.length) {
+    context.addIssue({ code: "custom", message: "Caption-evidence projections must not repeat retained package ids.", path: ["localEvidencePackageIds"] });
+  }
+  const seenEvidence = new Set<string>();
+  for (const evidence of value.evidence) {
+    const caption = captionById.get(evidence.itemId);
+    if (
+      caption === undefined
+      || caption.itemRevision !== evidence.itemRevision
+      || !caption.evidenceIds.includes(evidence.evidenceId)
+      || seenEvidence.has(evidence.evidenceId)
+    ) {
+      context.addIssue({
+        code: "custom",
+        message: "Caption-evidence links must resolve to the bounded caption context.",
+        path: ["evidence"],
+      });
+    }
+    seenEvidence.add(evidence.evidenceId);
+  }
+  for (const caption of value.captions) {
+    if (new Set(caption.evidenceIds).size !== caption.evidenceIds.length) {
+      context.addIssue({ code: "custom", message: "Caption evidence ids must be unique per caption.", path: ["captions"] });
+    }
+  }
+});
+
+/**
+ * Separate from caption receipts on purpose. An AD receipt is bound to the
+ * exact retained caption-evidence projection that guided visual analysis.
+ */
+export const AudioDescriptionGenerationRunReceiptSchema = z.object({
+  contractVersion: ContractVersionSchema,
+  version: z.literal(1),
+  type: z.literal("audio-description-generation-run-receipt"),
+  keyId: IdentifierSchema,
+  runId: IdentifierSchema,
+  projectId: IdentifierSchema,
+  targetTrack: z.literal("AudioDescriptions"),
+  expectedProjectRevision: ProjectRevisionSchema,
+  expectedQualityProfileRevision: ProjectRevisionSchema,
+  mediaSha256: Sha256Schema,
+  captionEvidenceHash: Sha256Schema,
+  sessionKey: z.string().regex(/^[0-9a-f]{64}$/),
+  ownerKey: z.string().regex(/^[0-9a-f]{64}$/),
+  projectKey: z.string().regex(/^[0-9a-f]{64}$/),
+  sourceByteLength: z.number().int().positive(),
+  sourceDurationMs: SafeTimestampSchema.refine((value) => value > 0),
+  operationId: IdentifierSchema,
+  operationKey: z.string().regex(/^[0-9a-f]{64}$/),
+  objectKey: z.string().min(1).max(1_000),
+  issuedAtMs: SafeTimestampSchema,
+  expiresAtMs: SafeTimestampSchema,
+}).strict().refine((value) => value.expiresAtMs > value.issuedAtMs, {
+  message: "Audio-description generation receipts must expire after they are issued.",
+  path: ["expiresAtMs"],
+});
+
 export const CaptionEvidenceWordSchema = EvidenceIntervalSchema.extend({
   evidenceId: IdentifierSchema,
   text: z.string().trim().min(1).max(1_000),
@@ -196,7 +299,7 @@ const ProviderCostSchema = z.discriminatedUnion("kind", [
 ]);
 
 export const GenerationProviderProvenanceSchema = z.object({
-  role: z.enum(["diarization", "word-timestamps", "reconciliation"]),
+  role: z.enum(["diarization", "word-timestamps", "reconciliation", "audio-description"]),
   model: z.string().trim().min(1).max(200),
   requestHash: Sha256Schema,
   responseHash: Sha256Schema,
@@ -327,6 +430,92 @@ export const StagedGenerationResultSchema = z.object({
   }
 });
 
+export const AudioDescriptionFrameEvidenceSchema = z.object({
+  evidenceId: IdentifierSchema,
+  atMs: SafeTimestampSchema,
+  sha256: Sha256Schema,
+  mimeType: z.string().trim().min(1).max(200),
+}).strict();
+
+export const AudioDescriptionEvidenceBundleSchema = z.object({
+  contractVersion: ContractVersionSchema,
+  runId: IdentifierSchema,
+  projectId: IdentifierSchema,
+  mediaSha256: Sha256Schema,
+  captionEvidenceHash: Sha256Schema,
+  preparedManifest: z.object({ key: z.string().min(1).max(1_000), sha256: Sha256Schema }).strict(),
+  frames: z.array(AudioDescriptionFrameEvidenceSchema).max(MAX_STAGED_AUDIO_DESCRIPTION_FRAMES),
+  sceneBoundaries: z.array(SafeTimestampSchema).max(256),
+  provenance: z.array(GenerationProviderProvenanceSchema).min(1).max(32),
+}).strict().superRefine((value, context) => {
+  if (new Set(value.frames.map((frame) => frame.evidenceId)).size !== value.frames.length) {
+    context.addIssue({ code: "custom", message: "Audio-description frame evidence ids must be unique.", path: ["frames"] });
+  }
+  if (value.provenance.some((entry) => entry.role !== "audio-description")) {
+    context.addIssue({ code: "custom", message: "Audio-description evidence may retain only visual-analysis provenance.", path: ["provenance"] });
+  }
+});
+
+export const StagedAudioDescriptionBeatSchema = EvidenceIntervalSchema.extend({
+  beatId: IdentifierSchema,
+  description: z.string().trim().min(1).max(1_000),
+  evidenceIds: z.array(IdentifierSchema).min(1).max(128),
+}).strict();
+
+export const ExtendedDescriptionRequirementSchema = z.object({
+  requirementId: IdentifierSchema,
+  /** Retained as review context, never surfaced as an asserted model fact. */
+  text: z.string().trim().min(1).max(2_000),
+  rationale: z.string().trim().min(1).max(2_000),
+  evidenceIds: z.array(IdentifierSchema).min(1).max(128),
+  reason: z.enum(["no-compatible-speech-gap", "requires-human-judgment", "insufficient-visual-evidence"]),
+}).strict();
+
+/** A staged AD result stays isolated from the caption result contract. */
+export const StagedAudioDescriptionGenerationResultSchema = z.object({
+  contractVersion: ContractVersionSchema,
+  runId: IdentifierSchema,
+  projectId: IdentifierSchema,
+  targetTrack: z.literal("AudioDescriptions"),
+  expectedProjectRevision: ProjectRevisionSchema,
+  expectedQualityProfileRevision: ProjectRevisionSchema,
+  mediaSha256: Sha256Schema,
+  captionEvidenceHash: Sha256Schema,
+  evidence: AudioDescriptionEvidenceBundleSchema,
+  audioDescriptions: z.array(StagedAudioDescriptionBeatSchema).max(MAX_STAGED_AUDIO_DESCRIPTIONS),
+  extendedDescriptionRequirements: z.array(ExtendedDescriptionRequirementSchema).max(MAX_STAGED_EXTENDED_DESCRIPTION_REQUIREMENTS),
+  outputSha256: Sha256Schema.optional(),
+  createdAtMs: SafeTimestampSchema,
+  expiresAtMs: SafeTimestampSchema,
+}).strict().superRefine((value, context) => {
+  if (value.expiresAtMs <= value.createdAtMs || value.expiresAtMs - value.createdAtMs > 24 * 60 * 60 * 1_000) {
+    context.addIssue({ code: "custom", message: "Staged audio-description results must retain private artifacts for no more than 24 hours.", path: ["expiresAtMs"] });
+  }
+  if (
+    value.evidence.runId !== value.runId
+    || value.evidence.projectId !== value.projectId
+    || value.evidence.mediaSha256.toLowerCase() !== value.mediaSha256.toLowerCase()
+    || value.evidence.captionEvidenceHash.toLowerCase() !== value.captionEvidenceHash.toLowerCase()
+  ) {
+    context.addIssue({ code: "custom", message: "Audio-description evidence must bind to its staged run, media, and caption-evidence base.", path: ["evidence"] });
+  }
+  const frameIds = new Set(value.evidence.frames.map((frame) => frame.evidenceId));
+  const generatedIds = new Set<string>();
+  const requirementIds = new Set<string>();
+  for (const beat of value.audioDescriptions) {
+    if (generatedIds.has(beat.beatId) || beat.evidenceIds.some((evidenceId) => !frameIds.has(evidenceId))) {
+      context.addIssue({ code: "custom", message: "Audio-description proposals must have unique ids and resolve retained frame evidence.", path: ["audioDescriptions"] });
+    }
+    generatedIds.add(beat.beatId);
+  }
+  for (const requirement of value.extendedDescriptionRequirements) {
+    if (requirementIds.has(requirement.requirementId) || requirement.evidenceIds.some((evidenceId) => !frameIds.has(evidenceId))) {
+      context.addIssue({ code: "custom", message: "Extended-description requirements must have unique ids and resolve retained frame evidence.", path: ["extendedDescriptionRequirements"] });
+    }
+    requirementIds.add(requirement.requirementId);
+  }
+});
+
 export const CueEvidenceBindingSchema = z.object({
   cueId: IdentifierSchema,
   itemId: IdentifierSchema,
@@ -376,6 +565,62 @@ export const LocalCaptionEvidencePackageSchema = z.object({
       }
       seenBindingIds.add(evidenceId);
     }
+  }
+});
+
+export const AudioDescriptionEvidenceBindingSchema = z.object({
+  beatId: IdentifierSchema,
+  itemId: IdentifierSchema,
+  itemRevision: z.number().int().positive(),
+  evidenceIds: z.array(IdentifierSchema).min(1).max(128),
+}).strict();
+
+export const ExtendedDescriptionRequirementEvidenceBindingSchema = z.object({
+  requirementId: IdentifierSchema,
+  evidenceIds: z.array(IdentifierSchema).min(1).max(128),
+}).strict();
+
+/**
+ * Compact visual evidence retained after a Human adopts an AD run. It never
+ * contains source video or synthesized TTS audio—only hashes, timestamps,
+ * provider provenance, and the evidence links the reviewer can inspect.
+ */
+export const LocalAudioDescriptionEvidencePackageSchema = z.object({
+  packageId: IdentifierSchema,
+  runId: IdentifierSchema,
+  projectId: IdentifierSchema,
+  mediaSha256: Sha256Schema,
+  expectedProjectRevision: ProjectRevisionSchema,
+  expectedQualityProfileRevision: ProjectRevisionSchema,
+  captionEvidenceHash: Sha256Schema,
+  retainedAtMs: SafeTimestampSchema,
+  outputSha256: Sha256Schema.optional(),
+  evidence: AudioDescriptionEvidenceBundleSchema,
+  beatBindings: z.array(AudioDescriptionEvidenceBindingSchema).max(MAX_STAGED_AUDIO_DESCRIPTIONS),
+  requirementBindings: z.array(ExtendedDescriptionRequirementEvidenceBindingSchema).max(MAX_STAGED_EXTENDED_DESCRIPTION_REQUIREMENTS),
+}).strict().superRefine((value, context) => {
+  if (
+    value.evidence.runId !== value.runId
+    || value.evidence.projectId !== value.projectId
+    || value.evidence.mediaSha256.toLowerCase() !== value.mediaSha256.toLowerCase()
+    || value.evidence.captionEvidenceHash.toLowerCase() !== value.captionEvidenceHash.toLowerCase()
+  ) {
+    context.addIssue({ code: "custom", message: "Local AD evidence must bind to its exact run, project, media, and caption-evidence base." });
+  }
+  const frames = new Set(value.evidence.frames.map((frame) => frame.evidenceId));
+  const seenBeatIds = new Set<string>();
+  for (const binding of value.beatBindings) {
+    if (binding.itemId !== binding.beatId || seenBeatIds.has(binding.beatId) || binding.evidenceIds.some((evidenceId) => !frames.has(evidenceId))) {
+      context.addIssue({ code: "custom", message: "Local AD beat evidence bindings must uniquely resolve retained frame evidence.", path: ["beatBindings"] });
+    }
+    seenBeatIds.add(binding.beatId);
+  }
+  const seenRequirementIds = new Set<string>();
+  for (const binding of value.requirementBindings) {
+    if (seenRequirementIds.has(binding.requirementId) || binding.evidenceIds.some((evidenceId) => !frames.has(evidenceId))) {
+      context.addIssue({ code: "custom", message: "Local extended-description bindings must uniquely resolve retained frame evidence.", path: ["requirementBindings"] });
+    }
+    seenRequirementIds.add(binding.requirementId);
   }
 });
 
@@ -466,10 +711,17 @@ export type GenerationTargetTrack = z.infer<
 >;
 export type GenerationRunStatus = z.infer<typeof GenerationRunStatusSchema>;
 export type GenerationRunReceipt = z.infer<typeof GenerationRunReceiptSchema>;
+export type CaptionEvidenceProjection = z.infer<typeof CaptionEvidenceProjectionSchema>;
+export type AudioDescriptionGenerationRunReceipt = z.infer<typeof AudioDescriptionGenerationRunReceiptSchema>;
 export type CaptionEvidenceWord = z.infer<typeof CaptionEvidenceWordSchema>;
 export type UncertaintySpan = z.infer<typeof UncertaintySpanSchema>;
 export type GenerationProviderProvenance = z.infer<typeof GenerationProviderProvenanceSchema>;
 export type CaptionEvidenceBundle = z.infer<typeof CaptionEvidenceBundleSchema>;
 export type StagedCaptionCue = z.infer<typeof StagedCaptionCueSchema>;
 export type StagedGenerationResult = z.infer<typeof StagedGenerationResultSchema>;
+export type AudioDescriptionEvidenceBundle = z.infer<typeof AudioDescriptionEvidenceBundleSchema>;
+export type StagedAudioDescriptionBeat = z.infer<typeof StagedAudioDescriptionBeatSchema>;
+export type ExtendedDescriptionRequirement = z.infer<typeof ExtendedDescriptionRequirementSchema>;
+export type StagedAudioDescriptionGenerationResult = z.infer<typeof StagedAudioDescriptionGenerationResultSchema>;
 export type LocalCaptionEvidencePackage = z.infer<typeof LocalCaptionEvidencePackageSchema>;
+export type LocalAudioDescriptionEvidencePackage = z.infer<typeof LocalAudioDescriptionEvidencePackageSchema>;

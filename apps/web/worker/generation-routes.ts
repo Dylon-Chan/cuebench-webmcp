@@ -161,6 +161,8 @@ export interface ActiveGenerationLease {
   readonly projectKey: string;
   readonly operationKey: string;
   readonly runId: string;
+  /** The global project fence remains single-owner; target is retained for audit/narrowing. */
+  readonly targetTrack: "Captions" | "AudioDescriptions";
   readonly state: "active" | "released";
   readonly expiresAtMs: number;
   readonly updatedAtMs: number;
@@ -188,6 +190,7 @@ export interface GenerationRunRecordStore {
     readonly projectKey: string;
     readonly operationKey: string;
     readonly runId: string;
+    readonly targetTrack: "Captions" | "AudioDescriptions";
     readonly expiresAtMs: number;
     readonly nowMs: number;
   }) => Promise<ActiveGenerationLeaseAcquisition>;
@@ -198,6 +201,7 @@ export interface GenerationRunRecordStore {
     readonly projectKey: string;
     readonly operationKey: string;
     readonly runId: string;
+    readonly targetTrack: "Captions" | "AudioDescriptions";
     readonly nowMs: number;
   }) => Promise<void>;
   /**
@@ -239,11 +243,12 @@ const activeOwnerKey = (value: Pick<ActiveGenerationLease, "sessionKey" | "owner
 
 const activeLeaseIdentityMatches = (
   lease: ActiveGenerationLease,
-  input: Pick<ActiveGenerationLease, "sessionKey" | "ownerKey" | "projectKey" | "operationKey" | "runId">,
+  input: Pick<ActiveGenerationLease, "sessionKey" | "ownerKey" | "projectKey" | "operationKey" | "runId" | "targetTrack">,
 ): boolean => activeOwnerKey(lease) === activeOwnerKey(input)
   && lease.projectKey === input.projectKey
   && lease.operationKey === input.operationKey
-  && lease.runId === input.runId;
+  && lease.runId === input.runId
+  && lease.targetTrack === input.targetTrack;
 
 export class InMemoryGenerationRunRecordStore implements GenerationRunRecordStore {
   private readonly records = new Map<string, GenerationRunRecord>();
@@ -267,6 +272,7 @@ export class InMemoryGenerationRunRecordStore implements GenerationRunRecordStor
       projectKey: record.claims.projectKey,
       operationKey: record.claims.operationKey,
       runId: record.claims.runId,
+      targetTrack: "Captions",
       nowMs: record.updatedAtMs,
     });
   }
@@ -303,6 +309,7 @@ export class InMemoryGenerationRunRecordStore implements GenerationRunRecordStor
     readonly projectKey: string;
     readonly operationKey: string;
     readonly runId: string;
+    readonly targetTrack: "Captions" | "AudioDescriptions";
     readonly expiresAtMs: number;
     readonly nowMs: number;
   }): Promise<ActiveGenerationLeaseAcquisition> {
@@ -320,6 +327,7 @@ export class InMemoryGenerationRunRecordStore implements GenerationRunRecordStor
       projectKey: input.projectKey,
       operationKey: input.operationKey,
       runId: input.runId,
+      targetTrack: input.targetTrack,
       state: "active",
       expiresAtMs: input.expiresAtMs,
       updatedAtMs: input.nowMs,
@@ -334,6 +342,7 @@ export class InMemoryGenerationRunRecordStore implements GenerationRunRecordStor
     readonly projectKey: string;
     readonly operationKey: string;
     readonly runId: string;
+    readonly targetTrack: "Captions" | "AudioDescriptions";
     readonly nowMs: number;
   }): Promise<void> {
     const ownerKey = activeOwnerKey(input);
@@ -391,6 +400,7 @@ const parsedActiveGenerationLease = (value: unknown): ActiveGenerationLease | nu
     && typeof lease.projectKey === "string" && SHA256.test(lease.projectKey)
     && typeof lease.operationKey === "string" && SHA256.test(lease.operationKey)
     && typeof lease.runId === "string" && OPAQUE_ID.test(lease.runId)
+    && (lease.targetTrack === undefined || lease.targetTrack === "Captions" || lease.targetTrack === "AudioDescriptions")
     && (lease.state === "active" || lease.state === "released")
     && Number.isSafeInteger(lease.expiresAtMs) && (lease.expiresAtMs as number) >= 0
     && Number.isSafeInteger(lease.updatedAtMs) && (lease.updatedAtMs as number) >= 0
@@ -401,6 +411,8 @@ const parsedActiveGenerationLease = (value: unknown): ActiveGenerationLease | nu
       projectKey: lease.projectKey.toLowerCase(),
       operationKey: lease.operationKey.toLowerCase(),
       runId: lease.runId,
+      // Existing short-lived caption leases predate target discrimination.
+      targetTrack: lease.targetTrack === "AudioDescriptions" ? "AudioDescriptions" : "Captions",
       state: lease.state,
       expiresAtMs: lease.expiresAtMs as number,
       updatedAtMs: lease.updatedAtMs as number,
@@ -1226,10 +1238,11 @@ export class R2GenerationRunRecordStore implements GenerationRunRecordStore {
     readonly projectKey: string;
     readonly operationKey: string;
     readonly runId: string;
+    readonly targetTrack: "Captions" | "AudioDescriptions";
     readonly expiresAtMs: number;
     readonly nowMs: number;
   }): Promise<ActiveGenerationLeaseAcquisition> {
-    if (!SHA256.test(input.sessionKey) || (input.ownerKey !== undefined && !SHA256.test(input.ownerKey)) || !SHA256.test(input.projectKey) || !SHA256.test(input.operationKey) || !OPAQUE_ID.test(input.runId) || !Number.isSafeInteger(input.expiresAtMs) || input.expiresAtMs <= input.nowMs) {
+    if (!SHA256.test(input.sessionKey) || (input.ownerKey !== undefined && !SHA256.test(input.ownerKey)) || !SHA256.test(input.projectKey) || !SHA256.test(input.operationKey) || !OPAQUE_ID.test(input.runId) || (input.targetTrack !== "Captions" && input.targetTrack !== "AudioDescriptions") || !Number.isSafeInteger(input.expiresAtMs) || input.expiresAtMs <= input.nowMs) {
       throw new Error("CueBench cannot acquire an invalid private generation lease.");
     }
     const desired: ActiveGenerationLease = {
@@ -1239,6 +1252,7 @@ export class R2GenerationRunRecordStore implements GenerationRunRecordStore {
       projectKey: input.projectKey.toLowerCase(),
       operationKey: input.operationKey.toLowerCase(),
       runId: input.runId,
+      targetTrack: input.targetTrack,
       state: "active",
       expiresAtMs: input.expiresAtMs,
       updatedAtMs: input.nowMs,
@@ -1277,9 +1291,10 @@ export class R2GenerationRunRecordStore implements GenerationRunRecordStore {
     readonly projectKey: string;
     readonly operationKey: string;
     readonly runId: string;
+    readonly targetTrack: "Captions" | "AudioDescriptions";
     readonly nowMs: number;
   }): Promise<void> {
-    if (!SHA256.test(input.sessionKey) || (input.ownerKey !== undefined && !SHA256.test(input.ownerKey)) || !SHA256.test(input.projectKey) || !SHA256.test(input.operationKey) || !OPAQUE_ID.test(input.runId)) return;
+    if (!SHA256.test(input.sessionKey) || (input.ownerKey !== undefined && !SHA256.test(input.ownerKey)) || !SHA256.test(input.projectKey) || !SHA256.test(input.operationKey) || !OPAQUE_ID.test(input.runId) || (input.targetTrack !== "Captions" && input.targetTrack !== "AudioDescriptions")) return;
     const ownerKey = activeOwnerKey(input).toLowerCase();
     for (let attempt = 0; attempt < 5; attempt += 1) {
       const current = await this.currentActiveLease(ownerKey, input.projectKey.toLowerCase());
@@ -1308,6 +1323,7 @@ export class R2GenerationRunRecordStore implements GenerationRunRecordStore {
       projectKey: record.claims.projectKey,
       operationKey: record.claims.operationKey,
       runId: record.claims.runId,
+      targetTrack: "Captions",
       nowMs: record.updatedAtMs,
     });
   }
@@ -1550,15 +1566,14 @@ export class R2GenerationRunRecordStore implements GenerationRunRecordStore {
         if (Object.keys(fields).length === 2 && typeof fields.outputKey === "string" && preparedOutputArtifactKey(fields.outputKey, claims)) {
           expectedKey = generationPreparationWriteLeaseKey(claims.operationKey, fields.outputKey);
         } else if (Object.keys(fields).length === 2 && typeof fields.artifactKey === "string") {
-          const parsed = parsedArtifactKey(fields.artifactKey, {
-            operationKey: claims.operationKey,
-            // A lease path below independently carries and verifies this id;
-            // supplying it here only lets the shared parser validate the
-            // immutable artifact shape before we compare its exact key.
-            runId: fields.artifactKey.split("/")[3] ?? "",
-          });
-          if (parsed === null) throw new Error("CueBench generation writer lease is invalid.");
-          expectedKey = generationArtifactWriteLeaseKey(claims.operationKey, fields.artifactKey.split("/")[3]!, fields.artifactKey);
+          // The shared operation fence can see a caption or AD checkpoint
+          // writer. Validate only its opaque, bounded path through the common
+          // helper—caption cleanup must not deserialize/read AD checkpoint
+          // fields, but it must conservatively remain pending while either
+          // target can still publish a private object.
+          const runId = fields.artifactKey.split("/")[3];
+          if (runId === undefined) throw new Error("CueBench generation writer lease is invalid.");
+          expectedKey = generationArtifactWriteLeaseKey(claims.operationKey, runId, fields.artifactKey);
         } else {
           throw new Error("CueBench private writer lease is invalid.");
         }
@@ -2258,6 +2273,7 @@ export const createGenerationRoutes = (env: WorkerEnv, dependencies: GenerationR
         projectKey: upload.projectKey,
         operationKey: upload.operationKey,
         runId: input.runId,
+        targetTrack: "Captions",
         expiresAtMs,
         nowMs: currentNow,
       });
@@ -2304,6 +2320,7 @@ export const createGenerationRoutes = (env: WorkerEnv, dependencies: GenerationR
           projectKey: upload.projectKey,
           operationKey: upload.operationKey,
           runId: input.runId,
+          targetTrack: "Captions",
           nowMs: currentNow,
         });
         return true;

@@ -1,6 +1,7 @@
 import {
   countJsonNodes,
   MAX_LOCAL_CAPTION_CUES,
+  MAX_LOCAL_AUDIO_DESCRIPTION_EVIDENCE_PACKAGES,
   MAX_LOCAL_CAPTION_EVIDENCE_PACKAGES,
   MAX_LOCAL_CAPTION_EVIDENCE_TOTAL_BYTES,
   MAX_LOCAL_CAPTION_EVIDENCE_TOTAL_JSON_NODES,
@@ -11,12 +12,14 @@ import {
   type CaptionEvidenceWord,
   type CertificationSnapshot,
   type LocalCaptionEvidencePackage,
+  type LocalAudioDescriptionEvidencePackage,
   type ReviewState,
   type StagedCaptionCue,
   type ValidationSnapshot,
 } from "@cuebench/contracts";
 import { exportProjectBackup } from "./backup/schema";
 import { canonicalSerialize } from "./quality/hash";
+import { captionEvidenceProjectionForAudioDescription } from "./audio-description-evidence";
 import type { DomainCommand } from "./commands";
 import { domainError, type DomainError } from "./errors";
 import {
@@ -27,9 +30,11 @@ import { prepareTrackExport } from "./export/round-trip";
 import { currentValidationRun, validateProject } from "./quality/validate";
 import type {
   AudioDescriptionBeat,
+  AudioDescriptionGenerationLeaseBase,
   AudioDescriptionBeatRevision,
   AudioDescriptionGap,
   CaptionCue,
+  CaptionGenerationLeaseBase,
   CaptionCueRevision,
   CaptionProject,
   DomainEvent,
@@ -221,6 +226,39 @@ const retainLocalEvidencePackages = (
   return retained.sort((left, right) => left.retainedAtMs - right.retainedAtMs || left.runId.localeCompare(right.runId));
 };
 
+/** Visual evidence used by a live Sustained AD beat is never evicted. */
+const audioDescriptionPackageSupportsLiveSustainedBeat = (
+  project: CaptionProject,
+  entry: LocalAudioDescriptionEvidencePackage,
+): boolean => entry.beatBindings.some((binding) => {
+  const item = project.audioDescriptions.items[binding.itemId];
+  return item?.supersededByRunId === null
+    && item.current.state === "Sustained"
+    && item.current.itemRevision === binding.itemRevision;
+});
+
+const retainLocalAudioDescriptionEvidencePackages = (
+  project: CaptionProject,
+  candidates: readonly LocalAudioDescriptionEvidencePackage[],
+  requiredRunId: string,
+): readonly LocalAudioDescriptionEvidencePackage[] | null => {
+  const protectedIds = new Set(candidates
+    .filter((entry) => audioDescriptionPackageSupportsLiveSustainedBeat(project, entry))
+    .map((entry) => entry.packageId));
+  if (protectedIds.size > MAX_LOCAL_AUDIO_DESCRIPTION_EVIDENCE_PACKAGES) return null;
+  const retained = [...candidates].sort((left, right) => (
+    left.retainedAtMs - right.retainedAtMs || left.runId.localeCompare(right.runId)
+  ));
+  while (retained.length > MAX_LOCAL_AUDIO_DESCRIPTION_EVIDENCE_PACKAGES) {
+    const evictIndex = retained.findIndex((entry) => (
+      entry.runId !== requiredRunId && !protectedIds.has(entry.packageId)
+    ));
+    if (evictIndex < 0) return null;
+    retained.splice(evictIndex, 1);
+  }
+  return retained.some((entry) => entry.runId === requiredRunId) ? retained : null;
+};
+
 const staleProject = (project: CaptionProject, expected: number) =>
   project.projectRevision !== expected
     ? domainError("STALE_PROJECT", "The project revision is no longer current.")
@@ -240,7 +278,7 @@ const eventFor = (project: CaptionProject, command: DomainCommand, itemId?: stri
   ...(itemId === undefined ? {} : { itemId }),
   ...(command.type === "ObjectItem"
     ? { detail: command.reason }
-    : command.type === "AdoptCaptionGenerationResult"
+    : command.type === "AdoptCaptionGenerationResult" || command.type === "AdoptAudioDescriptionGenerationResult"
       // Persist the immutable run identity in Court Record rather than
       // relying on a short-lived Worker receipt to reconstruct a backup.
       ? { detail: `generation:${command.runId}` }
@@ -417,7 +455,8 @@ const clone = <Value>(value: Value): Value => structuredClone(value);
 const captionLeaseBase = (
   project: CaptionProject,
   expectedProjectRevision: number,
-): NonNullable<GenerationLease["base"]> => ({
+): CaptionGenerationLeaseBase => ({
+  targetTrack: "Captions",
   expectedProjectRevision,
   mediaSha256: project.media.sha256.toLowerCase(),
   qualityProfileRevision: project.qualityProfile.revision,
@@ -432,7 +471,7 @@ const captionLeaseBase = (
     .sort((left, right) => left.itemId.localeCompare(right.itemId)),
 });
 
-const captionBaseMatches = (project: CaptionProject, base: NonNullable<GenerationLease["base"]>): boolean => {
+const captionBaseMatches = (project: CaptionProject, base: CaptionGenerationLeaseBase): boolean => {
   if (base.captionOrder.length !== project.captions.order.length || base.captionOrder.some((itemId, index) => itemId !== project.captions.order[index])) {
     return false;
   }
@@ -446,6 +485,60 @@ const captionBaseMatches = (project: CaptionProject, base: NonNullable<Generatio
         && item.state === expected.state
         && item.mergedIntoItemId === expected.mergedIntoItemId;
     });
+};
+
+const audioDescriptionLeaseBase = (
+  project: CaptionProject,
+  expectedProjectRevision: number,
+): AudioDescriptionGenerationLeaseBase | null => {
+  const captionEvidence = captionEvidenceProjectionForAudioDescription(project, expectedProjectRevision);
+  if (captionEvidence === null) return null;
+  return {
+    targetTrack: "AudioDescriptions",
+    expectedProjectRevision,
+    mediaSha256: project.media.sha256.toLowerCase(),
+    qualityProfileRevision: project.qualityProfile.revision,
+    captionEvidenceHash: captionEvidence.hash,
+    captionEvidencePackageIds: [...captionEvidence.projection.localEvidencePackageIds],
+    audioDescriptionOrder: [...project.audioDescriptions.order],
+    audioDescriptionRequirementIds: Object.keys(project.audioDescriptionRequirements).sort((left, right) => left.localeCompare(right)),
+    audioDescriptionItems: Object.values(project.audioDescriptions.items)
+      .map((item) => ({
+        itemId: item.itemId,
+        itemRevision: item.current.itemRevision,
+        state: item.current.state,
+        supersededByRunId: item.supersededByRunId,
+      }))
+      .sort((left, right) => left.itemId.localeCompare(right.itemId)),
+  };
+};
+
+const audioDescriptionBaseMatches = (
+  project: CaptionProject,
+  base: AudioDescriptionGenerationLeaseBase,
+): boolean => {
+  const current = audioDescriptionLeaseBase(project, base.expectedProjectRevision);
+  if (current === null) return false;
+  return (
+    current.mediaSha256 === base.mediaSha256
+    && current.qualityProfileRevision === base.qualityProfileRevision
+    && current.captionEvidenceHash === base.captionEvidenceHash
+    && current.captionEvidencePackageIds.length === base.captionEvidencePackageIds.length
+    && current.captionEvidencePackageIds.every((value, index) => value === base.captionEvidencePackageIds[index])
+    && current.audioDescriptionOrder.length === base.audioDescriptionOrder.length
+    && current.audioDescriptionOrder.every((value, index) => value === base.audioDescriptionOrder[index])
+    && current.audioDescriptionRequirementIds.length === base.audioDescriptionRequirementIds.length
+    && current.audioDescriptionRequirementIds.every((value, index) => value === base.audioDescriptionRequirementIds[index])
+    && current.audioDescriptionItems.length === base.audioDescriptionItems.length
+    && current.audioDescriptionItems.every((item, index) => {
+      const expected = base.audioDescriptionItems[index];
+      return expected !== undefined
+        && item.itemId === expected.itemId
+        && item.itemRevision === expected.itemRevision
+        && item.state === expected.state
+        && item.supersededByRunId === expected.supersededByRunId;
+    })
+  );
 };
 
 /**
@@ -479,11 +572,29 @@ const carryLocalEvidenceForReviewState = (
   )),
 }));
 
+/** Keep retained visual evidence resolvable across a human state-only AD ruling. */
+const carryLocalAudioDescriptionEvidenceForReviewState = (
+  project: CaptionProject,
+  previous: AudioDescriptionBeat,
+  revised: AudioDescriptionBeat,
+): CaptionProject["localAudioDescriptionEvidencePackages"] => project.localAudioDescriptionEvidencePackages.map((entry) => ({
+  ...entry,
+  beatBindings: entry.beatBindings.map((binding) => (
+    binding.itemId === previous.itemId && binding.itemRevision === previous.current.itemRevision
+      ? { ...binding, itemRevision: revised.current.itemRevision }
+      : binding
+  )),
+}));
+
 export const applyCommand = (project: CaptionProject, command: DomainCommand): CommandResult => {
   // Generation adoption/release deliberately fence the leased target state,
   // not the whole project revision. This permits a Human's unrelated
   // audio-description work to coexist with an in-flight caption run.
-  if (command.type !== "AdoptCaptionGenerationResult" && command.type !== "ReleaseGenerationRun") {
+  if (
+    command.type !== "AdoptCaptionGenerationResult"
+    && command.type !== "AdoptAudioDescriptionGenerationResult"
+    && command.type !== "ReleaseGenerationRun"
+  ) {
     const projectError = staleProject(project, command.expectedProjectRevision);
     if (projectError !== undefined) return { project, events: [], error: projectError };
   }
@@ -516,13 +627,20 @@ export const applyCommand = (project: CaptionProject, command: DomainCommand): C
   if (command.type === "StartGenerationRun") {
     if (project.activeGenerationRun !== null) return fail(project, "TARGET_TRACK_LEASE_CONFLICT", "A generation run is already active.");
     if (command.actor.type !== "CueBenchAI") return fail(project, "INVALID_ARGUMENT", "Only CueBench AI starts a generation run.");
+    const expectedProjectRevision = project.projectRevision + 1;
+    const base = command.targetTrack === "Captions"
+      ? captionLeaseBase(project, expectedProjectRevision)
+      : audioDescriptionLeaseBase(project, expectedProjectRevision);
+    if (base === null) {
+      return fail(project, "INVALID_ARGUMENT", "Audio-description generation requires current locally retained caption evidence.");
+    }
     const activeGenerationRun: GenerationLease = {
       runId: command.runId,
       targetTrack: command.targetTrack,
       actor: clone(command.actor),
       // The lease becomes visible in the incremented project revision that
       // the Worker signs into its generation receipt.
-      base: captionLeaseBase(project, project.projectRevision + 1),
+      base,
     };
     return commit(project, command, { activeGenerationRun });
   }
@@ -532,7 +650,7 @@ export const applyCommand = (project: CaptionProject, command: DomainCommand): C
       return fail(project, "STALE_RUN", "The matching caption generation run is no longer active.");
     }
     const leaseBase = project.activeGenerationRun.base;
-    if (leaseBase === undefined) {
+    if (leaseBase === undefined || leaseBase.targetTrack !== "Captions") {
       return fail(project, "STALE_RUN", "This legacy caption generation lease has no safe base-state fence. Discard it before starting a new run.");
     }
     if (
@@ -707,6 +825,206 @@ export const applyCommand = (project: CaptionProject, command: DomainCommand): C
     }
     return adopted;
   }
+  if (command.type === "AdoptAudioDescriptionGenerationResult") {
+    if (command.actor.type !== "CueBenchAI") return fail(project, "INVALID_ARGUMENT", "Only CueBench AI may adopt its complete audio-description generation result.");
+    if (project.activeGenerationRun?.runId !== command.runId || project.activeGenerationRun.targetTrack !== "AudioDescriptions") {
+      return fail(project, "STALE_RUN", "The matching audio-description generation run is no longer active.");
+    }
+    const leaseBase = project.activeGenerationRun.base;
+    if (leaseBase === undefined || leaseBase.targetTrack !== "AudioDescriptions") {
+      return fail(project, "STALE_RUN", "This legacy audio-description lease has no safe base-state fence. Discard it before starting a new run.");
+    }
+    if (
+      command.expectedProjectRevision !== leaseBase.expectedProjectRevision
+      || command.result.expectedProjectRevision !== leaseBase.expectedProjectRevision
+      || command.expectedQualityProfileRevision !== leaseBase.qualityProfileRevision
+      || command.result.expectedQualityProfileRevision !== leaseBase.qualityProfileRevision
+      || project.qualityProfile.revision !== leaseBase.qualityProfileRevision
+      || project.media.sha256.toLowerCase() !== leaseBase.mediaSha256
+      || !audioDescriptionBaseMatches(project, leaseBase)
+    ) {
+      return fail(project, "STALE_PROJECT", "The audio-description target or Quality Profile changed after generation started.");
+    }
+    if (
+      command.result.runId !== command.runId
+      || command.result.projectId !== project.projectId
+      || command.result.targetTrack !== "AudioDescriptions"
+      || command.result.mediaSha256.toLowerCase() !== project.media.sha256.toLowerCase()
+      || command.result.captionEvidenceHash.toLowerCase() !== leaseBase.captionEvidenceHash
+      || command.result.evidence.runId !== command.runId
+      || command.result.evidence.projectId !== project.projectId
+      || command.result.evidence.mediaSha256.toLowerCase() !== project.media.sha256.toLowerCase()
+      || command.result.evidence.captionEvidenceHash.toLowerCase() !== leaseBase.captionEvidenceHash
+    ) {
+      return fail(project, "MEDIA_HASH_MISMATCH", "The staged audio-description evidence does not bind to this exact retained caption-evidence base.");
+    }
+
+    const replaceableProposed = Object.values(project.audioDescriptions.items).filter((item) => (
+      item.supersededByRunId === null
+      && item.current.state === "Proposed"
+      && item.current.actor.type === "CueBenchAI"
+    ));
+    if (replaceableProposed.length > 0 && !command.confirmedProposedReplacement) {
+      return fail(project, "CONFIRMATION_DECLINED", "Replacing existing CueBench-AI Proposed audio descriptions requires visible human confirmation.");
+    }
+
+    const protectedIntervals = mergedIntervals(Object.values(project.audioDescriptions.items)
+      .filter((item) => item.supersededByRunId === null && !replaceableProposed.some((candidate) => candidate.itemId === item.itemId))
+      .map((item) => ({ startMs: item.current.startMs, endMs: item.current.endMs })));
+    const knownFrameIds = new Set(command.result.evidence.frames.map((frame) => frame.evidenceId));
+    const globalIds = new Set([
+      ...Object.keys(project.captions.items),
+      ...Object.keys(project.audioDescriptions.items),
+      ...Object.keys(project.audioDescriptionGaps),
+      ...Object.keys(project.audioDescriptionRequirements),
+    ]);
+    const generatedIds = new Set<string>();
+    for (const beat of command.result.audioDescriptions) {
+      if (
+        !beat.beatId.trim()
+        || globalIds.has(beat.beatId)
+        || generatedIds.has(beat.beatId)
+        || !hasValidTime(project, beat.startMs, beat.endMs)
+        || !beat.description.trim()
+        || beat.evidenceIds.length === 0
+        // A bounded immutable screenshot may explain several distinct beats
+        // (for example, a persistent chart across two gaps). This validates
+        // every citation without forcing duplicate frame objects or silently
+        // dropping a later proposal from the same evidence package.
+        || beat.evidenceIds.some((evidenceId) => !knownFrameIds.has(evidenceId))
+        || protectedIntervals.some((interval) => intersects(beat, interval))
+      ) return fail(project, "INVALID_ARGUMENT", "The staged audio-description result contains an invalid or protected proposal.");
+      generatedIds.add(beat.beatId);
+    }
+    if (replaceableProposed.length > 0 && command.result.audioDescriptions.length === 0) {
+      return fail(project, "INVALID_ARGUMENT", "An empty staged result cannot replace existing CueBench-AI Proposed audio descriptions.");
+    }
+    const requirementIds = new Set<string>();
+    for (const requirement of command.result.extendedDescriptionRequirements) {
+      if (
+        !requirement.requirementId.trim()
+        || globalIds.has(requirement.requirementId)
+        || requirementIds.has(requirement.requirementId)
+        || requirement.evidenceIds.some((evidenceId) => !knownFrameIds.has(evidenceId))
+      ) return fail(project, "INVALID_ARGUMENT", "The staged extended-description requirement is invalid or conflicts with project state.");
+      requirementIds.add(requirement.requirementId);
+    }
+
+    const generatedItems: Readonly<Record<string, AudioDescriptionBeat>> = Object.fromEntries(command.result.audioDescriptions.map((beat) => {
+      const current: AudioDescriptionBeatRevision = {
+        itemId: beat.beatId,
+        kind: "AudioDescriptionBeat",
+        itemRevision: 1,
+        state: "Proposed",
+        startMs: beat.startMs,
+        endMs: beat.endMs,
+        description: beat.description,
+        actor: clone(command.actor),
+        cause: `AdoptAudioDescriptionGenerationResult:${command.runId}`,
+        parentItemRevision: null,
+      };
+      return [beat.beatId, {
+        itemId: beat.beatId,
+        kind: "AudioDescriptionBeat" as const,
+        revisions: [current],
+        current,
+        supersededByRunId: null,
+      }];
+    }));
+    const supersededItems: Readonly<Record<string, AudioDescriptionBeat>> = Object.fromEntries(
+      Object.entries(project.audioDescriptions.items).map(([itemId, item]) => [
+        itemId,
+        replaceableProposed.some((candidate) => candidate.itemId === itemId)
+          ? { ...item, supersededByRunId: command.runId }
+          : item,
+      ]),
+    );
+    const firstGeneratedId = command.result.audioDescriptions[0]?.beatId;
+    const evidenceBinding = new Map<string, { readonly itemId: string | null; readonly itemRevision: number | null }>();
+    for (const beat of command.result.audioDescriptions) {
+      for (const evidenceId of beat.evidenceIds) evidenceBinding.set(evidenceId, { itemId: beat.beatId, itemRevision: 1 });
+    }
+    for (const requirement of command.result.extendedDescriptionRequirements) {
+      for (const evidenceId of requirement.evidenceIds) {
+        if (!evidenceBinding.has(evidenceId)) evidenceBinding.set(evidenceId, { itemId: null, itemRevision: null });
+      }
+    }
+    const generatedEvidence = [...evidenceBinding.entries()].map(([evidenceId, binding]) => ({
+      evidenceId,
+      projectId: project.projectId,
+      mediaSha256: project.media.sha256.toLowerCase(),
+      itemId: binding.itemId,
+      itemRevision: binding.itemRevision,
+    }));
+    if (generatedEvidence.some((entry) => project.evidence.some((existing) => existing.evidenceId === entry.evidenceId))) {
+      return fail(project, "INVALID_ARGUMENT", "The staged audio-description evidence conflicts with existing project evidence.");
+    }
+    const generatedRequirements = Object.fromEntries(command.result.extendedDescriptionRequirements.map((requirement) => [
+      requirement.requirementId,
+      {
+        requirementId: requirement.requirementId,
+        runId: command.runId,
+        text: requirement.text,
+        rationale: requirement.rationale,
+        evidenceIds: [...requirement.evidenceIds],
+        reason: requirement.reason,
+        createdAtMs: command.result.createdAtMs,
+      },
+    ]));
+    const localAudioDescriptionEvidencePackages = retainLocalAudioDescriptionEvidencePackages(project, [
+      ...project.localAudioDescriptionEvidencePackages.filter((entry) => entry.runId !== command.runId),
+      {
+        // A run id is already a bounded canonical identifier and is unique in
+        // this per-track package collection.
+        packageId: command.runId,
+        runId: command.runId,
+        projectId: project.projectId,
+        mediaSha256: project.media.sha256.toLowerCase(),
+        expectedProjectRevision: leaseBase.expectedProjectRevision,
+        expectedQualityProfileRevision: leaseBase.qualityProfileRevision,
+        captionEvidenceHash: leaseBase.captionEvidenceHash,
+        retainedAtMs: command.result.createdAtMs,
+        ...(command.result.outputSha256 === undefined ? {} : { outputSha256: command.result.outputSha256 }),
+        evidence: clone(command.result.evidence),
+        beatBindings: command.result.audioDescriptions.map((beat) => ({
+          beatId: beat.beatId,
+          itemId: beat.beatId,
+          itemRevision: 1,
+          evidenceIds: [...beat.evidenceIds],
+        })),
+        requirementBindings: command.result.extendedDescriptionRequirements.map((requirement) => ({
+          requirementId: requirement.requirementId,
+          evidenceIds: [...requirement.evidenceIds],
+        })),
+      },
+    ], command.runId);
+    if (localAudioDescriptionEvidencePackages === null) {
+      return fail(project, "INVALID_ARGUMENT", "CueBench cannot adopt this result because compact visual evidence required by Sustained audio descriptions would exceed the portable package limit.");
+    }
+    const firstGenerated = firstGeneratedId === undefined ? undefined : generatedItems[firstGeneratedId];
+    return commit(project, command, {
+      audioDescriptions: {
+        ...project.audioDescriptions,
+        order: [
+          ...project.audioDescriptions.order.filter((itemId) => !replaceableProposed.some((item) => item.itemId === itemId)),
+          ...command.result.audioDescriptions.map((beat) => beat.beatId),
+        ].sort((left, right) => {
+          const leftBeat = generatedItems[left] ?? project.audioDescriptions.items[left];
+          const rightBeat = generatedItems[right] ?? project.audioDescriptions.items[right];
+          return (leftBeat?.current.startMs ?? 0) - (rightBeat?.current.startMs ?? 0)
+            || (leftBeat?.current.endMs ?? 0) - (rightBeat?.current.endMs ?? 0)
+            || left.localeCompare(right);
+        }),
+        items: { ...supersededItems, ...generatedItems },
+      },
+      audioDescriptionRequirements: { ...project.audioDescriptionRequirements, ...generatedRequirements },
+      evidence: [...project.evidence, ...generatedEvidence],
+      localAudioDescriptionEvidencePackages,
+      activeGenerationRun: null,
+      ...(firstGenerated === undefined ? {} : { selectedItem: selectFor(firstGenerated) }),
+      ...withStaleArtifacts(project),
+    }, firstGeneratedId);
+  }
   if (command.type === "ReleaseGenerationRun") {
     if (project.activeGenerationRun?.runId !== command.runId) return fail(project, "STALE_RUN", "The generation run is no longer active.");
     if (command.actor.type !== "System" && command.actor.type !== "CueBenchAI" && command.actor.type !== "Human") return fail(project, "INVALID_ARGUMENT", "Only CueBench AI, System, or an authenticated Human may release a generation run.");
@@ -726,12 +1044,19 @@ export const applyCommand = (project: CaptionProject, command: DomainCommand): C
     if (project.activeGenerationRun !== null) return fail(project, "TARGET_TRACK_LEASE_CONFLICT", "Media cannot change while a generation run is active.");
     if (!isFiniteInteger(command.media.durationMs) || command.media.durationMs < 0) return fail(project, "INVALID_ARGUMENT", "Media duration must be a non-negative integer.");
     if (!allTimesFit(project, command.media.durationMs)) return fail(project, "INVALID_ARGUMENT", "Media duration must contain every stored item revision and gap.");
-    // Transcript words and their resolved provenance are evidence of one
-    // exact source hash. Keep the historical cue/revision record, but never
-    // carry a canonical Local Evidence Package across a media replacement.
+    // Transcript words and visual frames are evidence of one exact source
+    // hash. Keep historical cue/beat revisions, but never carry canonical
+    // evidence packages, visual provenance, or EDRs across a replacement.
     return commit(project, command, {
       media: { ...clone(command.media), relinkState: "Linked" },
       localEvidencePackages: [],
+      localAudioDescriptionEvidencePackages: [],
+      audioDescriptionRequirements: {},
+      // Evidence rows are append-only audit history in durable storage. Their
+      // old media hash makes them stale and non-resolvable for the relinked
+      // source; clearing the local packages/EDRs above removes every active
+      // AD provenance binding without trying to rewrite that history.
+      evidence: project.evidence,
       ...withStaleArtifacts(project),
     });
   }
@@ -875,7 +1200,7 @@ export const applyCommand = (project: CaptionProject, command: DomainCommand): C
     if (command.startMs < gap.startMs || command.endMs > gap.endMs) return fail(project, "INVALID_ARGUMENT", "The proposed beat must fit inside the selected gap.");
     if (command.actor.type === "System") return fail(project, "INVALID_ARGUMENT", "System cannot author semantic work.");
     const current: AudioDescriptionBeatRevision = { kind: "AudioDescriptionBeat", itemId: command.beatId, itemRevision: 1, state: "Proposed", startMs: command.startMs, endMs: command.endMs, description: command.description, actor: clone(command.actor), cause: "ProposeAudioDescriptionInGap", parentItemRevision: null };
-    const item: AudioDescriptionBeat = { itemId: command.beatId, kind: "AudioDescriptionBeat", revisions: [current], current };
+    const item: AudioDescriptionBeat = { itemId: command.beatId, kind: "AudioDescriptionBeat", revisions: [current], current, supersededByRunId: null };
     const consumedGap: AudioDescriptionGap = { ...gap, gapRevision: gap.gapRevision + 1, state: "Consumed" };
     return commit(project, command, { audioDescriptions: { ...project.audioDescriptions, order: [...project.audioDescriptions.order, item.itemId], items: { ...project.audioDescriptions.items, [item.itemId]: item } }, audioDescriptionGaps: { ...project.audioDescriptionGaps, [gap.gapId]: consumedGap }, selectedItem: selectFor(item), ...withStaleArtifacts(project) }, item.itemId);
   }
@@ -905,7 +1230,7 @@ export const applyCommand = (project: CaptionProject, command: DomainCommand): C
     return commit(project, command, {
       audioDescriptions: replaceAudioDescription(project, revised),
       evidence: carryEvidenceForReviewState(project, item, revised),
-      localEvidencePackages: carryLocalEvidenceForReviewState(project, item, revised),
+      localAudioDescriptionEvidencePackages: carryLocalAudioDescriptionEvidenceForReviewState(project, item, revised),
       selectedItem: selectFor(revised),
       ...withStaleArtifacts(project),
     }, item.itemId);
@@ -931,7 +1256,7 @@ export const applyCommand = (project: CaptionProject, command: DomainCommand): C
     return commit(project, command, {
       audioDescriptions: replaceAudioDescription(project, revised),
       evidence: carryEvidenceForReviewState(project, item, revised),
-      localEvidencePackages: carryLocalEvidenceForReviewState(project, item, revised),
+      localAudioDescriptionEvidencePackages: carryLocalAudioDescriptionEvidenceForReviewState(project, item, revised),
       selectedItem: selectFor(revised),
       ...withStaleArtifacts(project),
     }, item.itemId);

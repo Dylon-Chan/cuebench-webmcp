@@ -21,6 +21,7 @@ import {
 import { QualityFindings } from "../evidence/QualityFindings";
 import { HumanRulingControls } from "./HumanRulingControls";
 import { SelectedItemPanel } from "./SelectedItemPanel";
+import type { NarrationPreviewGateway } from "./NarrationPreview";
 import type { ReviewDraft, ReviewableItem } from "./review-utils";
 import {
   evidenceForItem,
@@ -87,6 +88,8 @@ export interface ReviewDocketProps {
   readonly onDraftStateChange?: (isDirty: boolean) => void;
   /** Provided by VideoEvidenceBay for a legal caption split convenience. */
   readonly onReadNativePlayheadMs?: () => number;
+  /** Hosted narration remains optional; all human review works without it. */
+  readonly narrationPreviewGateway?: NarrationPreviewGateway;
 }
 
 const filterOptions: readonly { readonly value: DocketFilter; readonly label: string }[] = [
@@ -188,7 +191,7 @@ export function ReviewSelectionSummary({ project }: { readonly project: CaptionP
  * The docket owns the draft and all review navigation. A visible dirty draft
  * cannot be silently abandoned by selecting a finding, an item, or evidence.
  */
-export function ReviewDocket({ project, onCommand, onSeekToMediaTime, footer, evidenceContentResolver, onRegisterItemNavigation, onRegisterItemRevisionFocus, onRegisterCanonicalTimelineEdit, onDraftStateChange, onReadNativePlayheadMs }: ReviewDocketProps) {
+export function ReviewDocket({ project, onCommand, onSeekToMediaTime, footer, evidenceContentResolver, onRegisterItemNavigation, onRegisterItemRevisionFocus, onRegisterCanonicalTimelineEdit, onDraftStateChange, onReadNativePlayheadMs, narrationPreviewGateway }: ReviewDocketProps) {
   const [filter, setFilter] = useState<DocketFilter>("all");
   const [isCommandPending, setIsCommandPending] = useState(false);
   const commandPendingRef = useRef(false);
@@ -666,6 +669,7 @@ export function ReviewDocket({ project, onCommand, onSeekToMediaTime, footer, ev
         {...(focusAfterSelection?.itemRevision === undefined ? {} : { focusedRevision: focusAfterSelection.itemRevision })}
         {...(onReadNativePlayheadMs === undefined ? {} : { onReadNativePlayheadMs })}
         {...(evidenceContentResolver === undefined ? {} : { evidenceContentResolver })}
+        {...(narrationPreviewGateway === undefined ? {} : { narrationPreviewGateway })}
       />
       <HumanRulingControls item={selectedItem} projectRevision={project.projectRevision} isCommandPending={isCommandPending} hasUnsavedDraft={hasUnsavedDraft} commandError={errorAnnouncement} onExecuteCommand={executeRuling} />
       {footer}

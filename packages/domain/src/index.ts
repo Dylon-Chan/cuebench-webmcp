@@ -1,4 +1,5 @@
 export * from "./commands";
+export * from "./audio-description-evidence";
 export * from "./backup/import";
 export * from "./backup/aggregate";
 export * from "./backup/schema";

@@ -39,8 +39,12 @@ type SourceMediaReference = Pick<MediaSourceSnapshot, "sourceId"> & Partial<Pick
 export interface NarrationBlobInput {
   readonly beatId: string;
   readonly itemRevision: number;
+  /** Canonical SHA-256 of text, voice, model, instructions and audio format. */
+  readonly cacheKey: string;
   readonly blob: Blob;
   readonly contentType?: string;
+  /** Actual decoded/rendered preview duration; callers must not guess this from text. */
+  readonly measuredDurationMs: number;
 }
 
 const sourceInputFrom = (
@@ -183,18 +187,29 @@ export const saveNarrationBlob = async (
   projectId: string,
   input: NarrationBlobInput,
 ): Promise<NarrationBlobRow> => {
-  if (!isIdentifier(projectId) || !isIdentifier(input.beatId) || !Number.isSafeInteger(input.itemRevision) || input.itemRevision <= 0) {
-    throw new TypeError("Narration blobs need a project, beat, and positive item revision.");
+  if (
+    !isIdentifier(projectId)
+    || !isIdentifier(input.beatId)
+    || !isSha256(input.cacheKey)
+    || !Number.isSafeInteger(input.itemRevision)
+    || input.itemRevision <= 0
+    || !Number.isSafeInteger(input.measuredDurationMs)
+    || input.measuredDurationMs < 0
+  ) {
+    throw new TypeError("Narration blobs need a project, beat, full-input cache key, positive item revision, and measured duration.");
   }
   assertBlob(input.blob, "Narration preview");
+  const cacheKey = input.cacheKey.toLowerCase();
   const row = validateNarrationBlobRow({
-    key: narrationBlobKey(projectId, input.beatId, input.itemRevision),
+    key: narrationBlobKey(projectId, cacheKey),
     projectId,
+    cacheKey,
     beatId: input.beatId,
     itemRevision: input.itemRevision,
     blob: input.blob,
     byteLength: input.blob.size,
     contentType: input.contentType ?? input.blob.type,
+    measuredDurationMs: input.measuredDurationMs,
     savedAtMs: now(),
   });
   await db.transaction("rw", db.narrationBlobs, async () => {
@@ -206,10 +221,12 @@ export const saveNarrationBlob = async (
 export const loadNarrationBlob = async (
   db: CueBenchDatabase,
   projectId: string,
-  beatId: string,
-  itemRevision: number,
+  cacheKey: string,
 ): Promise<NarrationBlobRow | undefined> => db.transaction("r", db.narrationBlobs, async () => {
-  const row = await db.narrationBlobs.get(narrationBlobKey(projectId, beatId, itemRevision));
+  if (!isIdentifier(projectId) || !isSha256(cacheKey)) {
+    throw new TypeError("Narration cache lookup needs a canonical project id and full-input cache key.");
+  }
+  const row = await db.narrationBlobs.get(narrationBlobKey(projectId, cacheKey));
   return row === undefined ? undefined : validateNarrationBlobRow(row);
 });
 

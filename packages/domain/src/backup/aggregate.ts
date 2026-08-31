@@ -7,6 +7,7 @@ import {
   MAX_LOCAL_CAPTION_EVIDENCE_TOTAL_JSON_NODES,
   MAX_LOCAL_CAPTION_EVIDENCE_TOTAL_WORDS,
   MAX_LOCAL_CAPTION_EVIDENCE_WORDS,
+  MAX_LOCAL_AUDIO_DESCRIPTION_EVIDENCE_PACKAGES,
   MAX_PORTABLE_PROJECT_JSON_NODES,
 } from "@cuebench/contracts";
 import type { Actor } from "@cuebench/contracts";
@@ -198,6 +199,54 @@ const assertLocalEvidencePackages = (project: CaptionProject): void => {
   }
 };
 
+/** Proves compact AD frame/provenance packages still resolve to canonical evidence. */
+const assertLocalAudioDescriptionEvidencePackages = (project: CaptionProject): void => {
+  const packages = project.localAudioDescriptionEvidencePackages;
+  unique(packages.map((entry) => entry.packageId), "Local audio-description evidence package ids");
+  requireAggregate(
+    packages.length <= MAX_LOCAL_AUDIO_DESCRIPTION_EVIDENCE_PACKAGES,
+    "Local audio-description evidence packages exceed the retained bound.",
+  );
+  const projectEvidence = new Map(project.evidence.map((entry) => [entry.evidenceId, entry]));
+  for (const entry of packages) {
+    requireAggregate(
+      entry.projectId === project.projectId
+        && entry.mediaSha256.toLowerCase() === project.media.sha256.toLowerCase(),
+      "Local audio-description evidence package belongs to another project or media source.",
+    );
+    const frameIds = new Set(entry.evidence.frames.map((frame) => frame.evidenceId));
+    for (const binding of entry.beatBindings) {
+      const item = project.audioDescriptions.items[binding.itemId];
+      requireAggregate(
+        item !== undefined
+          && binding.beatId === binding.itemId
+          && item.revisions.some((revision) => revision.itemRevision === binding.itemRevision),
+        "Local audio-description evidence binding references an unknown beat revision.",
+      );
+      for (const evidenceId of binding.evidenceIds) {
+        const provenance = projectEvidence.get(evidenceId);
+        requireAggregate(
+          frameIds.has(evidenceId)
+            && provenance !== undefined
+            && provenance.itemId === binding.itemId
+            && provenance.itemRevision === binding.itemRevision,
+          "Local audio-description frame does not resolve through canonical beat provenance.",
+        );
+      }
+    }
+    for (const binding of entry.requirementBindings) {
+      const requirement = project.audioDescriptionRequirements[binding.requirementId];
+      requireAggregate(
+        requirement !== undefined && binding.evidenceIds.every((evidenceId) => requirement.evidenceIds.includes(evidenceId)),
+        "Local extended-description evidence binding references an unknown requirement.",
+      );
+      for (const evidenceId of binding.evidenceIds) {
+        requireAggregate(frameIds.has(evidenceId) && projectEvidence.has(evidenceId), "Local extended-description evidence does not resolve through canonical provenance.");
+      }
+    }
+  }
+};
+
 const assertValidationRun = (run: ValidationRun, project: CaptionProject, label: string): void => {
   requireAggregate(run.projectId === project.projectId && run.input.projectId === project.projectId, `${label} belongs to another project.`);
   requireAggregate(run.projectRevision === run.input.projectRevision, `${label} revision does not match its immutable input.`);
@@ -277,6 +326,7 @@ const courtActors: Readonly<Record<string, readonly Actor["type"][]>> = {
   RelinkMedia: ["Human"],
   StartGenerationRun: ["CueBenchAI"],
   AdoptCaptionGenerationResult: ["CueBenchAI"],
+  AdoptAudioDescriptionGenerationResult: ["CueBenchAI"],
   ReleaseGenerationRun: ["CueBenchAI", "System", "Human"],
   ExportRoundTripVerified: ["System"],
   GenerationRunStageChanged: ["System"],
@@ -297,6 +347,7 @@ const itemCourtEventTypes = new Set([
   "ReviseAudioDescription",
   "ProposeAudioDescriptionInGap",
   "AdoptCaptionGenerationResult",
+  "AdoptAudioDescriptionGenerationResult",
   "MarkItemAgentReady",
   "ObjectItem",
   "SustainItem",
@@ -311,6 +362,7 @@ const revisionChangingCourtEventTypes = new Set([
   "ReviseAudioDescription",
   "ProposeAudioDescriptionInGap",
   "AdoptCaptionGenerationResult",
+  "AdoptAudioDescriptionGenerationResult",
   "MarkItemAgentReady",
   "ObjectItem",
   "SustainItem",
@@ -451,6 +503,30 @@ const assertCurrentRevisionEvent = (
     if (runId !== null) {
       for (const item of created) claimRevision(claimed, item, item.revisions[0]!, event);
     }
+    return;
+  }
+  if (event.type === "AdoptAudioDescriptionGenerationResult") {
+    const runId = event.detail?.startsWith("generation:") === true ? event.detail.slice("generation:".length) : null;
+    requireAggregate(
+      runId !== null && /^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$/u.test(runId),
+      "Court Record audio-description adoption must retain a canonical generation run id.",
+    );
+    const created = Object.values(project.audioDescriptions.items).filter((item) => {
+      const initial = item.revisions[0]!;
+      return initial.itemRevision === 1
+        && initial.parentItemRevision === null
+        && initial.state === "Proposed"
+        && initial.cause === `AdoptAudioDescriptionGenerationResult:${runId}`
+        && sameActor(initial.actor, event.actor);
+    });
+    if (event.itemId === undefined) {
+      requireAggregate(created.length === 0, "An itemless audio-description adoption cannot create beat revisions.");
+      return;
+    }
+    const primary = itemForCourtEvent(project, event);
+    requireAggregate(primary.kind === "AudioDescriptionBeat", "Court Record adoption must target its first generated audio description.");
+    requireAggregate(created.length > 0 && created.some((item) => item.itemId === primary.itemId), "Court Record adoption has no matching generated audio-description set.");
+    for (const item of created) claimRevision(claimed, item, item.revisions[0]!, event);
     return;
   }
   if (!revisionChangingCourtEventTypes.has(event.type)) return;
@@ -749,7 +825,7 @@ const assertCurrentCourtRecord = (
     const allowedActors = courtActors[event.type];
     requireAggregate(allowedActors !== undefined && event.type !== "LegacyItemRevisionPayloadHistoryUnavailable", `Court Record event type ${event.type} is not a current durable command.`);
     requireAggregate(allowedActors.includes(event.actor.type), `Court Record ${event.type} has invalid actor provenance.`);
-    if (event.type !== "ObjectItem" && event.type !== "AdoptCaptionGenerationResult") {
+    if (event.type !== "ObjectItem" && event.type !== "AdoptCaptionGenerationResult" && event.type !== "AdoptAudioDescriptionGenerationResult") {
       requireAggregate(event.detail === undefined, `Court Record ${event.type} cannot carry arbitrary detail.`);
     }
 
@@ -757,7 +833,10 @@ const assertCurrentCourtRecord = (
     if (event.type === "FocusGap") {
       requireAggregate(event.itemId !== undefined && project.audioDescriptionGaps[event.itemId] !== undefined, "Court Record FocusGap references an unknown gap.");
       projectedSelection = { kind: "AudioDescriptionGap", itemId: event.itemId };
-    } else if (itemCourtEventTypes.has(event.type) && !(event.type === "AdoptCaptionGenerationResult" && event.itemId === undefined)) {
+    } else if (
+      itemCourtEventTypes.has(event.type)
+      && !((event.type === "AdoptCaptionGenerationResult" || event.type === "AdoptAudioDescriptionGenerationResult") && event.itemId === undefined)
+    ) {
       eventItem = itemForCourtEvent(project, event);
     } else if (["ValidateProject", "RecordExportRoundTrip", "WaiveWarning", "CertifyProject", "ApplyProfile", "RelinkMedia", "StartGenerationRun", "ReleaseGenerationRun"].includes(event.type)) {
       requireAggregate(event.itemId === undefined, `Court Record ${event.type} cannot target an item.`);
@@ -893,6 +972,10 @@ const assertRelationships = (
     requireAggregate(item.itemId === itemId, "Audio-description item map key does not match its item id.");
     claimGlobalId(itemId);
     assertRevisionHistory(item, project);
+    requireAggregate(
+      item.supersededByRunId === null || /^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$/u.test(item.supersededByRunId),
+      "Audio-description supersession must retain a canonical generation run id.",
+    );
   }
   assertTrackOrder(
     project.captions.order,
@@ -901,9 +984,21 @@ const assertRelationships = (
   );
   assertTrackOrder(
     project.audioDescriptions.order,
-    Object.values(project.audioDescriptions.items).map((item) => item.itemId),
+    Object.values(project.audioDescriptions.items)
+      .filter((item) => item.supersededByRunId === null)
+      .map((item) => item.itemId),
     "Audio-description order",
   );
+  for (const [requirementId, requirement] of Object.entries(project.audioDescriptionRequirements)) {
+    claimGlobalId(requirementId);
+    requireAggregate(
+      requirement.requirementId === requirementId
+        && /^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$/u.test(requirement.runId)
+        && requirement.evidenceIds.length > 0
+        && new Set(requirement.evidenceIds).size === requirement.evidenceIds.length,
+      "Audio-description extended-description requirement is invalid.",
+    );
+  }
   for (const [gapId, gap] of Object.entries(project.audioDescriptionGaps)) {
     claimGlobalId(gapId);
     requireAggregate(
@@ -922,7 +1017,14 @@ const assertRelationships = (
       );
     }
   }
+  for (const requirement of Object.values(project.audioDescriptionRequirements)) {
+    requireAggregate(
+      requirement.evidenceIds.every((evidenceId) => project.evidence.some((evidence) => evidence.evidenceId === evidenceId)),
+      "Audio-description extended-description requirement references unknown evidence.",
+    );
+  }
   assertLocalEvidencePackages(project);
+  assertLocalAudioDescriptionEvidencePackages(project);
   requireAggregate(
     countJsonNodes(project) <= MAX_PORTABLE_PROJECT_JSON_NODES,
     "CaptionProject exceeds the browser backup JSON-node budget.",
@@ -940,6 +1042,7 @@ const assertRelationships = (
       requireAggregate(
         item !== undefined
           && item.kind === project.selectedItem.kind
+          && (item.kind !== "AudioDescriptionBeat" || item.supersededByRunId === null)
           && item.current.itemRevision === project.selectedItem.itemRevision,
         "Selected item is no longer current.",
       );
@@ -982,6 +1085,10 @@ const assertRelationships = (
   }
   if (project.activeGenerationRun !== null) {
     requireAggregate(project.activeGenerationRun.actor.type === "CueBenchAI", "Only CueBench AI may hold a generation write lease.");
+    requireAggregate(
+      project.activeGenerationRun.base === undefined || project.activeGenerationRun.base.targetTrack === project.activeGenerationRun.targetTrack,
+      "Generation lease base must be discriminated by its target track.",
+    );
   }
   for (const [findingId, waiver] of Object.entries(project.warningWaivers)) {
     requireAggregate(

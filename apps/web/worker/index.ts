@@ -55,11 +55,22 @@ import {
   type GenerationRunRecordStore,
   type GenerationWorkflowControl,
 } from "./generation-routes";
+import {
+  createAudioDescriptionGenerationRoutes,
+  type AudioDescriptionGenerationRunRecordStore,
+  type AudioDescriptionGenerationWorkflowControl,
+} from "./ad-generation-routes";
+import {
+  createNarrationPreviewRoutes,
+  type NarrationPreviewRecordStore,
+} from "./narration-preview-routes";
+import type { NarrationTtsProvider } from "./openai/tts";
 
 export { QuotaLedger } from "./quota-ledger";
 export { UploadCoordinator } from "./upload-operations";
 export { MediaPreparationContainer } from "./media-container";
 export { CaptionGenerationWorkflow } from "./workflows/generation";
+export { AudioDescriptionGenerationWorkflow } from "./workflows/audio-description-generation";
 export {
   MediaContainerPreparationService,
   type MediaPreparation,
@@ -106,6 +117,12 @@ export interface WorkerDependencies {
   /** Task 13 seams remain private Worker-only ports, never browser bindings. */
   readonly generationRuns?: GenerationRunRecordStore;
   readonly generationWorkflow?: GenerationWorkflowControl;
+  /** Isolated AD recovery records share only the target-discriminated project lease. */
+  readonly audioDescriptionRuns?: AudioDescriptionGenerationRunRecordStore;
+  readonly audioDescriptionWorkflow?: AudioDescriptionGenerationWorkflowControl;
+  /** Task 14 receipt/TTS seams remain Worker-only; preview audio stays browser-local. */
+  readonly narrationPreviews?: NarrationPreviewRecordStore;
+  readonly narrationTts?: NarrationTtsProvider;
   readonly telemetry?: TelemetrySink;
 }
 
@@ -648,6 +665,21 @@ export const createCueBenchWorker = (env: WorkerEnv, dependencies: WorkerDepende
     ...(generationQuotaLedger === undefined ? {} : { quotaLedger: generationQuotaLedger }),
     ...(dependencies.generationRuns === undefined ? {} : { runs: dependencies.generationRuns }),
     ...(dependencies.generationWorkflow === undefined ? {} : { workflow: dependencies.generationWorkflow }),
+  }));
+  const audioDescriptionQuotaLedger = quotaLedgerFor(env, dependencies);
+  app.route("/", createAudioDescriptionGenerationRoutes(env, {
+    ...(dependencies.clock === undefined ? {} : { clock: dependencies.clock }),
+    ...(audioDescriptionQuotaLedger === undefined ? {} : { quotaLedger: audioDescriptionQuotaLedger }),
+    ...(dependencies.audioDescriptionRuns === undefined ? {} : { runs: dependencies.audioDescriptionRuns }),
+    ...(dependencies.generationRuns === undefined ? {} : { leases: dependencies.generationRuns }),
+    ...(dependencies.audioDescriptionWorkflow === undefined ? {} : { workflow: dependencies.audioDescriptionWorkflow }),
+  }));
+  const narrationQuotaLedger = quotaLedgerFor(env, dependencies);
+  app.route("/", createNarrationPreviewRoutes(env, {
+    ...(dependencies.clock === undefined ? {} : { clock: dependencies.clock }),
+    ...(narrationQuotaLedger === undefined ? {} : { quotaLedger: narrationQuotaLedger }),
+    ...(dependencies.narrationPreviews === undefined ? {} : { previews: dependencies.narrationPreviews }),
+    ...(dependencies.narrationTts === undefined ? {} : { tts: dependencies.narrationTts }),
   }));
 
   app.get("/api/health", (context) => context.json({ status: "ok" }));

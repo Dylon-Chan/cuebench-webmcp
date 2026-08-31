@@ -4,7 +4,10 @@ import type {
   MediaSourceSnapshot,
   ValidationSnapshot,
 } from "@cuebench/contracts";
-import { LocalCaptionEvidencePackageSchema } from "@cuebench/contracts";
+import {
+  LocalAudioDescriptionEvidencePackageSchema,
+  LocalCaptionEvidencePackageSchema,
+} from "@cuebench/contracts";
 import {
   applicableWarningWaivers,
   buildValidationInput,
@@ -16,6 +19,7 @@ import {
   verifyCertificationSnapshot,
   type AudioDescriptionBeat,
   type AudioDescriptionBeatRevision,
+  type AudioDescriptionRequirement,
   type CaptionCue,
   type CaptionCueRevision,
   type CaptionProject,
@@ -39,7 +43,7 @@ export const STORAGE_SCHEMA_VERSION = 1 as const;
  * envelopes. Keep this number monotonic even while backup schema v1 remains
  * readable, otherwise Dexie silently treats changed indexes as an upgrade.
  */
-export const DEXIE_DATABASE_VERSION = 4 as const;
+export const DEXIE_DATABASE_VERSION = 5 as const;
 
 const DEXIE_V1_STORES = {
   projectHeaders: "&projectId, projectRevision, updatedAtMs",
@@ -76,6 +80,16 @@ const DEXIE_V3_STORES = DEXIE_V2_STORES;
 const DEXIE_V4_STORES = {
   ...DEXIE_V3_STORES,
   runReceipts: "&key, projectId, runId, [projectId+runId], [projectId+savedAtMs]",
+} as const;
+
+/**
+ * v5 makes preview-audio identity a full TTS-input fingerprint. Older rows
+ * were keyed only by a mutable beat revision and therefore cannot be safely
+ * reused after the provider/voice/output contract changes.
+ */
+const DEXIE_V5_STORES = {
+  ...DEXIE_V4_STORES,
+  narrationBlobs: "&key, projectId, cacheKey, beatId, itemRevision, [projectId+cacheKey], [projectId+beatId+itemRevision]",
 } as const;
 
 const clone = <Value>(value: Value): Value => structuredClone(value);
@@ -175,6 +189,8 @@ const AudioDescriptionBeatSchema = z.object({
   kind: z.literal("AudioDescriptionBeat"),
   revisions: z.array(AudioDescriptionBeatRevisionSchema).min(1),
   current: AudioDescriptionBeatRevisionSchema,
+  /** Older local projects did not retain superseded AI drafts explicitly. */
+  supersededByRunId: identifier.nullable().default(null),
 }).strict();
 
 const AudioDescriptionGapSchema = z.object({
@@ -223,22 +239,84 @@ const EvidenceProvenanceSchema = z.object({
   message: "Evidence item id and revision must be present together.",
 });
 
+const CaptionGenerationLeaseBaseSchema = z.object({
+  targetTrack: z.literal("Captions"),
+  expectedProjectRevision: positiveSafeInteger,
+  mediaSha256: lowercaseSha256,
+  qualityProfileRevision: positiveSafeInteger,
+  captionOrder: z.array(identifier),
+  captionItems: z.array(z.object({
+    itemId: identifier,
+    itemRevision: positiveSafeInteger,
+    state: ReviewStateStorageSchema,
+    mergedIntoItemId: identifier.nullable(),
+  }).strict()),
+}).strict();
+
+/** Read old caption leases, but normalize their base so target narrowing is sound. */
+const LegacyCaptionGenerationLeaseBaseSchema = z.object({
+  expectedProjectRevision: positiveSafeInteger,
+  mediaSha256: lowercaseSha256,
+  qualityProfileRevision: positiveSafeInteger,
+  captionOrder: z.array(identifier),
+  captionItems: z.array(z.object({
+    itemId: identifier,
+    itemRevision: positiveSafeInteger,
+    state: ReviewStateStorageSchema,
+    mergedIntoItemId: identifier.nullable(),
+  }).strict()),
+}).strict().transform((base) => ({ ...base, targetTrack: "Captions" as const }));
+
+const AudioDescriptionGenerationLeaseBaseSchema = z.object({
+  targetTrack: z.literal("AudioDescriptions"),
+  expectedProjectRevision: positiveSafeInteger,
+  mediaSha256: lowercaseSha256,
+  qualityProfileRevision: positiveSafeInteger,
+  captionEvidenceHash: lowercaseSha256,
+  captionEvidencePackageIds: z.array(identifier).min(1).max(4),
+  audioDescriptionOrder: z.array(identifier),
+  audioDescriptionRequirementIds: z.array(identifier),
+  audioDescriptionItems: z.array(z.object({
+    itemId: identifier,
+    itemRevision: positiveSafeInteger,
+    state: ReviewStateStorageSchema,
+    supersededByRunId: identifier.nullable(),
+  }).strict()),
+}).strict();
+
+const GenerationLeaseBaseSchema = z.union([
+  CaptionGenerationLeaseBaseSchema,
+  AudioDescriptionGenerationLeaseBaseSchema,
+  LegacyCaptionGenerationLeaseBaseSchema,
+]);
+
 const GenerationLeaseSchema = z.object({
   runId: identifier,
   targetTrack: z.enum(["Captions", "AudioDescriptions"]),
   actor: ActorStorageSchema,
-  base: z.object({
-    expectedProjectRevision: positiveSafeInteger,
-    mediaSha256: lowercaseSha256,
-    qualityProfileRevision: positiveSafeInteger,
-    captionOrder: z.array(identifier),
-    captionItems: z.array(z.object({
-      itemId: identifier,
-      itemRevision: positiveSafeInteger,
-      state: z.enum(["Proposed", "AgentReady", "Objected", "Sustained"]),
-      mergedIntoItemId: identifier.nullable(),
-    }).strict()),
-  }).strict().optional(),
+  base: GenerationLeaseBaseSchema.optional(),
+}).strict().superRefine((lease, context) => {
+  if (lease.base !== undefined && lease.base.targetTrack !== lease.targetTrack) {
+    context.addIssue({
+      code: "custom",
+      message: "Generation lease base must be discriminated by its target track.",
+      path: ["base", "targetTrack"],
+    });
+  }
+});
+
+const AudioDescriptionRequirementSchema = z.object({
+  requirementId: identifier,
+  runId: identifier,
+  text: boundedText(2_000),
+  rationale: boundedText(2_000),
+  evidenceIds: z.array(identifier).min(1).max(128),
+  reason: z.enum([
+    "no-compatible-speech-gap",
+    "requires-human-judgment",
+    "insufficient-visual-evidence",
+  ]),
+  createdAtMs: nonNegativeSafeInteger,
 }).strict();
 
 const DomainEventSchema = z.object({
@@ -260,6 +338,7 @@ const ValidationInputItemSchema = z.object({
   text: z.string(),
   speaker: z.string().nullable(),
   mergedIntoItemId: identifier.nullable().optional(),
+  supersededByRunId: identifier.nullable().optional(),
 }).strict().refine((item) => item.endMs > item.startMs, {
   message: "Validation input items must end after they start.",
   path: ["endMs"],
@@ -279,6 +358,15 @@ const ValidationInputSchema = z.object({
     order: z.array(identifier),
     items: z.array(ValidationInputItemSchema),
   }).strict(),
+  audioDescriptionRequirements: z.array(z.object({
+    requirementId: identifier,
+    evidenceIds: z.array(identifier).min(1).max(128),
+    reason: z.enum([
+      "no-compatible-speech-gap",
+      "requires-human-judgment",
+      "insufficient-visual-evidence",
+    ]),
+  }).strict()).optional(),
   audioDescriptionGaps: z.array(AudioDescriptionGapSchema),
 }).strict();
 
@@ -306,6 +394,12 @@ const FindingTargetSchema = z.discriminatedUnion("type", [
       itemId: identifier,
       itemRevision: positiveSafeInteger,
     }).strict(),
+  }).strict(),
+  z.object({
+    type: z.literal("extended-description-requirement"),
+    projectId: identifier,
+    projectRevision: positiveSafeInteger,
+    requirementId: identifier,
   }).strict(),
 ]);
 
@@ -395,6 +489,7 @@ const CaptionProjectSchema = z.object({
   media: MediaSourceStorageSchema,
   evidence: z.array(EvidenceProvenanceSchema),
   localEvidencePackages: z.array(LocalCaptionEvidencePackageSchema).max(4).default([]),
+  localAudioDescriptionEvidencePackages: z.array(LocalAudioDescriptionEvidencePackageSchema).max(4).default([]),
   captions: z.object({
     kind: z.literal("Captions"),
     order: z.array(identifier),
@@ -405,6 +500,7 @@ const CaptionProjectSchema = z.object({
     order: z.array(identifier),
     items: z.record(z.string(), AudioDescriptionBeatSchema),
   }).strict(),
+  audioDescriptionRequirements: z.record(z.string(), AudioDescriptionRequirementSchema).default({}),
   audioDescriptionGaps: z.record(z.string(), AudioDescriptionGapSchema),
   selectedItem: ItemSelectionSchema.nullable(),
   validation: ValidationSnapshotStorageSchema,
@@ -435,8 +531,10 @@ export interface ProjectHeaderRow {
   readonly title: string;
   readonly media: MediaSourceSnapshot;
   readonly localEvidencePackages: readonly import("@cuebench/contracts").LocalCaptionEvidencePackage[];
+  readonly localAudioDescriptionEvidencePackages: readonly import("@cuebench/contracts").LocalAudioDescriptionEvidencePackage[];
   readonly captionOrder: readonly string[];
   readonly audioDescriptionOrder: readonly string[];
+  readonly audioDescriptionRequirements: Readonly<Record<string, AudioDescriptionRequirement>>;
   readonly audioDescriptionGaps: Readonly<Record<string, import("@cuebench/domain").AudioDescriptionGap>>;
   readonly selectedItem: Selection | null;
   readonly validation: ValidationSnapshot;
@@ -460,6 +558,8 @@ export interface ItemRow {
   readonly kind: "CaptionCue" | "AudioDescriptionBeat";
   readonly currentItemRevision: number;
   readonly mergedIntoItemId: string | null;
+  /** Superseded AI drafts stay auditable but must not return to the live order. */
+  readonly supersededByRunId: string | null;
 }
 
 export interface RevisionRow {
@@ -520,11 +620,15 @@ export interface SourceBlobRow {
 export interface NarrationBlobRow {
   readonly key: string;
   readonly projectId: string;
+  /** SHA-256 over every synthesis input that can affect output audio. */
+  readonly cacheKey: string;
   readonly beatId: string;
   readonly itemRevision: number;
   readonly blob: Blob;
   readonly byteLength: number;
   readonly contentType: string;
+  /** Measured from the decoded/rendered preview, never an estimated text duration. */
+  readonly measuredDurationMs: number;
   readonly savedAtMs: number;
 }
 
@@ -559,8 +663,10 @@ const ProjectHeaderRowSchema = z.object({
   title: boundedText(1_000),
   media: MediaSourceStorageSchema,
   localEvidencePackages: z.array(LocalCaptionEvidencePackageSchema).max(4).default([]),
+  localAudioDescriptionEvidencePackages: z.array(LocalAudioDescriptionEvidencePackageSchema).max(4).default([]),
   captionOrder: z.array(identifier),
   audioDescriptionOrder: z.array(identifier),
+  audioDescriptionRequirements: z.record(z.string(), AudioDescriptionRequirementSchema).default({}),
   audioDescriptionGaps: z.record(z.string(), AudioDescriptionGapSchema),
   selectedItem: ItemSelectionSchema.nullable(),
   validation: ValidationSnapshotStorageSchema,
@@ -583,6 +689,7 @@ const ItemRowSchema = z.object({
   kind: z.enum(["CaptionCue", "AudioDescriptionBeat"]),
   currentItemRevision: positiveSafeInteger,
   mergedIntoItemId: identifier.nullable(),
+  supersededByRunId: identifier.nullable().default(null),
 }).strict();
 
 const RevisionRowSchema = z.object({
@@ -646,11 +753,13 @@ const SourceBlobRowSchema = z.object({
 const NarrationBlobRowSchema = z.object({
   key: nonBlankText,
   projectId: identifier,
+  cacheKey: lowercaseSha256,
   beatId: identifier,
   itemRevision: positiveSafeInteger,
   blob: blobSchema,
   byteLength: nonNegativeSafeInteger,
   contentType: z.string(),
+  measuredDurationMs: nonNegativeSafeInteger,
   savedAtMs: nonNegativeSafeInteger,
 }).strict();
 
@@ -730,8 +839,7 @@ const evidenceKey = (projectId: string, evidenceId: string, version: number) =>
 const courtRecordKey = (projectId: string, eventId: string) => recordKey(projectId, eventId);
 const certificationKey = (projectId: string, certificationId: string) => recordKey(projectId, certificationId);
 export const sourceBlobKey = (projectId: string, sourceSha256: string) => recordKey(projectId, sourceSha256);
-export const narrationBlobKey = (projectId: string, beatId: string, itemRevision: number) =>
-  recordKey(projectId, beatId, String(itemRevision));
+export const narrationBlobKey = (projectId: string, cacheKey: string) => recordKey(projectId, cacheKey.toLowerCase());
 export const runReceiptKey = (projectId: string, runId: string) => recordKey(projectId, runId);
 
 /**
@@ -959,6 +1067,17 @@ const upgradePhysicalV3ToV4 = async (transaction: Transaction): Promise<void> =>
   if (acknowledged.length > 0) await receipts.bulkDelete(acknowledged.map((row) => row.key));
 };
 
+/**
+ * Preview narration is a disposable cache, not certified project evidence.
+ * The v4 key did not bind voice, model, instructions, output format, or text;
+ * retaining it could replay a wrong voice after any of those inputs changed.
+ */
+const upgradePhysicalV4ToV5 = async (transaction: Transaction): Promise<void> => {
+  const narration = transaction.table("narrationBlobs") as Table<NarrationBlobRow, string>;
+  const keys = await narration.toCollection().primaryKeys();
+  if (keys.length > 0) await narration.bulkDelete(keys as string[]);
+};
+
 /** A validation run is immutable at its post-command project revision. */
 const validationScope = (run: StoredValidationRun) => `validation:${run.projectRevision}:${run.inputHash}`;
 
@@ -1125,6 +1244,82 @@ const assertLocalEvidencePackages = (project: CaptionProject): void => {
   }
 };
 
+/**
+ * Retained AD evidence is deliberately compact: hashes, timestamps, and
+ * provenance only. It must still resolve through the aggregate's canonical
+ * evidence projection, never through preview audio or raw media.
+ */
+const assertLocalAudioDescriptionEvidencePackages = (project: CaptionProject): void => {
+  assertUnique(
+    project.localAudioDescriptionEvidencePackages.map((entry) => entry.packageId),
+    "project headers",
+    "Local audio-description evidence package ids",
+  );
+  if (project.localAudioDescriptionEvidencePackages.length > 4) {
+    throw new StorageReadValidationError("project headers", "Local audio-description evidence packages exceed the retained bound.");
+  }
+  const evidenceById = new Map(project.evidence.map((entry) => [entry.evidenceId, entry]));
+  for (const entry of project.localAudioDescriptionEvidencePackages) {
+    if (
+      entry.projectId !== project.projectId
+      || entry.mediaSha256.toLowerCase() !== project.media.sha256.toLowerCase()
+    ) {
+      throw new StorageReadValidationError(
+        "project headers",
+        "Local audio-description evidence package belongs to another project or media source.",
+      );
+    }
+    const frameIds = new Set(entry.evidence.frames.map((frame) => frame.evidenceId));
+    for (const binding of entry.beatBindings) {
+      const item = project.audioDescriptions.items[binding.itemId];
+      if (
+        item === undefined
+        || binding.beatId !== binding.itemId
+        || !item.revisions.some((revision) => revision.itemRevision === binding.itemRevision)
+      ) {
+        throw new StorageReadValidationError(
+          "evidence",
+          "Local audio-description evidence binding references an unknown beat revision.",
+        );
+      }
+      for (const evidenceId of binding.evidenceIds) {
+        const provenance = evidenceById.get(evidenceId);
+        if (
+          !frameIds.has(evidenceId)
+          || provenance === undefined
+          || provenance.itemId !== binding.itemId
+          || provenance.itemRevision !== binding.itemRevision
+        ) {
+          throw new StorageReadValidationError(
+            "evidence",
+            "Local audio-description frame does not resolve through canonical beat provenance.",
+          );
+        }
+      }
+    }
+    for (const binding of entry.requirementBindings) {
+      const requirement = project.audioDescriptionRequirements[binding.requirementId];
+      if (
+        requirement === undefined
+        || binding.evidenceIds.some((evidenceId) => !requirement.evidenceIds.includes(evidenceId))
+      ) {
+        throw new StorageReadValidationError(
+          "evidence",
+          "Local extended-description evidence binding references an unknown requirement.",
+        );
+      }
+      for (const evidenceId of binding.evidenceIds) {
+        if (!frameIds.has(evidenceId) || !evidenceById.has(evidenceId)) {
+          throw new StorageReadValidationError(
+            "evidence",
+            "Local extended-description evidence does not resolve through canonical provenance.",
+          );
+        }
+      }
+    }
+  }
+};
+
 const assertProjectRelationships = (project: CaptionProject): void => {
   const globalIds = new Set<string>();
   const claimGlobalId = (id: string, table: string) => {
@@ -1151,9 +1346,20 @@ const assertProjectRelationships = (project: CaptionProject): void => {
   );
   assertTrackOrder(
     project.audioDescriptions.order,
-    Object.values(project.audioDescriptions.items).map((item) => item.itemId),
+    Object.values(project.audioDescriptions.items)
+      .filter((item) => item.supersededByRunId === null)
+      .map((item) => item.itemId),
     "project headers",
   );
+  for (const [requirementId, requirement] of Object.entries(project.audioDescriptionRequirements)) {
+    claimGlobalId(requirementId, "project headers");
+    if (
+      requirement.requirementId !== requirementId
+      || new Set(requirement.evidenceIds).size !== requirement.evidenceIds.length
+    ) {
+      throw new StorageReadValidationError("project headers", "Audio-description extended-description requirement is invalid.");
+    }
+  }
   for (const [gapId, gap] of Object.entries(project.audioDescriptionGaps)) {
     claimGlobalId(gapId, "project headers");
     if (gap.gapId !== gapId || gap.endMs > project.media.durationMs) {
@@ -1172,7 +1378,16 @@ const assertProjectRelationships = (project: CaptionProject): void => {
       }
     }
   }
+  for (const requirement of Object.values(project.audioDescriptionRequirements)) {
+    if (requirement.evidenceIds.some((evidenceId) => !project.evidence.some((evidence) => evidence.evidenceId === evidenceId))) {
+      throw new StorageReadValidationError(
+        "evidence",
+        "Audio-description extended-description requirement references unknown evidence.",
+      );
+    }
+  }
   assertLocalEvidencePackages(project);
+  assertLocalAudioDescriptionEvidencePackages(project);
   if (project.selectedItem !== null) {
     if (project.selectedItem.kind === "AudioDescriptionGap") {
       const gap = project.audioDescriptionGaps[project.selectedItem.itemId];
@@ -1182,7 +1397,12 @@ const assertProjectRelationships = (project: CaptionProject): void => {
     } else {
       const item = project.captions.items[project.selectedItem.itemId]
         ?? project.audioDescriptions.items[project.selectedItem.itemId];
-      if (item === undefined || item.kind !== project.selectedItem.kind || item.current.itemRevision !== project.selectedItem.itemRevision) {
+      if (
+        item === undefined
+        || item.kind !== project.selectedItem.kind
+        || (item.kind === "AudioDescriptionBeat" && item.supersededByRunId !== null)
+        || item.current.itemRevision !== project.selectedItem.itemRevision
+      ) {
         throw new StorageReadValidationError("project headers", "Selected item is no longer current.");
       }
     }
@@ -1216,8 +1436,16 @@ const assertProjectRelationships = (project: CaptionProject): void => {
       throw new StorageReadValidationError("project headers", "Export verification belongs to a future project revision.");
     }
   }
-  if (project.activeGenerationRun !== null && project.activeGenerationRun.actor.type !== "CueBenchAI") {
-    throw new StorageReadValidationError("project headers", "Only CueBench AI may hold a generation write lease.");
+  if (project.activeGenerationRun !== null) {
+    if (project.activeGenerationRun.actor.type !== "CueBenchAI") {
+      throw new StorageReadValidationError("project headers", "Only CueBench AI may hold a generation write lease.");
+    }
+    if (
+      project.activeGenerationRun.base !== undefined
+      && project.activeGenerationRun.base.targetTrack !== project.activeGenerationRun.targetTrack
+    ) {
+      throw new StorageReadValidationError("project headers", "Generation lease base must be discriminated by its target track.");
+    }
   }
   assertUnique(project.courtRecord.map((event) => event.eventId), "court record", "Court Record event ids");
   for (const event of project.courtRecord) {
@@ -1291,8 +1519,10 @@ export const normalizeProject = (
     title: project.title,
     media: clone(project.media),
     localEvidencePackages: clone(project.localEvidencePackages),
+    localAudioDescriptionEvidencePackages: clone(project.localAudioDescriptionEvidencePackages),
     captionOrder: clone(project.captions.order),
     audioDescriptionOrder: clone(project.audioDescriptions.order),
+    audioDescriptionRequirements: clone(project.audioDescriptionRequirements),
     audioDescriptionGaps: clone(project.audioDescriptionGaps),
     selectedItem: clone(project.selectedItem),
     validation: clone(project.validation),
@@ -1309,7 +1539,11 @@ export const normalizeProject = (
   };
   const items: ItemRow[] = [];
   const revisions: RevisionRow[] = [];
-  const appendItem = (item: CaptionCue | AudioDescriptionBeat, mergedIntoItemId: string | null) => {
+  const appendItem = (
+    item: CaptionCue | AudioDescriptionBeat,
+    mergedIntoItemId: string | null,
+    supersededByRunId: string | null,
+  ) => {
     items.push({
       key: itemKey(project.projectId, item.itemId),
       projectId: project.projectId,
@@ -1317,6 +1551,7 @@ export const normalizeProject = (
       kind: item.kind,
       currentItemRevision: item.current.itemRevision,
       mergedIntoItemId,
+      supersededByRunId,
     });
     for (const revision of item.revisions) {
       revisions.push({
@@ -1329,8 +1564,8 @@ export const normalizeProject = (
       });
     }
   };
-  for (const item of Object.values(project.captions.items)) appendItem(item, item.mergedIntoItemId);
-  for (const item of Object.values(project.audioDescriptions.items)) appendItem(item, null);
+  for (const item of Object.values(project.captions.items)) appendItem(item, item.mergedIntoItemId, null);
+  for (const item of Object.values(project.audioDescriptions.items)) appendItem(item, null, item.supersededByRunId);
 
   const findings: FindingRow[] = [];
   if (project.validationRun !== null) appendRunFindings(findings, project.projectId, project.validationRun);
@@ -1453,6 +1688,7 @@ export const rehydrateProject = (rows: NormalizedProjectRows): CaptionProject =>
         kind: "AudioDescriptionBeat",
         revisions: itemRevisions,
         current,
+        supersededByRunId: row.supersededByRunId,
       };
     }
   }
@@ -1490,8 +1726,10 @@ export const rehydrateProject = (rows: NormalizedProjectRows): CaptionProject =>
     media: clone(header.media),
     evidence: projectEvidence,
     localEvidencePackages: clone(header.localEvidencePackages),
+    localAudioDescriptionEvidencePackages: clone(header.localAudioDescriptionEvidencePackages),
     captions: { kind: "Captions", order: clone(header.captionOrder), items: captionItems },
     audioDescriptions: { kind: "AudioDescriptions", order: clone(header.audioDescriptionOrder), items: audioDescriptionItems },
+    audioDescriptionRequirements: clone(header.audioDescriptionRequirements),
     audioDescriptionGaps: clone(header.audioDescriptionGaps),
     selectedItem: clone(header.selectedItem),
     validation: clone(header.validation),
@@ -1528,7 +1766,8 @@ export class CueBenchDatabase extends Dexie {
     this.version(1).stores(DEXIE_V1_STORES);
     this.version(2).stores(DEXIE_V2_STORES).upgrade(upgradePhysicalV1ToV2);
     this.version(3).stores(DEXIE_V3_STORES).upgrade(upgradePhysicalV2ToV3);
-    this.version(DEXIE_DATABASE_VERSION).stores(DEXIE_V4_STORES).upgrade(upgradePhysicalV3ToV4);
+    this.version(4).stores(DEXIE_V4_STORES).upgrade(upgradePhysicalV3ToV4);
+    this.version(DEXIE_DATABASE_VERSION).stores(DEXIE_V5_STORES).upgrade(upgradePhysicalV4ToV5);
     this.projectHeaders = this.table("projectHeaders");
     this.items = this.table("items");
     this.revisions = this.table("revisions");
@@ -1811,8 +2050,8 @@ export const validateSourceBlobRow = (value: unknown): SourceBlobRow => {
 
 export const validateNarrationBlobRow = (value: unknown): NarrationBlobRow => {
   const row = parseStored<NarrationBlobRow>(NarrationBlobRowSchema, value, "narration blobs");
-  if (row.key !== narrationBlobKey(row.projectId, row.beatId, row.itemRevision)) {
-    throw new StorageReadValidationError("narration blobs", "Row primary key does not match narration fields.");
+  if (row.key !== narrationBlobKey(row.projectId, row.cacheKey)) {
+    throw new StorageReadValidationError("narration blobs", "Row primary key does not match the full TTS-input cache key.");
   }
   if (row.byteLength !== row.blob.size) {
     throw new StorageReadValidationError("narration blobs", "Stored byte length does not match Blob size.");
