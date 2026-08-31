@@ -12,6 +12,8 @@ export interface UploadMediaMetadata {
 interface UploadOperationTokenFields {
   readonly sessionId: string;
   readonly sessionKey: string;
+  /** Salted stable browser-project owner capability, distinct from a session. */
+  readonly ownerKey: string;
   readonly ipKey: string;
   readonly operationId: string;
   readonly operationKey: string;
@@ -126,13 +128,18 @@ export interface UploadOperationAuthorization extends UploadOperationTokenFields
   readonly issuedAtMs: number;
 }
 
-export const issueUploadCapability = async (input: UploadOperationAuthorization & {
+type UploadOperationAuthorizationInput = Omit<UploadOperationAuthorization, "ownerKey"> & { readonly ownerKey?: string };
+
+export const issueUploadCapability = async (input: UploadOperationAuthorizationInput & {
   readonly expiresAtMs: number;
   readonly settings: Pick<WorkerSettings, "keyRing">;
 }): Promise<string> => signOpaqueToken<UploadCapabilityClaims>({
   type: "upload-capability",
   sessionId: input.sessionId,
   sessionKey: input.sessionKey,
+  // Legacy receipt fixtures can still be parsed for their bounded TTL. Live
+  // upload creation always supplies a dedicated owner key.
+  ownerKey: input.ownerKey ?? input.sessionKey,
   ipKey: input.ipKey,
   operationId: input.operationId,
   operationKey: input.operationKey,
@@ -156,12 +163,13 @@ export const verifyUploadCapability = (token: string, settings: Pick<WorkerSetti
 );
 
 /** Issuing from the persisted creation timestamp makes retries return byte-for-byte the same receipt. */
-export const issueUploadReceipt = (input: UploadOperationAuthorization & {
+export const issueUploadReceipt = (input: UploadOperationAuthorizationInput & {
   readonly settings: Pick<WorkerSettings, "keyRing">;
 }): Promise<string> => signOpaqueToken<UploadReceiptClaims>({
   type: "upload-receipt",
   sessionId: input.sessionId,
   sessionKey: input.sessionKey,
+  ownerKey: input.ownerKey ?? input.sessionKey,
   ipKey: input.ipKey,
   operationId: input.operationId,
   operationKey: input.operationKey,

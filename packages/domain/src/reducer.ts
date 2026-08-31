@@ -1,10 +1,22 @@
 import {
+  countJsonNodes,
+  MAX_LOCAL_CAPTION_CUES,
+  MAX_LOCAL_CAPTION_EVIDENCE_PACKAGES,
+  MAX_LOCAL_CAPTION_EVIDENCE_TOTAL_BYTES,
+  MAX_LOCAL_CAPTION_EVIDENCE_TOTAL_JSON_NODES,
+  MAX_LOCAL_CAPTION_EVIDENCE_TOTAL_WORDS,
   MAX_LOCAL_CAPTION_EVIDENCE_WORDS,
+  MAX_PORTABLE_PROJECT_JSON_NODES,
   type Actor,
+  type CaptionEvidenceWord,
   type CertificationSnapshot,
+  type LocalCaptionEvidencePackage,
   type ReviewState,
+  type StagedCaptionCue,
   type ValidationSnapshot,
 } from "@cuebench/contracts";
+import { exportProjectBackup } from "./backup/schema";
+import { canonicalSerialize } from "./quality/hash";
 import type { DomainCommand } from "./commands";
 import { domainError, type DomainError } from "./errors";
 import {
@@ -45,6 +57,170 @@ const isFiniteInteger = (value: number) => Number.isSafeInteger(value);
 const hasValidTime = (project: CaptionProject, startMs: number, endMs: number) =>
   isFiniteInteger(startMs) && isFiniteInteger(endMs) && startMs >= 0 && startMs < endMs && endMs <= project.media.durationMs;
 
+interface CaptionInterval {
+  readonly startMs: number;
+  readonly endMs: number;
+}
+
+const intersects = (left: CaptionInterval, right: CaptionInterval): boolean => (
+  left.startMs < right.endMs && right.startMs < left.endMs
+);
+
+/** Merge protection ranges once so partitioning is deterministic at touching boundaries. */
+const mergedIntervals = (intervals: readonly CaptionInterval[]): readonly CaptionInterval[] => {
+  const result: CaptionInterval[] = [];
+  for (const interval of [...intervals].sort((left, right) => left.startMs - right.startMs || left.endMs - right.endMs)) {
+    const previous = result.at(-1);
+    if (previous !== undefined && interval.startMs <= previous.endMs) {
+      result[result.length - 1] = { startMs: previous.startMs, endMs: Math.max(previous.endMs, interval.endMs) };
+    } else result.push({ ...interval });
+  }
+  return result;
+};
+
+const remainingIntervals = (cue: CaptionInterval, protectedIntervals: readonly CaptionInterval[]): readonly CaptionInterval[] => {
+  let cursor = cue.startMs;
+  const remaining: CaptionInterval[] = [];
+  for (const protectedInterval of protectedIntervals) {
+    if (!intersects(cue, protectedInterval)) continue;
+    const startMs = Math.max(cue.startMs, protectedInterval.startMs);
+    const endMs = Math.min(cue.endMs, protectedInterval.endMs);
+    if (cursor < startMs) remaining.push({ startMs: cursor, endMs: startMs });
+    cursor = Math.max(cursor, endMs);
+  }
+  if (cursor < cue.endMs) remaining.push({ startMs: cursor, endMs: cue.endMs });
+  return remaining;
+};
+
+/**
+ * Generated full-media evidence must never overwrite a human Sustained cue.
+ * We retain only fully evidenced proposal portions outside protected intervals;
+ * a word straddling a human boundary is omitted rather than guessed/split.
+ */
+const partitionGeneratedCaptions = (
+  captions: readonly StagedCaptionCue[],
+  words: readonly CaptionEvidenceWord[],
+  protectedIntervals: readonly CaptionInterval[],
+): readonly StagedCaptionCue[] | null => {
+  const wordsById = new Map(words.map((word) => [word.evidenceId, word]));
+  const partitions: StagedCaptionCue[] = [];
+  for (const cue of captions) {
+    const sourceWords = cue.evidenceIds.map((evidenceId) => wordsById.get(evidenceId));
+    if (sourceWords.some((word) => word === undefined)) return null;
+    const remaining = remainingIntervals(cue, protectedIntervals);
+    if (remaining.length === 1 && remaining[0]!.startMs === cue.startMs && remaining[0]!.endMs === cue.endMs) {
+      partitions.push({ ...cue, evidenceIds: [...cue.evidenceIds] });
+      continue;
+    }
+    for (const [partIndex, interval] of remaining.entries()) {
+      const partWords = sourceWords
+        .filter((word): word is CaptionEvidenceWord => word !== undefined)
+        .filter((word) => word.startMs >= interval.startMs && word.endMs <= interval.endMs)
+        .sort((left, right) => left.startMs - right.startMs || left.sourceWordIndex - right.sourceWordIndex);
+      if (partWords.length === 0) continue;
+      const cueId = `${cue.cueId}-part-${partIndex + 1}`;
+      if (cueId.length > 200) return null;
+      const text = partWords.map((word) => word.text.trim()).filter(Boolean).join(" ").replace(/\s+/gu, " ").trim();
+      if (text === "") continue;
+      partitions.push({
+        cueId,
+        startMs: Math.max(interval.startMs, partWords[0]!.startMs),
+        endMs: Math.min(interval.endMs, partWords.at(-1)!.endMs),
+        text,
+        speaker: cue.speaker,
+        evidenceIds: partWords.map((word) => word.evidenceId),
+      });
+    }
+  }
+  const ordered = [...partitions].sort((left, right) => (
+    left.startMs - right.startMs || left.endMs - right.endMs || left.cueId.localeCompare(right.cueId)
+  ));
+  const seenEvidence = new Set<string>();
+  for (const [index, cue] of ordered.entries()) {
+    if (
+      cue.endMs <= cue.startMs
+      || protectedIntervals.some((interval) => intersects(cue, interval))
+      || (index > 0 && ordered[index - 1]!.endMs > cue.startMs)
+      || cue.evidenceIds.some((evidenceId) => seenEvidence.has(evidenceId))
+    ) return null;
+    for (const evidenceId of cue.evidenceIds) seenEvidence.add(evidenceId);
+  }
+  return ordered;
+};
+
+/** Evidence supporting a live human Sustained cue is never an eviction candidate. */
+const packageSupportsLiveSustainedCue = (project: CaptionProject, entry: LocalCaptionEvidencePackage): boolean => (
+  entry.cueBindings.some((binding) => {
+    const item = project.captions.items[binding.itemId];
+    return item?.mergedIntoItemId === null
+      && item.current.state === "Sustained"
+      && item.current.itemRevision === binding.itemRevision;
+  })
+);
+
+/**
+ * The import gate bounds the entire compact backup envelope, including Court
+ * Record, retained revisions/findings, and metadata—not just the transcript
+ * package. Export owns the exact wire serialization, so adoption probes that
+ * same boundary before any impossible aggregate can be committed.
+ */
+const fitsPortableBackupEnvelope = (project: CaptionProject): boolean => {
+  if (countJsonNodes(project) > MAX_PORTABLE_PROJECT_JSON_NODES) return false;
+  try {
+    exportProjectBackup(project);
+    return true;
+  } catch {
+    return false;
+  }
+};
+
+/**
+ * The persistent schema bounds Local Evidence Packages to four. Keep every
+ * package still needed by a live Sustained cue; discard only unreferenced
+ * history, and surface a safe adoption block if that bound cannot hold it.
+ */
+const retainLocalEvidencePackages = (
+  project: CaptionProject,
+  candidates: readonly LocalCaptionEvidencePackage[],
+  requiredRunId: string,
+): readonly LocalCaptionEvidencePackage[] | null => {
+  const protectedIds = new Set(candidates
+    .filter((entry) => packageSupportsLiveSustainedCue(project, entry))
+    .map((entry) => entry.packageId));
+  if (protectedIds.size > MAX_LOCAL_CAPTION_EVIDENCE_PACKAGES) return null;
+  // Keep newer unreferenced history first, then evict it oldest-first until
+  // every shared portable budget holds. A package referenced by a live
+  // Sustained cue and the result currently being adopted are never evictable.
+  const retained = [...candidates]
+    .sort((left, right) => {
+      const leftProtected = protectedIds.has(left.packageId);
+      const rightProtected = protectedIds.has(right.packageId);
+      if (leftProtected !== rightProtected) return leftProtected ? -1 : 1;
+      return right.retainedAtMs - left.retainedAtMs || right.runId.localeCompare(left.runId);
+    });
+  const fitsPortableBudget = (): boolean => (
+    retained.length <= MAX_LOCAL_CAPTION_EVIDENCE_PACKAGES
+    && retained.reduce((total, entry) => total + entry.evidence.words.length, 0) <= MAX_LOCAL_CAPTION_EVIDENCE_TOTAL_WORDS
+    && new TextEncoder().encode(canonicalSerialize(retained)).byteLength <= MAX_LOCAL_CAPTION_EVIDENCE_TOTAL_BYTES
+    && countJsonNodes(retained) <= MAX_LOCAL_CAPTION_EVIDENCE_TOTAL_JSON_NODES
+  );
+  while (!fitsPortableBudget()) {
+    const evictIndex = retained
+      .map((entry, index) => ({ entry, index }))
+      .filter(({ entry }) => entry.runId !== requiredRunId && !protectedIds.has(entry.packageId))
+      .sort((left, right) => (
+        left.entry.retainedAtMs - right.entry.retainedAtMs
+        || left.entry.runId.localeCompare(right.entry.runId)
+      ))
+      .at(0)?.index;
+    if (evictIndex === undefined) return null;
+    retained.splice(evictIndex, 1);
+  }
+  // The result being adopted is mandatory evidence, not evictable history.
+  if (!retained.some((entry) => entry.runId === requiredRunId)) return null;
+  return retained.sort((left, right) => left.retainedAtMs - right.retainedAtMs || left.runId.localeCompare(right.runId));
+};
+
 const staleProject = (project: CaptionProject, expected: number) =>
   project.projectRevision !== expected
     ? domainError("STALE_PROJECT", "The project revision is no longer current.")
@@ -63,7 +239,11 @@ const eventFor = (project: CaptionProject, command: DomainCommand, itemId?: stri
   actor: clone(command.actor),
   ...(itemId === undefined ? {} : { itemId }),
   ...(command.type === "ObjectItem"
-      ? { detail: command.reason }
+    ? { detail: command.reason }
+    : command.type === "AdoptCaptionGenerationResult"
+      // Persist the immutable run identity in Court Record rather than
+      // relying on a short-lived Worker receipt to reconstruct a backup.
+      ? { detail: `generation:${command.runId}` }
       : {}),
 });
 
@@ -377,11 +557,31 @@ export const applyCommand = (project: CaptionProject, command: DomainCommand): C
     if (command.result.evidence.words.length > MAX_LOCAL_CAPTION_EVIDENCE_WORDS) {
       return fail(project, "INVALID_ARGUMENT", "The staged caption evidence exceeds CueBench's bounded Local Evidence Package.");
     }
+    if (command.result.captions.length > MAX_LOCAL_CAPTION_CUES) {
+      return fail(project, "INVALID_ARGUMENT", "The staged caption result exceeds CueBench's bounded backup-safe cue count.");
+    }
 
     const existingProposed = Object.values(project.captions.items)
       .filter((item) => item.mergedIntoItemId === null && item.current.state === "Proposed");
     if (existingProposed.length > 0 && !command.confirmedProposedReplacement) {
       return fail(project, "CONFIRMATION_DECLINED", "Replacing existing Proposed captions requires visible human confirmation.");
+    }
+    // Never lay AI proposals across a human Sustained interval. We also
+    // protect any other live non-Proposed cue so the resulting canonical
+    // caption timeline remains export/validation-safe, not merely review-safe.
+    const protectedIntervals = mergedIntervals(Object.values(project.captions.items)
+      .filter((item) => item.mergedIntoItemId === null && item.current.state !== "Proposed")
+      .map((item) => ({ startMs: item.current.startMs, endMs: item.current.endMs })));
+    const effectiveCaptions = partitionGeneratedCaptions(
+      command.result.captions,
+      command.result.evidence.words,
+      protectedIntervals,
+    );
+    if (effectiveCaptions === null) {
+      return fail(project, "INVALID_ARGUMENT", "CueBench cannot adopt generated captions that overlap protected human caption intervals.");
+    }
+    if (command.result.captions.length > 0 && effectiveCaptions.length === 0) {
+      return fail(project, "INVALID_ARGUMENT", "CueBench cannot adopt a generated caption result wholly covered by protected human caption intervals.");
     }
     const globallyKnownIds = new Set([
       ...Object.keys(project.captions.items),
@@ -389,7 +589,7 @@ export const applyCommand = (project: CaptionProject, command: DomainCommand): C
       ...Object.keys(project.audioDescriptionGaps),
     ]);
     const generatedIds = new Set<string>();
-    for (const cue of command.result.captions) {
+    for (const cue of effectiveCaptions) {
       if (
         !cue.cueId.trim()
         || cue.cueId.length > 200
@@ -401,11 +601,11 @@ export const applyCommand = (project: CaptionProject, command: DomainCommand): C
       ) return fail(project, "INVALID_ARGUMENT", "The staged caption result contains an invalid or conflicting proposal.");
       generatedIds.add(cue.cueId);
     }
-    const firstGeneratedId = command.result.captions[0]?.cueId;
+    const firstGeneratedId = effectiveCaptions[0]?.cueId;
     if (existingProposed.length > 0 && firstGeneratedId === undefined) {
       return fail(project, "INVALID_ARGUMENT", "An empty staged result cannot replace existing Proposed captions.");
     }
-    const generatedItems: Readonly<Record<string, CaptionCue>> = Object.fromEntries(command.result.captions.map((cue) => {
+    const generatedItems: Readonly<Record<string, CaptionCue>> = Object.fromEntries(effectiveCaptions.map((cue) => {
       const current: CaptionCueRevision = {
         itemId: cue.cueId,
         kind: "CaptionCue",
@@ -416,7 +616,9 @@ export const applyCommand = (project: CaptionProject, command: DomainCommand): C
         text: cue.text,
         speaker: cue.speaker,
         actor: clone(command.actor),
-        cause: "AdoptCaptionGenerationResult",
+        // A run-scoped cause lets aggregate import prove which Court Record
+        // adoption event created each cue after older packages are pruned.
+        cause: `AdoptCaptionGenerationResult:${command.runId}`,
         parentItemRevision: null,
       };
       const item: CaptionCue = { itemId: cue.cueId, kind: "CaptionCue", revisions: [current], current, mergedIntoItemId: null };
@@ -429,7 +631,7 @@ export const applyCommand = (project: CaptionProject, command: DomainCommand): C
         : item,
     ]));
     const availableEvidenceIds = new Set(command.result.evidence.words.map((word) => word.evidenceId));
-    const generatedEvidence = command.result.captions.flatMap((cue) => cue.evidenceIds.map((evidenceId) => ({
+    const generatedEvidence = effectiveCaptions.flatMap((cue) => cue.evidenceIds.map((evidenceId) => ({
       evidenceId,
       projectId: project.projectId,
       mediaSha256: project.media.sha256.toLowerCase(),
@@ -443,36 +645,67 @@ export const applyCommand = (project: CaptionProject, command: DomainCommand): C
       || generatedEvidence.some((entry) => project.evidence.some((existing) => existing.evidenceId === entry.evidenceId))
     ) return fail(project, "INVALID_ARGUMENT", "The staged caption evidence conflicts with project evidence.");
     const firstGenerated = firstGeneratedId === undefined ? undefined : generatedItems[firstGeneratedId];
-    return commit(project, command, {
+    let retainedEvidence = retainLocalEvidencePackages(project, [
+      ...project.localEvidencePackages.filter((entry) => entry.runId !== command.runId),
+      {
+        packageId: `generation-${command.runId}`,
+        runId: command.runId,
+        projectId: project.projectId,
+        mediaSha256: project.media.sha256.toLowerCase(),
+        expectedProjectRevision: leaseBase.expectedProjectRevision,
+        expectedQualityProfileRevision: leaseBase.qualityProfileRevision,
+        retainedAtMs: command.result.createdAtMs,
+        ...(command.result.outputSha256 === undefined ? {} : { outputSha256: command.result.outputSha256 }),
+        evidence: clone(command.result.evidence),
+        cueBindings: effectiveCaptions.map((cue) => ({
+          cueId: cue.cueId,
+          itemId: cue.cueId,
+          itemRevision: 1,
+          evidenceIds: [...cue.evidenceIds],
+        })),
+      },
+    ], command.runId);
+    if (retainedEvidence === null) {
+      return fail(project, "INVALID_ARGUMENT", "CueBench cannot adopt this result because the Local Evidence Package budget is already required by live Sustained captions.");
+    }
+    const commitAdoption = (localEvidencePackages: readonly LocalCaptionEvidencePackage[]): CommandSuccess => commit(project, command, {
       captions: {
         ...project.captions,
-        order: [...project.captions.order.filter((itemId) => !existingProposed.some((item) => item.itemId === itemId)), ...command.result.captions.map((cue) => cue.cueId)],
+        order: [
+          ...project.captions.order.filter((itemId) => !existingProposed.some((item) => item.itemId === itemId)),
+          ...effectiveCaptions.map((cue) => cue.cueId),
+        ].sort((left, right) => {
+          const leftCue = generatedItems[left] ?? project.captions.items[left];
+          const rightCue = generatedItems[right] ?? project.captions.items[right];
+          return (leftCue?.current.startMs ?? 0) - (rightCue?.current.startMs ?? 0)
+            || (leftCue?.current.endMs ?? 0) - (rightCue?.current.endMs ?? 0)
+            || left.localeCompare(right);
+        }),
         items: { ...replacedItems, ...generatedItems },
       },
       evidence: [...project.evidence, ...generatedEvidence],
-      localEvidencePackages: [
-        ...project.localEvidencePackages.filter((entry) => entry.runId !== command.runId),
-        {
-          packageId: `generation-${command.runId}`,
-          runId: command.runId,
-          projectId: project.projectId,
-          mediaSha256: project.media.sha256.toLowerCase(),
-          expectedProjectRevision: leaseBase.expectedProjectRevision,
-          expectedQualityProfileRevision: leaseBase.qualityProfileRevision,
-          retainedAtMs: command.result.createdAtMs,
-          evidence: clone(command.result.evidence),
-          cueBindings: command.result.captions.map((cue) => ({
-            cueId: cue.cueId,
-            itemId: cue.cueId,
-            itemRevision: 1,
-            evidenceIds: [...cue.evidenceIds],
-          })),
-        },
-      ].slice(-4),
+      localEvidencePackages,
       activeGenerationRun: null,
       ...(firstGenerated === undefined ? {} : { selectedItem: selectFor(firstGenerated) }),
       ...withStaleArtifacts(project),
     }, firstGeneratedId);
+    let adopted = commitAdoption(retainedEvidence);
+    // Existing, unreferenced evidence may be the only expendable part of an
+    // otherwise valid project. Re-evaluate the *whole* export after each
+    // deterministic oldest-first eviction; never evict the just-adopted run
+    // or a package needed by a live Sustained cue.
+    while (!fitsPortableBackupEnvelope(adopted.project)) {
+      const evict = retainedEvidence
+        .filter((entry) => entry.runId !== command.runId && !packageSupportsLiveSustainedCue(project, entry))
+        .sort((left, right) => left.retainedAtMs - right.retainedAtMs || left.runId.localeCompare(right.runId))
+        .at(0);
+      if (evict === undefined) {
+        return fail(project, "INVALID_ARGUMENT", "CueBench cannot adopt this result because the complete portable backup would exceed its JSON-node or 10 MB byte budget.");
+      }
+      retainedEvidence = retainedEvidence.filter((entry) => entry.packageId !== evict.packageId);
+      adopted = commitAdoption(retainedEvidence);
+    }
+    return adopted;
   }
   if (command.type === "ReleaseGenerationRun") {
     if (project.activeGenerationRun?.runId !== command.runId) return fail(project, "STALE_RUN", "The generation run is no longer active.");

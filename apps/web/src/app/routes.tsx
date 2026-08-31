@@ -152,6 +152,7 @@ export function WorkbenchShell({ project, mode, sourceObjectUrl, sourceProvenanc
           durationMs={project.media.durationMs}
           mediaSha256={project.media.sha256}
           sourceObjectUrl={sourceObjectUrl}
+          resolveProjectOwnerCapability={store.getCloudProjectOwnerCapability}
         />
         <GenerationStatus project={project} store={store} />
       </div>

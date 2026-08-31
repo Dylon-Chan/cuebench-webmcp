@@ -1,6 +1,7 @@
 /// <reference types="@cloudflare/vitest-pool-workers/types" />
 
 import { SELF, env, runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
+import type { R2Bucket } from "@cloudflare/workers-types";
 import { StagedGenerationResultSchema } from "@cuebench/contracts";
 import { describe, expect, it, vi } from "vitest";
 import {
@@ -14,10 +15,20 @@ import { resolveWorkerSettings } from "./env";
 import { saltedLedgerKey } from "./quota-ledger";
 import { issueAnonymousSession } from "./session";
 import { issueUploadReceipt, verifyUploadReceipt } from "./uploads";
-import { sha256Hex } from "./openai/client";
+import { OpenAIProviderError, sha256Hex } from "./openai/client";
 import { fixtureMediaPreparationEnabled, fixtureMediaPreparationResponse } from "./media-preparation-fixture";
-import { generationCleanupMarkerKey, generationPreparationWriteLeaseKey } from "./generation-cleanup";
+import {
+  generationArtifactWriteLeaseKey,
+  generationCleanupMarkerKey,
+  generationPreparationWriteLeaseKey,
+} from "./generation-cleanup";
 import { signMediaJob } from "./probe";
+import {
+  CaptionGenerationRunner,
+  GenerationRunRecordBackedStore,
+  MAX_BILLABLE_WORKFLOW_STEP_RESULT_BYTES,
+  privateAudioBytes,
+} from "./workflows/generation";
 
 const session = async (): Promise<string> => {
   const currentNow = Date.now();
@@ -29,12 +40,16 @@ const session = async (): Promise<string> => {
   });
 };
 
+/** Browser-local owner capability used by the real hosted-upload route tests. */
+const workerdProjectOwnerCapability = "1".repeat(64);
+
 const post = (path: string, body: unknown, anonymousSession: string): Request => new Request(`https://cuebench.test${path}`, {
   method: "POST",
   headers: {
     authorization: `Bearer ${anonymousSession}`,
     "cf-connecting-ip": "203.0.113.10",
     "content-type": "application/json",
+    "x-cuebench-project-owner": workerdProjectOwnerCapability,
   },
   body: JSON.stringify(body),
 });
@@ -51,10 +66,11 @@ describe("workerd hosted upload boundary", () => {
       expiresAtMs: currentNow + 60 * 60_000,
       keyRing: settings.keyRing,
     });
-    const [sessionKey, ipKey, projectKey] = await Promise.all([
+    const [sessionKey, ipKey, projectKey, ownerKey] = await Promise.all([
       saltedLedgerKey(settings.quotaSalt, "session", sessionId),
       saltedLedgerKey(settings.quotaSalt, "network", "203.0.113.10"),
       saltedLedgerKey(settings.quotaSalt, "project", projectId),
+      saltedLedgerKey(settings.quotaSalt, "project-owner", workerdProjectOwnerCapability),
     ]);
     const source = new TextEncoder().encode("hello");
     const sourceSha256 = await sha256Hex(source);
@@ -69,6 +85,7 @@ describe("workerd hosted upload boundary", () => {
       const receipt = await issueUploadReceipt({
         sessionId,
         sessionKey,
+        ownerKey,
         ipKey,
         operationId,
         operationKey,
@@ -92,6 +109,7 @@ describe("workerd hosted upload boundary", () => {
           "cf-connecting-ip": "203.0.113.10",
           "content-type": "application/json",
           "x-cuebench-operation-receipt": uploadReceipt,
+          "x-cuebench-project-owner": workerdProjectOwnerCapability,
         },
         body: JSON.stringify({
           projectId,
@@ -124,6 +142,15 @@ describe("workerd hosted upload boundary", () => {
     const firstUpload = await upload("first");
     const first = await start(firstUpload.receipt, "workerd-generation-first");
     await instanceFor(first.claims);
+    // Real R2 CAS keeps the private project lease singular even when a valid
+    // upload receipt is replayed with another run id. The same run id is a
+    // recovery read and must not create a second Workflow instance.
+    const sameRun = await startRequest(firstUpload.receipt, first.claims.runId);
+    expect(sameRun.status).toBe(200);
+    const competing = await startRequest(firstUpload.receipt, "workerd-generation-competing");
+    expect(competing.status).toBe(409);
+    expect(await competing.json()).toEqual({ error: expect.objectContaining({ code: "GENERATION_LEASE_CONFLICT" }) });
+    expect(await env.PROCESSING_BUCKET.head(`processing/generation-leases/${ownerKey}/${projectKey}.json`)).not.toBeNull();
 
     await vi.waitFor(async () => expect((await records.load(first.claims))?.status.stage).toBe("AwaitingAdoption"), { timeout: 15_000, interval: 100 });
     const adopted = await SELF.fetch(new Request(`https://cuebench.test/api/generation-runs/${first.claims.runId}/acknowledge`, {
@@ -132,10 +159,20 @@ describe("workerd hosted upload boundary", () => {
         authorization: `Bearer ${anonymousSession}`,
         "content-type": "application/json",
         "x-cuebench-generation-receipt": first.receipt,
+        "x-cuebench-project-owner": workerdProjectOwnerCapability,
       },
       body: JSON.stringify({ action: "adopted", adoptedProjectRevision: 3 }),
     }));
     expect(adopted.status).toBe(200);
+    const releasedLease = await env.PROCESSING_BUCKET.get(`processing/generation-leases/${ownerKey}/${projectKey}.json`);
+    if (releasedLease === null) throw new Error("expected retained terminal project lease tombstone");
+    // Release is a retained tombstone, never a delete that an older run can
+    // accidentally erase after a new operation obtains the lease.
+    expect(JSON.parse(await releasedLease.text())).toMatchObject({
+      state: "released",
+      operationKey: first.claims.operationKey,
+      runId: first.claims.runId,
+    });
     await complete(first.claims);
     // Immediate private cleanup intentionally makes the old receipt unusable
     // before dispatch. A retry starts with a fresh upload/operation instead.
@@ -151,6 +188,7 @@ describe("workerd hosted upload boundary", () => {
       headers: {
         authorization: `Bearer ${anonymousSession}`,
         "x-cuebench-generation-receipt": afterAdoption.receipt,
+        "x-cuebench-project-owner": workerdProjectOwnerCapability,
       },
     }));
     expect(cancelled.status).toBe(200);
@@ -168,6 +206,7 @@ describe("workerd hosted upload boundary", () => {
       headers: {
         authorization: `Bearer ${anonymousSession}`,
         "x-cuebench-generation-receipt": afterCancellation.receipt,
+        "x-cuebench-project-owner": workerdProjectOwnerCapability,
       },
     }));
     expect(finalCancellation.status).toBe(200);
@@ -188,12 +227,13 @@ describe("workerd hosted upload boundary", () => {
       expiresAtMs: currentNow + 60 * 60_000,
       keyRing: settings.keyRing,
     });
-    const [sessionKey, ipKey, operationKey, projectKey, reservationKey] = await Promise.all([
+    const [sessionKey, ipKey, operationKey, projectKey, reservationKey, ownerKey] = await Promise.all([
       saltedLedgerKey(settings.quotaSalt, "session", sessionId),
       saltedLedgerKey(settings.quotaSalt, "network", "203.0.113.10"),
       saltedLedgerKey(settings.quotaSalt, "operation", `${sessionId}:${operationId}`),
       saltedLedgerKey(settings.quotaSalt, "project", projectId),
       saltedLedgerKey(settings.quotaSalt, "reservation", `${sessionId}:${operationId}`),
+      saltedLedgerKey(settings.quotaSalt, "project-owner", workerdProjectOwnerCapability),
     ]);
     const source = new TextEncoder().encode("cuebench-workerd-fixture-source");
     const sourceSha256 = await sha256Hex(source);
@@ -204,6 +244,7 @@ describe("workerd hosted upload boundary", () => {
     const uploadReceipt = await issueUploadReceipt({
       sessionId,
       sessionKey,
+      ownerKey,
       ipKey,
       operationId,
       operationKey,
@@ -250,6 +291,7 @@ describe("workerd hosted upload boundary", () => {
         "cf-connecting-ip": "203.0.113.10",
         "content-type": "application/json",
         "x-cuebench-operation-receipt": uploadReceipt,
+        "x-cuebench-project-owner": workerdProjectOwnerCapability,
       },
       body: JSON.stringify({
         projectId,
@@ -284,7 +326,7 @@ describe("workerd hosted upload boundary", () => {
     expect(staged?.evidence.provenance).toEqual(expect.arrayContaining([
       expect.objectContaining({ role: "diarization", store: null, model: "fixture" }),
       expect.objectContaining({ role: "word-timestamps", store: null, model: "fixture" }),
-      expect.objectContaining({ role: "reconciliation", store: false, model: "gpt-5.6-terra" }),
+      expect.objectContaining({ role: "reconciliation", store: null, model: "not-invoked", disposition: "skipped", skippedReason: "no-uncertainty" }),
     ]));
     expect(await env.PROCESSING_BUCKET.head(staged!.evidence.preparedManifest.key)).not.toBeNull();
     expect(await env.PROCESSING_BUCKET.head(staged!.evidence.normalizedAudio.key)).not.toBeNull();
@@ -304,6 +346,7 @@ describe("workerd hosted upload boundary", () => {
         authorization: `Bearer ${anonymousSession}`,
         "content-type": "application/json",
         "x-cuebench-generation-receipt": generationRunReceipt,
+        "x-cuebench-project-owner": workerdProjectOwnerCapability,
       },
       body: JSON.stringify({ action: "adopted", adoptedProjectRevision: 3 }),
     }));
@@ -371,6 +414,7 @@ describe("workerd hosted upload boundary", () => {
       expectedQualityProfileRevision: 1,
       mediaSha256: "b".repeat(64),
       sessionKey: "c".repeat(64),
+      projectKey: "d".repeat(64),
       sourceByteLength: 5,
       sourceDurationMs: 31_000,
       operationId: "workerd-generation-operation",
@@ -440,6 +484,718 @@ describe("workerd hosted upload boundary", () => {
     await env.PROCESSING_BUCKET.delete(`prepared/${operationKey}/generation-runs/${runId}.json`);
   });
 
+  it("keeps a checkpointed provider request/ref when the dispatch create-return save races it", async () => {
+    const settings = resolveWorkerSettings(env);
+    const currentNow = Date.now();
+    const operationKey = "1".repeat(64);
+    const runId = `generation-create-return-race-${currentNow}`;
+    const receipt = await issueGenerationRunReceipt({
+      runId,
+      projectId: "workerd-generation-create-return-race",
+      targetTrack: "Captions",
+      expectedProjectRevision: 2,
+      expectedQualityProfileRevision: 1,
+      mediaSha256: "2".repeat(64),
+      sessionKey: "3".repeat(64),
+      projectKey: "4".repeat(64),
+      sourceByteLength: 5,
+      sourceDurationMs: 31_000,
+      operationId: "workerd-generation-create-return-race-operation",
+      operationKey,
+      objectKey: `processing/${operationKey}`,
+      issuedAtMs: currentNow,
+      expiresAtMs: currentNow + 60_000,
+    }, settings);
+    const claims = await verifyGenerationRunReceipt(receipt, settings, currentNow);
+    const queued = {
+      contractVersion: 1 as const,
+      runId,
+      projectId: claims.projectId,
+      targetTrack: "Captions" as const,
+      expectedProjectRevision: claims.expectedProjectRevision,
+      stage: "Queued" as const,
+    };
+    const store = new R2GenerationRunRecordStore(env.PROCESSING_BUCKET);
+    const initial: GenerationRunRecord = {
+      version: 1,
+      receipt,
+      claims,
+      uploadReceipt: "private-upload-receipt",
+      status: queued,
+      cancelled: false,
+      dispatched: false,
+      updatedAtMs: currentNow,
+    };
+    await store.save(initial);
+    const stalePreCreate = await store.load(claims);
+    if (stalePreCreate === null) throw new Error("expected stale pre-create snapshot");
+
+    const providerRef = await store.writeProviderCheckpoint({
+      claims,
+      value: { accepted: "paid request output" },
+    });
+    const transcribing = { ...queued, stage: "Transcribing" as const, progress: 0 };
+    // The Workflow can write this checkpoint after create() accepts, but
+    // before the route regains control and saves `dispatched: true` from its
+    // stale pre-create snapshot.
+    await store.save({
+      ...stalePreCreate,
+      status: transcribing,
+      workflowState: {
+        request: { runId, projectId: claims.projectId },
+        stageHistory: [queued, transcribing],
+        cancelled: false,
+        providerAttempts: [{
+          attemptId: "diarization:chunk-1:attempt-1",
+          pass: "diarization",
+          requestKey: "chunk-1",
+          state: "completed",
+          startedAtMs: currentNow + 1,
+          responseHash: "5".repeat(64),
+        }],
+        diarizationChunks: [{ requestKey: "chunk-1", artifactRef: providerRef }],
+      },
+      updatedAtMs: currentNow + 1,
+    });
+    await store.save({ ...stalePreCreate, dispatched: true, updatedAtMs: currentNow + 2 });
+
+    const recovered = await store.load(claims);
+    expect(recovered).toMatchObject({
+      dispatched: true,
+      status: { stage: "Transcribing" },
+      workflowState: {
+        providerAttempts: [expect.objectContaining({ attemptId: "diarization:chunk-1:attempt-1", state: "completed" })],
+        diarizationChunks: [expect.objectContaining({ requestKey: "chunk-1", artifactRef: providerRef })],
+      },
+      artifactRefs: expect.arrayContaining([providerRef]),
+    });
+    // The post-CAS reclaim only deletes superseded snapshots. It must never
+    // see a newer request ref as stale merely because the route saved late.
+    expect(await env.PROCESSING_BUCKET.head(providerRef.key)).not.toBeNull();
+
+    const privateObjects = await env.PROCESSING_BUCKET.list({ prefix: `prepared/${operationKey}/generation-runs/${runId}/` });
+    await env.PROCESSING_BUCKET.delete([
+      `prepared/${operationKey}/generation-runs/${runId}.json`,
+      ...privateObjects.objects.map((object: { readonly key: string }) => object.key),
+    ]);
+  });
+
+  it("reconciles a terminal lease release after the record PUT succeeds but its first lease CAS fails", async () => {
+    const settings = resolveWorkerSettings(env);
+    const currentNow = Date.now();
+    const operationKey = "e".repeat(64);
+    const projectKey = "f".repeat(64);
+    const sessionKey = "a".repeat(64);
+    const runId = `generation-terminal-release-repair-${currentNow}`;
+    const receipt = await issueGenerationRunReceipt({
+      runId,
+      projectId: "workerd-terminal-release-repair",
+      targetTrack: "Captions",
+      expectedProjectRevision: 2,
+      expectedQualityProfileRevision: 1,
+      mediaSha256: "b".repeat(64),
+      sessionKey,
+      projectKey,
+      sourceByteLength: 5,
+      sourceDurationMs: 31_000,
+      operationId: "workerd-terminal-release-repair-operation",
+      operationKey,
+      objectKey: `processing/${operationKey}`,
+      issuedAtMs: currentNow,
+      expiresAtMs: currentNow + 60_000,
+    }, settings);
+    const claims = await verifyGenerationRunReceipt(receipt, settings, currentNow);
+    const leaseKey = `processing/generation-leases/${sessionKey}/${projectKey}.json`;
+    let failedLeaseWrites = 0;
+    const target = env.PROCESSING_BUCKET;
+    const flakyBucket = new Proxy(target, {
+      get(source, property, receiver) {
+        if (property === "put") {
+          return async (key: string, value: unknown, options: unknown) => {
+            if (key === leaseKey && failedLeaseWrites > 0) {
+              failedLeaseWrites -= 1;
+              throw new Error("injected terminal lease CAS failure");
+            }
+            return (source.put as unknown as (nextKey: string, nextValue: unknown, nextOptions: unknown) => Promise<unknown>)(key, value, options);
+          };
+        }
+        const value = Reflect.get(source, property, receiver);
+        return typeof value === "function" ? value.bind(source) : value;
+      },
+    }) as unknown as R2Bucket;
+    const store = new R2GenerationRunRecordStore(flakyBucket);
+    const queued = {
+      contractVersion: 1 as const,
+      runId,
+      projectId: claims.projectId,
+      targetTrack: "Captions" as const,
+      expectedProjectRevision: 2,
+      stage: "Queued" as const,
+    };
+    const initial: GenerationRunRecord = {
+      version: 1,
+      receipt,
+      claims,
+      uploadReceipt: "private-upload-receipt",
+      status: queued,
+      cancelled: false,
+      dispatched: true,
+      updatedAtMs: currentNow,
+    };
+    await store.acquireActiveLease({
+      sessionKey,
+      projectKey,
+      operationKey,
+      runId,
+      expiresAtMs: currentNow + 60_000,
+      nowMs: currentNow,
+    });
+    await store.save(initial);
+
+    // R2 commits the terminal record before the independent lease tombstone.
+    // A transport fault on that first CAS must leave a durable repair marker.
+    failedLeaseWrites = 1;
+    await expect(store.save({
+      ...initial,
+      cancelled: true,
+      status: { ...queued, stage: "Cancelled" },
+      updatedAtMs: currentNow + 1,
+    })).rejects.toThrow("injected terminal lease CAS failure");
+    const raw = await target.get(`prepared/${operationKey}/generation-runs/${runId}.json`);
+    if (raw === null) throw new Error("expected terminal R2 recovery record");
+    expect(JSON.parse(await raw.text())).toEqual(expect.objectContaining({
+      status: expect.objectContaining({ stage: "Cancelled" }),
+      leaseReleasePending: true,
+    }));
+    const activeLease = await target.get(leaseKey);
+    if (activeLease === null) throw new Error("expected active project lease after injected failure");
+    expect(JSON.parse(await activeLease.text())).toMatchObject({ state: "active", runId });
+
+    // A terminal read is a non-throwing repair point. Keep failures injected
+    // for this first read, then let the authenticated cleanup retry settle it.
+    failedLeaseWrites = 1;
+    await expect(store.load(claims)).resolves.toMatchObject({ status: { stage: "Cancelled" }, leaseReleasePending: true });
+    const cleaned = await store.cleanup({ claims, action: "cancelled", nowMs: currentNow + 2 });
+    expect(cleaned?.cleanup).toMatchObject({ state: "completed", action: "cancelled" });
+    const released = await target.get(leaseKey);
+    if (released === null) throw new Error("expected retained released lease tombstone");
+    expect(JSON.parse(await released.text())).toMatchObject({ state: "released", runId });
+
+    await target.delete([
+      `prepared/${operationKey}/generation-runs/${runId}.json`,
+      `prepared/${operationKey}/generation-cleanup.json`,
+      leaseKey,
+    ]);
+  });
+
+  it("stores a legal >1 MiB provider response in R2 and returns only a bounded checkpoint ref from each Workflow step", async () => {
+    const settings = resolveWorkerSettings(env);
+    const currentNow = Date.now();
+    const operationKey = "c".repeat(64);
+    const runId = `generation-large-provider-step-${currentNow}`;
+    const receipt = await issueGenerationRunReceipt({
+      runId,
+      projectId: "workerd-large-provider-step-project",
+      targetTrack: "Captions",
+      expectedProjectRevision: 2,
+      expectedQualityProfileRevision: 1,
+      mediaSha256: "d".repeat(64),
+      sessionKey: "e".repeat(64),
+      projectKey: "f".repeat(64),
+      sourceByteLength: 5,
+      sourceDurationMs: 31_000,
+      operationId: "workerd-large-provider-step-operation",
+      operationKey,
+      objectKey: `processing/${operationKey}`,
+      issuedAtMs: currentNow,
+      expiresAtMs: currentNow + 60_000,
+    }, settings);
+    const claims = await verifyGenerationRunReceipt(receipt, settings, currentNow);
+    const queued = {
+      contractVersion: 1 as const,
+      runId,
+      projectId: claims.projectId,
+      targetTrack: "Captions" as const,
+      expectedProjectRevision: 2,
+      stage: "Queued" as const,
+    };
+    const records = new R2GenerationRunRecordStore(env.PROCESSING_BUCKET);
+    await records.save({
+      version: 1,
+      receipt,
+      claims,
+      uploadReceipt: "private-upload-receipt",
+      status: queued,
+      cancelled: false,
+      dispatched: true,
+      updatedAtMs: currentNow,
+    });
+
+    // The provider payload is legal at this boundary but well beyond the
+    // 1 MiB Workflow step-result cap. Canonical project evidence keeps only
+    // a bounded 1,000-character source excerpt per diarization segment.
+    const segmentText = "x".repeat(1_100_000);
+    const diarization = {
+      speakerSegments: [
+        ...Array.from({ length: 500 }, (_unused, index) => ({
+        id: `large-speaker-${index + 1}`,
+        startMs: index * 60,
+        endMs: index * 60 + 50,
+        speaker: "A",
+          text: "word",
+        })),
+        // This is a legal diarization-only excerpt inside the authoritative
+        // duration. It has no word-pass overlap, so it exercises response
+        // retention rather than manufacturing a reconciliation disagreement.
+        { id: "large-unassigned-speaker", startMs: 30_100, endMs: 30_900, speaker: "A", text: segmentText },
+      ],
+      provenance: { model: "fixture", requestHash: "1".repeat(64), responseHash: "2".repeat(64) },
+    };
+    expect(new TextEncoder().encode(JSON.stringify(diarization)).byteLength).toBeGreaterThan(1024 * 1024);
+    const words = Array.from({ length: 500 }, (_unused, index) => ({
+      startMs: index * 60,
+      endMs: index * 60 + 50,
+      text: "word",
+    }));
+    const returnedStepResults: unknown[] = [];
+    const checkpointSizes: number[] = [];
+    const cached = new Map<string, unknown>();
+    const runner = new CaptionGenerationRunner(
+      new GenerationRunRecordBackedStore(records, claims),
+      {
+        preparation: { prepare: async () => ({ key: `prepared/${operationKey}/manifests/${"a".repeat(64)}.json`, sha256: "a".repeat(64) }) },
+        artifacts: {
+          readManifest: async () => ({
+            source: { sha256: claims.mediaSha256, byteLength: claims.sourceByteLength, durationMs: claims.sourceDurationMs },
+            normalizedAudio: {
+              key: `prepared/${operationKey}/audio/${"b".repeat(64)}.wav`,
+              sha256: "b".repeat(64),
+              byteLength: 128,
+              durationMs: claims.sourceDurationMs,
+              contentType: "audio/wav",
+            },
+          }),
+        },
+        transcription: {
+          diarize: async () => diarization,
+          wordTimestamps: async () => ({ words, provenance: { model: "fixture", requestHash: "3".repeat(64), responseHash: "4".repeat(64) } }),
+          // This test intentionally enters the request-level production
+          // shape: each rich result must be persisted under its own R2 ref
+          // before the Workflow step returns its <=64 KiB value.
+          resumable: {
+            requests: async () => [{ requestKey: "chunk-1", index: 0, offsetMs: 0, endMs: claims.sourceDurationMs, overlapWithPreviousMs: 0 }],
+            diarizeRequest: async () => diarization,
+            wordTimestampRequest: async () => ({ words, provenance: { model: "fixture", requestHash: "3".repeat(64), responseHash: "4".repeat(64) } }),
+            aggregateDiarization: async ({ results }) => results[0]!.value,
+            aggregateWordTimestamps: async ({ results }) => results[0]!.value,
+          },
+        },
+        reconciliation: {
+          reconcile: async ({ alignedWords }) => ({
+            words: alignedWords,
+            provenance: { model: "fixture", requestHash: "5".repeat(64), responseHash: "6".repeat(64), store: false },
+          }),
+        },
+        clock: () => currentNow,
+      },
+      {
+        run: async (pass, requestKey, work) => {
+          const cacheKey = `${pass}:${requestKey}`;
+          const cachedResult = cached.get(cacheKey);
+          const result = cachedResult === undefined ? await work() : cachedResult;
+          cached.set(cacheKey, result);
+          returnedStepResults.push(result);
+          const stepResult = result as { readonly checkpoint?: { readonly key: string } };
+          if (stepResult.checkpoint !== undefined) {
+            const persistedCheckpoint = await env.PROCESSING_BUCKET.head(stepResult.checkpoint.key);
+            if (persistedCheckpoint === null) throw new Error("expected provider step checkpoint in R2 before Workflow step completion");
+            checkpointSizes.push(persistedCheckpoint.size);
+          }
+          return result as Awaited<ReturnType<typeof work>>;
+        },
+      },
+    );
+    await runner.run({
+      runId,
+      projectId: claims.projectId,
+      targetTrack: "Captions",
+      expectedProjectRevision: 2,
+      expectedQualityProfileRevision: 1,
+      mediaSha256: claims.mediaSha256,
+      sourceByteLength: claims.sourceByteLength,
+      sourceDurationMs: claims.sourceDurationMs,
+      operation: {
+        operationId: claims.operationId,
+        operationKey,
+        objectKey: claims.objectKey,
+        inputByteLength: claims.sourceByteLength,
+        inputContentType: "video/webm",
+        operationReceipt: "private-upload-receipt",
+        receiptExpiresAtMs: claims.expiresAtMs,
+      },
+    });
+
+    expect(returnedStepResults).toHaveLength(3);
+    for (const result of returnedStepResults) {
+      expect(new TextEncoder().encode(JSON.stringify(result)).byteLength).toBeLessThanOrEqual(MAX_BILLABLE_WORKFLOW_STEP_RESULT_BYTES);
+      expect(result).toEqual(expect.objectContaining({ checkpoint: expect.objectContaining({ key: expect.stringContaining(`/generation-runs/${runId}/artifacts/`) }) }));
+    }
+    expect(returnedStepResults).toEqual(expect.arrayContaining([
+      expect.objectContaining({ checkpoint: expect.objectContaining({ key: expect.stringContaining("provider-result-") }) }),
+    ]));
+    expect(checkpointSizes.some((size) => size > 1024 * 1024)).toBe(true);
+    const persisted = await records.load(claims);
+    expect(persisted?.status.stage).toBe("AwaitingAdoption");
+    expect(persisted?.artifactRefs).toEqual(expect.arrayContaining([
+      expect.objectContaining({ key: expect.stringContaining("workflow-state-"), byteLength: expect.any(Number) }),
+    ]));
+    // Once the request aggregate is durable, only its compact current state
+    // remains. Older rich request artifacts are reclaimed after the record
+    // CAS and would still be found by exact-prefix cleanup if a delete lost
+    // its response.
+    expect((persisted?.artifactRefs ?? []).some((reference) => reference.byteLength > 1024 * 1024)).toBe(false);
+    const privateObjects = await env.PROCESSING_BUCKET.list({ prefix: `prepared/${operationKey}/` });
+    await env.PROCESSING_BUCKET.delete(privateObjects.objects.map((object: { readonly key: string }) => object.key));
+  });
+
+  it("resumes real R2 request checkpoints after later chunk/window 503s without replaying accepted earlier requests", async () => {
+    const settings = resolveWorkerSettings(env);
+    const currentNow = Date.now();
+    const operationKey = "7".repeat(64);
+    const runId = `generation-request-resume-${currentNow}`;
+    const receipt = await issueGenerationRunReceipt({
+      runId,
+      projectId: "workerd-request-resume-project",
+      targetTrack: "Captions",
+      expectedProjectRevision: 2,
+      expectedQualityProfileRevision: 1,
+      mediaSha256: "8".repeat(64),
+      sessionKey: "9".repeat(64),
+      projectKey: "a".repeat(64),
+      sourceByteLength: 5,
+      sourceDurationMs: 4_000,
+      operationId: "workerd-request-resume-operation",
+      operationKey,
+      objectKey: `processing/${operationKey}`,
+      issuedAtMs: currentNow,
+      expiresAtMs: currentNow + 60_000,
+    }, settings);
+    const claims = await verifyGenerationRunReceipt(receipt, settings, currentNow);
+    const queued = {
+      contractVersion: 1 as const,
+      runId,
+      projectId: claims.projectId,
+      targetTrack: "Captions" as const,
+      expectedProjectRevision: 2,
+      stage: "Queued" as const,
+    };
+    const records = new R2GenerationRunRecordStore(env.PROCESSING_BUCKET);
+    await records.save({
+      version: 1,
+      receipt,
+      claims,
+      uploadReceipt: "private-upload-receipt",
+      status: queued,
+      cancelled: false,
+      dispatched: true,
+      updatedAtMs: currentNow,
+    });
+
+    const chunks = [
+      { requestKey: "chunk-1", index: 0, offsetMs: 0, endMs: 2_000, overlapWithPreviousMs: 0 },
+      { requestKey: "chunk-2", index: 1, offsetMs: 1_900, endMs: 4_000, overlapWithPreviousMs: 100 },
+    ] as const;
+    const calls: string[] = [];
+    let chunkTwoFailures = 0;
+    let windowTwoFailures = 0;
+    const workflowCache = new Map<string, unknown>();
+    const runner = new CaptionGenerationRunner(
+      new GenerationRunRecordBackedStore(records, claims),
+      {
+        preparation: { prepare: async () => ({ key: `prepared/${operationKey}/manifests/${"b".repeat(64)}.json`, sha256: "b".repeat(64) }) },
+        artifacts: {
+          readManifest: async () => ({
+            source: { sha256: claims.mediaSha256, byteLength: claims.sourceByteLength, durationMs: claims.sourceDurationMs },
+            normalizedAudio: {
+              key: `prepared/${operationKey}/audio/${"c".repeat(64)}.wav`,
+              sha256: "c".repeat(64),
+              byteLength: 128,
+              durationMs: claims.sourceDurationMs,
+              contentType: "audio/wav",
+            },
+          }),
+        },
+        transcription: {
+          diarize: async () => { throw new Error("legacy transcription must not run"); },
+          wordTimestamps: async () => { throw new Error("legacy transcription must not run"); },
+          resumable: {
+            requests: async () => chunks,
+            diarizeRequest: async ({ request: chunk }) => {
+              calls.push(`diarization:${chunk.requestKey}`);
+              if (chunk.requestKey === "chunk-2" && chunkTwoFailures++ === 0) {
+                throw new OpenAIProviderError("known diarization 429 before acceptance", true, "safe-to-replay");
+              }
+              return {
+                speakerSegments: [{
+                  id: `speaker-${chunk.index + 1}`,
+                  startMs: chunk.offsetMs,
+                  endMs: Math.min(chunk.endMs, chunk.offsetMs + 600),
+                  speaker: "A",
+                  text: `word-${chunk.index + 1}`,
+                }],
+                provenance: { model: "fixture-diarization", requestHash: (chunk.index === 0 ? "d" : "e").repeat(64), responseHash: (chunk.index === 0 ? "f" : "0").repeat(64) },
+              };
+            },
+            wordTimestampRequest: async ({ request: chunk }) => {
+              calls.push(`words:${chunk.requestKey}`);
+              return {
+                words: [{ startMs: chunk.offsetMs, endMs: Math.min(chunk.endMs, chunk.offsetMs + 500), text: `word-${chunk.index + 1}` }],
+                provenance: { model: "fixture-words", requestHash: (chunk.index === 0 ? "1" : "2").repeat(64), responseHash: (chunk.index === 0 ? "3" : "4").repeat(64) },
+              };
+            },
+            aggregateDiarization: async ({ results }) => ({
+              speakerSegments: results.flatMap((result) => result.value.speakerSegments),
+              provenance: { model: "fixture-diarization", requestHash: "5".repeat(64), responseHash: "6".repeat(64) },
+            }),
+            aggregateWordTimestamps: async ({ results }) => ({
+              words: results.flatMap((result) => result.value.words),
+              provenance: { model: "fixture-words", requestHash: "7".repeat(64), responseHash: "8".repeat(64) },
+            }),
+          },
+        },
+        reconciliation: {
+          reconcile: async () => { throw new Error("legacy reconciliation must not run"); },
+          resumable: {
+            requests: async ({ alignedWords }) => alignedWords.map((word, index) => ({
+              requestKey: `window-${index + 1}`,
+              window: {
+                windowId: `window-${index + 1}`,
+                allowedWordIds: [word.evidenceId],
+                words: [{
+                  id: word.evidenceId,
+                  startMs: word.startMs,
+                  endMs: word.endMs,
+                  text: word.text,
+                  normalizedText: word.text.toLowerCase(),
+                  speaker: word.speaker ?? "Unknown",
+                  diarizationSegmentIds: word.speakerSegmentIds,
+                }],
+              },
+            })),
+            reconcileRequest: async ({ request: window }) => {
+              calls.push(`reconciliation:${window.requestKey}`);
+              if (window.requestKey === "window-2" && windowTwoFailures++ === 0) {
+                throw new OpenAIProviderError("known reconciliation 429 before acceptance", true, "safe-to-replay");
+              }
+              const seed = window.requestKey === "window-1" ? "9" : "a";
+              return {
+                requestKey: window.requestKey,
+                windowId: window.window.windowId,
+                replacements: [],
+                provenance: {
+                  provider: "fixture",
+                  model: "fixture-reconciliation",
+                  requestHash: seed.repeat(64),
+                  responseHash: (seed === "9" ? "b" : "c").repeat(64),
+                  rawResponseSha256: (seed === "9" ? "b" : "c").repeat(64),
+                  store: false,
+                  background: false,
+                  usage: null,
+                  providerResponseId: null,
+                },
+              };
+            },
+            aggregate: async ({ alignedWords, results }) => ({
+              words: alignedWords,
+              provenance: {
+                model: "fixture-reconciliation",
+                requestHash: "d".repeat(64),
+                responseHash: "e".repeat(64),
+                store: false,
+                requestMetadata: { windowCount: String(results.length) },
+              },
+            }),
+          },
+        },
+        clock: () => currentNow,
+      },
+      {
+        run: async (pass, requestKey, work) => {
+          const key = `${pass}:${requestKey}`;
+          const cached = workflowCache.get(key);
+          if (cached !== undefined) return cached as Awaited<ReturnType<typeof work>>;
+          const result = await work();
+          workflowCache.set(key, result);
+          return result;
+        },
+      },
+    );
+    const request = {
+      runId,
+      projectId: claims.projectId,
+      targetTrack: "Captions" as const,
+      expectedProjectRevision: 2,
+      expectedQualityProfileRevision: 1,
+      mediaSha256: claims.mediaSha256,
+      sourceByteLength: claims.sourceByteLength,
+      sourceDurationMs: claims.sourceDurationMs,
+      operation: {
+        operationId: claims.operationId,
+        operationKey,
+        objectKey: claims.objectKey,
+        inputByteLength: claims.sourceByteLength,
+        inputContentType: "video/webm" as const,
+        operationReceipt: "private-upload-receipt",
+        receiptExpiresAtMs: claims.expiresAtMs,
+      },
+    };
+
+    await expect(runner.run(request)).rejects.toMatchObject({ retryable: true });
+    expect(calls).toEqual(["diarization:chunk-1", "diarization:chunk-2"]);
+    const afterChunkFailure = await records.load(claims);
+    expect(afterChunkFailure?.artifactRefs).toEqual(expect.arrayContaining([
+      expect.objectContaining({ key: expect.stringContaining("provider-result-") }),
+    ]));
+
+    await expect(runner.run(request)).rejects.toMatchObject({ retryable: true });
+    expect(calls).toEqual([
+      "diarization:chunk-1", "diarization:chunk-2", "diarization:chunk-2",
+      "words:chunk-1", "words:chunk-2",
+      "reconciliation:window-1", "reconciliation:window-2",
+    ]);
+
+    await runner.run(request);
+    expect(calls).toEqual([
+      "diarization:chunk-1", "diarization:chunk-2", "diarization:chunk-2",
+      "words:chunk-1", "words:chunk-2",
+      "reconciliation:window-1", "reconciliation:window-2", "reconciliation:window-2",
+    ]);
+    const completed = await records.load(claims);
+    expect(completed).toMatchObject({ status: { stage: "AwaitingAdoption" } });
+    expect((completed?.artifactRefs ?? []).some((reference) => reference.key.includes("provider-result-"))).toBe(false);
+    const privateObjects = await env.PROCESSING_BUCKET.list({ prefix: `prepared/${operationKey}/` });
+    await env.PROCESSING_BUCKET.delete(privateObjects.objects.map((object: { readonly key: string }) => object.key));
+  });
+
+  it("reclaims a workflow artifact when terminal cleanup wins immediately after its R2 PUT", async () => {
+    const settings = resolveWorkerSettings(env);
+    const currentNow = Date.now();
+    const operationKey = "1".repeat(64);
+    const projectKey = "2".repeat(64);
+    const runId = `generation-artifact-fence-${currentNow}`;
+    const receipt = await issueGenerationRunReceipt({
+      runId,
+      projectId: "workerd-artifact-fence-project",
+      targetTrack: "Captions",
+      expectedProjectRevision: 2,
+      expectedQualityProfileRevision: 1,
+      mediaSha256: "3".repeat(64),
+      sessionKey: "4".repeat(64),
+      projectKey,
+      sourceByteLength: 5,
+      sourceDurationMs: 31_000,
+      operationId: "workerd-artifact-fence-operation",
+      operationKey,
+      objectKey: `processing/${operationKey}`,
+      issuedAtMs: currentNow,
+      expiresAtMs: currentNow + 60_000,
+    }, settings);
+    const claims = await verifyGenerationRunReceipt(receipt, settings, currentNow);
+    const queued = {
+      contractVersion: 1 as const,
+      runId,
+      projectId: claims.projectId,
+      targetTrack: "Captions" as const,
+      expectedProjectRevision: 2,
+      stage: "Queued" as const,
+    };
+    const workflowState = { request: { runId, projectId: claims.projectId }, stageHistory: [queued], cancelled: false };
+    const checkpointDigest = await sha256Hex(new TextEncoder().encode(JSON.stringify(workflowState)));
+    const checkpointKey = `prepared/${operationKey}/generation-runs/${runId}/artifacts/workflow-state-${checkpointDigest}.json`;
+    const marker = generationCleanupMarkerKey(operationKey);
+    let markerInstalled = false;
+    const target = env.PROCESSING_BUCKET;
+    const racingBucket = new Proxy(target, {
+      get(source, property, receiver) {
+        if (property === "put") {
+          return async (key: string, value: unknown, options: unknown) => {
+            const result = await (source.put as unknown as (nextKey: string, nextValue: unknown, nextOptions: unknown) => Promise<unknown>)(key, value, options);
+            if (key === checkpointKey && !markerInstalled) {
+              markerInstalled = true;
+              await source.put(marker, JSON.stringify({ version: 1, action: "cancelled" }));
+            }
+            return result;
+          };
+        }
+        const value = Reflect.get(source, property, receiver);
+        return typeof value === "function" ? value.bind(source) : value;
+      },
+    }) as unknown as R2Bucket;
+    const store = new R2GenerationRunRecordStore(racingBucket);
+    await expect(store.save({
+      version: 1,
+      receipt,
+      claims,
+      uploadReceipt: "private-upload-receipt",
+      status: queued,
+      cancelled: false,
+      dispatched: true,
+      workflowState,
+      updatedAtMs: currentNow,
+    })).rejects.toThrow("terminal cleanup reclaimed");
+    expect(markerInstalled).toBe(true);
+    await expect(target.head(checkpointKey)).resolves.toBeNull();
+    await expect(target.head(generationArtifactWriteLeaseKey(operationKey, runId, checkpointKey))).resolves.toBeNull();
+    await expect(target.head(`prepared/${operationKey}/generation-runs/${runId}.json`)).resolves.toBeNull();
+    await target.delete(marker);
+  });
+
+  it("verifies normalized audio R2 metadata, exact size, and body digest before a provider can read it", async () => {
+    const operationKey = "5".repeat(64);
+    const bytes = new TextEncoder().encode("private normalized wav fixture");
+    const digest = await sha256Hex(bytes);
+    const key = `prepared/${operationKey}/audio/${digest}.wav`;
+    await env.PROCESSING_BUCKET.put(key, bytes, {
+      httpMetadata: { contentType: "audio/wav" },
+      customMetadata: { sha256: digest },
+    });
+    await expect(privateAudioBytes(env.PROCESSING_BUCKET, {
+      key,
+      sha256: digest,
+      byteLength: bytes.byteLength,
+      durationMs: 1_000,
+      contentType: "audio/wav",
+    })).resolves.toEqual(bytes);
+
+    const metadataMismatchKey = `prepared/${operationKey}/audio/${"6".repeat(64)}.wav`;
+    await env.PROCESSING_BUCKET.put(metadataMismatchKey, bytes, {
+      httpMetadata: { contentType: "audio/wav" },
+      customMetadata: { sha256: "6".repeat(64) },
+    });
+    await expect(privateAudioBytes(env.PROCESSING_BUCKET, {
+      key: metadataMismatchKey,
+      sha256: digest,
+      byteLength: bytes.byteLength,
+      durationMs: 1_000,
+      contentType: "audio/wav",
+    })).rejects.toThrow("normalized private audio");
+    const bodyMismatchKey = `prepared/${operationKey}/audio/${"7".repeat(64)}.wav`;
+    const altered = new Uint8Array(bytes);
+    altered[0] = altered[0] === 0 ? 1 : altered[0]! - 1;
+    await env.PROCESSING_BUCKET.put(bodyMismatchKey, altered, {
+      httpMetadata: { contentType: "audio/wav" },
+      customMetadata: { sha256: digest },
+    });
+    await expect(privateAudioBytes(env.PROCESSING_BUCKET, {
+      key: bodyMismatchKey,
+      sha256: digest,
+      byteLength: altered.byteLength,
+      durationMs: 1_000,
+      contentType: "audio/wav",
+    })).rejects.toThrow("integrity check");
+    await env.PROCESSING_BUCKET.delete([key, metadataMismatchKey, bodyMismatchKey]);
+  });
+
   it("keeps a 15-minute, 2,700-word staged run under the R2 record bound with content-addressed artifacts", async () => {
     const settings = resolveWorkerSettings(env);
     const currentNow = Date.now();
@@ -453,6 +1209,7 @@ describe("workerd hosted upload boundary", () => {
       expectedQualityProfileRevision: 1,
       mediaSha256: "e".repeat(64),
       sessionKey: "f".repeat(64),
+      projectKey: "0".repeat(64),
       sourceByteLength: 5,
       sourceDurationMs: 15 * 60_000,
       operationId: "workerd-artifact-operation",
@@ -492,7 +1249,17 @@ describe("workerd hosted upload boundary", () => {
           { role: "word-timestamps", model: "fixture", requestHash: "e".repeat(64), responseHash: "f".repeat(64), store: null },
         ],
       },
-      captions: words.map((word, index) => ({ cueId: `caption-${index + 1}`, startMs: word.startMs, endMs: word.endMs, text: `Caption ${index + 1}`, speaker: "A", evidenceIds: [word.evidenceId] })),
+      captions: Array.from({ length: Math.ceil(words.length / 128) }, (_unused, index) => {
+        const cueWords = words.slice(index * 128, (index + 1) * 128);
+        return {
+          cueId: `caption-${index + 1}`,
+          startMs: cueWords[0]!.startMs,
+          endMs: cueWords.at(-1)!.endMs,
+          text: `Caption ${index + 1}`,
+          speaker: "A",
+          evidenceIds: cueWords.map((word) => word.evidenceId),
+        };
+      }),
       createdAtMs: currentNow,
       expiresAtMs: currentNow + 60_000,
     });
@@ -539,10 +1306,12 @@ describe("workerd hosted upload boundary", () => {
       stagedResult: staged,
       updatedAtMs: currentNow,
     });
-    // A later durable checkpoint must retain the earlier immutable state
-    // reference for exact cleanup rather than leaving it to lifecycle expiry.
+    // A later durable checkpoint replaces its superseded whole-state snapshot
+    // after the record CAS. Terminal cleanup still re-inventories the exact
+    // namespace, so a failed post-CAS delete remains discoverable.
     const firstCheckpoint = await store.load(claims);
     if (firstCheckpoint?.workflowState === undefined) throw new Error("expected first private workflow checkpoint");
+    const firstWorkflowStateRef = firstCheckpoint.workflowStateRef;
     await store.save({
       ...firstCheckpoint,
       workflowState: {
@@ -555,6 +1324,8 @@ describe("workerd hosted upload boundary", () => {
       },
       updatedAtMs: currentNow + 1,
     });
+    if (firstWorkflowStateRef === undefined) throw new Error("expected first compact workflow-state ref");
+    await expect(env.PROCESSING_BUCKET.head(firstWorkflowStateRef.key)).resolves.toBeNull();
     const raw = await env.PROCESSING_BUCKET.get(`prepared/${operationKey}/generation-runs/${runId}.json`);
     if (raw === null) throw new Error("expected bounded recovery record");
     expect(raw.size).toBeLessThan(2 * 1024 * 1024);
@@ -609,6 +1380,18 @@ describe("workerd hosted upload boundary", () => {
     // bridge has explicitly settled it (or the <=24h lifecycle backstop).
     const strandedOutput = temporaryMediaKeys[3]!;
     const writeLease = generationPreparationWriteLeaseKey(operationKey, strandedOutput);
+    // Model a workflow checkpoint PUT that survived a process crash before
+    // its compact record CAS. It is deliberately absent from `artifactRefs`;
+    // terminal cleanup must drain the bounded namespace, not trust only the
+    // last record inventory.
+    const strandedCheckpointDigest = "9".repeat(64);
+    const strandedCheckpoint = `prepared/${operationKey}/generation-runs/${runId}/artifacts/workflow-state-${strandedCheckpointDigest}.json`;
+    const checkpointWriteLease = generationArtifactWriteLeaseKey(operationKey, runId, strandedCheckpoint);
+    await env.PROCESSING_BUCKET.put(strandedCheckpoint, JSON.stringify({ crashed: true }));
+    await env.PROCESSING_BUCKET.put(checkpointWriteLease, JSON.stringify({
+      version: 1,
+      artifactKey: strandedCheckpoint,
+    }));
     await env.PROCESSING_BUCKET.put(writeLease, JSON.stringify({
       version: 1,
       outputKey: strandedOutput,
@@ -619,27 +1402,34 @@ describe("workerd hosted upload boundary", () => {
     });
     expect(await env.PROCESSING_BUCKET.head(strandedOutput)).not.toBeNull();
     expect(await env.PROCESSING_BUCKET.head(writeLease)).not.toBeNull();
+    expect(await env.PROCESSING_BUCKET.head(strandedCheckpoint)).not.toBeNull();
+    expect(await env.PROCESSING_BUCKET.head(checkpointWriteLease)).not.toBeNull();
     // A timestamp cannot prove an unabortable R2 writer drained. Even well
     // after the former lease expiry, this must remain a durable pending
     // tombstone rather than claim an exact cleanup that a late PUT can undo.
     const stillPendingCleanup = await store.cleanup({ claims, action: "discarded", nowMs: currentNow + 60_001 });
     expect(stillPendingCleanup).toMatchObject({ cleanup: { state: "pending", action: "discarded" } });
     expect(await env.PROCESSING_BUCKET.head(writeLease)).not.toBeNull();
+    expect(await env.PROCESSING_BUCKET.head(checkpointWriteLease)).not.toBeNull();
 
     // The bridge's normal completion path removes its own lease only after
     // its R2 write and terminal-marker checks settle. A retry can now rescan,
     // persist every exact output key, delete them, and complete cleanup.
     await env.PROCESSING_BUCKET.delete(writeLease);
+    await env.PROCESSING_BUCKET.delete(checkpointWriteLease);
     const resumedCleanup = await store.cleanup({ claims, action: "discarded", nowMs: currentNow + 60_002 });
     expect(resumedCleanup).toMatchObject({
       cleanup: { state: "completed", action: "discarded" },
     });
     expect(resumedCleanup?.cleanup?.artifactKeys).toEqual(expect.arrayContaining(cleanupKeys));
+    expect(resumedCleanup?.cleanup?.artifactKeys).toContain(strandedCheckpoint);
     await expect(env.PROCESSING_BUCKET.head(writeLease)).resolves.toBeNull();
+    await expect(env.PROCESSING_BUCKET.head(checkpointWriteLease)).resolves.toBeNull();
     expect(resumedCleanup?.stagedResult).toBeUndefined();
     expect(resumedCleanup?.workflowState).toBeUndefined();
     await Promise.all(references.map(async (reference) => expect(await env.PROCESSING_BUCKET.head(reference.key)).toBeNull()));
     await Promise.all(temporaryMediaKeys.map(async (key) => expect(await env.PROCESSING_BUCKET.head(key)).toBeNull()));
+    await expect(env.PROCESSING_BUCKET.head(strandedCheckpoint)).resolves.toBeNull();
     await expect(store.cleanup({ claims, action: "discarded", nowMs: currentNow + 3 })).resolves.toMatchObject({
       cleanup: { state: "completed", action: "discarded" },
     });
@@ -648,10 +1438,120 @@ describe("workerd hosted upload boundary", () => {
     await env.PROCESSING_BUCKET.delete(objects.objects.map((object: { readonly key: string }) => object.key));
   });
 
+  it("batches a >1,000-key real R2 cleanup and retains its pending tombstone when a later batch fails", async () => {
+    const settings = resolveWorkerSettings(env);
+    const currentNow = Date.now();
+    const operationKey = await sha256Hex(`workerd-cleanup-batches-${currentNow}`);
+    const runId = `generation-cleanup-batches-${currentNow}`;
+    const receipt = await issueGenerationRunReceipt({
+      runId,
+      projectId: "workerd-cleanup-batches",
+      targetTrack: "Captions",
+      expectedProjectRevision: 2,
+      expectedQualityProfileRevision: 1,
+      mediaSha256: "1".repeat(64),
+      sessionKey: "2".repeat(64),
+      projectKey: "3".repeat(64),
+      sourceByteLength: 5,
+      sourceDurationMs: 31_000,
+      operationId: "workerd-cleanup-batches-operation",
+      operationKey,
+      objectKey: `processing/${operationKey}`,
+      issuedAtMs: currentNow,
+      expiresAtMs: currentNow + 60_000,
+    }, settings);
+    const claims = await verifyGenerationRunReceipt(receipt, settings, currentNow);
+    const target = env.PROCESSING_BUCKET;
+    const artifactPrefix = `prepared/${operationKey}/generation-runs/${runId}/artifacts/`;
+    const artifactKeys = Array.from({ length: 1_001 }, (_unused, index) => (
+      `${artifactPrefix}provider-result-${index.toString(16).padStart(64, "0")}.json`
+    ));
+    // The recovery scanner validates keys rather than trusting a last record
+    // snapshot, so use actual R2 objects to cross the provider-artifact page.
+    await Promise.all(artifactKeys.map(async (artifactKey, index) => {
+      await target.put(artifactKey, JSON.stringify({ index }));
+    }));
+
+    let failLaterBatch = true;
+    const deleteBatches: number[] = [];
+    const flakyBucket = new Proxy(target, {
+      get(source, property, receiver) {
+        if (property === "delete") {
+          return async (candidate: string | readonly string[]) => {
+            const keys = typeof candidate === "string" ? [candidate] : [...candidate];
+            const isRunArtifactBatch = keys.some((key) => key.startsWith(artifactPrefix));
+            if (isRunArtifactBatch) {
+              deleteBatches.push(keys.length);
+              // This is the production R2 API contract; a future accidental
+              // one-shot delete is caught even if Miniflare is permissive.
+              expect(keys.length).toBeLessThanOrEqual(1_000);
+              if (failLaterBatch && deleteBatches.length === 2) {
+                failLaterBatch = false;
+                throw new Error("injected second cleanup batch failure");
+              }
+            }
+            return (source.delete as unknown as (input: string | readonly string[]) => Promise<void>)(candidate);
+          };
+        }
+        const value = Reflect.get(source, property, receiver);
+        return typeof value === "function" ? value.bind(source) : value;
+      },
+    }) as unknown as R2Bucket;
+    const store = new R2GenerationRunRecordStore(flakyBucket);
+    const cancelled = {
+      contractVersion: 1 as const,
+      runId,
+      projectId: claims.projectId,
+      targetTrack: "Captions" as const,
+      expectedProjectRevision: claims.expectedProjectRevision,
+      stage: "Cancelled" as const,
+    };
+    await store.save({
+      version: 1,
+      receipt,
+      claims,
+      uploadReceipt: "private-upload-receipt",
+      status: cancelled,
+      cancelled: true,
+      dispatched: true,
+      cleanup: {
+        version: 1,
+        state: "pending",
+        action: "cancelled",
+        artifactKeys: [],
+        requestedAtMs: currentNow,
+      },
+      updatedAtMs: currentNow,
+    });
+
+    const pending = await store.cleanup({ claims, action: "cancelled", nowMs: currentNow + 1 });
+    expect(deleteBatches).toEqual([1_000, 1]);
+    expect(pending).toMatchObject({
+      cleanup: { state: "pending", action: "cancelled", artifactKeys: expect.arrayContaining(artifactKeys) },
+    });
+    expect(await target.head(artifactKeys[0]!)).toBeNull();
+    expect(await target.head(artifactKeys.at(-1)!)).not.toBeNull();
+
+    // Repeating the exact tombstone inventory is idempotent: already-deleted
+    // first-batch keys are harmless, the stranded final key is drained, and
+    // only then may the durable cleanup acknowledgement become completed.
+    const completed = await store.cleanup({ claims, action: "cancelled", nowMs: currentNow + 2 });
+    expect(deleteBatches).toEqual([1_000, 1, 1_000, 1]);
+    expect(completed).toMatchObject({ cleanup: { state: "completed", action: "cancelled" } });
+    const remaining = await target.list({ prefix: artifactPrefix });
+    expect(remaining.objects).toEqual([]);
+
+    await target.delete([
+      `prepared/${operationKey}/generation-runs/${runId}.json`,
+      generationCleanupMarkerKey(operationKey),
+    ]);
+  });
+
   it("serializes duplicate operation creation in a real Durable Object, uses actual R2 multipart replay, and sets security headers", async () => {
     const anonymousSession = await session();
     const request = () => post("/api/uploads", {
       projectId: "workerd-project",
+      projectOwnerCapability: workerdProjectOwnerCapability,
       operationId: "workerd-operation",
       media: { byteLength: 5, durationMs: 60_000, contentType: "video/webm" },
       disclosureAccepted: true,
@@ -675,6 +1575,7 @@ describe("workerd hosted upload boundary", () => {
         "cf-connecting-ip": "203.0.113.10",
         "content-type": "video/webm",
         "x-cuebench-upload-capability": capability,
+        "x-cuebench-project-owner": workerdProjectOwnerCapability,
       },
       body: "hello",
     }));
@@ -693,6 +1594,7 @@ describe("workerd hosted upload boundary", () => {
         "cf-connecting-ip": "203.0.113.10",
         "content-type": "application/json",
         "x-cuebench-operation-receipt": receipt,
+        "x-cuebench-project-owner": workerdProjectOwnerCapability,
       },
       body: "{}",
     }));
@@ -709,6 +1611,7 @@ describe("workerd hosted upload boundary", () => {
     const anonymousSession = await session();
     const created = await SELF.fetch(post("/api/uploads", {
       projectId: "workerd-alarm-project",
+      projectOwnerCapability: workerdProjectOwnerCapability,
       operationId: "workerd-alarm-operation",
       media: { byteLength: 5, durationMs: 60_000, contentType: "video/webm" },
       disclosureAccepted: true,
@@ -752,6 +1655,7 @@ describe("workerd hosted upload boundary", () => {
     const anonymousSession = await session();
     const created = await SELF.fetch(post("/api/uploads", {
       projectId: "workerd-r2-abort-project",
+      projectOwnerCapability: workerdProjectOwnerCapability,
       operationId: "workerd-r2-abort-operation",
       media: { byteLength: 5, durationMs: 60_000, contentType: "video/webm" },
       disclosureAccepted: true,

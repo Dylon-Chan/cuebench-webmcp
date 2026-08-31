@@ -76,6 +76,67 @@ const normalizedTokens = (text: string): readonly string[] => {
   return normalized === "" ? [] : normalized.split(" ");
 };
 
+interface IndexedToken {
+  readonly token: string;
+  readonly wordIndex: number;
+}
+
+/**
+ * Deterministic LCS alignment: token sets hide duplicate words and reordering,
+ * whereas this preserves every position and chooses one stable traceback.
+ */
+const orderedTokenMatches = (
+  segmentTokens: readonly string[],
+  wordTokens: readonly IndexedToken[],
+): { readonly matchedWordTokenIndices: ReadonlySet<number>; readonly hasUnmatchedSegmentToken: boolean } => {
+  const matrix = Array.from(
+    { length: segmentTokens.length + 1 },
+    () => Array<number>(wordTokens.length + 1).fill(0),
+  );
+  for (let segmentIndex = segmentTokens.length - 1; segmentIndex >= 0; segmentIndex -= 1) {
+    for (let wordIndex = wordTokens.length - 1; wordIndex >= 0; wordIndex -= 1) {
+      matrix[segmentIndex]![wordIndex] = segmentTokens[segmentIndex] === wordTokens[wordIndex]!.token
+        ? matrix[segmentIndex + 1]![wordIndex + 1]! + 1
+        // Prefer consuming the segment side on an equal score. This makes
+        // duplicate-token alignment stable across engines and replay runs.
+        : Math.max(matrix[segmentIndex + 1]![wordIndex]!, matrix[segmentIndex]![wordIndex + 1]!);
+    }
+  }
+  const matchedWordTokenIndices = new Set<number>();
+  let segmentIndex = 0;
+  let wordIndex = 0;
+  while (segmentIndex < segmentTokens.length && wordIndex < wordTokens.length) {
+    if (
+      segmentTokens[segmentIndex] === wordTokens[wordIndex]!.token
+      && matrix[segmentIndex]![wordIndex] === matrix[segmentIndex + 1]![wordIndex + 1]! + 1
+    ) {
+      matchedWordTokenIndices.add(wordIndex);
+      segmentIndex += 1;
+      wordIndex += 1;
+    } else if (matrix[segmentIndex + 1]![wordIndex]! >= matrix[segmentIndex]![wordIndex + 1]!) {
+      segmentIndex += 1;
+    } else {
+      wordIndex += 1;
+    }
+  }
+  return {
+    matchedWordTokenIndices,
+    hasUnmatchedSegmentToken: matchedWordTokenIndices.size < segmentTokens.length,
+  };
+};
+
+const sameTokenMultiset = (left: readonly string[], right: readonly string[]): boolean => {
+  if (left.length !== right.length) return false;
+  const counts = new Map<string, number>();
+  for (const token of left) counts.set(token, (counts.get(token) ?? 0) + 1);
+  for (const token of right) {
+    const remaining = counts.get(token);
+    if (remaining === undefined || remaining === 0) return false;
+    counts.set(token, remaining - 1);
+  }
+  return [...counts.values()].every((count) => count === 0);
+};
+
 const assertIntervals = (segments: readonly DiarizedSegment[], words: WordTimestampTranscript): void => {
   const ids = new Set<string>();
   for (const segment of segments) {
@@ -183,10 +244,12 @@ export const alignCaptionEvidence = (
     .map((word, index) => ({ ...word, index }))
     .sort(stableWordOrder);
   const candidates: SpanCandidate[] = [];
+  const winnerByWordIndex = new Map<number, DiarizedSegment | undefined>();
   const alignedWords = words.map((word, wordPassIndex) => {
     const overlaps = orderedOverlaps(word, segments);
     const diarizationSegmentIds = overlaps.map((candidate) => candidate.segment.id).sort((left, right) => left.localeCompare(right));
     const winner = overlaps[0]?.segment;
+    winnerByWordIndex.set(wordPassIndex, winner);
     const aligned: AlignedWordEvidence = {
       id: `word:${word.startMs}:${word.endMs}:${wordPassIndex}`,
       text: word.text,
@@ -214,18 +277,63 @@ export const alignCaptionEvidence = (
         diarizationSegmentIds,
       });
     }
-    const speakerTokens = new Set(normalizedTokens(winner!.text));
-    if (!normalizedTokens(word.text).every((token) => speakerTokens.has(token))) {
-      candidates.push({
-        reason: "TranscriptDisagreement",
-        wordIndex: wordPassIndex,
-        word: aligned,
-        diarizationSegmentIds,
-      });
-    }
     return aligned;
   });
-  return { words: alignedWords, uncertaintySpans: uncertaintySpans(candidates) };
+  const transcriptDisagreementWordIndexes = new Set<number>();
+  for (const segment of segments) {
+    const assigned = alignedWords
+      .map((word, wordIndex) => ({ word, wordIndex }))
+      .filter(({ wordIndex }) => winnerByWordIndex.get(wordIndex)?.id === segment.id);
+    if (assigned.length === 0) continue;
+    const wordTokens: IndexedToken[] = assigned.flatMap(({ word, wordIndex }) => (
+      normalizedTokens(word.text).map((token) => ({ token, wordIndex }))
+    ));
+    const segmentTokens = normalizedTokens(segment.text);
+    const matches = orderedTokenMatches(segmentTokens, wordTokens);
+    const matchedByWord = new Map<number, number>();
+    for (const tokenIndex of matches.matchedWordTokenIndices) {
+      const owner = wordTokens[tokenIndex]?.wordIndex;
+      if (owner !== undefined) matchedByWord.set(owner, (matchedByWord.get(owner) ?? 0) + 1);
+    }
+    const reorderedEqualMultiset = sameTokenMultiset(segmentTokens, wordTokens.map((token) => token.token))
+      && matches.matchedWordTokenIndices.size < segmentTokens.length;
+    let hasUnmatchedWordToken = false;
+    for (const { word, wordIndex } of assigned) {
+      const tokenCount = normalizedTokens(word.text).length;
+      if (reorderedEqualMultiset || (matchedByWord.get(wordIndex) ?? 0) !== tokenCount) {
+        hasUnmatchedWordToken = true;
+        transcriptDisagreementWordIndexes.add(wordIndex);
+      }
+    }
+    // A diarization-only deletion has no one word token to flag. Tie it to
+    // every winner-assigned word in that segment so a reviewer sees the
+    // missing source phrase instead of silently accepting a false match.
+    if (matches.hasUnmatchedSegmentToken && !hasUnmatchedWordToken) {
+      for (const { wordIndex } of assigned) transcriptDisagreementWordIndexes.add(wordIndex);
+    }
+  }
+  for (const wordIndex of [...transcriptDisagreementWordIndexes].sort((left, right) => left - right)) {
+    const word = alignedWords[wordIndex]!;
+    candidates.push({
+      reason: "TranscriptDisagreement",
+      wordIndex,
+      word,
+      diarizationSegmentIds: word.diarizationSegmentIds,
+    });
+  }
+  const reasonOrder: Readonly<Record<UncertaintyReason, number>> = {
+    AmbiguousSpeakerEvidence: 0,
+    TranscriptDisagreement: 1,
+    NoSpeakerEvidence: 2,
+  };
+  return {
+    words: alignedWords,
+    uncertaintySpans: uncertaintySpans([...candidates].sort((left, right) => (
+      left.wordIndex - right.wordIndex
+      || reasonOrder[left.reason] - reasonOrder[right.reason]
+      || left.word.id.localeCompare(right.word.id)
+    ))),
+  };
 };
 
 /** Performs both ports then makes the deterministic alignment available to the Workflow. */

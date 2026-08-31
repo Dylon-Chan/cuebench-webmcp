@@ -45,6 +45,8 @@ export interface PersistedCloudUpload {
   readonly sourceSha256: string;
   readonly sourceContentType: string;
   readonly durationMs: number;
+  /** Stable non-portable browser-project owner secret; never included in backups. */
+  readonly projectOwnerCapability: string;
   /** Opaque anonymous bearer needed to resume this exact owner-bound operation. */
   readonly session?: string;
   /** Session expiry is persisted so a stale browser tab cannot silently reuse it. */
@@ -67,6 +69,11 @@ export interface UploadCloudProcessingCopyInput {
   /** SHA-256 from the locally ingested project media, never a server guess. */
   readonly sourceSha256: string;
   readonly durationMs: number;
+  /**
+   * Stable non-portable project-instance capability read from IndexedDB.
+   * Optional cloud work may never mint or recover this from localStorage.
+   */
+  readonly projectOwnerCapability: string;
   /** Must be an affirmative UI choice; the client never infers consent. */
   readonly disclosureAccepted: boolean;
   readonly receiptStore?: CloudUploadReceiptStore;
@@ -80,7 +87,7 @@ export interface CloudUploadResult {
   readonly operation: PersistedCloudUpload;
 }
 
-export type PersistedCloudUploadRecovery = Pick<PersistedCloudUpload, "operationId" | "sourceByteLength" | "sourceSha256" | "durationMs"> & Partial<Pick<PersistedCloudUpload, "session" | "sessionExpiresAtMs" | "operationReceipt" | "uploadCapability">>;
+export type PersistedCloudUploadRecovery = Pick<PersistedCloudUpload, "operationId" | "sourceByteLength" | "sourceSha256" | "durationMs" | "projectOwnerCapability"> & Partial<Pick<PersistedCloudUpload, "session" | "sessionExpiresAtMs" | "operationReceipt" | "uploadCapability">>;
 
 export interface CancelCloudProcessingCopyInput {
   readonly fetcher?: CloudUploadFetch;
@@ -88,6 +95,7 @@ export interface CancelCloudProcessingCopyInput {
   readonly projectId: string;
   readonly operationId: string;
   readonly receipt: string;
+  readonly projectOwnerCapability: string;
   readonly receiptStore?: CloudUploadReceiptStore;
 }
 
@@ -139,6 +147,11 @@ const sourceSha256 = (value: unknown, fallback: string): string => {
   return value.toLowerCase();
 };
 
+const projectOwnerCapability = (value: unknown, fallback: string): string => {
+  if (typeof value !== "string" || !/^[0-9a-f]{64}$/i.test(value)) throw new CloudUploadError(fallback);
+  return value.toLowerCase();
+};
+
 const responseError = async (response: Response, fallback: string): Promise<CloudUploadError> => {
   try {
     const body = await response.json() as { readonly error?: Readonly<Record<string, unknown>> };
@@ -182,7 +195,7 @@ const parseWorkerOperation = (value: unknown): WorkerOperationResponse => {
   };
 };
 
-const parseStored = (value: unknown, input: Pick<UploadCloudProcessingCopyInput, "projectId" | "operationId" | "source" | "sourceSha256" | "durationMs">): PersistedCloudUpload | null => {
+const parseStored = (value: unknown, input: Pick<UploadCloudProcessingCopyInput, "projectId" | "operationId" | "source" | "sourceSha256" | "durationMs" | "projectOwnerCapability">): PersistedCloudUpload | null => {
   if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
   const record = value as Readonly<Record<string, unknown>>;
   if (
@@ -193,6 +206,8 @@ const parseStored = (value: unknown, input: Pick<UploadCloudProcessingCopyInput,
     || record.sourceSha256 !== input.sourceSha256.toLowerCase()
     || record.sourceContentType !== input.source.type.trim().toLowerCase()
     || record.durationMs !== input.durationMs
+    || typeof record.projectOwnerCapability !== "string" || !/^[0-9a-f]{64}$/i.test(record.projectOwnerCapability)
+    || record.projectOwnerCapability.toLowerCase() !== input.projectOwnerCapability.toLowerCase()
     || !Number.isSafeInteger(record.partSize)
     || !Number.isSafeInteger(record.partCount)
     || typeof record.partReceipts !== "object"
@@ -211,6 +226,7 @@ const parseStored = (value: unknown, input: Pick<UploadCloudProcessingCopyInput,
       sourceSha256: sourceSha256(record.sourceSha256, "CueBench's saved source identity is incomplete."),
       sourceContentType: input.source.type.trim().toLowerCase(),
       durationMs: input.durationMs,
+      projectOwnerCapability: projectOwnerCapability(record.projectOwnerCapability, "CueBench's saved browser-project owner identity is incomplete."),
       ...(typeof record.session === "string" && record.session.length > 0 ? { session: record.session } : {}),
       ...(Number.isSafeInteger(record.sessionExpiresAtMs) && (record.sessionExpiresAtMs as number) > 0 ? { sessionExpiresAtMs: record.sessionExpiresAtMs as number } : {}),
       operationReceipt: opaqueString(record.operationReceipt, "CueBench's saved private-operation receipt is incomplete."),
@@ -235,6 +251,7 @@ const createOperation = async (input: UploadCloudProcessingCopyInput, fetcher: C
     body: JSON.stringify({
       projectId: input.projectId,
       operationId: input.operationId,
+      projectOwnerCapability: projectOwnerCapability(input.projectOwnerCapability, "CueBench needs a stable browser-project owner identity before optional cloud processing."),
       media: {
         byteLength: input.source.size,
         durationMs: input.durationMs,
@@ -254,6 +271,7 @@ const createOperation = async (input: UploadCloudProcessingCopyInput, fetcher: C
       sourceSha256: sourceSha256(input.sourceSha256, "CueBench needs the browser-canonical source identity before uploading."),
       sourceContentType: input.source.type.trim().toLowerCase(),
       durationMs: input.durationMs,
+      projectOwnerCapability: projectOwnerCapability(input.projectOwnerCapability, "CueBench needs a stable browser-project owner identity before optional cloud processing."),
       session: input.session,
       ...(input.sessionExpiresAtMs === undefined ? {} : { sessionExpiresAtMs: input.sessionExpiresAtMs }),
       operationReceipt: worker.operationReceipt,
@@ -272,6 +290,8 @@ export const loadPersistedCloudUpload = (
   projectId: string,
   expectedSource: { readonly sha256: string; readonly durationMs: number } | undefined = undefined,
   store: CloudUploadReceiptStore | null = defaultReceiptStore(),
+  /** The current non-portable IndexedDB project-instance capability. */
+  expectedProjectOwnerCapability: string | undefined = undefined,
 ): PersistedCloudUploadRecovery | null => {
   const value = store?.load(receiptKey(projectId));
   if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
@@ -289,6 +309,7 @@ export const loadPersistedCloudUpload = (
         sourceByteLength: record.sourceByteLength as number,
         sourceSha256: sourceSha256(record.sourceSha256, "CueBench's saved source identity is incomplete."),
         durationMs: record.durationMs as number,
+        projectOwnerCapability: projectOwnerCapability(record.projectOwnerCapability, "CueBench's saved browser-project owner identity is incomplete."),
     ...(typeof record.session === "string" && record.session.length > 0 ? { session: record.session } : {}),
     ...(Number.isSafeInteger(record.sessionExpiresAtMs) && (record.sessionExpiresAtMs as number) > 0 ? { sessionExpiresAtMs: record.sessionExpiresAtMs as number } : {}),
     ...(typeof record.operationReceipt === "string" && record.operationReceipt.length > 0 ? { operationReceipt: record.operationReceipt } : {}),
@@ -304,10 +325,17 @@ export const loadPersistedCloudUpload = (
       recovered.sourceSha256 !== expectedSource.sha256.toLowerCase()
       || recovered.durationMs !== expectedSource.durationMs
     ))
+    || (expectedProjectOwnerCapability !== undefined && (
+      recovered.projectOwnerCapability !== projectOwnerCapability(
+        expectedProjectOwnerCapability,
+        "CueBench needs the current browser-project owner identity before restoring private upload recovery.",
+      )
+    ))
   ) {
-    // A receipt can authorize a different private media object. Never restore
-    // it after the local project source changed.
-    store?.remove(receiptKey(projectId));
+    // A receipt can authorize a different private media object or an older
+    // imported project instance. Reject it without relying on a mutable
+    // localStorage delete for correctness: another tab may still be reading
+    // that opaque tombstone while IndexedDB has already rotated the owner.
     return null;
   }
   return recovered;
@@ -340,6 +368,7 @@ const refreshOperation = async (input: UploadCloudProcessingCopyInput, fetcher: 
     headers: {
       authorization: `Bearer ${input.session}`,
       "x-cuebench-operation-receipt": operation.operationReceipt,
+      "x-cuebench-project-owner": projectOwnerCapability(input.projectOwnerCapability, "CueBench needs a stable browser-project owner identity before optional cloud processing."),
     },
   });
   if (!response.ok) throw await responseError(response, "CueBench could not refresh this private upload's resumable state.");
@@ -347,6 +376,7 @@ const refreshOperation = async (input: UploadCloudProcessingCopyInput, fetcher: 
   return {
     operation: {
       ...operation,
+      projectOwnerCapability: projectOwnerCapability(input.projectOwnerCapability, "CueBench needs a stable browser-project owner identity before optional cloud processing."),
       session: input.session,
       ...(input.sessionExpiresAtMs === undefined ? {} : { sessionExpiresAtMs: input.sessionExpiresAtMs }),
       operationReceipt: worker.operationReceipt,
@@ -387,12 +417,16 @@ export const uploadCloudProcessingCopy = async (input: UploadCloudProcessingCopy
   if (!contentType.startsWith("video/")) throw new CloudUploadError("Choose a supported local video before starting cloud processing.");
   const fetcher = input.fetcher ?? defaultFetcher();
   const store = input.receiptStore ?? defaultReceiptStore();
-  const saved = parseStored(store?.load(receiptKey(input.projectId)) ?? null, input);
+  const ownerBoundInput: UploadCloudProcessingCopyInput = {
+    ...input,
+    projectOwnerCapability: projectOwnerCapability(input.projectOwnerCapability, "CueBench needs a stable browser-project owner identity before optional cloud processing."),
+  };
+  const saved = parseStored(store?.load(receiptKey(input.projectId)) ?? null, ownerBoundInput);
   let state: { readonly operation: PersistedCloudUpload; readonly uploadedPartNumbers: readonly number[]; readonly status: string };
   try {
     state = saved === null
-      ? await createOperation(input, fetcher)
-      : await refreshOperation(input, fetcher, saved);
+      ? await createOperation(ownerBoundInput, fetcher)
+      : await refreshOperation(ownerBoundInput, fetcher, saved);
   } catch (error) {
     if (error instanceof CloudUploadError && error.details.code === "UPLOAD_EXPIRED" && error.details.nextAction === "start-new-operation") {
       clearPersistedCloudUpload(input.projectId, store);
@@ -403,7 +437,7 @@ export const uploadCloudProcessingCopy = async (input: UploadCloudProcessingCopy
   persist(store, operation);
   if (state.status === "creating") {
     try {
-      state = await refreshOperation(input, fetcher, operation);
+      state = await refreshOperation(ownerBoundInput, fetcher, operation);
     } catch (error) {
       if (error instanceof CloudUploadError && error.details.code === "UPLOAD_EXPIRED" && error.details.nextAction === "start-new-operation") clearPersistedCloudUpload(input.projectId, store);
       throw error;
@@ -427,6 +461,7 @@ export const uploadCloudProcessingCopy = async (input: UploadCloudProcessingCopy
         authorization: `Bearer ${input.session}`,
         "content-type": contentType,
         "x-cuebench-upload-capability": operation.uploadCapability,
+        "x-cuebench-project-owner": ownerBoundInput.projectOwnerCapability,
       },
       body: part,
     });
@@ -444,9 +479,10 @@ export const uploadCloudProcessingCopy = async (input: UploadCloudProcessingCopy
   const completion = await fetcher(`/api/uploads/${encodeURIComponent(input.operationId)}/complete`, {
     method: "POST",
     headers: {
-      authorization: `Bearer ${input.session}`,
-      "content-type": "application/json",
-      "x-cuebench-operation-receipt": operation.operationReceipt,
+        authorization: `Bearer ${input.session}`,
+        "content-type": "application/json",
+        "x-cuebench-operation-receipt": operation.operationReceipt,
+        "x-cuebench-project-owner": ownerBoundInput.projectOwnerCapability,
     },
     body: "{}",
   });
@@ -468,6 +504,7 @@ export const cancelCloudProcessingCopy = async (input: CancelCloudProcessingCopy
     headers: {
       authorization: `Bearer ${input.session}`,
       "x-cuebench-operation-receipt": input.receipt,
+      "x-cuebench-project-owner": projectOwnerCapability(input.projectOwnerCapability, "CueBench needs a stable browser-project owner identity before optional cleanup."),
     },
   });
   if (!response.ok) {

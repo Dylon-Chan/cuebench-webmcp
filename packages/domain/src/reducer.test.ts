@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { LocalCaptionEvidencePackage, StagedGenerationResult } from "@cuebench/contracts";
-import { applyCommand, createProject, type CaptionProject, type DomainCommand } from "./index";
+import { applyCommand, createProject, prepareTrackExport, validateProject, type CaptionProject, type DomainCommand } from "./index";
 import { fixtureProject } from "../test/fixtures";
 
 describe("domain reducer", () => {
@@ -217,6 +217,206 @@ describe("domain reducer", () => {
       cueBindings: [{ cueId: "generated-1", itemId: "generated-1", evidenceIds: ["word-1"] }],
       evidence: { words: [{ evidenceId: "word-1", text: "Generated" }] },
     });
+  });
+
+  it("never evicts Local Evidence Packages referenced by live Sustained cues and prunes only unreferenced history", () => {
+    const base = fixtureProject({ cueState: "Sustained" });
+    const evidencePackage = (runId: string, retainedAtMs: number, bindSustained: boolean): LocalCaptionEvidencePackage => ({
+      packageId: `generation-${runId}`,
+      runId,
+      projectId: base.projectId,
+      mediaSha256: base.media.sha256,
+      expectedProjectRevision: base.projectRevision,
+      expectedQualityProfileRevision: base.qualityProfile.revision,
+      retainedAtMs,
+      evidence: {
+        contractVersion: 1,
+        runId,
+        projectId: base.projectId,
+        mediaSha256: base.media.sha256,
+        preparedManifest: { key: `prepared/${runId}/manifest.json`, sha256: "b".repeat(64) },
+        normalizedAudio: { key: `prepared/${runId}/audio.wav`, sha256: "c".repeat(64), byteLength: 4, durationMs: base.media.durationMs, contentType: "audio/wav" },
+        words: [{ evidenceId: `${runId}-word`, sourceWordIndex: 0, startMs: 1_000, endMs: 1_500, text: "Sustained", speaker: "Teacher", speakerSegmentIds: [`${runId}-speaker`] }],
+        uncertaintySpans: [],
+        provenance: [
+          { role: "diarization", model: "fixture", requestHash: "d".repeat(64), responseHash: "e".repeat(64), store: null, requestMetadata: {}, warnings: [] },
+          { role: "word-timestamps", model: "fixture", requestHash: "f".repeat(64), responseHash: "0".repeat(64), store: null, requestMetadata: {}, warnings: [] },
+        ],
+      },
+      cueBindings: bindSustained
+        ? [{ cueId: "c05", itemId: "c05", itemRevision: 1, evidenceIds: [`${runId}-word`] }]
+        : [],
+    });
+    const stagedFor = (leased: CaptionProject): StagedGenerationResult => ({
+      contractVersion: 1,
+      runId: "run-retention-new",
+      projectId: leased.projectId,
+      targetTrack: "Captions",
+      expectedProjectRevision: leased.projectRevision,
+      expectedQualityProfileRevision: leased.qualityProfile.revision,
+      createdAtMs: 1_700_000_010_000,
+      expiresAtMs: 1_700_086_410_000,
+      evidence: {
+        contractVersion: 1,
+        runId: "run-retention-new",
+        projectId: leased.projectId,
+        mediaSha256: leased.media.sha256,
+        preparedManifest: { key: "prepared/new/manifest.json", sha256: "b".repeat(64) },
+        normalizedAudio: { key: "prepared/new/audio.wav", sha256: "c".repeat(64), byteLength: 4, durationMs: leased.media.durationMs, contentType: "audio/wav" },
+        words: [{ evidenceId: "new-word", sourceWordIndex: 0, startMs: 6_000, endMs: 7_000, text: "Generated", speaker: "Teacher", speakerSegmentIds: ["new-speaker"] }],
+        uncertaintySpans: [],
+        provenance: [
+          { role: "diarization", model: "fixture", requestHash: "d".repeat(64), responseHash: "e".repeat(64), store: null, requestMetadata: {}, warnings: [] },
+          { role: "word-timestamps", model: "fixture", requestHash: "f".repeat(64), responseHash: "0".repeat(64), store: null, requestMetadata: {}, warnings: [] },
+        ],
+      },
+      captions: [{ cueId: "retention-generated", startMs: 6_000, endMs: 7_000, text: "Generated", speaker: "Teacher", evidenceIds: ["new-word"] }],
+    });
+    const adopt = (project: CaptionProject) => {
+      const leased = applyCommand(project, {
+        type: "StartGenerationRun",
+        actor: { type: "CueBenchAI", id: "cuebench-ai" },
+        runId: "run-retention-new",
+        targetTrack: "Captions",
+        expectedProjectRevision: project.projectRevision,
+      }).project;
+      return applyCommand(leased, {
+        type: "AdoptCaptionGenerationResult",
+        actor: { type: "CueBenchAI", id: "cuebench-ai" },
+        runId: "run-retention-new",
+        expectedProjectRevision: leased.projectRevision,
+        expectedQualityProfileRevision: leased.qualityProfile.revision,
+        confirmedProposedReplacement: true,
+        result: stagedFor(leased),
+      });
+    };
+
+    const blocked = adopt({
+      ...base,
+      localEvidencePackages: [1, 2, 3, 4].map((index) => evidencePackage(`sustained-${index}`, index, true)),
+    });
+    expect(blocked.error?.code).toBe("INVALID_ARGUMENT");
+    expect(blocked.project.localEvidencePackages.map((entry) => entry.runId)).toEqual([
+      "sustained-1", "sustained-2", "sustained-3", "sustained-4",
+    ]);
+
+    const retained = adopt({
+      ...base,
+      localEvidencePackages: [
+        evidencePackage("sustained-1", 1, true),
+        evidencePackage("sustained-2", 2, true),
+        evidencePackage("sustained-3", 3, true),
+        evidencePackage("old-unreferenced-1", 4, false),
+        evidencePackage("old-unreferenced-2", 5, false),
+      ],
+    });
+    expect(retained.error).toBeUndefined();
+    expect(retained.project.localEvidencePackages.map((entry) => entry.runId)).toEqual([
+      "sustained-1", "sustained-2", "sustained-3", "run-retention-new",
+    ]);
+
+    const fullUnreferencedHistory: LocalCaptionEvidencePackage = {
+      ...evidencePackage("word-budget-old", 1, false),
+      evidence: {
+        ...evidencePackage("word-budget-old", 1, false).evidence,
+        words: Array.from({ length: 2_700 }, (_, index) => ({
+          evidenceId: `word-budget-old-${index}`,
+          sourceWordIndex: index,
+          startMs: index * 2,
+          endMs: index * 2 + 1,
+          text: "History",
+          speaker: "Teacher",
+          speakerSegmentIds: [],
+        })),
+      },
+    };
+    const prunedForSharedPortableBudget = adopt({
+      ...base,
+      localEvidencePackages: [fullUnreferencedHistory],
+    });
+    expect(prunedForSharedPortableBudget.error).toBeUndefined();
+    // The current package must remain adoptable, so an unreferenced retained
+    // package is evicted when its 2,700 words would otherwise make the
+    // portable aggregate exceed the shared evidence/node budget.
+    expect(prunedForSharedPortableBudget.project.localEvidencePackages.map((entry) => entry.runId)).toEqual([
+      "run-retention-new",
+    ]);
+  });
+
+  const sustainedPartitionCases = [
+    { label: "start", cueId: "start-overlap", startMs: 500, endMs: 1_500, words: [[500, 900, "Before"], [1_100, 1_400, "Protected"]], expectedIds: ["start-overlap-part-1"] },
+    { label: "middle", cueId: "middle-overlap", startMs: 500, endMs: 3_500, words: [[500, 900, "Before"], [1_100, 1_400, "Protected"], [3_100, 3_400, "After"]], expectedIds: ["middle-overlap-part-1", "middle-overlap-part-2"] },
+    { label: "end", cueId: "end-overlap", startMs: 2_500, endMs: 3_500, words: [[2_600, 2_900, "Protected"], [3_100, 3_400, "After"]], expectedIds: ["end-overlap-part-1"] },
+  ] satisfies readonly {
+    readonly label: string;
+    readonly cueId: string;
+    readonly startMs: number;
+    readonly endMs: number;
+    readonly words: readonly (readonly [number, number, string])[];
+    readonly expectedIds: readonly string[];
+  }[];
+  it.each(sustainedPartitionCases)("partitions generated $label overlap around a Sustained cue before adoption/export", ({ cueId, startMs, endMs, words, expectedIds }) => {
+    const leased = applyCommand(fixtureProject({ cueState: "Sustained" }), {
+      type: "StartGenerationRun",
+      actor: { type: "CueBenchAI", id: "cuebench-ai" },
+      runId: `run-${cueId}`,
+      targetTrack: "Captions",
+      expectedProjectRevision: 1,
+    }).project;
+    const evidenceWords = words.map(([wordStartMs, wordEndMs, text], index) => ({
+      evidenceId: `${cueId}-word-${index + 1}`,
+      sourceWordIndex: index,
+      startMs: wordStartMs,
+      endMs: wordEndMs,
+      text,
+      speaker: "Teacher",
+      speakerSegmentIds: ["speaker-1"],
+    }));
+    const staged: StagedGenerationResult = {
+      contractVersion: 1,
+      runId: `run-${cueId}`,
+      projectId: leased.projectId,
+      targetTrack: "Captions",
+      expectedProjectRevision: leased.projectRevision,
+      expectedQualityProfileRevision: leased.qualityProfile.revision,
+      createdAtMs: 1_700_000_000_000,
+      expiresAtMs: 1_700_086_400_000,
+      evidence: {
+        contractVersion: 1,
+        runId: `run-${cueId}`,
+        projectId: leased.projectId,
+        mediaSha256: leased.media.sha256,
+        preparedManifest: { key: "prepared/a/manifests/b.json", sha256: "b".repeat(64) },
+        normalizedAudio: { key: "prepared/a/audio/c.wav", sha256: "c".repeat(64), byteLength: 4, durationMs: leased.media.durationMs, contentType: "audio/wav" },
+        words: evidenceWords,
+        uncertaintySpans: [],
+        provenance: [
+          { role: "diarization", model: "fixture", requestHash: "d".repeat(64), responseHash: "e".repeat(64), store: null, requestMetadata: {}, warnings: [] },
+          { role: "word-timestamps", model: "fixture", requestHash: "f".repeat(64), responseHash: "0".repeat(64), store: null, requestMetadata: {}, warnings: [] },
+        ],
+      },
+      captions: [{ cueId, startMs, endMs, text: words.map(([, , value]) => value).join(" "), speaker: "Teacher", evidenceIds: evidenceWords.map((word) => word.evidenceId) }],
+    };
+    const adopted = applyCommand(leased, {
+      type: "AdoptCaptionGenerationResult",
+      actor: { type: "CueBenchAI", id: "cuebench-ai" },
+      runId: staged.runId,
+      expectedProjectRevision: leased.projectRevision,
+      expectedQualityProfileRevision: leased.qualityProfile.revision,
+      confirmedProposedReplacement: true,
+      result: staged,
+    });
+
+    expect(adopted.error).toBeUndefined();
+    expect(adopted.project.captions.items.c05?.current.state).toBe("Sustained");
+    expect(adopted.project.captions.order.filter((itemId) => itemId.startsWith(cueId))).toEqual(expectedIds);
+    const sustained = adopted.project.captions.items.c05!.current;
+    for (const generatedId of expectedIds) {
+      const generated = adopted.project.captions.items[generatedId]!.current;
+      expect(generated.endMs <= sustained.startMs || generated.startMs >= sustained.endMs).toBe(true);
+    }
+    expect(validateProject(adopted.project).findings.some((finding) => finding.ruleId === "caption.no-overlap" && finding.severity === "blocker")).toBe(false);
+    expect(prepareTrackExport({ project: adopted.project, trackKind: "Captions", format: "vtt", disposition: "draft" }).roundTrip).toEqual({ ok: true });
   });
 
   it("removes canonical local caption evidence when a Human relinks different media", () => {

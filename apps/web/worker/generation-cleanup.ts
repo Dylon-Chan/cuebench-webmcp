@@ -27,3 +27,23 @@ export const generationPreparationWriteLeaseKey = (operationKey: string, outputK
   }
   return `prepared/${operationKey}/generation-inflight/${match[1]}-${match[2]}.json`;
 };
+
+/**
+ * Workflow checkpoints are immutable R2 objects too. They use their own
+ * scoped writer lease so terminal cleanup can drain a provider/Workflow write
+ * that started immediately before its operation fence was published.
+ */
+export const generationArtifactWriteLeaseKey = (
+  operationKey: string,
+  runId: string,
+  artifactKey: string,
+): string => {
+  if (!/^[A-Za-z0-9_-]{1,128}$/.test(runId)) {
+    throw new Error("CueBench cannot create a generation-artifact lease for an invalid run id.");
+  }
+  const match = artifactKey.match(new RegExp(`^prepared/${operationKey}/generation-runs/${runId}/artifacts/(workflow-state|staged-result|provider-result)-([a-f0-9]{64})\\.json$`));
+  if (match === null || match[1] === undefined || match[2] === undefined) {
+    throw new Error("CueBench cannot create a generation-artifact lease for an invalid private checkpoint key.");
+  }
+  return `prepared/${operationKey}/generation-inflight/artifact/${runId}/${match[1]}-${match[2]}.json`;
+};

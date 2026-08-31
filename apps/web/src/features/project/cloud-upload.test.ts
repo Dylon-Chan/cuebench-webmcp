@@ -15,6 +15,7 @@ import {
 
 const source = (): Blob => new Blob(["hello"], { type: "video/webm" });
 const sourceSha256 = "a".repeat(64);
+const projectOwnerCapability = "1".repeat(64);
 
 const operation = (overrides: Record<string, unknown> = {}) => ({
   operationReceipt: "opaque-operation-receipt",
@@ -53,6 +54,7 @@ describe("resumable cloud upload client", () => {
       source: source(),
       sourceSha256,
       durationMs: 60_000,
+      projectOwnerCapability,
       disclosureAccepted: false,
     })).rejects.toThrow(/accept.*cloud processing/i);
 
@@ -75,6 +77,7 @@ describe("resumable cloud upload client", () => {
       source: source(),
       sourceSha256,
       durationMs: 60_000,
+      projectOwnerCapability,
       disclosureAccepted: true,
       receiptStore: persisted.store,
     });
@@ -106,6 +109,7 @@ describe("resumable cloud upload client", () => {
       sourceSha256,
       sourceContentType: "video/webm",
       durationMs: 60_000,
+      projectOwnerCapability: "1".repeat(64),
       operationReceipt: "opaque-operation-receipt",
       uploadCapability: "expired-capability",
       partSize: 3,
@@ -126,6 +130,7 @@ describe("resumable cloud upload client", () => {
       source: source(),
       sourceSha256,
       durationMs: 60_000,
+      projectOwnerCapability,
       disclosureAccepted: true,
       receiptStore: persisted.store,
     });
@@ -152,6 +157,7 @@ describe("resumable cloud upload client", () => {
       source: source(),
       sourceSha256,
       durationMs: 60_000,
+      projectOwnerCapability,
       disclosureAccepted: true,
     })).rejects.toMatchObject({ details: { code: "UNSUPPORTED_ERROR_VERSION", status: 503, retrySafe: false } });
   });
@@ -187,6 +193,7 @@ describe("resumable cloud upload client", () => {
       sourceSha256,
       sourceContentType: "video/webm",
       durationMs: 60_000,
+      projectOwnerCapability: "1".repeat(64),
       operationReceipt: "expired-opaque-receipt",
       uploadCapability: "expired-capability",
       partSize: 3,
@@ -205,6 +212,7 @@ describe("resumable cloud upload client", () => {
       source: source(),
       sourceSha256,
       durationMs: 60_000,
+      projectOwnerCapability,
       disclosureAccepted: true,
       receiptStore: persisted.store,
     })).rejects.toMatchObject({ details: { code: "UPLOAD_EXPIRED", status: 410, nextAction: "start-new-operation" } });
@@ -214,7 +222,7 @@ describe("resumable cloud upload client", () => {
     expect(persisted.values.size).toBe(0);
   });
 
-  it("invalidates a restored receipt when the browser project source changed", () => {
+  it("invalidates a restored receipt when the browser project source changed without relying on localStorage deletion", () => {
     const persisted = receiptStore();
     persisted.store.save("cuebench-cloud-upload:project-fixture", {
       version: 1,
@@ -224,6 +232,7 @@ describe("resumable cloud upload client", () => {
       sourceSha256,
       sourceContentType: "video/webm",
       durationMs: 60_000,
+      projectOwnerCapability: "1".repeat(64),
       operationReceipt: "opaque-operation-receipt",
       uploadCapability: "opaque-capability",
       partSize: 3,
@@ -236,7 +245,34 @@ describe("resumable cloud upload client", () => {
       { sha256: "b".repeat(64), durationMs: 60_000 },
       persisted.store,
     )).toBeNull();
-    expect(persisted.values.size).toBe(0);
+    expect(persisted.values.size).toBe(1);
+  });
+
+  it("rejects an old imported project-instance owner receipt without deleting the opaque local recovery record", () => {
+    const persisted = receiptStore();
+    persisted.store.save("cuebench-cloud-upload:project-fixture", {
+      version: 1,
+      projectId: "project-fixture",
+      operationId: "operation-fixture",
+      sourceByteLength: 5,
+      sourceSha256,
+      sourceContentType: "video/webm",
+      durationMs: 60_000,
+      projectOwnerCapability,
+      operationReceipt: "opaque-operation-receipt",
+      uploadCapability: "opaque-capability",
+      partSize: 3,
+      partCount: 2,
+      partReceipts: {},
+    });
+
+    expect(loadPersistedCloudUpload(
+      "project-fixture",
+      { sha256: sourceSha256, durationMs: 60_000 },
+      persisted.store,
+      "2".repeat(64),
+    )).toBeNull();
+    expect(persisted.values.get("cuebench-cloud-upload:project-fixture")).toMatchObject({ projectOwnerCapability });
   });
 
   it("uses a same-origin Turnstile token and opaque idempotency key to create its anonymous session", async () => {
@@ -265,6 +301,7 @@ describe("resumable cloud upload client", () => {
       projectId: "project-fixture",
       operationId: "operation-fixture",
       receipt: "opaque-receipt",
+      projectOwnerCapability,
       receiptStore: persisted.store,
     });
 

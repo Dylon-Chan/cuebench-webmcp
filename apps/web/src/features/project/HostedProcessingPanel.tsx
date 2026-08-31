@@ -119,6 +119,11 @@ export interface HostedProcessingPanelProps {
   readonly mediaSha256: string;
   /** This is the browser-owned local Blob URL from ProjectStore, never a cloud media URL. */
   readonly sourceObjectUrl: string;
+  /**
+   * Reads the current non-portable project-instance capability from durable
+   * IndexedDB. A replacement import can rotate it while an older tab is open.
+   */
+  readonly resolveProjectOwnerCapability?: (projectId: string) => Promise<string | null>;
   /** Test override only; production reads VITE_TURNSTILE_SITE_KEY. */
   readonly siteKey?: string;
 }
@@ -127,19 +132,43 @@ export interface HostedProcessingPanelProps {
  * The hosted route is optional and never becomes a project store: this panel
  * reads the browser-owned Blob only after disclosure and Turnstile acceptance.
  */
-export function HostedProcessingPanel({ projectId, durationMs, mediaSha256, sourceObjectUrl, siteKey = configuredSiteKey() }: HostedProcessingPanelProps) {
+export function HostedProcessingPanel({
+  projectId,
+  durationMs,
+  mediaSha256,
+  sourceObjectUrl,
+  resolveProjectOwnerCapability,
+  siteKey = configuredSiteKey(),
+}: HostedProcessingPanelProps) {
   const [accepted, setAccepted] = useState(false);
   const [turnstileToken, setTurnstileToken] = useState<string | null>(null);
   const [session, setSession] = useState<{ readonly value: string; readonly expiresAtMs: number } | null>(null);
   const [status, setStatus] = useState("Cloud processing is optional. Your browser remains the canonical project store.");
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
-  const [recovery, setRecovery] = useState(() => loadPersistedCloudUpload(projectId, { sha256: mediaSha256, durationMs }));
+  const [projectOwnerCapability, setProjectOwnerCapability] = useState<string | null>(null);
+  const [recovery, setRecovery] = useState<ReturnType<typeof loadPersistedCloudUpload>>(null);
   const [forceNewOperation, setForceNewOperation] = useState(false);
   useEffect(() => {
-    setRecovery(loadPersistedCloudUpload(projectId, { sha256: mediaSha256, durationMs }));
-    setForceNewOperation(false);
-  }, [durationMs, mediaSha256, projectId]);
+    let disposed = false;
+    void (async () => {
+      const capability = resolveProjectOwnerCapability === undefined
+        ? null
+        : await resolveProjectOwnerCapability(projectId);
+      if (disposed) return;
+      setProjectOwnerCapability(capability);
+      setRecovery(capability === null
+        ? null
+        : loadPersistedCloudUpload(projectId, { sha256: mediaSha256, durationMs }, undefined, capability));
+      setForceNewOperation(false);
+    })().catch(() => {
+      if (!disposed) {
+        setProjectOwnerCapability(null);
+        setRecovery(null);
+      }
+    });
+    return () => { disposed = true; };
+  }, [durationMs, mediaSha256, projectId, resolveProjectOwnerCapability]);
   const currentNow = Date.now();
   const persistedSession = recovery?.session !== undefined && (recovery.sessionExpiresAtMs ?? 0) > currentNow
     ? { value: recovery.session, expiresAtMs: recovery.sessionExpiresAtMs! }
@@ -147,8 +176,27 @@ export function HostedProcessingPanel({ projectId, durationMs, mediaSha256, sour
   const availableSession = session !== null && session.expiresAtMs > currentNow ? session : persistedSession;
   const operationReceipt = recovery?.operationReceipt ?? null;
   const operationId = recovery?.operationId ?? null;
-  const canStart = accepted && siteKey.length > 0 && (turnstileToken !== null || availableSession !== null) && !busy;
-  const canCancel = accepted && siteKey.length > 0 && operationReceipt !== null && operationId !== null && (availableSession !== null || turnstileToken !== null) && !busy;
+  const canStart = accepted && siteKey.length > 0 && projectOwnerCapability !== null && (turnstileToken !== null || availableSession !== null) && !busy;
+  const canCancel = accepted && siteKey.length > 0 && projectOwnerCapability !== null && operationReceipt !== null && operationId !== null && (availableSession !== null || turnstileToken !== null) && !busy;
+
+  /** Re-read IndexedDB immediately before a cloud request; localStorage is only an opaque receipt cache. */
+  const currentOwnerCapability = async (): Promise<string> => {
+    const capability = resolveProjectOwnerCapability === undefined
+      ? null
+      : await resolveProjectOwnerCapability(projectId);
+    if (capability === null || !/^[0-9a-f]{64}$/i.test(capability)) {
+      throw new CloudUploadError("CueBench needs the durable browser-project owner identity before optional cloud processing.");
+    }
+    const normalized = capability.toLowerCase();
+    setProjectOwnerCapability(normalized);
+    return normalized;
+  };
+
+  const refreshRecoveryForOwner = (owner: string) => {
+    const refreshed = loadPersistedCloudUpload(projectId, { sha256: mediaSha256, durationMs }, undefined, owner);
+    setRecovery(refreshed);
+    return refreshed;
+  };
 
   const begin = async () => {
     if (!canStart) return;
@@ -163,7 +211,11 @@ export function HostedProcessingPanel({ projectId, durationMs, mediaSha256, sour
       const sourceResponse = await fetch(sourceObjectUrl);
       if (!sourceResponse.ok) throw new CloudUploadError("CueBench could not read the browser-owned local media Blob for cloud processing.");
       const source = await sourceResponse.blob();
-      const nextOperationId = forceNewOperation ? randomOpaqueId() : recovery?.operationId ?? randomOpaqueId();
+      // Resolve only after reading the local Blob. A replacement import can
+      // rotate the durable project capability while this older tab is open.
+      const owner = await currentOwnerCapability();
+      const currentRecovery = refreshRecoveryForOwner(owner);
+      const nextOperationId = forceNewOperation ? randomOpaqueId() : currentRecovery?.operationId ?? randomOpaqueId();
       const result = await uploadCloudProcessingCopy({
         session: anonymous.session,
         sessionExpiresAtMs: anonymous.expiresAtMs,
@@ -172,6 +224,7 @@ export function HostedProcessingPanel({ projectId, durationMs, mediaSha256, sour
         source,
         sourceSha256: mediaSha256,
         durationMs,
+        projectOwnerCapability: owner,
         disclosureAccepted: true,
       });
       setRecovery(result.operation);
@@ -184,7 +237,7 @@ export function HostedProcessingPanel({ projectId, durationMs, mediaSha256, sour
         clearPersistedCloudSession(projectId);
         setSession(null);
         setTurnstileToken(null);
-        setRecovery(loadPersistedCloudUpload(projectId, { sha256: mediaSha256, durationMs }));
+        if (projectOwnerCapability !== null) refreshRecoveryForOwner(projectOwnerCapability);
         setStatus("CueBench needs a fresh anti-abuse verification before it can resume this private operation. Its opaque recovery receipt was kept.");
       }
       if (cause instanceof CloudUploadError && cause.details.status === 410) {
@@ -204,6 +257,11 @@ export function HostedProcessingPanel({ projectId, durationMs, mediaSha256, sour
     setBusy(true);
     setError(null);
     try {
+      const owner = await currentOwnerCapability();
+      const currentRecovery = refreshRecoveryForOwner(owner);
+      if (currentRecovery === null || currentRecovery.operationId !== operationId || currentRecovery.operationReceipt !== operationReceipt) {
+        throw new CloudUploadError("This private upload recovery belongs to an older browser-project instance and cannot be resumed after import.");
+      }
       const cleanupSession = availableSession === null
         ? await createAnonymousCloudSession({ turnstileToken: turnstileToken!, idempotencyKey: randomOpaqueId(), purpose: "cleanup" })
         : { session: availableSession.value, expiresAtMs: availableSession.expiresAtMs };
@@ -212,6 +270,7 @@ export function HostedProcessingPanel({ projectId, durationMs, mediaSha256, sour
         projectId,
         operationId,
         receipt: operationReceipt,
+        projectOwnerCapability: owner,
       });
       setRecovery(null);
       setForceNewOperation(false);
@@ -221,7 +280,7 @@ export function HostedProcessingPanel({ projectId, durationMs, mediaSha256, sour
         clearPersistedCloudSession(projectId);
         setSession(null);
         setTurnstileToken(null);
-        setRecovery(loadPersistedCloudUpload(projectId, { sha256: mediaSha256, durationMs }));
+        if (projectOwnerCapability !== null) refreshRecoveryForOwner(projectOwnerCapability);
         setStatus("CueBench needs a fresh anti-abuse verification before it can confirm cleanup. The recovery receipt was kept.");
       }
       if (cause instanceof CloudUploadError && cause.details.status === 410) {

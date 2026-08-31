@@ -1,3 +1,4 @@
+import type { GenerationProviderProvenance } from "@cuebench/contracts";
 import type { CaptionProject, EvidenceProvenance } from "@cuebench/domain";
 import type { EvidenceContentResolver, LocalEvidenceWindow } from "./EvidenceInspector";
 
@@ -23,6 +24,7 @@ export const projectLocalEvidenceContentResolver = (project: CaptionProject): Ev
       if (binding === undefined) continue;
       const word = entry.evidence.words.find((candidate) => candidate.evidenceId === provenance.evidenceId);
       if (word === undefined) continue;
+      const speakerSegmentIds = new Set(word.speakerSegmentIds);
       return {
         evidenceId: provenance.evidenceId,
         source: "LocalEvidencePackage",
@@ -33,6 +35,17 @@ export const projectLocalEvidenceContentResolver = (project: CaptionProject): Ev
         mediaSha256: project.media.sha256,
         itemId: binding.itemId,
         itemRevision: binding.itemRevision,
+        stagedOutputSha256: entry.outputSha256 ?? null,
+        sourceText: word.sourceText ?? null,
+        speakerEvidence: (entry.evidence.speakerSegments ?? [])
+          .filter((segment) => speakerSegmentIds.has(segment.id))
+          .map((segment) => ({
+            id: segment.id,
+            speaker: segment.speaker,
+            text: segment.text,
+            startMs: segment.startMs,
+            endMs: segment.endMs,
+          })),
         uncertainty: entry.evidence.uncertaintySpans
           .filter((span) => span.evidenceIds.includes(provenance.evidenceId))
           .map((span) => ({
@@ -41,11 +54,10 @@ export const projectLocalEvidenceContentResolver = (project: CaptionProject): Ev
             startMs: span.startMs,
             endMs: span.endMs,
           })),
-        provenance: entry.evidence.provenance.map((source) => ({
-          role: source.role,
-          model: source.model,
-          store: source.store,
-        })),
+        // The full validated v2 record is durable project/backup evidence,
+        // not an opaque short-lived receipt. It excludes raw audio/prompt
+        // bodies while retaining resolved parameters and hashes for audit.
+        provenance: entry.evidence.provenance as readonly GenerationProviderProvenance[],
       };
     }
     return null;

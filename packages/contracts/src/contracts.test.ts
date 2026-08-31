@@ -656,6 +656,8 @@ describe("signed generation receipt contract", () => {
       expectedQualityProfileRevision: 2,
       mediaSha256: SHA_256,
       sessionKey: "c".repeat(64),
+      ownerKey: "d".repeat(64),
+      projectKey: "e".repeat(64),
       sourceByteLength: 5,
       sourceDurationMs: 60_000,
       operationId: "operation-1",

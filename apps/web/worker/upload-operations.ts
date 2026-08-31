@@ -46,6 +46,8 @@ type ClaimedPart = OperationLease;
 
 export interface UploadOperationRecord {
   readonly ownerSessionKey: string;
+  /** Stable salted browser-project owner, retained across session renewal. */
+  readonly ownerKey?: string;
   /** Saved only as a salted quota identity; it is never checked for recovery ownership. */
   readonly ownerIpKey: string;
   readonly metadataHash: string;
@@ -75,6 +77,7 @@ export interface UploadOperationRecord {
 
 export interface BeginUploadOperationInput {
   readonly ownerSessionKey: string;
+  readonly ownerKey?: string;
   readonly ownerIpKey: string;
   readonly metadataHash: string;
   readonly reservationKey: string;
@@ -221,6 +224,9 @@ const normaliseRecord = (input: UploadOperationRecord | null, nowMs: number): Up
   const partGenerations = legacy.partGenerations ?? Object.fromEntries(Object.entries(claims).map(([key, claim]) => [key, claim.generation]));
   const maxGeneration = Math.max(0, ...Object.values(partGenerations));
   const record = withRecord(input, {
+    // Existing short-lived operations predate the stable browser owner key.
+    // Their session key remains the only compatible owner until expiry.
+    ownerKey: legacy.ownerKey ?? input.ownerSessionKey,
     claims,
     partGenerations,
     completionLease: leaseIsLive(legacy.completionLease ?? null, nowMs) ? legacy.completionLease! : null,
@@ -259,6 +265,7 @@ const allPartsPresent = (record: UploadOperationRecord): boolean => Object.keys(
 
 const createRecord = (input: BeginUploadOperationInput): UploadOperationRecord => ({
   ownerSessionKey: input.ownerSessionKey,
+  ...(input.ownerKey === undefined ? {} : { ownerKey: input.ownerKey }),
   ownerIpKey: input.ownerIpKey,
   metadataHash: input.metadataHash,
   reservationKey: input.reservationKey,
@@ -283,7 +290,7 @@ const createRecord = (input: BeginUploadOperationInput): UploadOperationRecord =
   reconciliationNote: null,
 });
 
-const compatible = (record: UploadOperationRecord, input: BeginUploadOperationInput): boolean => record.ownerSessionKey === input.ownerSessionKey
+const compatible = (record: UploadOperationRecord, input: BeginUploadOperationInput): boolean => (record.ownerKey ?? record.ownerSessionKey) === (input.ownerKey ?? input.ownerSessionKey)
   && record.metadataHash === input.metadataHash
   && record.reservationKey === input.reservationKey
   && record.objectKey === input.objectKey

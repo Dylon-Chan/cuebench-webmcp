@@ -16,6 +16,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   adoptStagedCaptionGenerationResult,
   CueBenchDatabase,
+  DEXIE_DATABASE_VERSION,
   StorageImmutableWriteError,
   StorageReadValidationError,
   estimateProjectStorage,
@@ -23,7 +24,9 @@ import {
   initializeProject,
   loadProject,
   loadRunReceipt,
+  listRunReceipts,
   loadSourceMedia,
+  reserveRunReceiptSlot,
   saveRunReceipt,
   saveSourceMedia,
 } from "./index";
@@ -580,7 +583,7 @@ describe("CueBenchDatabase", () => {
     const upgraded = new CueBenchDatabase(intermediateName);
     databases.push(upgraded);
     await upgraded.open();
-    expect(upgraded.verno).toBe(3);
+    expect(upgraded.verno).toBe(DEXIE_DATABASE_VERSION);
     expect(await upgraded.certifications.get(normalized.certifications[0]!.key)).toEqual(normalized.certifications[0]);
     expect(await loadProject(upgraded, aggregate.projectId)).toEqual(aggregate);
 
@@ -1017,6 +1020,73 @@ describe("CueBenchDatabase", () => {
     const cyclic: { version: number; payload: { self?: unknown } } = { version: 1, payload: {} };
     cyclic.payload.self = cyclic;
     await expect(saveRunReceipt(db, "project-1", "run-3", cyclic)).rejects.toThrow();
+  });
+
+  it("lists only the current project's opaque recovery receipts for detached terminal cleanup", async () => {
+    const db = testDatabase();
+    await saveRunReceipt(db, "project-1", "cancelled-run", { version: 1, payload: { state: "cleanup-pending" } });
+    await saveRunReceipt(db, "project-1", "adopted-run", { version: 1, payload: { state: "cleanup-complete" } });
+    await saveRunReceipt(db, "another-project", "foreign-run", { version: 1, payload: { state: "private" } });
+
+    const rows = await listRunReceipts(db, "project-1");
+
+    expect(rows.map((row) => row.runId).sort()).toEqual(["adopted-run", "cancelled-run"]);
+    expect(rows.every((row) => row.projectId === "project-1")).toBe(true);
+  });
+
+  it("keeps a strict bounded pending receipt index and prunes fully acknowledged capabilities", async () => {
+    const db = testDatabase();
+    for (let index = 0; index < 16; index += 1) {
+      await saveRunReceipt(db, "project-1", `pending-${index}`, {
+        version: 1,
+        payload: { signedGenerationReceipt: `opaque-${index}` },
+      });
+    }
+    expect(await listRunReceipts(db, "project-1")).toHaveLength(16);
+    await saveRunReceipt(db, "project-1", "acknowledged-terminal", {
+      version: 1,
+      payload: {
+        adoption: {
+          status: "adopted",
+          cleanupAcknowledgement: "acknowledged",
+        },
+      },
+    });
+    await expect(loadRunReceipt(db, "project-1", "acknowledged-terminal")).resolves.toBeUndefined();
+    await expect(saveRunReceipt(db, "project-1", "pending-overflow", {
+      version: 1,
+      payload: { signedGenerationReceipt: "opaque-overflow" },
+    })).rejects.toThrow(/too many pending private generation receipts/i);
+    expect(await listRunReceipts(db, "project-1")).toHaveLength(16);
+  });
+
+  it("evicts non-actionable lifecycle tombstones before reserving a durable receipt slot", async () => {
+    const db = testDatabase();
+    for (let index = 0; index < 16; index += 1) {
+      await saveRunReceipt(db, "project-1", `expired-${index}`, {
+        version: 1,
+        payload: {
+          signedGenerationReceipt: `opaque-expired-${index}`,
+          expirySettlement: {
+            state: "lifecycle-pending",
+            disposition: "receipt-expired",
+            localLeaseRelease: "released",
+          },
+        },
+      });
+    }
+
+    await expect(reserveRunReceiptSlot(db, "project-1", "new-durable-run")).resolves.toBeUndefined();
+    await expect(loadRunReceipt(db, "project-1", "new-durable-run")).resolves.toBeDefined();
+    // Reservations are an internal crash-safe preflight marker, never a UI
+    // recovery receipt. The new server run can overwrite this exact row.
+    expect((await listRunReceipts(db, "project-1")).map((row) => row.runId)).not.toContain("new-durable-run");
+
+    await saveRunReceipt(db, "project-1", "new-durable-run", {
+      version: 1,
+      payload: { signedGenerationReceipt: "opaque-new-durable-run" },
+    });
+    expect((await listRunReceipts(db, "project-1")).map((row) => row.runId)).toContain("new-durable-run");
   });
 
   it("adopts a complete staged caption result and its recovery evidence in one expected-revision transaction", async () => {

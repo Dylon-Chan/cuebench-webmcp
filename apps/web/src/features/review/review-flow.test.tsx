@@ -208,6 +208,8 @@ const retainedFixtureEvidence: EvidenceContentResolver = {
     mediaSha256: evidence.mediaSha256,
     itemId: evidence.itemId,
     itemRevision: evidence.itemRevision,
+    sourceText: null,
+    speakerEvidence: [],
     uncertainty: [],
     provenance: [],
   }),

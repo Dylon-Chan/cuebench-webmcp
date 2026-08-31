@@ -22,8 +22,11 @@ import {
   loadProject,
   loadProjectInTransaction,
   loadRunReceipt,
+  listRunReceipts,
   loadSetting,
   loadSourceMedia,
+  releaseRunReceiptReservation,
+  reserveRunReceiptSlot,
   saveRunReceipt,
   saveSetting,
   sourceBlobKey,
@@ -150,6 +153,13 @@ const metadataReserveBytes = 16 * 1024 * 1024;
 const defaultCreateId = (): string => globalThis.crypto.randomUUID();
 const projectModeKey = (projectId: string): string => `project-mode:${projectId}`;
 const projectOwnerKey = (projectId: string): string => `project-owner:${projectId}`;
+/**
+ * This is deliberately separate from the short-lived project creation marker
+ * above. It is a stable, non-portable browser-project instance capability
+ * used to bind optional private cloud operations across anonymous-session
+ * renewal. Backups never carry it.
+ */
+const projectInstanceOwnerCapabilityKey = (projectId: string): string => `project-instance-owner-capability:${projectId}`;
 const projectSourceProvenanceKey = (projectId: string): string => `project-source-provenance:${projectId}`;
 const lastDurableProjectKey = "last-durable-project";
 const importSafetyBackupKey = (projectId: string, backupId: string): string => `import-safety-backup:${projectId}:${backupId}`;
@@ -174,6 +184,32 @@ interface DeletionReceipt {
   readonly state: "pending" | "deleted" | "failed";
   readonly message: string;
 }
+
+interface ProjectInstanceOwnerCapability {
+  readonly version: 1;
+  readonly projectId: string;
+  readonly capability: string;
+}
+
+const createProjectInstanceOwnerCapability = (): string => {
+  const bytes = new Uint8Array(32);
+  if (globalThis.crypto?.getRandomValues === undefined) {
+    throw new Error("CueBench cannot create a cryptographically random browser-project owner capability.");
+  }
+  globalThis.crypto.getRandomValues(bytes);
+  return [...bytes].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+};
+
+const readProjectInstanceOwnerCapability = (value: unknown, projectId: string): string | null => {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
+  const record = value as Readonly<Record<string, unknown>>;
+  return record.version === 1
+    && record.projectId === projectId
+    && typeof record.capability === "string"
+    && /^[0-9a-f]{64}$/i.test(record.capability)
+    ? record.capability.toLowerCase()
+    : null;
+};
 
 const emptySnapshot = (): ProjectStoreSnapshot => ({
   route: "start",
@@ -269,6 +305,37 @@ export class ProjectStore {
   }
 
   public getSnapshot = (): ProjectStoreSnapshot => this.snapshot;
+
+  /**
+   * Resolves the current non-portable project-instance capability directly
+   * from IndexedDB before any cloud mutation. This is intentionally a fresh
+   * durable read rather than a projectId-keyed localStorage value: a backup
+   * import can atomically rotate the capability while an older tab remains
+   * open with an obsolete opaque upload receipt.
+   */
+  public getCloudProjectOwnerCapability = async (projectId: string): Promise<string | null> => {
+    return this.database.transaction("rw", [this.database.projectHeaders, this.database.settings], async () => {
+      const header = await this.database.projectHeaders.get(projectId);
+      if (header === undefined) return null;
+      const existing = await this.database.settings.get(projectInstanceOwnerCapabilityKey(projectId));
+      const capability = readProjectInstanceOwnerCapability(existing?.value, projectId);
+      if (capability !== null) return capability;
+      // Compatibility migration for durable projects saved before this
+      // capability existed. The record is born transactionally with the
+      // project namespace and never reconstructed from localStorage.
+      const value: ProjectInstanceOwnerCapability = {
+        version: 1,
+        projectId,
+        capability: createProjectInstanceOwnerCapability(),
+      };
+      await this.database.settings.put({
+        key: projectInstanceOwnerCapabilityKey(projectId),
+        value,
+        updatedAtMs: Date.now(),
+      });
+      return value.capability;
+    });
+  };
 
   public subscribe = (listener: () => void): (() => void) => {
     this.listeners.add(listener);
@@ -458,6 +525,32 @@ export class ProjectStore {
     return queued;
   }
 
+  /** Reserve the exact opaque receipt row before a server-side generation start. */
+  public reserveCaptionGenerationReceipt(runId: string): Promise<void> {
+    const reserve = async (): Promise<void> => {
+      const snapshot = this.snapshot;
+      if (snapshot.project === null || snapshot.mode !== "durable") {
+        throw new Error("CueBench needs durable browser storage before it can reserve a recoverable caption-generation receipt.");
+      }
+      await reserveRunReceiptSlot(this.database, snapshot.project.projectId, runId);
+    };
+    const queued = this.commandQueue.then(reserve, reserve);
+    this.commandQueue = queued.then(() => undefined, () => undefined);
+    return queued;
+  }
+
+  /** Release only an internal unfulfilled write-ahead reservation. */
+  public releaseCaptionGenerationReceiptReservation(runId: string): Promise<void> {
+    const release = async (): Promise<void> => {
+      const snapshot = this.snapshot;
+      if (snapshot.project === null || snapshot.mode !== "durable") return;
+      await releaseRunReceiptReservation(this.database, snapshot.project.projectId, runId);
+    };
+    const queued = this.commandQueue.then(release, release);
+    this.commandQueue = queued.then(() => undefined, () => undefined);
+    return queued;
+  }
+
   /** Reads only the recovery receipt belonging to the currently visible project. */
   public async loadCaptionGenerationReceipt(runId: string): Promise<unknown | null> {
     const snapshot = this.snapshot;
@@ -466,13 +559,23 @@ export class ProjectStore {
     return row?.receipt.version === 1 ? row.receipt.payload : null;
   }
 
+  /** Lists opaque receipt ids so detached terminal cleanup can recover on reload. */
+  public async listCaptionGenerationReceiptRunIds(): Promise<readonly string[]> {
+    const snapshot = this.snapshot;
+    if (snapshot.project === null || snapshot.mode !== "durable") return [];
+    return (await listRunReceipts(this.database, snapshot.project.projectId)).map((row) => row.runId);
+  }
+
   /** Produces a portable manifest only; source video remains in browser storage and is never serialized. */
   public async exportProjectBackup(): Promise<ProjectBackupDownload> {
     const { project, freshnessNotice } = await this.freshProjectForSerialization();
     const backup = exportProjectBackupManifest(project, { exportedAtMs: Date.now() });
     return {
       filename: buildProjectBackupFilename(project.title),
-      text: JSON.stringify(backup, null, 2),
+      // Domain validates this exact compact representation against the shared
+      // 10 MiB import envelope; pretty indentation would otherwise turn a
+      // valid aggregate into a download the same browser refuses to import.
+      text: JSON.stringify(backup),
       ...(freshnessNotice === null ? {} : { freshnessNotice }),
     };
   }
@@ -609,6 +712,15 @@ export class ProjectStore {
 
       const importedProject = exactPreview.project;
       const backupId = this.createId();
+      // A portable backup never imports browser authority. Generate the next
+      // project-instance capability before entering the Dexie transaction and
+      // persist it with the replacement rows, so an old tab's local receipt
+      // cannot be accepted after the imported project becomes authoritative.
+      const importedProjectOwnerCapability: ProjectInstanceOwnerCapability = {
+        version: 1,
+        projectId: importedProject.projectId,
+        capability: createProjectInstanceOwnerCapability(),
+      };
       /** The SHA-256 was recomputed immediately above; write its immutable binding within the same local transaction. */
       const verifiedMediaRow: SourceBlobRow = {
         key: sourceBlobKey(importedProject.projectId, importedProject.media.sha256),
@@ -704,6 +816,11 @@ export class ProjectStore {
             await initializeProject(this.database, importedProject);
             await this.database.sourceBlobs.add(verifiedMediaRow);
             await this.database.settings.put({ key: projectModeKey(importedProject.projectId), value: { mode: "durable" }, updatedAtMs: Date.now() });
+            await this.database.settings.put({
+              key: projectInstanceOwnerCapabilityKey(importedProject.projectId),
+              value: importedProjectOwnerCapability,
+              updatedAtMs: Date.now(),
+            });
             await this.database.settings.put({ key: projectSourceProvenanceKey(importedProject.projectId), value: uploadedSourceProvenance, updatedAtMs: Date.now() });
             await this.database.settings.put({ key: lastDurableProjectKey, value: { projectId: importedProject.projectId }, updatedAtMs: Date.now() });
           },
@@ -1124,20 +1241,31 @@ export class ProjectStore {
   }
 
   /** Claims a unique persistent owner before writing media, so a losing tab cannot roll back another tab. */
-  private async claimProjectOwnership(projectId: string): Promise<void> {
+  private async claimProjectOwnership(projectId: string): Promise<string> {
     const token = this.createId();
+    const instanceCapability: ProjectInstanceOwnerCapability = {
+      version: 1,
+      projectId,
+      capability: createProjectInstanceOwnerCapability(),
+    };
     try {
       await this.database.transaction("rw", [this.database.projectHeaders, this.database.settings], async () => {
-        const [existingProject, existingOwner] = await Promise.all([
+        const [existingProject, existingOwner, existingInstanceCapability] = await Promise.all([
           this.database.projectHeaders.get(projectId),
           this.database.settings.get(projectOwnerKey(projectId)),
+          this.database.settings.get(projectInstanceOwnerCapabilityKey(projectId)),
         ]);
-        if (existingProject !== undefined || existingOwner !== undefined) {
+        if (existingProject !== undefined || existingOwner !== undefined || existingInstanceCapability !== undefined) {
           throw new Error("CueBench could not claim a unique local project. Try opening the media again.");
         }
         await this.database.settings.add({
           key: projectOwnerKey(projectId),
           value: { projectId, token },
+          updatedAtMs: Date.now(),
+        });
+        await this.database.settings.add({
+          key: projectInstanceOwnerCapabilityKey(projectId),
+          value: instanceCapability,
           updatedAtMs: Date.now(),
         });
       });
@@ -1148,6 +1276,7 @@ export class ProjectStore {
       throw error;
     }
     this.ownedProjectTokens.set(projectId, token);
+    return instanceCapability.capability;
   }
 
   /** Compensates immutable writes only after proving this store owns the lifecycle marker. */
@@ -1177,6 +1306,7 @@ export class ProjectStore {
           await Promise.all([
             this.database.settings.delete(projectModeKey(projectId)),
             this.database.settings.delete(projectOwnerKey(projectId)),
+            this.database.settings.delete(projectInstanceOwnerCapabilityKey(projectId)),
             this.database.settings.delete(projectSourceProvenanceKey(projectId)),
           ]);
         },
@@ -1264,6 +1394,7 @@ export class ProjectStore {
       .filter((key) => (
         key === projectModeKey(projectId)
         || key === projectOwnerKey(projectId)
+        || key === projectInstanceOwnerCapabilityKey(projectId)
         || key === projectSourceProvenanceKey(projectId)
         || (includeSafetyBackups && (
           key.startsWith(`import-safety-backup:${projectId}:`)

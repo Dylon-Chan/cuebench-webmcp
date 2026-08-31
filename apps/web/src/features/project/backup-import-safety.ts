@@ -1,9 +1,11 @@
+import { MAX_PORTABLE_PROJECT_BACKUP_BYTES } from "@cuebench/contracts";
+
 /**
  * Import files are untrusted input. Keep these bounds deliberately below the
  * browser-media budget so a malformed portable manifest cannot monopolize the
  * page before the domain migration/validation boundary gets a chance to run.
  */
-export const MAX_BACKUP_FILE_BYTES = 10 * 1024 * 1024;
+export const MAX_BACKUP_FILE_BYTES = MAX_PORTABLE_PROJECT_BACKUP_BYTES;
 export const MAX_BACKUP_JSON_DEPTH = 64;
 export const MAX_BACKUP_JSON_NODES = 50_000;
 export const MAX_BACKUP_STRING_LENGTH = 1_000_000;
@@ -64,7 +66,7 @@ const assertBoundedJsonValue = (value: unknown): void => {
 };
 
 export const parseBoundedBackupJson = (text: string): unknown => {
-  if (text.length > MAX_BACKUP_FILE_BYTES) {
+  if (new TextEncoder().encode(text).byteLength > MAX_BACKUP_FILE_BYTES) {
     throw new BackupImportSafetyError("CueBench rejects backup JSON larger than 10 MB before previewing it.");
   }
   let parsed: unknown;

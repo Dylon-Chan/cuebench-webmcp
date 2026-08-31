@@ -39,7 +39,7 @@ export const STORAGE_SCHEMA_VERSION = 1 as const;
  * envelopes. Keep this number monotonic even while backup schema v1 remains
  * readable, otherwise Dexie silently treats changed indexes as an upgrade.
  */
-export const DEXIE_DATABASE_VERSION = 3 as const;
+export const DEXIE_DATABASE_VERSION = 4 as const;
 
 const DEXIE_V1_STORES = {
   projectHeaders: "&projectId, projectRevision, updatedAtMs",
@@ -71,6 +71,12 @@ const DEXIE_V2_STORES = {
 
 /** v3 changes immutable certification hash encoding, not table indexes. */
 const DEXIE_V3_STORES = DEXIE_V2_STORES;
+
+/** v4 gives the bounded run-receipt recovery index a project/time ordering. */
+const DEXIE_V4_STORES = {
+  ...DEXIE_V3_STORES,
+  runReceipts: "&key, projectId, runId, [projectId+runId], [projectId+savedAtMs]",
+} as const;
 
 const clone = <Value>(value: Value): Value => structuredClone(value);
 const sameValue = (left: unknown, right: unknown): boolean => canonicalSerialize(left) === canonicalSerialize(right);
@@ -921,6 +927,38 @@ const upgradePhysicalV1ToV2 = async (transaction: Transaction): Promise<void> =>
 const upgradePhysicalV2ToV3 = async (transaction: Transaction): Promise<void> =>
   upgradePhysicalCertificationRows(transaction);
 
+/**
+ * Run receipts are opaque capability envelopes. The v4 index lets normal
+ * writes enforce the bounded pending set; the migration also removes legacy
+ * receipts whose authenticated terminal cleanup had already completed.
+ * Pending legacy capabilities are deliberately retained rather than silently
+ * dropping a user's only cancellation/adoption recovery path.
+ */
+const legacyReceiptNeedsRecovery = (payload: unknown): boolean => {
+  if (typeof payload !== "object" || payload === null || Array.isArray(payload)) return true;
+  const receipt = payload as Readonly<Record<string, unknown>>;
+  const adoption = receipt.adoption;
+  if (typeof adoption === "object" && adoption !== null && !Array.isArray(adoption)) {
+    const value = adoption as Readonly<Record<string, unknown>>;
+    if (value.status === "adopted") return value.cleanupAcknowledgement !== "acknowledged";
+  }
+  const terminal = receipt.terminalCleanup;
+  if (typeof terminal === "object" && terminal !== null && !Array.isArray(terminal)) {
+    const value = terminal as Readonly<Record<string, unknown>>;
+    if (value.action === "cancelled") {
+      return value.cleanupAcknowledgement !== "acknowledged" || value.localLeaseRelease !== "released";
+    }
+  }
+  return true;
+};
+
+const upgradePhysicalV3ToV4 = async (transaction: Transaction): Promise<void> => {
+  const receipts = transaction.table("runReceipts") as Table<RunReceiptRow, string>;
+  const rows = await receipts.toArray();
+  const acknowledged = rows.filter((row) => !legacyReceiptNeedsRecovery(row.receipt.payload));
+  if (acknowledged.length > 0) await receipts.bulkDelete(acknowledged.map((row) => row.key));
+};
+
 /** A validation run is immutable at its post-command project revision. */
 const validationScope = (run: StoredValidationRun) => `validation:${run.projectRevision}:${run.inputHash}`;
 
@@ -1489,7 +1527,8 @@ export class CueBenchDatabase extends Dexie {
     super(name);
     this.version(1).stores(DEXIE_V1_STORES);
     this.version(2).stores(DEXIE_V2_STORES).upgrade(upgradePhysicalV1ToV2);
-    this.version(DEXIE_DATABASE_VERSION).stores(DEXIE_V3_STORES).upgrade(upgradePhysicalV2ToV3);
+    this.version(3).stores(DEXIE_V3_STORES).upgrade(upgradePhysicalV2ToV3);
+    this.version(DEXIE_DATABASE_VERSION).stores(DEXIE_V4_STORES).upgrade(upgradePhysicalV3ToV4);
     this.projectHeaders = this.table("projectHeaders");
     this.items = this.table("items");
     this.revisions = this.table("revisions");

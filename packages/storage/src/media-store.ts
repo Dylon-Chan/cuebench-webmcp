@@ -213,6 +213,166 @@ export const loadNarrationBlob = async (
   return row === undefined ? undefined : validateNarrationBlobRow(row);
 });
 
+/**
+ * Only a small, explicitly pending recovery set may persist per project. A
+ * receipt is intentionally opaque to storage, but these stable terminal
+ * fields are sufficient to delete a fully acknowledged capability without
+ * decoding or exposing its signed token.
+ */
+export const MAX_RUN_RECEIPTS_PER_PROJECT = 16;
+
+/**
+ * An internal write-ahead reservation occupies the exact receipt row that a
+ * just-started server run will later overwrite. It is deliberately never
+ * exposed to recovery UI: its sole job is to make receipt persistence
+ * possible even when a tab starts from a saturated historic tombstone set.
+ */
+const receiptReservationMarker = "cuebench-generation-receipt-reservation-v1";
+
+const objectValue = (value: unknown): Readonly<Record<string, unknown>> | null => (
+  typeof value === "object" && value !== null && !Array.isArray(value)
+    ? value as Readonly<Record<string, unknown>>
+    : null
+);
+
+const isReceiptReservation = (payload: unknown): boolean => (
+  objectValue(payload)?._cuebenchInternal === receiptReservationMarker
+);
+
+/**
+ * Lifecycle only means the server retention rule owns eventual deletion. It
+ * is useful status while space permits, but it cannot authenticate another
+ * action and must never indefinitely consume the active recovery budget.
+ */
+const isLifecycleTombstone = (payload: unknown): boolean => {
+  const receipt = objectValue(payload);
+  if (receipt === null) return false;
+  const adoption = objectValue(receipt.adoption);
+  if (adoption?.status === "adopted" && adoption.cleanupAcknowledgement === "lifecycle-pending") return true;
+  const terminal = objectValue(receipt.terminalCleanup);
+  if (
+    terminal?.action === "cancelled"
+    && terminal.cleanupAcknowledgement === "lifecycle-pending"
+    && terminal.localLeaseRelease === "released"
+  ) return true;
+  const expiry = objectValue(receipt.expirySettlement);
+  return expiry?.state === "lifecycle-pending" && expiry.localLeaseRelease === "released";
+};
+
+const receiptNeedsRecovery = (payload: unknown): boolean => {
+  if (isReceiptReservation(payload) || isLifecycleTombstone(payload)) return false;
+  const receipt = objectValue(payload);
+  if (receipt === null) return true;
+  const adoption = objectValue(receipt.adoption);
+  if (adoption?.status === "adopted") return adoption.cleanupAcknowledgement !== "acknowledged";
+  const terminal = objectValue(receipt.terminalCleanup);
+  if (terminal?.action === "cancelled") {
+    return terminal.cleanupAcknowledgement !== "acknowledged" || terminal.localLeaseRelease !== "released";
+  }
+  // Active/failed receipts, cancellation intent, and lifecycle-pending
+  // expiry settlements all remain recoverable/tombstoned until a terminal
+  // server acknowledgement or the browser’s bounded lifecycle UI handles it.
+  return true;
+};
+
+const receiptRowsForProject = async (db: CueBenchDatabase, projectId: string): Promise<RunReceiptRow[]> => (
+  db.runReceipts
+    .where("[projectId+savedAtMs]")
+    .between([projectId, 0], [projectId, Number.MAX_SAFE_INTEGER])
+    .toArray()
+);
+
+/**
+ * Deletes capability-free receipts first, then bounds retained lifecycle
+ * notices. Active recovery rows are never evicted here; admission checks
+ * below fail before a new billable start when all 16 remain actionable.
+ */
+const pruneNonActionableReceipts = async (
+  db: CueBenchDatabase,
+  projectId: string,
+  protectedKey?: string,
+): Promise<void> => {
+  const rows = await receiptRowsForProject(db, projectId);
+  const disposable = rows
+    .filter((candidate) => candidate.key !== protectedKey && !receiptNeedsRecovery(candidate.receipt.payload))
+    .sort((left, right) => left.savedAtMs - right.savedAtMs || left.runId.localeCompare(right.runId));
+  // Fully acknowledged tokens have no remaining UI value at all. Lifecycle
+  // tombstones remain only within the same bounded index and are evicted
+  // oldest-first when an active receipt needs their slot.
+  const acknowledged = disposable.filter((candidate) => !isLifecycleTombstone(candidate.receipt.payload) && !isReceiptReservation(candidate.receipt.payload));
+  if (acknowledged.length > 0) await db.runReceipts.bulkDelete(acknowledged.map((candidate) => candidate.key));
+  const afterAcknowledged = await receiptRowsForProject(db, projectId);
+  if (afterAcknowledged.length <= MAX_RUN_RECEIPTS_PER_PROJECT) return;
+  const evictable = afterAcknowledged
+    .filter((candidate) => candidate.key !== protectedKey && (isLifecycleTombstone(candidate.receipt.payload) || isReceiptReservation(candidate.receipt.payload)))
+    .sort((left, right) => left.savedAtMs - right.savedAtMs || left.runId.localeCompare(right.runId));
+  const overflow = afterAcknowledged.length - MAX_RUN_RECEIPTS_PER_PROJECT;
+  if (overflow > 0 && evictable.length > 0) {
+    await db.runReceipts.bulkDelete(evictable.slice(0, overflow).map((candidate) => candidate.key));
+  }
+};
+
+const activeReceiptCount = async (db: CueBenchDatabase, projectId: string, excludingKey?: string): Promise<number> => (
+  (await receiptRowsForProject(db, projectId)).filter((candidate) => (
+    candidate.key !== excludingKey && receiptNeedsRecovery(candidate.receipt.payload)
+  )).length
+);
+
+/**
+ * Reserves an exact receipt primary key before a server start. A successful
+ * `saveRunReceipt` for the same run atomically replaces this opaque marker;
+ * a definitive pre-dispatch failure can release it. This prevents a started
+ * durable run from being stranded solely because historic lifecycle notices
+ * filled the browser receipt index.
+ */
+export const reserveRunReceiptSlot = async (
+  db: CueBenchDatabase,
+  projectId: string,
+  runId: string,
+): Promise<void> => {
+  if (!isIdentifier(projectId) || !isIdentifier(runId)) throw new TypeError("Run receipt reservations need project and run ids.");
+  const key = runReceiptKey(projectId, runId);
+  await db.transaction("rw", db.runReceipts, async () => {
+    const existing = await db.runReceipts.get(key);
+    if (existing !== undefined) return;
+    await pruneNonActionableReceipts(db, projectId);
+    if (await activeReceiptCount(db, projectId) >= MAX_RUN_RECEIPTS_PER_PROJECT) {
+      throw new TypeError("CueBench has too many pending private generation receipts for this project. Finish or discard an existing recovery before starting another run.");
+    }
+    // If only lifecycle tombstones remain, one must give way before this new
+    // active reservation can be inserted while keeping the index hard-bounded.
+    const rows = await receiptRowsForProject(db, projectId);
+    if (rows.length >= MAX_RUN_RECEIPTS_PER_PROJECT) {
+      const tombstone = rows
+        .filter((candidate) => isLifecycleTombstone(candidate.receipt.payload))
+        .sort((left, right) => left.savedAtMs - right.savedAtMs || left.runId.localeCompare(right.runId))[0];
+      if (tombstone !== undefined) await db.runReceipts.delete(tombstone.key);
+    }
+    const reservation = validateRunReceiptRow({
+      key,
+      projectId,
+      runId,
+      receipt: { version: 1, payload: { _cuebenchInternal: receiptReservationMarker } },
+      savedAtMs: now(),
+    });
+    await db.runReceipts.put(reservation);
+  });
+};
+
+/** Remove only an unfulfilled local reservation; never delete a real receipt. */
+export const releaseRunReceiptReservation = async (
+  db: CueBenchDatabase,
+  projectId: string,
+  runId: string,
+): Promise<void> => {
+  if (!isIdentifier(projectId) || !isIdentifier(runId)) throw new TypeError("Run receipt reservations need project and run ids.");
+  const key = runReceiptKey(projectId, runId);
+  await db.transaction("rw", db.runReceipts, async () => {
+    const existing = await db.runReceipts.get(key);
+    if (existing !== undefined && isReceiptReservation(existing.receipt.payload)) await db.runReceipts.delete(key);
+  });
+};
+
 /** Persist the opaque signed recovery capability before status polling starts. */
 export const saveRunReceipt = async (
   db: CueBenchDatabase,
@@ -223,7 +383,13 @@ export const saveRunReceipt = async (
   if (!isIdentifier(projectId) || !isIdentifier(runId)) throw new TypeError("Run receipts need project and run ids.");
   const row = validateRunReceiptRow({ key: runReceiptKey(projectId, runId), projectId, runId, receipt, savedAtMs: now() });
   await db.transaction("rw", db.runReceipts, async () => {
+    const existing = await db.runReceipts.get(row.key);
+    await pruneNonActionableReceipts(db, projectId, row.key);
+    if (existing === undefined && receiptNeedsRecovery(row.receipt.payload) && await activeReceiptCount(db, projectId, row.key) >= MAX_RUN_RECEIPTS_PER_PROJECT) {
+      throw new TypeError("CueBench has too many pending private generation receipts for this project. Finish or discard an existing recovery before starting another run.");
+    }
     await db.runReceipts.put(row);
+    await pruneNonActionableReceipts(db, projectId, receiptNeedsRecovery(row.receipt.payload) ? row.key : undefined);
   });
   return row;
 };
@@ -235,6 +401,28 @@ export const loadRunReceipt = async (
 ): Promise<RunReceiptRow | undefined> => db.transaction("r", db.runReceipts, async () => {
   const row = await db.runReceipts.get(runReceiptKey(projectId, runId));
   return row === undefined ? undefined : validateRunReceiptRow(row);
+});
+
+/**
+ * Recovery receipts are separate from the project aggregate so a terminal
+ * cleanup acknowledgement can remain visible after its target lease is gone.
+ * Return only this project’s bounded opaque rows; callers still validate each
+ * payload against their active media before using a capability.
+ */
+export const listRunReceipts = async (
+  db: CueBenchDatabase,
+  projectId: string,
+): Promise<readonly RunReceiptRow[]> => db.transaction("r", db.runReceipts, async () => {
+  if (!isIdentifier(projectId)) throw new TypeError("Run receipts need a project id.");
+  const rows = await db.runReceipts
+    .where("[projectId+savedAtMs]")
+    .between([projectId, 0], [projectId, Number.MAX_SAFE_INTEGER])
+    .reverse()
+    .toArray();
+  return rows
+    .map(validateRunReceiptRow)
+    .filter((row) => !isReceiptReservation(row.receipt.payload))
+    .sort((left, right) => right.savedAtMs - left.savedAtMs || right.runId.localeCompare(left.runId));
 });
 
 export const saveSetting = async (

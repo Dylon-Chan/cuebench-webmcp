@@ -106,27 +106,74 @@ const reconciliationProvenance = (result: ProviderResult<ReconciliationResponse>
   ...(result.warnings === undefined ? {} : { warnings: result.warnings }),
 });
 
+/** A validated result of exactly one foreground Responses API request. */
+export interface ReconciliationWindowResult {
+  readonly windowId: string;
+  readonly replacements: readonly ReconciliationResponse["replacements"][number][];
+  readonly provenance: ProviderCallProvenance;
+}
+
 /**
- * Applies only provider-confirmed, evidence-linked replacements. It has no
- * adoption side effect; the durable workflow stages the resulting evidence as
- * one complete object after every window succeeds.
+ * Executes and validates one bounded window. The durable Workflow journals
+ * this value before it moves to a later window, so a retry never repeats an
+ * earlier accepted provider call.
  */
-export const reconcileCaptionEvidence = async (
+export const reconcileCaptionEvidenceWindow = async (
   provider: ReconciliationProvider | OpenAIReconciliationProvider,
+  window: ReconciliationRequest,
+): Promise<ReconciliationWindowResult> => {
+  const result = await provider.reconcile(window);
+  // Reconciliation must remain one immediate, non-retained Responses call.
+  if (result.store !== false || result.background !== false) {
+    throw new Error("CueBench reconciliation must use foreground non-retained provider calls.");
+  }
+  assertResponseShape(result.value);
+  const allowed = new Set(window.allowedWordIds);
+  const seen = new Set<string>();
+  for (const replacement of result.value.replacements) {
+    if (!allowed.has(replacement.wordId)) {
+      throw new Error("CueBench rejected a replacement that is not evidence-linked to this window.");
+    }
+    if (seen.has(replacement.wordId)) {
+      throw new Error("CueBench rejected duplicate reconciliation replacements.");
+    }
+    seen.add(replacement.wordId);
+  }
+  return {
+    windowId: window.windowId,
+    replacements: result.value.replacements.map((replacement) => ({ ...replacement, text: replacement.text.trim() })),
+    provenance: reconciliationProvenance(result),
+  };
+};
+
+/**
+ * Rebuilds the final evidence deterministically from already-journaled window
+ * outputs. It accepts no provider port, so resume cannot trigger an earlier
+ * outbound request while aggregating partial success.
+ */
+export const applyReconciliationWindowResults = (
   evidence: Pick<CaptionEvidenceBundle, "words" | "uncertaintySpans">,
-): Promise<ReconciledCaptionEvidence> => {
+  results: readonly ReconciliationWindowResult[],
+): ReconciledCaptionEvidence => {
   const windows = createReconciliationWindows(evidence);
+  if (results.length !== windows.length) {
+    throw new Error("CueBench reconciliation window checkpoint is incomplete.");
+  }
+  const resultByWindowId = new Map<string, ReconciliationWindowResult>();
+  for (const result of results) {
+    if (resultByWindowId.has(result.windowId)) {
+      throw new Error("CueBench found duplicate reconciliation window checkpoints.");
+    }
+    resultByWindowId.set(result.windowId, result);
+  }
   const replacementById = new Map<string, string>();
   const provenance: ProviderCallProvenance[] = [];
   for (const window of windows) {
-    const result = await provider.reconcile(window);
-    // Reconciliation must remain one immediate, non-retained Responses call.
-    if (result.store !== false || result.background !== false) {
-      throw new Error("CueBench reconciliation must use foreground non-retained provider calls.");
-    }
-    assertResponseShape(result.value);
+    const result = resultByWindowId.get(window.windowId);
+    if (result === undefined) throw new Error("CueBench reconciliation window checkpoint is incomplete.");
+    assertResponseShape({ replacements: result.replacements });
     const allowed = new Set(window.allowedWordIds);
-    for (const replacement of result.value.replacements) {
+    for (const replacement of result.replacements) {
       if (!allowed.has(replacement.wordId)) {
         throw new Error("CueBench rejected a replacement that is not evidence-linked to this window.");
       }
@@ -135,7 +182,7 @@ export const reconcileCaptionEvidence = async (
       }
       replacementById.set(replacement.wordId, replacement.text.trim());
     }
-    provenance.push(reconciliationProvenance(result));
+    provenance.push(result.provenance);
   }
   return {
     words: evidence.words.map((word) => {
@@ -153,4 +200,19 @@ export const reconcileCaptionEvidence = async (
     uncertaintySpans: evidence.uncertaintySpans,
     provenance,
   };
+};
+
+/**
+ * Applies only provider-confirmed, evidence-linked replacements. It has no
+ * adoption side effect; the durable workflow stages the resulting evidence as
+ * one complete object after every window succeeds.
+ */
+export const reconcileCaptionEvidence = async (
+  provider: ReconciliationProvider | OpenAIReconciliationProvider,
+  evidence: Pick<CaptionEvidenceBundle, "words" | "uncertaintySpans">,
+): Promise<ReconciledCaptionEvidence> => {
+  const windows = createReconciliationWindows(evidence);
+  const results: ReconciliationWindowResult[] = [];
+  for (const window of windows) results.push(await reconcileCaptionEvidenceWindow(provider, window));
+  return applyReconciliationWindowResults(evidence, results);
 };

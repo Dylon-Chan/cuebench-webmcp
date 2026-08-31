@@ -148,6 +148,7 @@ const bearerToken = (request: Request): string | null => {
 };
 
 const opaqueId = (value: unknown): value is string => typeof value === "string" && /^[A-Za-z0-9_-]{1,128}$/.test(value);
+const projectOwnerCapability = (value: unknown): value is string => typeof value === "string" && /^[0-9a-f]{64}$/i.test(value);
 
 const asRecord = (value: unknown): Readonly<Record<string, unknown>> | null => typeof value === "object" && value !== null && !Array.isArray(value)
   ? value as Readonly<Record<string, unknown>>
@@ -156,6 +157,7 @@ const asRecord = (value: unknown): Readonly<Record<string, unknown>> | null => t
 const uploadRequest = (value: unknown): {
   readonly projectId: string;
   readonly operationId: string;
+  readonly projectOwnerCapability: string;
   readonly media: UploadMediaMetadata;
   readonly disclosureAccepted: boolean;
 } | null => {
@@ -166,6 +168,7 @@ const uploadRequest = (value: unknown): {
     || media === null
     || !opaqueId(record.projectId)
     || !opaqueId(record.operationId)
+    || !projectOwnerCapability(record.projectOwnerCapability)
     || typeof media.byteLength !== "number"
     || typeof media.durationMs !== "number"
     || typeof media.contentType !== "string"
@@ -174,6 +177,7 @@ const uploadRequest = (value: unknown): {
   return {
     projectId: record.projectId,
     operationId: record.operationId,
+    projectOwnerCapability: record.projectOwnerCapability.toLowerCase(),
     media: { byteLength: media.byteLength, durationMs: media.durationMs, contentType: media.contentType },
     disclosureAccepted: record.disclosureAccepted,
   };
@@ -317,6 +321,21 @@ type AuthenticatedOperation = {
   readonly receipt: UploadReceiptClaims;
 };
 
+const requestOwnsProjectOwner = async (
+  ownerCapability: string | undefined,
+  session: AnonymousSessionClaims,
+  ownerKey: string,
+  settings: WorkerSettings,
+): Promise<boolean> => {
+  if (projectOwnerCapability(ownerCapability)) {
+    return (await saltedLedgerKey(settings.quotaSalt, "project-owner", ownerCapability.toLowerCase())) === ownerKey;
+  }
+  // Receipts issued before the owner-capability deployment survive only for
+  // their already-signed TTL and remain tied to their original session.
+  if (ownerKey !== await saltedLedgerKey(settings.quotaSalt, "session", session.sessionId)) return false;
+  return true;
+};
+
 /**
  * Keeps receipt-expiry semantics and cleanup-only session scope identical for
  * every receipt-bearing operation route. The receipt remains the opaque
@@ -325,6 +344,7 @@ type AuthenticatedOperation = {
 const resolveAuthenticatedOperation = async (input: {
   readonly sessionToken: string;
   readonly receiptToken: string;
+  readonly ownerCapability: string | undefined;
   readonly settings: WorkerSettings;
   readonly nowMs: number;
   readonly requireUploadPurpose: boolean;
@@ -341,6 +361,9 @@ const resolveAuthenticatedOperation = async (input: {
   }
   try {
     const receipt = await verifyUploadReceipt(input.receiptToken, input.settings, input.nowMs);
+    if (!await requestOwnsProjectOwner(input.ownerCapability, session, receipt.ownerKey, input.settings)) {
+      return apiError(403, "UPLOAD_OWNERSHIP_MISMATCH", "This private upload belongs to a different browser project owner.", { nextAction: "start-new-operation" });
+    }
     return { session, receipt };
   } catch (error) {
     return receiptFailure(error);
@@ -406,6 +429,7 @@ const probeFor = (
 
 interface DerivedOperation {
   readonly sessionKey: string;
+  readonly ownerKey: string;
   readonly ipKey: string;
   readonly operationKey: string;
   readonly projectKey: string;
@@ -416,9 +440,10 @@ interface DerivedOperation {
   readonly expiresAtMs: number;
 }
 
-const deriveOperation = async (settings: WorkerSettings, session: AnonymousSessionClaims, ip: string, input: { readonly projectId: string; readonly operationId: string; readonly media: UploadMediaMetadata }, currentNow: number): Promise<DerivedOperation> => {
+const deriveOperation = async (settings: WorkerSettings, session: AnonymousSessionClaims, ip: string, input: { readonly projectId: string; readonly operationId: string; readonly projectOwnerCapability: string; readonly media: UploadMediaMetadata }, currentNow: number): Promise<DerivedOperation> => {
   const partCount = Math.ceil(input.media.byteLength / settings.partSizeBytes);
-  const operationSource = `${session.sessionId}:${input.operationId}`;
+  const ownerKey = await saltedLedgerKey(settings.quotaSalt, "project-owner", input.projectOwnerCapability);
+  const operationSource = `${ownerKey}:${input.operationId}`;
   const metadataSource = JSON.stringify({ projectId: input.projectId, media: input.media, partSize: settings.partSizeBytes, partCount });
   const [sessionKey, ipKey, operationKey, projectKey, reservationKey, metadataHash] = await Promise.all([
     saltedLedgerKey(settings.quotaSalt, "session", session.sessionId),
@@ -430,12 +455,13 @@ const deriveOperation = async (settings: WorkerSettings, session: AnonymousSessi
   ]);
   return {
     sessionKey,
+    ownerKey,
     ipKey,
     operationKey,
     projectKey,
     reservationKey,
     metadataHash,
-    objectKey: `processing/${sessionKey}/${operationKey}`,
+    objectKey: `processing/${ownerKey}/${operationKey}`,
     partCount,
     // The signed recovery receipt, not a changing network or a short-lived
     // Turnstile session, is the resumable operation credential.
@@ -443,11 +469,10 @@ const deriveOperation = async (settings: WorkerSettings, session: AnonymousSessi
   };
 };
 
-type OperationAuthorizationFields = Pick<UploadOperationAuthorization, "sessionKey" | "ipKey" | "reservationKey" | "metadataHash" | "objectKey" | "media" | "partSize" | "partCount" | "receiptExpiresAtMs">;
+type OperationAuthorizationFields = Pick<UploadOperationAuthorization, "ownerKey" | "reservationKey" | "metadataHash" | "objectKey" | "media" | "partSize" | "partCount" | "receiptExpiresAtMs">;
 
 const recordMatchesReceipt = (record: UploadOperationRecord | null, receipt: OperationAuthorizationFields): record is UploadOperationRecord => record !== null
-  && record.ownerSessionKey === receipt.sessionKey
-  && record.ownerIpKey === receipt.ipKey
+  && (record.ownerKey ?? record.ownerSessionKey) === receipt.ownerKey
   && record.reservationKey === receipt.reservationKey
   && record.metadataHash === receipt.metadataHash
   && record.objectKey === receipt.objectKey
@@ -463,6 +488,7 @@ const operationAuthorization = (input: {
   readonly media: UploadMediaMetadata;
   readonly operationId: string;
   readonly sessionKey: string;
+  readonly ownerKey: string;
   readonly ipKey: string;
   readonly operationKey: string;
   readonly projectKey: string;
@@ -480,6 +506,7 @@ const receiptFromRecord = (sessionId: string, input: { readonly operationId: str
   media: input.media,
   operationId: input.operationId,
   sessionKey: derived.sessionKey,
+  ownerKey: derived.ownerKey,
   // Network identity is retained only for quota accounting. A signed recovery
   // receipt must survive a normal mobile/Wi-Fi network change.
   ipKey: record.ownerIpKey,
@@ -744,6 +771,7 @@ export const createCueBenchWorker = (env: WorkerEnv, dependencies: WorkerDepende
     }
     const begin = await coordinator.begin({
       ownerSessionKey: derived.sessionKey,
+      ownerKey: derived.ownerKey,
       ownerIpKey: derived.ipKey,
       metadataHash: derived.metadataHash,
       reservationKey: derived.reservationKey,
@@ -765,7 +793,7 @@ export const createCueBenchWorker = (env: WorkerEnv, dependencies: WorkerDepende
       try {
         multipart = await objectStore.createMultipart(record.objectKey, {
           contentType: media.contentType,
-          customMetadata: { operation: record.objectKey.split("/").at(-1) ?? "", owner: record.ownerSessionKey },
+          customMetadata: { operation: record.objectKey.split("/").at(-1) ?? "", owner: record.ownerKey ?? record.ownerSessionKey },
         });
       } catch {
         const cleanup = await cleanupOperation({
@@ -846,6 +874,9 @@ export const createCueBenchWorker = (env: WorkerEnv, dependencies: WorkerDepende
     if (purposeFailure !== null) return purposeFailure;
     if (capability.sessionId !== session.sessionId || capability.operationId !== operationId) {
       return apiError(403, "UPLOAD_OWNERSHIP_MISMATCH", "This private multipart capability belongs to a different anonymous session or operation.", { nextAction: "start-new-operation" });
+    }
+    if (!await requestOwnsProjectOwner(context.req.header("x-cuebench-project-owner"), session, capability.ownerKey, settings)) {
+      return apiError(403, "UPLOAD_OWNERSHIP_MISMATCH", "This private multipart capability belongs to a different browser project owner.", { nextAction: "start-new-operation" });
     }
     if (normaliseContentType(context.req.header("content-type") ?? "") !== capability.media.contentType) {
       return apiError(422, "CONTENT_TYPE_MISMATCH", "CueBench could not verify this private upload part's media type. No part was stored.", { nextAction: "resume-upload" });
@@ -931,7 +962,7 @@ export const createCueBenchWorker = (env: WorkerEnv, dependencies: WorkerDepende
     const sessionToken = bearerToken(context.req.raw);
     const receiptToken = context.req.header("x-cuebench-operation-receipt");
     if (!opaqueId(operationId) || sessionToken === null || receiptToken === undefined) return apiError(401, "UPLOAD_RECEIPT_REQUIRED", "CueBench needs the anonymous session and signed operation receipt.", { nextAction: "resume-upload" });
-    const authenticated = await resolveAuthenticatedOperation({ sessionToken, receiptToken, settings, nowMs: currentNow, requireUploadPurpose: true });
+    const authenticated = await resolveAuthenticatedOperation({ sessionToken, receiptToken, ownerCapability: context.req.header("x-cuebench-project-owner"), settings, nowMs: currentNow, requireUploadPurpose: true });
     if (authenticated instanceof Response) return authenticated;
     const { session, receipt } = authenticated;
     if (receipt.operationId !== operationId) return apiError(403, "UPLOAD_OWNERSHIP_MISMATCH", "This private upload receipt belongs to a different operation.", { nextAction: "start-new-operation" });
@@ -955,7 +986,7 @@ export const createCueBenchWorker = (env: WorkerEnv, dependencies: WorkerDepende
     const sessionToken = bearerToken(context.req.raw);
     const receiptToken = context.req.header("x-cuebench-operation-receipt");
     if (!opaqueId(operationId) || sessionToken === null || receiptToken === undefined) return apiError(401, "UPLOAD_RECEIPT_REQUIRED", "CueBench needs the anonymous session and signed operation receipt.", { nextAction: "resume-upload" });
-    const authenticated = await resolveAuthenticatedOperation({ sessionToken, receiptToken, settings, nowMs: currentNow, requireUploadPurpose: true });
+    const authenticated = await resolveAuthenticatedOperation({ sessionToken, receiptToken, ownerCapability: context.req.header("x-cuebench-project-owner"), settings, nowMs: currentNow, requireUploadPurpose: true });
     if (authenticated instanceof Response) return authenticated;
     const { receipt } = authenticated;
     if (receipt.operationId !== operationId) return apiError(403, "UPLOAD_OWNERSHIP_MISMATCH", "This signed private-upload receipt belongs to a different operation.", { nextAction: "start-new-operation" });
@@ -1221,7 +1252,7 @@ export const createCueBenchWorker = (env: WorkerEnv, dependencies: WorkerDepende
     const sessionToken = bearerToken(context.req.raw);
     const receiptToken = context.req.header("x-cuebench-operation-receipt");
     if (!opaqueId(operationId) || sessionToken === null || receiptToken === undefined) return apiError(401, "UPLOAD_RECEIPT_REQUIRED", "CueBench needs the anonymous session and signed operation receipt.", { nextAction: "resume-upload" });
-    const authenticated = await resolveAuthenticatedOperation({ sessionToken, receiptToken, settings, nowMs: currentNow, requireUploadPurpose: false });
+    const authenticated = await resolveAuthenticatedOperation({ sessionToken, receiptToken, ownerCapability: context.req.header("x-cuebench-project-owner"), settings, nowMs: currentNow, requireUploadPurpose: false });
     if (authenticated instanceof Response) return authenticated;
     const { receipt } = authenticated;
     if (receipt.operationId !== operationId) return apiError(403, "UPLOAD_OWNERSHIP_MISMATCH", "This private upload receipt belongs to a different operation.", { nextAction: "start-new-operation" });

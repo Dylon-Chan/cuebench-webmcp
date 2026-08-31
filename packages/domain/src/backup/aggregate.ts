@@ -1,5 +1,16 @@
-import { CaptionProjectAggregateSchema } from "@cuebench/contracts";
+import {
+  CaptionProjectAggregateSchema,
+  countJsonNodes,
+  MAX_LOCAL_CAPTION_CUES,
+  MAX_LOCAL_CAPTION_EVIDENCE_PACKAGES,
+  MAX_LOCAL_CAPTION_EVIDENCE_TOTAL_BYTES,
+  MAX_LOCAL_CAPTION_EVIDENCE_TOTAL_JSON_NODES,
+  MAX_LOCAL_CAPTION_EVIDENCE_TOTAL_WORDS,
+  MAX_LOCAL_CAPTION_EVIDENCE_WORDS,
+  MAX_PORTABLE_PROJECT_JSON_NODES,
+} from "@cuebench/contracts";
 import type { Actor } from "@cuebench/contracts";
+import { exportProjectBackup } from "./schema";
 import type {
   AudioDescriptionBeat,
   CaptionCue,
@@ -144,7 +155,19 @@ const canonicalEvidence = (evidence: readonly EvidenceProvenance[]): readonly Ev
 /** Proves retained local transcript content still resolves through project provenance. */
 const assertLocalEvidencePackages = (project: CaptionProject): void => {
   unique(project.localEvidencePackages.map((entry) => entry.packageId), "Local Evidence Package ids");
-  requireAggregate(project.localEvidencePackages.length <= 4, "Local Evidence Packages exceed the retained bound.");
+  requireAggregate(project.localEvidencePackages.length <= MAX_LOCAL_CAPTION_EVIDENCE_PACKAGES, "Local Evidence Packages exceed the retained bound.");
+  requireAggregate(
+    new TextEncoder().encode(canonicalSerialize(project.localEvidencePackages)).byteLength <= MAX_LOCAL_CAPTION_EVIDENCE_TOTAL_BYTES,
+    "Local Evidence Packages exceed the backup-safe retained byte budget.",
+  );
+  requireAggregate(
+    countJsonNodes(project.localEvidencePackages) <= MAX_LOCAL_CAPTION_EVIDENCE_TOTAL_JSON_NODES,
+    "Local Evidence Packages exceed the backup-safe retained JSON-node budget.",
+  );
+  requireAggregate(
+    project.localEvidencePackages.reduce((total, entry) => total + entry.evidence.words.length, 0) <= MAX_LOCAL_CAPTION_EVIDENCE_TOTAL_WORDS,
+    "Local Evidence Packages exceed the shared retained word budget.",
+  );
   const projectEvidence = new Map(project.evidence.map((entry) => [entry.evidenceId, entry]));
   for (const entry of project.localEvidencePackages) {
     requireAggregate(
@@ -152,6 +175,8 @@ const assertLocalEvidencePackages = (project: CaptionProject): void => {
       "Local Evidence Package belongs to another project or media source.",
     );
     const words = new Set(entry.evidence.words.map((word) => word.evidenceId));
+    requireAggregate(entry.evidence.words.length <= MAX_LOCAL_CAPTION_EVIDENCE_WORDS, "Local Evidence Package exceeds the retained word bound.");
+    requireAggregate(entry.cueBindings.length <= MAX_LOCAL_CAPTION_CUES, "Local Evidence Package exceeds the retained cue-binding bound.");
     for (const binding of entry.cueBindings) {
       const item = project.captions.items[binding.itemId];
       requireAggregate(
@@ -251,6 +276,7 @@ const courtActors: Readonly<Record<string, readonly Actor["type"][]>> = {
   ApplyProfile: ["Human"],
   RelinkMedia: ["Human"],
   StartGenerationRun: ["CueBenchAI"],
+  AdoptCaptionGenerationResult: ["CueBenchAI"],
   ReleaseGenerationRun: ["CueBenchAI", "System", "Human"],
   ExportRoundTripVerified: ["System"],
   GenerationRunStageChanged: ["System"],
@@ -270,6 +296,7 @@ const itemCourtEventTypes = new Set([
   "AdjustAudioDescriptionTiming",
   "ReviseAudioDescription",
   "ProposeAudioDescriptionInGap",
+  "AdoptCaptionGenerationResult",
   "MarkItemAgentReady",
   "ObjectItem",
   "SustainItem",
@@ -283,6 +310,7 @@ const revisionChangingCourtEventTypes = new Set([
   "AdjustAudioDescriptionTiming",
   "ReviseAudioDescription",
   "ProposeAudioDescriptionInGap",
+  "AdoptCaptionGenerationResult",
   "MarkItemAgentReady",
   "ObjectItem",
   "SustainItem",
@@ -387,6 +415,44 @@ const assertCurrentRevisionEvent = (
   event: DomainEvent,
   claimed: Set<string>,
 ): void => {
+  if (event.type === "AdoptCaptionGenerationResult") {
+    const runId = event.detail?.startsWith("generation:") === true ? event.detail.slice("generation:".length) : null;
+    requireAggregate(
+      (runId !== null && /^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$/u.test(runId)) || event.detail === undefined,
+      "Court Record adoption must retain a canonical generation run id.",
+    );
+    const created = Object.values(project.captions.items).filter((item) => {
+      const initial = item.revisions[0]!;
+      return initial.itemRevision === 1
+        && initial.parentItemRevision === null
+        && initial.state === "Proposed"
+        // b13 used an unscoped cause/detail. Its manifest remains
+        // authenticated, so import may preserve it read-write; new output is
+        // always run-scoped and receives the stronger one-event proof below.
+        && initial.cause === (runId === null ? "AdoptCaptionGenerationResult" : `AdoptCaptionGenerationResult:${runId}`)
+        && sameActor(initial.actor, event.actor);
+    });
+    if (event.itemId === undefined) {
+      // A genuine silent-media result is an explicit, complete generation
+      // adoption with no caption item/revision transition. Its run-scoped
+      // Local Evidence Package remains the durable proof, rather than forcing
+      // an impossible synthetic cue into exports/backups.
+      requireAggregate(runId !== null, "An itemless Court Record adoption must retain its canonical generation run id.");
+      requireAggregate(created.length === 0, "An itemless Court Record adoption cannot create caption revisions.");
+      requireAggregate(
+        project.localEvidencePackages.some((entry) => entry.runId === runId && entry.cueBindings.length === 0),
+        "An itemless Court Record adoption has no matching silent Local Evidence Package.",
+      );
+      return;
+    }
+    const primary = itemForCourtEvent(project, event);
+    requireAggregate(primary.kind === "CaptionCue", "Court Record adoption must target its first generated caption.");
+    requireAggregate(created.length > 0 && created.some((item) => item.itemId === primary.itemId), "Court Record adoption has no matching generated caption set.");
+    if (runId !== null) {
+      for (const item of created) claimRevision(claimed, item, item.revisions[0]!, event);
+    }
+    return;
+  }
   if (!revisionChangingCourtEventTypes.has(event.type)) return;
   const item = itemForCourtEvent(project, event);
   const successorFor = (
@@ -683,7 +749,7 @@ const assertCurrentCourtRecord = (
     const allowedActors = courtActors[event.type];
     requireAggregate(allowedActors !== undefined && event.type !== "LegacyItemRevisionPayloadHistoryUnavailable", `Court Record event type ${event.type} is not a current durable command.`);
     requireAggregate(allowedActors.includes(event.actor.type), `Court Record ${event.type} has invalid actor provenance.`);
-    if (event.type !== "ObjectItem") {
+    if (event.type !== "ObjectItem" && event.type !== "AdoptCaptionGenerationResult") {
       requireAggregate(event.detail === undefined, `Court Record ${event.type} cannot carry arbitrary detail.`);
     }
 
@@ -691,7 +757,7 @@ const assertCurrentCourtRecord = (
     if (event.type === "FocusGap") {
       requireAggregate(event.itemId !== undefined && project.audioDescriptionGaps[event.itemId] !== undefined, "Court Record FocusGap references an unknown gap.");
       projectedSelection = { kind: "AudioDescriptionGap", itemId: event.itemId };
-    } else if (itemCourtEventTypes.has(event.type)) {
+    } else if (itemCourtEventTypes.has(event.type) && !(event.type === "AdoptCaptionGenerationResult" && event.itemId === undefined)) {
       eventItem = itemForCourtEvent(project, event);
     } else if (["ValidateProject", "RecordExportRoundTrip", "WaiveWarning", "CertifyProject", "ApplyProfile", "RelinkMedia", "StartGenerationRun", "ReleaseGenerationRun"].includes(event.type)) {
       requireAggregate(event.itemId === undefined, `Court Record ${event.type} cannot target an item.`);
@@ -857,6 +923,10 @@ const assertRelationships = (
     }
   }
   assertLocalEvidencePackages(project);
+  requireAggregate(
+    countJsonNodes(project) <= MAX_PORTABLE_PROJECT_JSON_NODES,
+    "CaptionProject exceeds the browser backup JSON-node budget.",
+  );
   if (project.selectedItem !== null) {
     if (project.selectedItem.kind === "AudioDescriptionGap") {
       const gap = project.audioDescriptionGaps[project.selectedItem.itemId];
@@ -949,5 +1019,15 @@ export const validateCaptionProjectAggregate = (
   assertRelationships(project, options);
   const normalized = normalizeMediaDigestCasing(project);
   assertRelationships(normalized, options);
+  try {
+    // Validate the exact compact envelope a browser later imports, rather
+    // than treating the evidence-only budget as a proxy for Court Record,
+    // revision, finding, and metadata growth.
+    exportProjectBackup(normalized);
+  } catch (error) {
+    throw new CaptionProjectAggregateError(error instanceof Error
+      ? `CaptionProject exceeds the portable backup byte budget: ${error.message}`
+      : "CaptionProject exceeds the portable backup byte budget.");
+  }
   return clone(normalized);
 };

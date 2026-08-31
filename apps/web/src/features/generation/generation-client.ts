@@ -22,7 +22,8 @@ export interface GenerationReceiptAdoption {
   readonly status: "adopted";
   readonly adoptedProjectRevision: number;
   readonly localEvidencePackageId: string;
-  readonly cleanupAcknowledgement: "pending" | "acknowledged";
+  /** `lifecycle-pending` means the bounded R2 rule, not an exact delete, owns expiry cleanup. */
+  readonly cleanupAcknowledgement: "pending" | "acknowledged" | "lifecycle-pending";
 }
 
 /**
@@ -48,6 +49,18 @@ export interface GenerationReceiptCancellationIntent {
   readonly status: "requested";
 }
 
+/**
+ * A signed receipt/session has elapsed before the browser can authenticate a
+ * final server action. The result can never be adopted with that capability,
+ * so the local caption lease is released while the private lifecycle backstop
+ * remains truthfully visible rather than being claimed as an exact deletion.
+ */
+export interface GenerationReceiptExpirySettlement {
+  readonly state: "lifecycle-pending";
+  readonly disposition: "receipt-expired" | "cancellation-unconfirmed";
+  readonly localLeaseRelease: "pending" | "released";
+}
+
 export interface GenerationClientReceipt {
   readonly version: 1;
   readonly runId: string;
@@ -61,6 +74,8 @@ export interface GenerationClientReceipt {
   readonly mediaSha256: string;
   readonly sourceByteLength: number;
   readonly sourceDurationMs: number;
+  /** Stable non-portable browser-project owner secret required for every run. */
+  readonly projectOwnerCapability: string;
   /** Worker-attested expiry from the signed generation receipt claims. */
   readonly retentionExpiresAtMs: number;
   readonly savedAtMs: number;
@@ -70,6 +85,8 @@ export interface GenerationClientReceipt {
   readonly cancellationRequested?: GenerationReceiptCancellationIntent;
   /** Present after cancellation is accepted by the authenticated Worker. */
   readonly terminalCleanup?: GenerationReceiptTerminalCleanup;
+  /** Present when the signed owner capability elapsed before a terminal ACK. */
+  readonly expirySettlement?: GenerationReceiptExpirySettlement;
 }
 
 export interface GenerationProjectStore {
@@ -77,7 +94,15 @@ export interface GenerationProjectStore {
   readonly executeCommand: (command: DomainCommand) => Promise<CommandResult>;
   /** This must complete before the browser starts polling an opaque receipt. */
   readonly persistCaptionGenerationReceipt: (runId: string, receipt: GenerationClientReceipt) => Promise<void>;
+  /** Durable ProjectStore reserves a crash-safe slot before server dispatch. */
+  readonly reserveCaptionGenerationReceipt?: (runId: string) => Promise<void>;
+  /** Removes only an unfulfilled internal receipt reservation. */
+  readonly releaseCaptionGenerationReceiptReservation?: (runId: string) => Promise<void>;
   readonly loadCaptionGenerationReceipt: (runId: string) => Promise<unknown | null>;
+  /** Optional upgrade path for showing detached pending cleanup after reload. */
+  readonly listCaptionGenerationReceiptRunIds?: () => Promise<readonly string[]>;
+  /** Reads the current non-portable project-instance owner from IndexedDB. */
+  readonly getCloudProjectOwnerCapability?: (projectId: string) => Promise<string | null>;
   readonly adoptStagedCaptionGenerationResult: (command: CaptionGenerationAdoptionCommand) => Promise<CommandResult>;
 }
 
@@ -98,7 +123,7 @@ export class GenerationClientError extends Error {
 export interface StartCaptionGenerationInput {
   readonly project: CaptionProject;
   readonly store: GenerationProjectStore;
-  readonly upload: Pick<PersistedCloudUploadRecovery, "operationId" | "session" | "operationReceipt" | "sourceByteLength" | "sourceSha256" | "durationMs">;
+  readonly upload: Pick<PersistedCloudUploadRecovery, "operationId" | "session" | "operationReceipt" | "sourceByteLength" | "sourceSha256" | "durationMs" | "projectOwnerCapability">;
 }
 
 export interface StartedCaptionGeneration {
@@ -125,7 +150,8 @@ export interface CaptionGenerationClientPort {
   readonly cancel: (input: CancelCaptionGenerationInput) => Promise<GenerationRunStatus>;
   readonly adopt: (input: AdoptCaptionGenerationInput) => Promise<CommandResult>;
   /** Idempotently retries the authenticated cloud cleanup after local adoption. */
-  readonly retryAdoptionCleanup: (input: Pick<AdoptCaptionGenerationInput, "store" | "receipt">) => Promise<void>;
+  /** Returns the exact persisted settlement; callers must not synthesize an acknowledgement. */
+  readonly retryAdoptionCleanup: (input: Pick<AdoptCaptionGenerationInput, "store" | "receipt">) => Promise<GenerationClientReceipt>;
   /** Retries a cancellation tombstone without releasing its local lease early. */
   readonly retryCancellationCleanup: (input: CancelCaptionGenerationInput) => Promise<void>;
   readonly loadStoredReceipt: (store: GenerationProjectStore, project: CaptionProject, runId: string) => Promise<GenerationClientReceipt | null>;
@@ -151,7 +177,7 @@ const responseError = async (response: Response, fallback: string): Promise<Gene
       return new GenerationClientError(error.message, {
         status: response.status,
         ...(code === undefined ? {} : { code }),
-        ...(code === "GENERATION_DISPATCH_PENDING" ? { dispatchMayBeDurable: true } : {}),
+        ...(["GENERATION_DISPATCH_PENDING", "GENERATION_RECORD_UNCERTAIN", "GENERATION_LEASE_UNCERTAIN"].includes(code ?? "") ? { dispatchMayBeDurable: true } : {}),
       });
     }
   } catch {
@@ -171,7 +197,7 @@ const parseStatus = (value: unknown): GenerationRunStatus => {
   return parsed.data;
 };
 
-const requireUploadAuthorization = (upload: StartCaptionGenerationInput["upload"], project: CaptionProject): { readonly session: string; readonly operationReceipt: string; readonly sourceByteLength: number; readonly sourceDurationMs: number } => {
+const requireUploadAuthorization = (upload: StartCaptionGenerationInput["upload"], project: CaptionProject): { readonly session: string; readonly operationReceipt: string; readonly sourceByteLength: number; readonly sourceDurationMs: number; readonly projectOwnerCapability: string } => {
   if (
     typeof upload.session !== "string" || upload.session.trim().length === 0
     || typeof upload.operationReceipt !== "string" || upload.operationReceipt.trim().length === 0
@@ -180,6 +206,7 @@ const requireUploadAuthorization = (upload: StartCaptionGenerationInput["upload"
     || typeof upload.sourceSha256 !== "string" || !sha256.test(upload.sourceSha256)
     || upload.sourceSha256.toLowerCase() !== project.media.sha256.toLowerCase()
     || upload.durationMs !== project.media.durationMs
+    || typeof upload.projectOwnerCapability !== "string" || !/^[0-9a-f]{64}$/i.test(upload.projectOwnerCapability)
   ) {
     throw new GenerationClientError("Complete or refresh optional cloud processing before starting caption generation.");
   }
@@ -188,6 +215,7 @@ const requireUploadAuthorization = (upload: StartCaptionGenerationInput["upload"
     operationReceipt: upload.operationReceipt,
     sourceByteLength: upload.sourceByteLength,
     sourceDurationMs: upload.durationMs,
+    projectOwnerCapability: upload.projectOwnerCapability.toLowerCase(),
   };
 };
 
@@ -197,7 +225,7 @@ const parseStart = (
   expectedProjectRevision: number,
   runId: string,
   savedAtMs: number,
-  authorization: { readonly session: string; readonly sourceByteLength: number; readonly sourceDurationMs: number },
+  authorization: { readonly session: string; readonly sourceByteLength: number; readonly sourceDurationMs: number; readonly projectOwnerCapability: string },
 ): StartedCaptionGeneration => {
   const record = responseRecord(value, "CueBench did not return a signed caption-generation receipt.");
   if (typeof record.generationRunReceipt !== "string" || record.generationRunReceipt.trim().length === 0) {
@@ -227,6 +255,7 @@ const parseStart = (
       mediaSha256: project.media.sha256.toLowerCase(),
       sourceByteLength: authorization.sourceByteLength,
       sourceDurationMs: authorization.sourceDurationMs,
+      projectOwnerCapability: authorization.projectOwnerCapability,
       retentionExpiresAtMs: record.retentionExpiresAtMs as number,
       savedAtMs,
     },
@@ -254,12 +283,26 @@ const parsedAdoption = (value: unknown): GenerationReceiptAdoption | null => {
     && (adoption.adoptedProjectRevision as number) > 0
     && typeof adoption.localEvidencePackageId === "string"
     && opaqueId.test(adoption.localEvidencePackageId)
-    && (adoption.cleanupAcknowledgement === "pending" || adoption.cleanupAcknowledgement === "acknowledged")
+    && (adoption.cleanupAcknowledgement === "pending" || adoption.cleanupAcknowledgement === "acknowledged" || adoption.cleanupAcknowledgement === "lifecycle-pending")
     ? {
       status: "adopted",
       adoptedProjectRevision: adoption.adoptedProjectRevision as number,
       localEvidencePackageId: adoption.localEvidencePackageId,
       cleanupAcknowledgement: adoption.cleanupAcknowledgement,
+    }
+    : null;
+};
+
+const parsedExpirySettlement = (value: unknown): GenerationReceiptExpirySettlement | null => {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
+  const settlement = value as Readonly<Record<string, unknown>>;
+  return settlement.state === "lifecycle-pending"
+    && (settlement.disposition === "receipt-expired" || settlement.disposition === "cancellation-unconfirmed")
+    && (settlement.localLeaseRelease === "pending" || settlement.localLeaseRelease === "released")
+    ? {
+      state: "lifecycle-pending",
+      disposition: settlement.disposition,
+      localLeaseRelease: settlement.localLeaseRelease,
     }
     : null;
 };
@@ -329,9 +372,11 @@ export class CaptionGenerationClient implements CaptionGenerationClientPort {
     }
     let leasedProject = visibleProject;
     let runId: string;
+    const receiptSlotReserved = input.store.reserveCaptionGenerationReceipt !== undefined;
     if (leasedProject.activeGenerationRun === null) {
       runId = this.createRunId();
       if (!opaqueId.test(runId)) throw new GenerationClientError("CueBench generated an invalid caption-generation run identifier.");
+      await input.store.reserveCaptionGenerationReceipt?.(runId);
       const lease = await input.store.executeCommand({
         type: "StartGenerationRun",
         actor: aiActor,
@@ -339,13 +384,22 @@ export class CaptionGenerationClient implements CaptionGenerationClientPort {
         targetTrack: "Captions",
         expectedProjectRevision: leasedProject.projectRevision,
       });
-      if (lease.error !== undefined) throw new GenerationClientError(lease.error.message, { code: lease.error.code });
+      if (lease.error !== undefined) {
+        if (receiptSlotReserved) await input.store.releaseCaptionGenerationReceiptReservation?.(runId);
+        throw new GenerationClientError(lease.error.message, { code: lease.error.code });
+      }
       leasedProject = lease.project;
     } else if (isMatchingCaptionLease(leasedProject, leasedProject.activeGenerationRun.runId)) {
       runId = leasedProject.activeGenerationRun.runId;
+      await input.store.reserveCaptionGenerationReceipt?.(runId);
     } else {
       throw new GenerationClientError("A different generation run currently holds CueBench's target-track lease.", { code: "TARGET_TRACK_LEASE_CONFLICT" });
     }
+    // A retry may happen after permitted Audio Description edits have advanced
+    // the global project revision. The signed server idempotency tuple must
+    // remain the immutable caption lease base, never a later whole-project
+    // revision that would turn a safe retry into an identity conflict.
+    const leaseBase = captionLeaseBase(leasedProject, runId);
 
     let durableStartMayExist = false;
     try {
@@ -355,13 +409,14 @@ export class CaptionGenerationClient implements CaptionGenerationClientPort {
           authorization: `Bearer ${authorization.session}`,
           "content-type": "application/json",
           "x-cuebench-operation-receipt": authorization.operationReceipt,
+          "x-cuebench-project-owner": authorization.projectOwnerCapability,
         },
         body: JSON.stringify({
           projectId: leasedProject.projectId,
           runId,
-          expectedProjectRevision: leasedProject.projectRevision,
-          expectedQualityProfileRevision: leasedProject.qualityProfile.revision,
-          mediaSha256: leasedProject.media.sha256.toLowerCase(),
+          expectedProjectRevision: leaseBase.expectedProjectRevision,
+          expectedQualityProfileRevision: leaseBase.qualityProfileRevision,
+          mediaSha256: leaseBase.mediaSha256,
           sourceByteLength: authorization.sourceByteLength,
           sourceDurationMs: authorization.sourceDurationMs,
           qualityProfileRules: leasedProject.qualityProfile.rules,
@@ -372,7 +427,7 @@ export class CaptionGenerationClient implements CaptionGenerationClientPort {
       // private record. Retain the local lease even if a hostile/corrupt body
       // cannot be parsed or IndexedDB fails before saving the browser receipt.
       durableStartMayExist = true;
-      const started = parseStart(await response.json(), leasedProject, leasedProject.projectRevision, runId, this.clock(), authorization);
+      const started = parseStart(await response.json(), leasedProject, leaseBase.expectedProjectRevision, runId, this.clock(), authorization);
       // This await is intentionally before returning to UI polling. If a tab
       // closes immediately after start, the signed capability still recovers.
       await input.store.persistCaptionGenerationReceipt(runId, started.receipt);
@@ -390,6 +445,7 @@ export class CaptionGenerationClient implements CaptionGenerationClientPort {
           runId,
           expectedProjectRevision: current.projectRevision,
         }).catch(() => undefined);
+        if (receiptSlotReserved) await input.store.releaseCaptionGenerationReceiptReservation?.(runId).catch(() => undefined);
       }
       throw error;
     }
@@ -398,8 +454,9 @@ export class CaptionGenerationClient implements CaptionGenerationClientPort {
   public async status(receipt: GenerationClientReceipt): Promise<GenerationRunStatus> {
     const response = await this.fetcher(`/api/generation-runs/${encodeURIComponent(receipt.runId)}`, {
       headers: {
-        authorization: `Bearer ${receipt.session}`,
-        "x-cuebench-generation-receipt": receipt.signedGenerationReceipt,
+      authorization: `Bearer ${receipt.session}`,
+      "x-cuebench-generation-receipt": receipt.signedGenerationReceipt,
+      "x-cuebench-project-owner": receipt.projectOwnerCapability,
       },
     });
     if (!response.ok) throw await responseError(response, "CueBench could not read caption-generation status.");
@@ -420,6 +477,7 @@ export class CaptionGenerationClient implements CaptionGenerationClientPort {
       headers: {
         authorization: `Bearer ${receipt.session}`,
         "x-cuebench-generation-receipt": receipt.signedGenerationReceipt,
+        "x-cuebench-project-owner": receipt.projectOwnerCapability,
       },
     });
     if (!response.ok) throw await responseError(response, "CueBench could not cancel this caption-generation run.");
@@ -478,11 +536,15 @@ export class CaptionGenerationClient implements CaptionGenerationClientPort {
     // cleanup response is a durable capability to retry, not a successful
     // cancellation completion that can be forgotten after a reload.
     const persisted = await this.persistCancellationCleanup(input.store, receipt, remote.cleanup);
-    if (remote.cleanup === "completed") await this.settleCancelledCaptionLease(input.store, persisted);
+    // Server-side Cancelled is the authoritative terminal fence. Browser
+    // editability must not be held hostage by an independent private-object
+    // drain; its pending receipt remains visible and retryable after release.
+    await this.settleCancelledCaptionLease(input.store, persisted);
     return remote;
   }
 
-  private async releaseCancelledCaptionLease(
+  /** Release only the matching target lease; remote terminal/expiry state is persisted first. */
+  private async releaseCaptionLease(
     store: GenerationProjectStore,
     runId: string,
   ): Promise<void> {
@@ -535,13 +597,72 @@ export class CaptionGenerationClient implements CaptionGenerationClientPort {
     // Preserve `localLeaseRelease: pending` before invoking the project
     // command. If the tab closes after the cloud acknowledgement but before
     // this command, reload has an explicit safe, idempotent release path.
-    await this.releaseCancelledCaptionLease(store, receipt.runId);
+    await this.releaseCaptionLease(store, receipt.runId);
     const settled: GenerationClientReceipt = {
       ...receipt,
       terminalCleanup: {
         ...terminal,
         localLeaseRelease: "released",
       },
+    };
+    await store.persistCaptionGenerationReceipt(receipt.runId, settled);
+    return settled;
+  }
+
+  /**
+   * Settles an elapsed owner capability without pretending that R2 has already
+   * deleted every private object. At this point adoption/cancellation cannot
+   * be authenticated with the expired capability; retaining the browser lease
+   * would therefore create a permanent local lock.
+   */
+  private async settleExpiredReceipt(
+    store: GenerationProjectStore,
+    receipt: GenerationClientReceipt,
+  ): Promise<GenerationClientReceipt> {
+    const adoption = receipt.adoption;
+    if (adoption?.cleanupAcknowledgement === "pending") {
+      const lifecyclePending: GenerationClientReceipt = {
+        ...receipt,
+        adoption: { ...adoption, cleanupAcknowledgement: "lifecycle-pending" },
+      };
+      await store.persistCaptionGenerationReceipt(receipt.runId, lifecyclePending);
+      return lifecyclePending;
+    }
+    const terminal = receipt.terminalCleanup;
+    if (terminal?.action === "cancelled") {
+      const lifecyclePending: GenerationClientReceipt = terminal.cleanupAcknowledgement === "lifecycle-pending"
+        ? receipt
+        : {
+          ...receipt,
+          terminalCleanup: { ...terminal, cleanupAcknowledgement: "lifecycle-pending" },
+        };
+      if (lifecyclePending !== receipt) {
+        await store.persistCaptionGenerationReceipt(receipt.runId, lifecyclePending);
+      }
+      return this.settleCancelledCaptionLease(store, lifecyclePending);
+    }
+
+    const previous = receipt.expirySettlement;
+    const pending: GenerationClientReceipt = previous?.localLeaseRelease === "released"
+      ? receipt
+      : {
+        ...receipt,
+        expirySettlement: {
+          state: "lifecycle-pending",
+          disposition: receipt.cancellationRequested?.status === "requested"
+            ? "cancellation-unconfirmed"
+            : "receipt-expired",
+          localLeaseRelease: "pending",
+        },
+      };
+    if (pending !== receipt) await store.persistCaptionGenerationReceipt(receipt.runId, pending);
+    if (pending.expirySettlement?.localLeaseRelease === "released") return pending;
+    // Persisted pending intent precedes the local command so a crash can
+    // resume this exact lease release after reload.
+    await this.releaseCaptionLease(store, receipt.runId);
+    const settled: GenerationClientReceipt = {
+      ...pending,
+      expirySettlement: { ...pending.expirySettlement!, localLeaseRelease: "released" },
     };
     await store.persistCaptionGenerationReceipt(receipt.runId, settled);
     return settled;
@@ -559,15 +680,16 @@ export class CaptionGenerationClient implements CaptionGenerationClientPort {
         throw new GenerationClientError("CueBench cannot retry cancellation cleanup before cancellation is durably recorded in this browser.");
       }
       if (this.clock() >= input.receipt.retentionExpiresAtMs) {
-        // An intent proves only that this browser meant to send DELETE, not
-        // that the Worker accepted it. Never release a local lease on deadline
-        // expiry until an authenticated terminal response was durably saved.
-        throw new GenerationClientError("CueBench cannot prove cancellation after this recovery receipt expired. Keep the protected caption lease and contact support to recover it safely.");
+        // An intent alone cannot prove remote cancellation. It does prove the
+        // browser must retain a truthful lifecycle-pending tombstone; after
+        // the owner capability elapsed it can no longer adopt anything, so do
+        // not leave the target track permanently locked.
+        await this.settleExpiredReceipt(input.store, input.receipt);
+        return;
       }
       await this.completeCancellationRequest(input, input.receipt);
       return;
     }
-    if (terminal.localLeaseRelease === "released") return;
     if (terminal.cleanupAcknowledgement === "acknowledged" || terminal.cleanupAcknowledgement === "lifecycle-pending") {
       await this.settleCancelledCaptionLease(input.store, input.receipt);
       return;
@@ -602,6 +724,7 @@ export class CaptionGenerationClient implements CaptionGenerationClientPort {
         authorization: `Bearer ${receipt.session}`,
         "content-type": "application/json",
         "x-cuebench-generation-receipt": receipt.signedGenerationReceipt,
+        "x-cuebench-project-owner": receipt.projectOwnerCapability,
       },
       body: JSON.stringify({ action: "adopted", adoptedProjectRevision }),
     });
@@ -624,19 +747,24 @@ export class CaptionGenerationClient implements CaptionGenerationClientPort {
     }
   }
 
-  public async retryAdoptionCleanup(input: Pick<AdoptCaptionGenerationInput, "store" | "receipt">): Promise<void> {
+  public async retryAdoptionCleanup(input: Pick<AdoptCaptionGenerationInput, "store" | "receipt">): Promise<GenerationClientReceipt> {
     const adoption = input.receipt.adoption;
     if (adoption === undefined || adoption.status !== "adopted") {
       throw new GenerationClientError("CueBench cannot retry cleanup before the local caption adoption has committed.");
     }
+    if (this.clock() >= input.receipt.retentionExpiresAtMs) {
+      return this.settleExpiredReceipt(input.store, input.receipt);
+    }
     await this.acknowledgeAdoption(input.receipt, adoption.adoptedProjectRevision);
-    await input.store.persistCaptionGenerationReceipt(input.receipt.runId, {
+    const acknowledged: GenerationClientReceipt = {
       ...input.receipt,
       adoption: {
         ...adoption,
         cleanupAcknowledgement: "acknowledged",
       },
-    });
+    };
+    await input.store.persistCaptionGenerationReceipt(input.receipt.runId, acknowledged);
+    return acknowledged;
   }
 
   public async adopt(input: AdoptCaptionGenerationInput): Promise<CommandResult> {
@@ -644,6 +772,7 @@ export class CaptionGenerationClient implements CaptionGenerationClientPort {
       headers: {
         authorization: `Bearer ${input.receipt.session}`,
         "x-cuebench-generation-receipt": input.receipt.signedGenerationReceipt,
+        "x-cuebench-project-owner": input.receipt.projectOwnerCapability,
       },
     });
     if (!response.ok) throw await responseError(response, "CueBench could not retrieve a complete staged caption result.");
@@ -713,6 +842,7 @@ export class CaptionGenerationClient implements CaptionGenerationClientPort {
       ? undefined
       : parsedCancellationIntent(receipt.cancellationRequested);
     const terminalCleanup = receipt.terminalCleanup === undefined ? undefined : parsedTerminalCleanup(receipt.terminalCleanup);
+    const expirySettlement = receipt.expirySettlement === undefined ? undefined : parsedExpirySettlement(receipt.expirySettlement);
     if (
       receipt.version !== 1
       || receipt.runId !== runId
@@ -724,6 +854,7 @@ export class CaptionGenerationClient implements CaptionGenerationClientPort {
       || typeof receipt.mediaSha256 !== "string" || !sha256.test(receipt.mediaSha256)
       || typeof receipt.sourceByteLength !== "number" || !Number.isSafeInteger(receipt.sourceByteLength) || receipt.sourceByteLength <= 0
       || typeof receipt.sourceDurationMs !== "number" || !Number.isSafeInteger(receipt.sourceDurationMs) || receipt.sourceDurationMs <= 0
+      || typeof receipt.projectOwnerCapability !== "string" || !/^[0-9a-f]{64}$/i.test(receipt.projectOwnerCapability)
       || receipt.mediaSha256.toLowerCase() !== project.media.sha256.toLowerCase()
       || receipt.sourceDurationMs !== project.media.durationMs
       || typeof savedAtMs !== "number" || !Number.isSafeInteger(savedAtMs) || savedAtMs < 0
@@ -731,13 +862,19 @@ export class CaptionGenerationClient implements CaptionGenerationClientPort {
       || (receipt.adoption !== undefined && adoption === null)
       || (receipt.cancellationRequested !== undefined && cancellationRequested === null)
       || (receipt.terminalCleanup !== undefined && terminalCleanup === null)
+      || (receipt.expirySettlement !== undefined && expirySettlement === null)
     ) return null;
-    return {
+    const normalized: GenerationClientReceipt = {
       ...receipt,
       retentionExpiresAtMs,
+      projectOwnerCapability: receipt.projectOwnerCapability.toLowerCase(),
       ...(adoption === undefined ? {} : { adoption }),
       ...(cancellationRequested === undefined ? {} : { cancellationRequested }),
       ...(terminalCleanup === undefined ? {} : { terminalCleanup }),
+      ...(expirySettlement === undefined ? {} : { expirySettlement }),
     } as GenerationClientReceipt;
+    return this.clock() >= normalized.retentionExpiresAtMs
+      ? this.settleExpiredReceipt(store, normalized)
+      : normalized;
   }
 }

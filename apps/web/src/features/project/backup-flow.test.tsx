@@ -13,6 +13,7 @@ import { BackupDialog, type BackupManager } from "./BackupDialog";
 import { DeleteProjectDialog } from "./DeleteProjectDialog";
 import { ObjectUrlLease } from "./local-media";
 import { ProjectStore } from "./project-store";
+import { loadPersistedCloudUpload, type CloudUploadReceiptStore } from "./cloud-upload";
 
 const projectFixture = (): CaptionProject => createProject({
   projectId: "backup-ui",
@@ -301,6 +302,77 @@ describe("Backup, relink, and deletion human workflows", () => {
     expect(await loadProject(database, before.projectId)).toMatchObject({ projectId: before.projectId });
     expect((await database.settings.toArray()).some((setting) => setting.key.startsWith(`import-safety-backup:${before.projectId}:`))).toBe(true);
     expect((await database.settings.toArray()).some((setting) => setting.key.startsWith(`replacement-safety-backup:${before.projectId}:`))).toBe(true);
+    await database.delete();
+  });
+
+  it("rotates the durable non-portable project-instance owner on import and rejects old-tab cloud recovery without deleting localStorage", async () => {
+    const database = new CueBenchDatabase(`task-13-owner-import-${crypto.randomUUID()}`);
+    const first = new ProjectStore({
+      database,
+      browserStorage: browserStorage(),
+      objectUrlLease: new ObjectUrlLease({ createObjectURL: vi.fn(() => "blob:cuebench:owner-first"), revokeObjectURL: vi.fn() }),
+      bundledSampleLoader: bundledFile,
+      mediaDurationProbe: async () => 90_000,
+    });
+    await first.openSample();
+    const project = first.getSnapshot().project;
+    if (project === null) throw new Error("Expected a durable project.");
+    const second = new ProjectStore({
+      database,
+      browserStorage: browserStorage(),
+      objectUrlLease: new ObjectUrlLease({ createObjectURL: vi.fn(() => "blob:cuebench:owner-second"), revokeObjectURL: vi.fn() }),
+      mediaDurationProbe: async () => 90_000,
+    });
+    await second.restoreLastDurableProject();
+
+    const oldOwner = await first.getCloudProjectOwnerCapability(project.projectId);
+    expect(oldOwner).toMatch(/^[0-9a-f]{64}$/);
+    expect(await second.getCloudProjectOwnerCapability(project.projectId)).toBe(oldOwner);
+    const portable = await first.exportProjectBackup();
+    expect(portable.text).not.toContain(oldOwner!);
+
+    const values = new Map<string, unknown>();
+    const receiptStore: CloudUploadReceiptStore = {
+      load: (key) => values.get(key) ?? null,
+      save: (key, value) => { values.set(key, value); },
+      remove: (key) => { values.delete(key); },
+    };
+    const staleReceiptKey = `cuebench-cloud-upload:${project.projectId}`;
+    values.set(staleReceiptKey, {
+      version: 1,
+      projectId: project.projectId,
+      operationId: "old-import-operation",
+      sourceByteLength: 13,
+      sourceSha256: project.media.sha256,
+      sourceContentType: "video/mp4",
+      durationMs: project.media.durationMs,
+      projectOwnerCapability: oldOwner,
+      operationReceipt: "opaque-old-operation",
+      uploadCapability: "opaque-old-upload",
+      partSize: 13,
+      partCount: 1,
+      partReceipts: {},
+    });
+
+    await first.previewBackupText(portable.text);
+    await first.relinkImportedMedia(bundledFile());
+    await first.importPreviewedBackup();
+
+    const freshOwner = await first.getCloudProjectOwnerCapability(project.projectId);
+    expect(freshOwner).toMatch(/^[0-9a-f]{64}$/);
+    expect(freshOwner).not.toBe(oldOwner);
+    // The second (older) tab bypasses its stale React projection and reads
+    // the fresh capability from IndexedDB before any cloud mutation.
+    expect(await second.getCloudProjectOwnerCapability(project.projectId)).toBe(freshOwner);
+    expect(loadPersistedCloudUpload(
+      project.projectId,
+      { sha256: project.media.sha256, durationMs: project.media.durationMs },
+      receiptStore,
+      freshOwner!,
+    )).toBeNull();
+    // Correctness comes from the durable owner comparison, not a best-effort
+    // localStorage remove that could race another tab's recovery read.
+    expect(values.get(staleReceiptKey)).toMatchObject({ projectOwnerCapability: oldOwner });
     await database.delete();
   });
 

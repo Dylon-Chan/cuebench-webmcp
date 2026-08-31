@@ -99,6 +99,37 @@ describe("two-pass caption evidence alignment", () => {
     expect(evidence.uncertaintySpans).toEqual([]);
   });
 
+  it("marks insertions, deletions, reordered tokens, and duplicate-token disagreement with ordered alignment", () => {
+    const evidence = (segmentText: string, wordTexts: readonly string[]) => alignCaptionEvidence({
+      text: segmentText,
+      durationMs: wordTexts.length * 1_000,
+      segments: [{ id: "speaker-a", startMs: 0, endMs: wordTexts.length * 1_000, speaker: "A", text: segmentText }],
+    }, {
+      text: wordTexts.join(" "),
+      words: wordTexts.map((text, index) => ({ text, startMs: index * 1_000, endMs: index * 1_000 + 900 })),
+    });
+
+    // The former Set-based check accepted these because their token sets are
+    // equal; LCS exposes the reordering and repeated-token multiplicity.
+    const reordered = evidence("one two one", ["one", "one", "two"]);
+    expect(reordered.uncertaintySpans).toMatchObject([{
+      reason: "TranscriptDisagreement",
+      wordIds: reordered.words.map((word) => word.id),
+    }]);
+
+    const insertion = evidence("alpha", ["alpha", "beta"]);
+    expect(insertion.uncertaintySpans).toMatchObject([{
+      reason: "TranscriptDisagreement",
+      wordIds: [insertion.words[1]!.id],
+    }]);
+
+    const deletion = evidence("alpha beta", ["alpha"]);
+    expect(deletion.uncertaintySpans).toMatchObject([{
+      reason: "TranscriptDisagreement",
+      wordIds: [deletion.words[0]!.id],
+    }]);
+  });
+
   it("preserves raw response hashes and runs both provider passes as typed ports", async () => {
     const provider: CaptionEvidenceProvider = {
       diarize: async () => ({

@@ -1,4 +1,5 @@
 import type { CaptionProject } from "../model";
+import { MAX_PORTABLE_PROJECT_BACKUP_BYTES } from "@cuebench/contracts";
 import { canonicalHash } from "../quality/hash";
 import type { RoundTripResult } from "../export/round-trip";
 
@@ -54,6 +55,16 @@ export class ProjectBackupManifestError extends Error {
     this.name = "ProjectBackupManifestError";
   }
 }
+
+/** UTF-8 byte length of the exact compact wire representation we download. */
+export const projectBackupSerializedByteLength = (backup: ProjectBackupV1): number =>
+  new TextEncoder().encode(JSON.stringify(backup)).byteLength;
+
+export const assertPortableProjectBackupByteBudget = (backup: ProjectBackupV1): void => {
+  if (projectBackupSerializedByteLength(backup) > MAX_PORTABLE_PROJECT_BACKUP_BYTES) {
+    throw new ProjectBackupManifestError("CueBench project backup exceeds the 10 MB portable import budget.");
+  }
+};
 
 export interface LegacyProjectBackupEnvelopeV0 {
   readonly schemaVersion: 0;
@@ -306,7 +317,9 @@ export const exportProjectBackup = (
     project: portableProject,
     exportMetadata: metadata,
   };
-  return { ...payload, manifestHash: projectBackupManifestHash(payload) };
+  const backup = { ...payload, manifestHash: projectBackupManifestHash(payload) };
+  assertPortableProjectBackupByteBudget(backup);
+  return backup;
 };
 
 /** Returns true only for the complete, integrity-checked v1 portable manifest. */
@@ -335,6 +348,7 @@ export const verifyProjectBackupManifest = (value: unknown): ProjectBackupV1 => 
     throw new ProjectBackupManifestError("CueBenchProjectBackup v1 requires a complete, strict manifest.");
   }
   const backup = value as unknown as ProjectBackupV1;
+  assertPortableProjectBackupByteBudget(backup);
   assertPortableManifestValue(backup.project, "project");
   assertPortableManifestValue(backup.exportMetadata, "exportMetadata");
   if (

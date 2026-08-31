@@ -7,6 +7,7 @@ import { R2PrivateObjectStore, classifyMultipartAbortError, type MultipartPrivat
 import type { WorkerEnv } from "./env";
 
 const partSize = 8 * 1024 * 1024;
+const projectOwnerCapability = "1".repeat(64);
 
 class MultipartFixtureStore implements MultipartPrivateObjectStore {
   public createCalls = 0;
@@ -89,6 +90,7 @@ const json = (path: string, body: unknown, session?: string): Request => new Req
   headers: {
     "content-type": "application/json",
     "cf-connecting-ip": "203.0.113.10",
+    "x-cuebench-project-owner": projectOwnerCapability,
     ...(session === undefined ? {} : { authorization: `Bearer ${session}` }),
   },
   body: JSON.stringify(body),
@@ -96,6 +98,7 @@ const json = (path: string, body: unknown, session?: string): Request => new Req
 
 const uploadRequest = (session: string): Request => json("/api/uploads", {
   projectId: "project-fixture",
+  projectOwnerCapability,
   operationId: "operation-fixture",
   media: { byteLength: partSize + 1, durationMs: 60_000, contentType: "video/webm" },
   disclosureAccepted: true,

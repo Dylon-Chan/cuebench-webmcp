@@ -156,6 +156,11 @@ const workerEnv = (overrides: Partial<WorkerEnv> = {}): WorkerEnv => ({
   ...overrides,
 });
 
+// Production browsers retain this opaque value locally per project. Keeping a
+// fixed fixture value makes every helper exercise the owner-bound route rather
+// than accidentally falling through the bounded legacy-session path.
+const projectOwnerCapability = "1".repeat(64);
+
 const probeFor = (options: Partial<Awaited<ReturnType<MediaProbe["probe"]>>> = {}): MediaProbe => ({
   probe: async () => ({
     container: "webm",
@@ -214,13 +219,14 @@ const makeFixture = (options: {
   };
 };
 
-const jsonRequest = (path: string, body: unknown, options: { readonly method?: "POST"; readonly session?: string; readonly ip?: string; readonly receipt?: string } = {}): Request => new Request(`https://cuebench.test${path}`, {
+const jsonRequest = (path: string, body: unknown, options: { readonly method?: "POST"; readonly session?: string; readonly ip?: string; readonly receipt?: string; readonly projectOwnerCapability?: string } = {}): Request => new Request(`https://cuebench.test${path}`, {
   method: options.method ?? "POST",
   headers: {
     "content-type": "application/json",
     "cf-connecting-ip": options.ip ?? "203.0.113.10",
     ...(options.session === undefined ? {} : { authorization: `Bearer ${options.session}` }),
     ...(options.receipt === undefined ? {} : { "x-cuebench-operation-receipt": options.receipt }),
+    ...(options.projectOwnerCapability === undefined ? { "x-cuebench-project-owner": projectOwnerCapability } : { "x-cuebench-project-owner": options.projectOwnerCapability }),
   },
   body: JSON.stringify(body),
 });
@@ -240,6 +246,7 @@ const requestUpload = (app: ReturnType<typeof createCueBenchWorker>, session: st
   readonly ip?: string;
 } = {}): Promise<Response> => Promise.resolve(app.fetch(jsonRequest("/api/uploads", {
   projectId: "project-fixture",
+  projectOwnerCapability,
   operationId: options.operationId ?? "operation-fixture",
   media: {
     byteLength: options.byteLength ?? 5,
@@ -249,13 +256,14 @@ const requestUpload = (app: ReturnType<typeof createCueBenchWorker>, session: st
   disclosureAccepted: options.disclosureAccepted ?? true,
 }, { session, ...(options.ip === undefined ? {} : { ip: options.ip }) })));
 
-const partRequest = (session: string, capability: string, body = "hello", ip = "203.0.113.10"): Request => new Request("https://cuebench.test/api/uploads/operation-fixture/parts/1", {
+const partRequest = (session: string, capability: string, body = "hello", ip = "203.0.113.10", ownerCapability = projectOwnerCapability): Request => new Request("https://cuebench.test/api/uploads/operation-fixture/parts/1", {
   method: "PUT",
   headers: {
     authorization: `Bearer ${session}`,
     "cf-connecting-ip": ip,
     "content-type": "video/webm",
     "x-cuebench-upload-capability": capability,
+    "x-cuebench-project-owner": ownerCapability,
   },
   body,
 });
@@ -361,7 +369,11 @@ describe("CueBench anonymous multipart Worker", () => {
     const cleanupSession = (await sessionResponse.json() as { readonly session: string }).session;
     const cancelled = await open.app.fetch(new Request("https://cuebench.test/api/uploads/operation-fixture", {
       method: "DELETE",
-      headers: { authorization: `Bearer ${cleanupSession}`, "x-cuebench-operation-receipt": operationReceipt },
+      headers: {
+        authorization: `Bearer ${cleanupSession}`,
+        "x-cuebench-operation-receipt": operationReceipt,
+        "x-cuebench-project-owner": projectOwnerCapability,
+      },
     }));
     expect(cancelled.status).toBe(204);
     expect(bucket.abortCalls).toBe(1);
@@ -510,6 +522,7 @@ describe("CueBench anonymous multipart Worker", () => {
         authorization: `Bearer ${renewed}`,
         "cf-connecting-ip": "203.0.113.11",
         "x-cuebench-operation-receipt": operationReceipt,
+        "x-cuebench-project-owner": projectOwnerCapability,
       },
     }));
     const resumed = await status.json() as { readonly uploadCapability: string };
@@ -529,9 +542,11 @@ describe("CueBench anonymous multipart Worker", () => {
         authorization: `Bearer ${session}`,
         "content-type": "application/json",
         "x-forwarded-for": "198.51.100.1",
+        "x-cuebench-project-owner": projectOwnerCapability,
       },
       body: JSON.stringify({
         projectId: "project-fixture",
+        projectOwnerCapability,
         operationId: "forwarded-ip-fixture",
         media: { byteLength: 5, durationMs: 60_000, contentType: "video/webm" },
         disclosureAccepted: true,
@@ -545,6 +560,7 @@ describe("CueBench anonymous multipart Worker", () => {
         authorization: `Bearer ${session}`,
         "content-type": "video/webm",
         "x-cuebench-upload-capability": uploadCapability,
+        "x-cuebench-project-owner": projectOwnerCapability,
         "x-forwarded-for": "198.51.100.2",
       },
       body: "hello",
@@ -1010,6 +1026,7 @@ describe("CueBench anonymous multipart Worker", () => {
         authorization: `Bearer ${session}`,
         "cf-connecting-ip": "203.0.113.10",
         "x-cuebench-operation-receipt": operationReceipt,
+        "x-cuebench-project-owner": projectOwnerCapability,
       },
     }));
     release.resolve();
