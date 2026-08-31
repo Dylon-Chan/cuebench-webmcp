@@ -14,13 +14,17 @@ import {
 } from "./generation-routes";
 import {
   audioDescriptionWorkflowInstanceId,
+  createAudioDescriptionGenerationRoutes,
   issueAudioDescriptionGenerationRunReceipt,
+  MAX_AUDIO_DESCRIPTION_WORKFLOW_ATTEMPTS,
   R2AudioDescriptionGenerationRunRecordStore,
   verifyAudioDescriptionGenerationRunReceipt,
   type AudioDescriptionGenerationRunRecord,
 } from "./ad-generation-routes";
 import { resolveWorkerSettings } from "./env";
-import { saltedLedgerKey } from "./quota-ledger";
+import { reconcileWorkerPrivateLifecycle } from "./index";
+import { lifecycleReconciliationKey } from "./lifecycle-reconciler";
+import { InMemoryQuotaLedger, saltedLedgerKey } from "./quota-ledger";
 import { issueAnonymousSession } from "./session";
 import { issueUploadReceipt, verifyUploadReceipt } from "./uploads";
 import { OpenAIProviderError, sha256Hex } from "./openai/client";
@@ -449,6 +453,7 @@ describe("workerd hosted upload boundary", () => {
       status: queued,
       cancelled: false,
       dispatched: true,
+      workflowAttempt: 1,
       updatedAtMs: currentNow,
     };
     await store.save(initial);
@@ -648,6 +653,7 @@ describe("workerd hosted upload boundary", () => {
       status: queued,
       cancelled: false,
       dispatched: true,
+      workflowAttempt: 1,
       updatedAtMs: currentNow,
     };
     await store.acquireActiveLease({
@@ -1226,6 +1232,7 @@ describe("workerd hosted upload boundary", () => {
       windowCheckpoints: {},
       artifactRefs: [],
       privateObjectKeys: [claims.objectKey],
+      workflowAttempt: 1,
       updatedAtMs: currentNow,
     });
     const claim = await targetStore.claimWindowProviderCall({ claims, windowId: "ad-window-fence", nowMs: currentNow });
@@ -1290,7 +1297,7 @@ describe("workerd hosted upload boundary", () => {
     expect((await target.list({ prefix: `prepared/${operationKey}/audio-description-runs/${runId}/artifacts/` })).objects).toEqual([]);
   });
 
-  it("tombstones a failed AD upload before releasing its lease, rejects same-upload reuse, and isolates a fresh upload from an old cancel", async () => {
+  it("terminally exhausts a second safe AD retry before exact cleanup releases its shared lease", async () => {
     const settings = resolveWorkerSettings(env);
     const currentNow = Date.now();
     const sessionId = `workerd-ad-failed-owner-session-${currentNow}`;
@@ -1396,14 +1403,26 @@ describe("workerd hosted upload boundary", () => {
         expectedProjectRevision: 2,
         stage: "Failed",
         code: "GENERATION_STAGE_FAILED",
-        message: "fixture terminal failure",
-        retryable: false,
+        message: "fixture known-safe second provider failure",
+        // Simulate the durable state written by the second Workflow after a
+        // provider failure known not to have been accepted. The authenticated
+        // status route must normalize this legacy/in-flight retry marker to a
+        // terminal failure before it can release the shared project lease.
+        retryable: true,
       },
       cancelled: false,
       dispatched: true,
-      windowCheckpoints: {},
+      windowCheckpoints: {
+        "ad-window-safe": {
+          state: "retryable-failed",
+          attempt: 2,
+          attemptId: "ad-window-safe-a2",
+          updatedAtMs: currentNow,
+        },
+      },
       artifactRefs: [],
       privateObjectKeys: [uploadA.objectKey],
+      workflowAttempt: MAX_AUDIO_DESCRIPTION_WORKFLOW_ATTEMPTS,
       leaseReleasePending: true,
       updatedAtMs: currentNow,
     });
@@ -1425,12 +1444,24 @@ describe("workerd hosted upload boundary", () => {
       },
     }));
     expect(statusA.status).toBe(200);
+    await expect(statusA.json()).resolves.toEqual(expect.objectContaining({
+      status: expect.objectContaining({ stage: "Failed", retryable: false }),
+    }));
     await vi.waitFor(async () => expect(await records.load(claimsA)).toMatchObject({
       cleanup: { state: "completed", action: "discarded" },
       contentRedacted: true,
       receipt: "redacted",
     }), { timeout: 5_000, interval: 50 });
     expect(await env.PROCESSING_BUCKET.head(generationCleanupMarkerKey(uploadA.operationKey))).not.toBeNull();
+    await expect(leases.ownsActiveLease({
+      sessionKey,
+      ownerKey,
+      projectKey,
+      operationKey: uploadA.operationKey,
+      runId: runIdA,
+      targetTrack: "AudioDescriptions",
+      nowMs: currentNow,
+    })).resolves.toBe(false);
 
     const requestStart = (uploadReceipt: string, runId: string) => SELF.fetch(new Request("https://cuebench.test/api/audio-description-runs", {
       method: "POST",
@@ -1462,8 +1493,9 @@ describe("workerd hosted upload boundary", () => {
     const fresh = await requestStart(uploadB.receipt, runIdB);
     expect(fresh.status).toBe(201);
     const receiptB = (await fresh.json() as { readonly audioDescriptionGenerationReceipt: string }).audioDescriptionGenerationReceipt;
-    // The old receipt has been redacted and cannot re-enter cleanup. More
-    // importantly, its operation namespace is distinct from B's fresh source.
+    // The old receipt has been redacted and cannot re-enter a *different*
+    // terminal action. More importantly, its operation namespace is distinct
+    // from B's fresh source.
     const oldCancel = await SELF.fetch(new Request(`https://cuebench.test/api/audio-description-runs/${runIdA}`, {
       method: "DELETE",
       headers: {
@@ -1472,7 +1504,7 @@ describe("workerd hosted upload boundary", () => {
         "x-cuebench-project-owner": workerdProjectOwnerCapability,
       },
     }));
-    expect(oldCancel.status).toBe(404);
+    expect(oldCancel.status).toBe(409);
     expect(await env.PROCESSING_BUCKET.head(uploadB.objectKey)).not.toBeNull();
     // Avoid retaining this test's fresh private source. The deletion is
     // idempotent even if its fixture Workflow has already failed.
@@ -1484,6 +1516,194 @@ describe("workerd hosted upload boundary", () => {
         "x-cuebench-project-owner": workerdProjectOwnerCapability,
       },
     }));
+  }, 20_000);
+
+  it("repairs a redacted terminal AD record after a transient real-R2 lease CAS failure", async () => {
+    const settings = resolveWorkerSettings(env);
+    const currentNow = Date.now();
+    const sessionId = `workerd-ad-redacted-lease-repair-session-${currentNow}`;
+    const projectId = "workerd-ad-redacted-lease-repair-project";
+    const operationId = `workerd-ad-redacted-lease-repair-operation-${currentNow}`;
+    const runId = `workerd-ad-redacted-lease-repair-run-${currentNow}`;
+    const [sessionKey, ownerKey, projectKey, operationKey] = await Promise.all([
+      saltedLedgerKey(settings.quotaSalt, "session", sessionId),
+      saltedLedgerKey(settings.quotaSalt, "project-owner", workerdProjectOwnerCapability),
+      saltedLedgerKey(settings.quotaSalt, "project", projectId),
+      saltedLedgerKey(settings.quotaSalt, "operation", `${sessionId}:${operationId}`),
+    ]);
+    const anonymousSession = await issueAnonymousSession({
+      sessionId,
+      issuedAtMs: currentNow,
+      expiresAtMs: currentNow + 60_000,
+      keyRing: settings.keyRing,
+    });
+    const objectKey = `processing/${sessionKey}/${operationKey}`;
+    const projection = {
+      contractVersion: 1 as const,
+      projectId,
+      expectedProjectRevision: 2,
+      expectedQualityProfileRevision: 1,
+      mediaSha256: "c".repeat(64),
+      localEvidencePackageIds: ["caption-package-redacted-lease-repair"],
+      captions: [{ itemId: "caption-redacted-lease-repair", itemRevision: 1, state: "Sustained" as const, startMs: 1_000, endMs: 2_000, text: "A bounded caption cue.", evidenceIds: [] }],
+      evidence: [],
+    };
+    const receipt = await issueAudioDescriptionGenerationRunReceipt({
+      runId,
+      projectId,
+      targetTrack: "AudioDescriptions",
+      expectedProjectRevision: 2,
+      expectedQualityProfileRevision: 1,
+      mediaSha256: projection.mediaSha256,
+      captionEvidenceHash: canonicalHash("cuebench.audio-description.caption-evidence.v1", projection).slice("sha256:".length),
+      sessionKey,
+      ownerKey,
+      projectKey,
+      sourceByteLength: 5,
+      sourceDurationMs: 31_000,
+      operationId,
+      operationKey,
+      objectKey,
+      issuedAtMs: currentNow,
+      expiresAtMs: currentNow + 60_000,
+    }, settings);
+    const claims = await verifyAudioDescriptionGenerationRunReceipt(receipt, settings, currentNow);
+    const records = new R2AudioDescriptionGenerationRunRecordStore(env.PROCESSING_BUCKET);
+    const baseLeases = new R2GenerationRunRecordStore(env.PROCESSING_BUCKET);
+    await env.PROCESSING_BUCKET.put(objectKey, "hello", { httpMetadata: { contentType: "video/webm" } });
+    await records.save({
+      version: 1,
+      receipt,
+      claims,
+      uploadReceipt: "private-upload-receipt",
+      captionEvidenceProjection: projection,
+      status: {
+        contractVersion: 1,
+        runId,
+        projectId,
+        targetTrack: "AudioDescriptions",
+        expectedProjectRevision: 2,
+        stage: "Failed",
+        code: "GENERATION_STAGE_FAILED",
+        message: "static category only",
+        retryable: false,
+      },
+      cancelled: false,
+      dispatched: true,
+      workflowAttempt: 1,
+      windowCheckpoints: {},
+      artifactRefs: [],
+      privateObjectKeys: [objectKey],
+      leaseReleasePending: true,
+      updatedAtMs: currentNow,
+    });
+    await baseLeases.acquireActiveLease({
+      sessionKey,
+      ownerKey,
+      projectKey,
+      operationKey,
+      runId,
+      targetTrack: "AudioDescriptions",
+      expiresAtMs: currentNow + 60_000,
+      nowMs: currentNow,
+    });
+    // Model the durable point immediately after the exact R2 object cleanup
+    // redacted this run but before its independent shared-lease CAS. The
+    // route must keep the same signed cancellation usable for repair without
+    // ever restoring bearer material to R2.
+    const terminal = await records.terminal({ claims, action: "cancelled", nowMs: currentNow });
+    if (terminal === null) throw new Error("Expected a durable AD terminal record.");
+    const cleaned = await records.cleanup({ claims, action: "cancelled", nowMs: currentNow });
+    if (cleaned === null) throw new Error("Expected a durable redacted AD cleanup record.");
+    const activeLeaseKey = `processing/generation-leases/${ownerKey}/${projectKey}.json`;
+    let failLeaseRelease = true;
+    const flakyBucket = new Proxy(env.PROCESSING_BUCKET, {
+      get(source, property, receiver) {
+        if (property === "put") {
+          return async (key: string, value: unknown, options: unknown) => {
+            if (key === activeLeaseKey && failLeaseRelease) {
+              failLeaseRelease = false;
+              throw new Error("injected AD terminal lease CAS failure");
+            }
+            return (source.put as unknown as (nextKey: string, nextValue: unknown, nextOptions: unknown) => Promise<unknown>)(key, value, options);
+          };
+        }
+        const value = Reflect.get(source, property, receiver);
+        return typeof value === "function" ? value.bind(source) : value;
+      },
+    }) as unknown as R2Bucket;
+    const repairApp = createAudioDescriptionGenerationRoutes(env, {
+      clock: () => currentNow,
+      quotaLedger: new InMemoryQuotaLedger(),
+      runs: records,
+      leases: new R2GenerationRunRecordStore(flakyBucket),
+      workflow: { startAudioDescriptionGeneration: async () => undefined, cancelAudioDescriptionGeneration: async () => undefined },
+    });
+    const headers = {
+      authorization: `Bearer ${anonymousSession}`,
+      "x-cuebench-audio-description-receipt": receipt,
+      "x-cuebench-project-owner": workerdProjectOwnerCapability,
+    };
+    const cancellation = () => repairApp.fetch(new Request(`https://cuebench.test/api/audio-description-runs/${runId}`, {
+      method: "DELETE",
+      headers,
+    }));
+    const status = () => repairApp.fetch(new Request(`https://cuebench.test/api/audio-description-runs/${runId}`, {
+      headers: {
+        authorization: `Bearer ${anonymousSession}`,
+        "x-cuebench-audio-description-receipt": receipt,
+        "x-cuebench-project-owner": workerdProjectOwnerCapability,
+      },
+    }));
+
+    const first = await cancellation();
+    expect(first.status).toBe(200);
+    await expect(first.json()).resolves.toMatchObject({
+      status: { stage: "Cancelled" },
+      cleanup: { state: "pending", action: "cancelled" },
+    });
+    await expect(records.load(claims)).resolves.toMatchObject({
+      receipt: "redacted",
+      uploadReceipt: "redacted",
+      contentRedacted: true,
+      cleanup: { state: "completed", action: "cancelled" },
+      leaseReleasePending: true,
+    });
+    await expect(baseLeases.ownsActiveLease({ sessionKey, ownerKey, projectKey, operationKey, runId, targetTrack: "AudioDescriptions", nowMs: currentNow })).resolves.toBe(true);
+
+    // A reconnect GET can repair the server lease. It never restores raw
+    // capability data, and the same exact DELETE remains idempotent after
+    // this GET clears the repair marker.
+    const reconciled = await status();
+    expect(reconciled.status).toBe(200);
+    await expect(reconciled.json()).resolves.toMatchObject({
+      status: { stage: "Cancelled" },
+      cleanup: { state: "completed", action: "cancelled" },
+    });
+    const repairedRecord = await records.load(claims);
+    expect(repairedRecord).toMatchObject({ receipt: "redacted", uploadReceipt: "redacted", contentRedacted: true });
+    expect(repairedRecord).not.toHaveProperty("leaseReleasePending");
+    await expect(baseLeases.ownsActiveLease({ sessionKey, ownerKey, projectKey, operationKey, runId, targetTrack: "AudioDescriptions", nowMs: currentNow })).resolves.toBe(false);
+    const idempotent = await cancellation();
+    expect(idempotent.status).toBe(200);
+    await expect(idempotent.json()).resolves.toMatchObject({ cleanup: { state: "completed", action: "cancelled" } });
+    await expect(baseLeases.acquireActiveLease({
+      sessionKey,
+      ownerKey,
+      projectKey,
+      operationKey: "d".repeat(64),
+      runId: `caption-after-ad-redacted-lease-repair-${currentNow}`,
+      targetTrack: "Captions",
+      expiresAtMs: currentNow + 60_000,
+      nowMs: currentNow,
+    })).resolves.toMatchObject({ kind: "acquired" });
+
+    await env.PROCESSING_BUCKET.delete([
+      `prepared/${operationKey}/audio-description-runs/${runId}.json`,
+      `prepared/${operationKey}/generation-cleanup.json`,
+      `processing/private-lifecycle/audio-descriptions/${operationKey}/${runId}.json`,
+      activeLeaseKey,
+    ]);
   }, 20_000);
 
   it("verifies normalized audio R2 metadata, exact size, and body digest before a provider can read it", async () => {
@@ -2166,6 +2386,7 @@ describe("workerd hosted upload boundary", () => {
       },
       cancelled: false,
       dispatched: false,
+      workflowAttempt: 1,
       windowCheckpoints: {},
       artifactRefs: [],
       privateObjectKeys: [claims.objectKey],
@@ -2276,6 +2497,155 @@ describe("workerd hosted upload boundary", () => {
     }));
     expect((await reconciled.json() as { readonly state: string }).state).toBe("cancelled");
     expect(await env.PROCESSING_BUCKET.head(receipt.objectKey)).toBeNull();
+  });
+
+  it("runs the authenticated scheduled exact-key sweep before the private 24-hour deadline", async () => {
+    const settings = resolveWorkerSettings(env);
+    const currentNow = Date.now();
+    const retentionExpiresAtMs = currentNow + 24 * 60 * 60 * 1_000;
+    const operationKey = "c".repeat(64);
+    const runId = `scheduled-cleanup-${currentNow}`;
+    const receipt = await issueGenerationRunReceipt({
+      runId,
+      projectId: "workerd-scheduled-cleanup-project",
+      targetTrack: "Captions",
+      expectedProjectRevision: 2,
+      expectedQualityProfileRevision: 1,
+      mediaSha256: "d".repeat(64),
+      sessionKey: "e".repeat(64),
+      projectKey: "f".repeat(64),
+      sourceByteLength: 5,
+      sourceDurationMs: 31_000,
+      operationId: `scheduled-cleanup-operation-${currentNow}`,
+      operationKey,
+      objectKey: `processing/${"e".repeat(64)}/${operationKey}`,
+      issuedAtMs: currentNow,
+      expiresAtMs: retentionExpiresAtMs,
+    }, settings);
+    const claims = await verifyGenerationRunReceipt(receipt, settings, currentNow);
+    const recordKey = `prepared/${operationKey}/generation-runs/${runId}.json`;
+    const indexKey = lifecycleReconciliationKey({ targetTrack: "Captions", operationKey, runId });
+    const records = new R2GenerationRunRecordStore(env.PROCESSING_BUCKET);
+    await env.PROCESSING_BUCKET.put(claims.objectKey, "private source media");
+    await records.save({
+      version: 1,
+      receipt,
+      claims,
+      uploadReceipt: "private-upload-receipt",
+      status: {
+        contractVersion: 1,
+        runId,
+        projectId: claims.projectId,
+        targetTrack: "Captions",
+        expectedProjectRevision: claims.expectedProjectRevision,
+        stage: "Queued",
+      },
+      cancelled: false,
+      dispatched: true,
+      workflowAttempt: 1,
+      updatedAtMs: currentNow,
+    });
+
+    expect(await env.PROCESSING_BUCKET.head(indexKey)).not.toBeNull();
+    const result = await reconcileWorkerPrivateLifecycle(env, retentionExpiresAtMs - 30 * 60 * 1_000);
+
+    // The Workerd bucket intentionally persists other test operations too;
+    // this asserts our run was included without assuming it was the only due
+    // exact tombstone in the bounded scheduled batch.
+    expect(result?.scanned).toBeGreaterThanOrEqual(1);
+    expect(result?.due).toBeGreaterThanOrEqual(1);
+    expect(result?.completed).toBeGreaterThanOrEqual(1);
+    expect(result?.pending).toBe(0);
+    await expect(env.PROCESSING_BUCKET.head(claims.objectKey)).resolves.toBeNull();
+    await expect(env.PROCESSING_BUCKET.head(recordKey)).resolves.toBeNull();
+    await expect(env.PROCESSING_BUCKET.head(indexKey)).resolves.toBeNull();
+    await expect(env.PROCESSING_BUCKET.head(generationCleanupMarkerKey(operationKey))).resolves.toBeNull();
+  });
+
+  it("uses the same bounded scheduled tombstone path for private audio-description recovery", async () => {
+    const settings = resolveWorkerSettings(env);
+    const currentNow = Date.now();
+    const retentionExpiresAtMs = currentNow + 24 * 60 * 60 * 1_000;
+    const operationKey = "8".repeat(64);
+    const runId = `scheduled-ad-cleanup-${currentNow}`;
+    const projectId = "workerd-scheduled-ad-cleanup-project";
+    const sessionKey = "9".repeat(64);
+    const ownerKey = "a".repeat(64);
+    const projectKey = "b".repeat(64);
+    const projection = {
+      contractVersion: 1 as const,
+      projectId,
+      expectedProjectRevision: 2,
+      expectedQualityProfileRevision: 1,
+      mediaSha256: "c".repeat(64),
+      localEvidencePackageIds: ["scheduled-caption-package"],
+      captions: [{
+        itemId: "scheduled-caption-1",
+        itemRevision: 1,
+        state: "Sustained" as const,
+        startMs: 1_000,
+        endMs: 3_000,
+        text: "The lecturer names the diagram.",
+        evidenceIds: [],
+      }],
+      evidence: [],
+    };
+    const captionEvidenceHash = canonicalHash("cuebench.audio-description.caption-evidence.v1", projection).slice("sha256:".length);
+    const receipt = await issueAudioDescriptionGenerationRunReceipt({
+      runId,
+      projectId,
+      targetTrack: "AudioDescriptions",
+      expectedProjectRevision: 2,
+      expectedQualityProfileRevision: 1,
+      mediaSha256: projection.mediaSha256,
+      captionEvidenceHash,
+      sessionKey,
+      ownerKey,
+      projectKey,
+      sourceByteLength: 5,
+      sourceDurationMs: 31_000,
+      operationId: `scheduled-ad-cleanup-operation-${currentNow}`,
+      operationKey,
+      objectKey: `processing/${sessionKey}/${operationKey}`,
+      issuedAtMs: currentNow,
+      expiresAtMs: retentionExpiresAtMs,
+    }, settings);
+    const claims = await verifyAudioDescriptionGenerationRunReceipt(receipt, settings, currentNow);
+    const recordKey = `prepared/${operationKey}/audio-description-runs/${runId}.json`;
+    const indexKey = lifecycleReconciliationKey({ targetTrack: "AudioDescriptions", operationKey, runId });
+    const records = new R2AudioDescriptionGenerationRunRecordStore(env.PROCESSING_BUCKET);
+    await env.PROCESSING_BUCKET.put(claims.objectKey, "private source media");
+    await records.save({
+      version: 1,
+      receipt,
+      claims,
+      uploadReceipt: "private-upload-receipt",
+      captionEvidenceProjection: projection,
+      status: {
+        contractVersion: 1,
+        runId,
+        projectId,
+        targetTrack: "AudioDescriptions",
+        expectedProjectRevision: claims.expectedProjectRevision,
+        stage: "Queued",
+      },
+      cancelled: false,
+      dispatched: true,
+      workflowAttempt: 1,
+      windowCheckpoints: {},
+      artifactRefs: [],
+      privateObjectKeys: [claims.objectKey],
+      updatedAtMs: currentNow,
+    });
+
+    const result = await reconcileWorkerPrivateLifecycle(env, retentionExpiresAtMs - 30 * 60 * 1_000);
+
+    expect(result?.completed).toBeGreaterThanOrEqual(1);
+    expect(result?.pending).toBe(0);
+    await expect(env.PROCESSING_BUCKET.head(claims.objectKey)).resolves.toBeNull();
+    await expect(env.PROCESSING_BUCKET.head(recordKey)).resolves.toBeNull();
+    await expect(env.PROCESSING_BUCKET.head(indexKey)).resolves.toBeNull();
+    await expect(env.PROCESSING_BUCKET.head(generationCleanupMarkerKey(operationKey))).resolves.toBeNull();
   });
 
   it("keeps an invalid multipart abort non-terminal when local workerd cannot identify it as NoSuchUpload", async () => {

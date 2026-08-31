@@ -1,18 +1,58 @@
 import * as Dialog from "@radix-ui/react-dialog";
-import { useRef, useSyncExternalStore, type ChangeEvent } from "react";
+import { useCallback, useEffect, useRef, useState, useSyncExternalStore, type ChangeEvent } from "react";
 import { StorageDisclosure } from "./StorageDisclosure";
 import { BackupDialog } from "./BackupDialog";
+import { CloudCleanupStatus, type CloudCleanupStatusEntry } from "./CloudCleanupStatus";
 import type { ProjectStore } from "./project-store";
 
 export interface ProjectStartProps {
   readonly store: ProjectStore;
+  /** Testable escape hatch; production reloads the current browser page. */
+  readonly onReloadCleanupStatus?: () => void;
 }
 
-export function ProjectStart({ store }: ProjectStartProps) {
+export function ProjectStart({ store, onReloadCleanupStatus }: ProjectStartProps) {
   const snapshot = useSyncExternalStore(store.subscribe, store.getSnapshot, store.getSnapshot);
+  const [cleanupEntries, setCleanupEntries] = useState<readonly CloudCleanupStatusEntry[]>([]);
+  const [cleanupLoadError, setCleanupLoadError] = useState(false);
   const temporaryChoiceOpen = snapshot.route === "temporary-choice";
   const uploadInput = useRef<HTMLInputElement>(null);
   const busy = snapshot.activity !== null;
+  const refreshCloudCleanup = useCallback(async () => {
+    try {
+      const entries = await store.listCloudCleanupReceipts();
+      setCleanupEntries(entries);
+      setCleanupLoadError(false);
+    } catch {
+      // Do not erase the last durable public projection when IndexedDB has a
+      // transient read fault. It may be the Human's only visible evidence
+      // that a protected cleanup is still lifecycle-pending.
+      setCleanupLoadError(true);
+    }
+  }, [store]);
+
+  useEffect(() => {
+    let disposed = false;
+    void (async () => {
+      try {
+        const entries = await store.listCloudCleanupReceipts();
+        if (!disposed) {
+          setCleanupEntries(entries);
+          setCleanupLoadError(false);
+        }
+      } catch {
+        if (!disposed) setCleanupLoadError(true);
+      }
+    })();
+    return () => { disposed = true; };
+  }, [snapshot.cleanupNotice, store]);
+  const reloadCleanupStatus = () => {
+    if (onReloadCleanupStatus !== undefined) {
+      onReloadCleanupStatus();
+      return;
+    }
+    globalThis.location?.reload();
+  };
   const busyMessage = snapshot.activity === "hydrating"
     ? "Restoring a local project…"
     : snapshot.activity === "saving"
@@ -55,6 +95,26 @@ export function ProjectStart({ store }: ProjectStartProps) {
         {busy ? <p className="form-status" role="status" aria-live="polite">{busyMessage}</p> : null}
         {snapshot.error === null ? null : <p className="form-error" role="alert">{snapshot.error}</p>}
         {snapshot.cleanupNotice === null ? null : <p className="form-status" role="status" aria-live="polite">{snapshot.cleanupNotice}</p>}
+        {cleanupLoadError ? (
+          <section className="cloud-cleanup-refresh-error" role="alert" aria-live="assertive" aria-label="Private cleanup status unavailable">
+            <p>CueBench could not refresh private cleanup status. Any last saved status remains visible below.</p>
+            <div className="cloud-cleanup-refresh-error__actions">
+              <button className="button button--outline" type="button" onClick={() => void refreshCloudCleanup()}>
+                Retry cleanup status
+              </button>
+              <button className="button button--outline" type="button" onClick={reloadCleanupStatus}>
+                Reload CueBench
+              </button>
+            </div>
+          </section>
+        ) : null}
+        <CloudCleanupStatus
+          entries={cleanupEntries}
+          onRetry={async (receiptId) => {
+            await store.retryCloudCleanup(receiptId);
+            await refreshCloudCleanup();
+          }}
+        />
         <StorageDisclosure mode={null} />
         <p className="project-start__limits">Video limits: 500 MB and 15 minutes. No account is required.</p>
       </section>

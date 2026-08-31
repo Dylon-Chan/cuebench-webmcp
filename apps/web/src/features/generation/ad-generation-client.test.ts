@@ -112,6 +112,48 @@ const stagedResult = (project: CaptionProject, runId: string): StagedAudioDescri
 };
 
 describe("audio-description generation browser boundary", () => {
+  it("uses the exact signed retry route without minting a new AD run or upload operation", async () => {
+    const project = projectFixture();
+    const receipt: AudioDescriptionGenerationReceipt = {
+      version: 1,
+      runId: "ad-safe-retry",
+      projectId: project.projectId,
+      signedAudioDescriptionGenerationReceipt: "opaque-ad-safe-retry",
+      session: upload.session,
+      expectedProjectRevision: project.projectRevision,
+      expectedQualityProfileRevision: project.qualityProfile.revision,
+      mediaSha256: project.media.sha256,
+      captionEvidenceHash: "b".repeat(64),
+      sourceByteLength: upload.sourceByteLength,
+      sourceDurationMs: upload.durationMs,
+      projectOwnerCapability: owner,
+      savedAtMs: now,
+      retentionExpiresAtMs: now + 60_000,
+    };
+    const fetcher = vi.fn(async () => Response.json({
+      status: {
+        contractVersion: 1,
+        runId: receipt.runId,
+        projectId: receipt.projectId,
+        targetTrack: "AudioDescriptions",
+        expectedProjectRevision: receipt.expectedProjectRevision,
+        stage: "Queued",
+      },
+    }));
+    const client = new AudioDescriptionGenerationClient({ fetcher, clock: () => now });
+
+    await expect(client.retry(receipt)).resolves.toMatchObject({ stage: "Queued", runId: receipt.runId });
+    expect(fetcher).toHaveBeenCalledWith(`/api/audio-description-runs/${receipt.runId}/retry`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${upload.session}`,
+        "x-cuebench-audio-description-receipt": receipt.signedAudioDescriptionGenerationReceipt,
+        "x-cuebench-project-owner": owner,
+      },
+    });
+    expect(JSON.stringify(fetcher.mock.calls)).not.toContain("/api/uploads");
+  });
+
   it("honors an agent abort after an awaited reservation and before acquiring an AD lease", async () => {
     let project = projectFixture();
     let releaseReservation: () => void = () => { throw new Error("Reservation was not reached."); };
@@ -186,6 +228,67 @@ describe("audio-description generation browser boundary", () => {
 
     expect(fetcher).toHaveBeenCalledTimes(1);
     expect(fetcher.mock.calls[0]?.[1]?.signal).toBeUndefined();
+  });
+
+  it("captures an AD start when deletion wins between the first recovery read and receipt persistence", async () => {
+    let project: CaptionProject | null = projectFixture();
+    const executeCommand = vi.fn(async (command) => {
+      if (project === null) throw new Error("Project was deleted.");
+      const result = applyCommand(project, command);
+      project = result.project;
+      return result;
+    });
+    const reserveAudioDescriptionGenerationReceipt = vi.fn();
+    const persistAudioDescriptionGenerationReceipt = vi.fn(async () => {
+      project = null;
+      throw new Error("Project was deleted before the AD receipt could persist.");
+    });
+    const reconcileDeletedAudioDescriptionGenerationStart = vi.fn(async () => {
+      return project === null;
+    });
+    const fetcher = vi.fn(async () => {
+      const current = project;
+      const base = current?.activeGenerationRun?.base;
+      if (current === null || base?.targetTrack !== "AudioDescriptions") throw new Error("Expected AD lease.");
+      return Response.json({
+        audioDescriptionGenerationReceipt: "opaque-deleted-ad-receipt",
+        retentionExpiresAtMs: now + 86_400_000,
+        status: {
+          contractVersion: 1,
+          runId: "deleted-during-ad-start",
+          projectId: current.projectId,
+          targetTrack: "AudioDescriptions",
+          expectedProjectRevision: base.expectedProjectRevision,
+          stage: "Queued",
+        },
+      }, { status: 201 });
+    });
+    const store: AudioDescriptionGenerationProjectStore = {
+      getSnapshot: () => ({ project, mode: "durable" as const }),
+      executeCommand,
+      reserveAudioDescriptionGenerationReceipt,
+      persistAudioDescriptionGenerationReceipt,
+      reconcileDeletedAudioDescriptionGenerationStart,
+      loadAudioDescriptionGenerationReceipt: vi.fn(),
+      adoptStagedAudioDescriptionGenerationResult: vi.fn(),
+    };
+    const client = new AudioDescriptionGenerationClient({ fetcher, createRunId: () => "deleted-during-ad-start", clock: () => now });
+
+    await expect(client.start({ project: projectFixture(), store, upload })).rejects.toMatchObject({
+      details: {
+        code: "PROJECT_DELETED_DURING_START",
+        lifecycleOutcome: expect.objectContaining({ runId: "deleted-during-ad-start", receiptState: "available" }),
+      },
+    });
+    expect(reconcileDeletedAudioDescriptionGenerationStart).toHaveBeenCalledWith(expect.objectContaining({
+      projectId: "ad-browser-project",
+      operationId: upload.operationId,
+      runId: "deleted-during-ad-start",
+      targetTrack: "AudioDescriptions",
+    }));
+    expect(reconcileDeletedAudioDescriptionGenerationStart).toHaveBeenCalledTimes(2);
+    expect(persistAudioDescriptionGenerationReceipt).toHaveBeenCalledTimes(1);
+    expect(reserveAudioDescriptionGenerationReceipt).toHaveBeenCalledWith("deleted-during-ad-start", expect.objectContaining({ targetTrack: "AudioDescriptions" }));
   });
 
   it("stops AD cancellation before its durable intent when the invocation is already aborted", async () => {

@@ -174,6 +174,75 @@ describe("caption generation browser recovery", () => {
     expect(fetcher.mock.calls[0]?.[1]?.signal).toBeUndefined();
   });
 
+  it("captures a caption start when deletion wins between the first recovery read and receipt persistence", async () => {
+    let project: CaptionProject | null = projectFixture();
+    const executeCommand = vi.fn(async (command) => {
+      if (project === null) throw new Error("Project was deleted.");
+      const result = applyCommand(project, command);
+      project = result.project;
+      return result;
+    });
+    const reserveCaptionGenerationReceipt = vi.fn();
+    const persistCaptionGenerationReceipt = vi.fn(async () => {
+      // The first recovery read has already observed a live tab. Model the
+      // deletion transaction winning immediately before this queued write.
+      project = null;
+      throw new Error("Project was deleted before the receipt could persist.");
+    });
+    const reconcileDeletedCaptionGenerationStart = vi.fn(async () => {
+      // The second call is the required persistence-failure handoff. It owns
+      // the exact signed run after a different tab has removed the project.
+      return project === null;
+    });
+    const fetcher = vi.fn(async () => {
+      const current = project;
+      const base = current?.activeGenerationRun?.base;
+      if (current === null || base?.targetTrack !== "Captions") throw new Error("Expected caption lease.");
+      return Response.json({
+        generationRunReceipt: "opaque-deleted-caption-receipt",
+        retentionExpiresAtMs: receipt.retentionExpiresAtMs,
+        status: {
+          contractVersion: 1,
+          runId: "deleted-during-caption-start",
+          projectId: current.projectId,
+          targetTrack: "Captions",
+          expectedProjectRevision: base.expectedProjectRevision,
+          stage: "Queued",
+        },
+      }, { status: 201 });
+    });
+    const store: GenerationProjectStore = {
+      getSnapshot: () => ({ project, mode: "durable" as const }),
+      executeCommand,
+      reserveCaptionGenerationReceipt,
+      persistCaptionGenerationReceipt,
+      reconcileDeletedCaptionGenerationStart,
+      loadCaptionGenerationReceipt: vi.fn(),
+      adoptStagedCaptionGenerationResult: vi.fn(),
+    };
+    const client = new CaptionGenerationClient({ fetcher, createRunId: () => "deleted-during-caption-start", clock: () => receipt.savedAtMs });
+
+    await expect(client.start({
+      project: projectFixture(),
+      store,
+      upload: { operationId: "upload-run", session: "anonymous-session", operationReceipt: "opaque-upload-receipt", sourceByteLength: 5, sourceSha256: "a".repeat(64), durationMs: 60_000, projectOwnerCapability },
+    })).rejects.toMatchObject({
+      details: {
+        code: "PROJECT_DELETED_DURING_START",
+        lifecycleOutcome: expect.objectContaining({ runId: "deleted-during-caption-start", receiptState: "available" }),
+      },
+    });
+    expect(reconcileDeletedCaptionGenerationStart).toHaveBeenCalledWith(expect.objectContaining({
+      projectId: "generation-project",
+      operationId: "upload-run",
+      runId: "deleted-during-caption-start",
+      targetTrack: "Captions",
+    }));
+    expect(reconcileDeletedCaptionGenerationStart).toHaveBeenCalledTimes(2);
+    expect(persistCaptionGenerationReceipt).toHaveBeenCalledTimes(1);
+    expect(reserveCaptionGenerationReceipt).toHaveBeenCalledWith("deleted-during-caption-start", expect.objectContaining({ targetTrack: "Captions" }));
+  });
+
   it("stops caption cancellation before its durable intent when the invocation is already aborted", async () => {
     const project = applyCommand(projectFixture(), {
       type: "StartGenerationRun",

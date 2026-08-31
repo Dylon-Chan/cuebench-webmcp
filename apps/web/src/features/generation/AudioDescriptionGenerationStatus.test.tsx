@@ -142,4 +142,134 @@ describe("AudioDescriptionGenerationStatus", () => {
     await userEvent.click(screen.getByRole("button", { name: "Confirm replacement of AI proposals" }));
     await waitFor(() => expect(adopt).toHaveBeenCalledWith(expect.objectContaining({ confirmedProposedReplacement: true })));
   });
+
+  it("offers a retry for a retryable AD failure without creating a new run identity", async () => {
+    const project = projectWithEvidenceAndAnAiProposal();
+    const receipt = receiptFor(project);
+    const retry = vi.fn(async () => ({
+      contractVersion: 1 as const,
+      runId: receipt.runId,
+      projectId: project.projectId,
+      targetTrack: "AudioDescriptions" as const,
+      expectedProjectRevision: receipt.expectedProjectRevision,
+      stage: "Queued" as const,
+    }));
+    const store = {
+      getSnapshot: () => ({ project, mode: "durable" as const }),
+      executeCommand: vi.fn(),
+      persistAudioDescriptionGenerationReceipt: vi.fn(),
+      loadAudioDescriptionGenerationReceipt: vi.fn(),
+      adoptStagedAudioDescriptionGenerationResult: vi.fn(),
+    } as unknown as AudioDescriptionGenerationProjectStore;
+    const client = {
+      start: vi.fn(),
+      retry,
+      status: vi.fn(async () => ({
+        contractVersion: 1 as const,
+        runId: receipt.runId,
+        projectId: project.projectId,
+        targetTrack: "AudioDescriptions" as const,
+        expectedProjectRevision: receipt.expectedProjectRevision,
+        stage: "Failed" as const,
+        retryable: true,
+      })),
+      cancel: vi.fn(),
+      adopt: vi.fn(),
+      retryAdoptionCleanup: vi.fn(),
+      retryCancellationCleanup: vi.fn(),
+      loadStoredReceipt: vi.fn(async () => receipt),
+    } as unknown as AudioDescriptionGenerationClientPort;
+
+    render(
+      <AudioDescriptionGenerationStatus
+        project={project}
+        store={store}
+        client={client}
+        uploadRecovery={null}
+      />,
+    );
+
+    const retryButton = await screen.findByRole("button", { name: "Retry AD review" });
+    await userEvent.click(retryButton);
+    await waitFor(() => expect(retry).toHaveBeenCalledWith(receipt));
+    expect(client.start).not.toHaveBeenCalled();
+  });
+
+  it("does not offer an impossible retry after the bounded AD retry is exhausted", async () => {
+    const project = projectWithEvidenceAndAnAiProposal();
+    const receipt = receiptFor(project);
+    const retry = vi.fn();
+    const store = {
+      getSnapshot: () => ({ project, mode: "durable" as const }),
+      executeCommand: vi.fn(),
+      persistAudioDescriptionGenerationReceipt: vi.fn(),
+      loadAudioDescriptionGenerationReceipt: vi.fn(),
+      adoptStagedAudioDescriptionGenerationResult: vi.fn(),
+    } as unknown as AudioDescriptionGenerationProjectStore;
+    const client = {
+      start: vi.fn(),
+      retry,
+      status: vi.fn(async () => ({
+        contractVersion: 1 as const,
+        runId: receipt.runId,
+        projectId: project.projectId,
+        targetTrack: "AudioDescriptions" as const,
+        expectedProjectRevision: receipt.expectedProjectRevision,
+        stage: "Failed" as const,
+        retryable: false,
+      })),
+      cancel: vi.fn(),
+      adopt: vi.fn(),
+      retryAdoptionCleanup: vi.fn(),
+      retryCancellationCleanup: vi.fn(),
+      loadStoredReceipt: vi.fn(async () => receipt),
+    } as unknown as AudioDescriptionGenerationClientPort;
+
+    render(<AudioDescriptionGenerationStatus project={project} store={store} client={client} uploadRecovery={null} />);
+
+    await screen.findByText("Terminal recovery");
+    expect(screen.queryByRole("button", { name: "Retry AD review" })).toBeNull();
+    expect(retry).not.toHaveBeenCalled();
+  });
+
+  it("keeps a lease-CAS-pending cancellation visible and retryable instead of treating it as completed", async () => {
+    const project = projectWithEvidenceAndAnAiProposal();
+    const receipt: AudioDescriptionGenerationReceipt = {
+      ...receiptFor(project),
+      terminalCleanup: {
+        action: "cancelled",
+        cleanupAcknowledgement: "pending",
+        localLeaseRelease: "pending",
+      },
+    };
+    const retryCancellationCleanup = vi.fn(async () => undefined);
+    const store = {
+      getSnapshot: () => ({ project, mode: "durable" as const }),
+      executeCommand: vi.fn(),
+      persistAudioDescriptionGenerationReceipt: vi.fn(),
+      loadAudioDescriptionGenerationReceipt: vi.fn(),
+      adoptStagedAudioDescriptionGenerationResult: vi.fn(),
+    } as unknown as AudioDescriptionGenerationProjectStore;
+    const client = {
+      start: vi.fn(),
+      retry: vi.fn(),
+      status: vi.fn(),
+      cancel: vi.fn(),
+      adopt: vi.fn(),
+      retryAdoptionCleanup: vi.fn(),
+      retryCancellationCleanup,
+      loadStoredReceipt: vi.fn(async () => receipt),
+    } as unknown as AudioDescriptionGenerationClientPort;
+
+    render(<AudioDescriptionGenerationStatus project={project} store={store} client={client} uploadRecovery={null} />);
+
+    const retryCleanup = await screen.findByRole("button", { name: "Retry private cleanup" });
+    expect(screen.getByText("Private cleanup pending")).toBeInTheDocument();
+    await userEvent.click(retryCleanup);
+    await waitFor(() => expect(retryCancellationCleanup).toHaveBeenCalledWith(expect.objectContaining({
+      project,
+      store,
+      receipt,
+    })));
+  });
 });

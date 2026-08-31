@@ -9,6 +9,7 @@ const API_BASE = "https://api.cloudflare.com/client/v4";
 const scriptDirectory = dirname(fileURLToPath(import.meta.url));
 const defaultPolicyPath = resolve(scriptDirectory, "../deploy/r2-processing-lifecycle.json");
 const defaultWranglerConfigPath = resolve(scriptDirectory, "../wrangler.jsonc");
+const supportedDeploymentEnvironments = new Set(["local", "preview", "production"]);
 
 export const PROCESSING_LIFECYCLE_POLICY = Object.freeze({
   version: 1,
@@ -82,6 +83,62 @@ export const validateLifecyclePolicy = (value) => {
   return policy;
 };
 
+/** Reads only the deploy environment selector; all other Wrangler flags stay opaque to this policy tool. */
+export const deploymentEnvironmentFromArgs = (argv) => {
+  let selectedEnvironment = null;
+  for (let index = 0; index < argv.length; index += 1) {
+    const argument = argv[index];
+    const inline = typeof argument === "string" && argument.startsWith("--env=")
+      ? argument.slice("--env=".length)
+      : undefined;
+    const selected = argument === "--env" ? argv[index + 1] : inline;
+    if (argument === "--env" && selected === undefined) {
+      throw new LifecyclePolicyError("CueBench lifecycle deployment needs an environment after --env.");
+    }
+    if (selected === undefined) continue;
+    if (typeof selected !== "string" || !supportedDeploymentEnvironments.has(selected)) {
+      throw new LifecyclePolicyError("CueBench lifecycle deployment accepts only local, preview, or production environments.");
+    }
+    if (selectedEnvironment !== null && selectedEnvironment !== selected) {
+      throw new LifecyclePolicyError("CueBench lifecycle deployment received conflicting environment selectors.");
+    }
+    selectedEnvironment = selected;
+    if (argument === "--env") index += 1;
+  }
+  return selectedEnvironment ?? "local";
+};
+
+const environmentConfigFor = (wranglerConfig, environment) => {
+  const config = asRecord(wranglerConfig);
+  if (config === null) throw new LifecyclePolicyError("wrangler.jsonc must be an object before CueBench can verify private-media retention.");
+  if (environment === "local") return config;
+  const environments = asRecord(config.env);
+  const selected = environments === null ? null : asRecord(environments[environment]);
+  if (selected === null) {
+    throw new LifecyclePolicyError(`wrangler.jsonc must declare the ${environment} environment before CueBench can verify private-media retention.`);
+  }
+  return selected;
+};
+
+const processingBucketNameFor = (wranglerConfig, environment) => {
+  const config = environmentConfigFor(wranglerConfig, environment);
+  const buckets = Array.isArray(config.r2_buckets) ? config.r2_buckets : [];
+  const processingBucket = buckets
+    .map(asRecord)
+    .find((bucket) => bucket?.binding === "PROCESSING_BUCKET");
+  if (processingBucket === undefined || typeof processingBucket.bucket_name !== "string") {
+    throw new LifecyclePolicyError(`wrangler.jsonc must declare the private PROCESSING_BUCKET R2 binding for ${environment} before deployment.`);
+  }
+  return processingBucket.bucket_name;
+};
+
+/** Rebinds the static rule set to the exact selected deployment bucket. */
+export const lifecyclePolicyForEnvironment = (policy, wranglerConfig, environment = "local") => {
+  const validPolicy = validateLifecyclePolicy(policy);
+  const bucketName = processingBucketNameFor(wranglerConfig, environment);
+  return validateLifecyclePolicy({ ...validPolicy, bucketName });
+};
+
 export const readLifecyclePolicyFile = async (policyPath = defaultPolicyPath) => {
   let parsed;
   try {
@@ -93,17 +150,9 @@ export const readLifecyclePolicyFile = async (policyPath = defaultPolicyPath) =>
 };
 
 /** The policy may only target the Worker binding that owns private processing media. */
-export const validateProcessingBucketBinding = (policy, wranglerConfig) => {
+export const validateProcessingBucketBinding = (policy, wranglerConfig, environment = "local") => {
   const validPolicy = validateLifecyclePolicy(policy);
-  const config = asRecord(wranglerConfig);
-  const buckets = config === null || !Array.isArray(config.r2_buckets) ? [] : config.r2_buckets;
-  const processingBucket = buckets
-    .map(asRecord)
-    .find((bucket) => bucket?.binding === "PROCESSING_BUCKET");
-  if (processingBucket === undefined || typeof processingBucket.bucket_name !== "string") {
-    throw new LifecyclePolicyError("wrangler.jsonc must declare the private PROCESSING_BUCKET R2 binding before deployment.");
-  }
-  if (processingBucket.bucket_name !== validPolicy.bucketName) {
+  if (processingBucketNameFor(wranglerConfig, environment) !== validPolicy.bucketName) {
     throw new LifecyclePolicyError("CueBench R2 lifecycle policy bucket does not match the Wrangler PROCESSING_BUCKET binding.");
   }
   return validPolicy;
@@ -253,8 +302,10 @@ export const provisionAndVerifyLifecycle = async ({ policy, accountId, apiToken,
 };
 
 export const main = async ({ argv = globalThis.process.argv.slice(2), env = globalThis.process.env, fetcher = globalThis.fetch, policyPath = defaultPolicyPath, wranglerConfigPath = defaultWranglerConfigPath } = {}) => {
-  const policy = await readLifecyclePolicyFile(policyPath);
-  validateProcessingBucketBinding(policy, await readWranglerConfig(wranglerConfigPath));
+  const environment = deploymentEnvironmentFromArgs(argv);
+  const wranglerConfig = await readWranglerConfig(wranglerConfigPath);
+  const policy = lifecyclePolicyForEnvironment(await readLifecyclePolicyFile(policyPath), wranglerConfig, environment);
+  validateProcessingBucketBinding(policy, wranglerConfig, environment);
   if (argv.includes("--dry-run") || argv.includes("--preflight")) return policy;
   return provisionAndVerifyLifecycle({
     policy,

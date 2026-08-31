@@ -1,3 +1,5 @@
+import type { AnalyticsEngineDataset } from "@cloudflare/workers-types";
+
 export interface SanitizedUsage {
   readonly inputTokens?: number;
   readonly outputTokens?: number;
@@ -19,6 +21,40 @@ export interface SanitizedTelemetryEvent {
 export interface TelemetrySink {
   record: (event: SanitizedTelemetryEvent) => void | Promise<void>;
 }
+
+/**
+ * Maps the strict telemetry allowlist to one Analytics Engine point. The
+ * binding sees only fixed-position measurements and already-sanitized labels;
+ * it never receives a request, file name, transcript, URL, or receipt.
+ */
+export const analyticsEngineTelemetrySink = (dataset: AnalyticsEngineDataset | undefined): TelemetrySink | undefined => {
+  if (dataset === undefined) return undefined;
+  return {
+    record: (event) => {
+      const safe = redactTelemetryEvent(event);
+      dataset.writeDataPoint({
+        // Analytics Engine supports one sampling index. Keep it fixed so no
+        // request-derived value (including stage/status) can create a second
+        // cardinality dimension; those already-redacted labels live in the
+        // fixed blob positions below instead.
+        indexes: ["cuebench"],
+        blobs: [safe.stage ?? "unknown", safe.status ?? "unknown", safe.errorCode ?? "none"],
+        // Fixed ordering keeps Analytics Engine schema stable without turning
+        // optional data into caller-controlled shape or content.
+        doubles: [
+          safe.durationMs ?? 0,
+          safe.byteSize ?? 0,
+          safe.latencyMs ?? 0,
+          safe.costCents ?? 0,
+          safe.usage?.inputTokens ?? 0,
+          safe.usage?.outputTokens ?? 0,
+          safe.usage?.audioSeconds ?? 0,
+          safe.usage?.requests ?? 0,
+        ],
+      });
+    },
+  };
+};
 
 const safeNumber = (value: unknown): number | undefined => typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : undefined;
 const safeLabel = (value: unknown): string | undefined => typeof value === "string" && /^[A-Za-z0-9_-]{1,80}$/.test(value) ? value : undefined;

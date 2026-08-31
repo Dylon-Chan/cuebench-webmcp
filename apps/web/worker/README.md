@@ -48,7 +48,10 @@ returned to the browser and the Worker’s R2 binding is never injected there.
 
 The upload-completion path deliberately fails closed and cleans private R2
 state when either `MEDIA_PREPARER` or a complete dedicated key configuration
-is absent. Session HMAC keys are never reused for media jobs. Both
-`processing/` inputs and `prepared/` evidence have a verified 24-hour R2
-lifecycle deletion backstop; incomplete `processing/` MPUs are also aborted
-within 24 hours.
+is absent. Session HMAC keys are never reused for media jobs. A Cloudflare
+scheduled event reads a bounded set of opaque, exact-key lifecycle tombstones
+and retries fenced private cleanup before each receipt's 24-hour deadline;
+it has no public HTTP route and never performs a prefix delete. Both
+`processing/` inputs and `prepared/` evidence also have a verified 24-hour R2
+lifecycle deletion backstop; incomplete `processing/` MPUs are aborted within
+24 hours.

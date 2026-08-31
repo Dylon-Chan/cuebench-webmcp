@@ -20,7 +20,7 @@ export function CloudProcessingDisclosure({
         This browser remains CueBench&apos;s canonical project store; the cloud copy is not a cloud project or backup.
       </p>
       <p>
-        CueBench requests immediate deletion after success or cancellation. Failed or detached work may remain privately for recovery for no more than 24 hours, with lifecycle deletion as a backstop.
+        CueBench requests immediate deletion after success or cancellation. Failed or detached work is queued for scheduled exact-key cleanup before its 24-hour limit; R2 lifecycle deletion remains a backstop.
       </p>
       <label className="cloud-processing-disclosure__acceptance">
         <input

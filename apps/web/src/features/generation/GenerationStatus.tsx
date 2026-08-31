@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import * as Dialog from "@radix-ui/react-dialog";
 import type { GenerationRunStatus } from "@cuebench/contracts";
 import type { CaptionProject, CommandResult } from "@cuebench/domain";
+import { classifyRecoveryState } from "../../../worker/recovery";
 import { loadPersistedCloudUpload, type PersistedCloudUploadRecovery } from "../project/cloud-upload";
 import {
   CaptionGenerationClient,
@@ -9,6 +10,7 @@ import {
   type GenerationClientReceipt,
   type GenerationProjectStore,
 } from "./generation-client";
+import { RecoveryNotice } from "./RecoveryNotice";
 
 const pollingIntervalMs = 1_500;
 
@@ -112,7 +114,7 @@ const hasCancellationCleanupVisibility = (receipt: GenerationClientReceipt | nul
   hasPendingCancellationRecovery(receipt) || hasLifecyclePendingCancellationCleanup(receipt)
 );
 
-const hasCleanupRecoveryVisibility = (receipt: GenerationClientReceipt | null): receipt is GenerationClientReceipt => (
+const hasCleanupRecoveryVisibility = (receipt: GenerationClientReceipt | null): boolean => (
   hasPendingAdoptionCleanup(receipt)
   || hasLifecyclePendingAdoptionCleanup(receipt)
   || hasCancellationCleanupVisibility(receipt)
@@ -446,12 +448,25 @@ export function GenerationStatus({ project, store, uploadRecovery, client: suppl
   const durableStorage = store.getSnapshot().mode !== "temporary";
   const canStart = durableStorage && !pendingCleanup && !busy && (runId === null || missingRecovery) && hasUploadAuthorization(recovery, project, projectOwnerCapability);
   const otherRunActive = project.activeGenerationRun !== null && project.activeGenerationRun.targetTrack !== "Captions";
+  const recoveryCleanup = receipt === null
+    ? undefined
+    : hasCleanupRecoveryVisibility(receipt)
+      ? "pending" as const
+      : receipt?.terminalCleanup?.cleanupAcknowledgement === "acknowledged"
+        ? "completed" as const
+        : undefined;
+  const recoveryState = receipt === null ? null : classifyRecoveryState({
+    stage: stage ?? "Queued",
+    retryable: failedRetryable,
+    ...(recoveryCleanup === undefined ? {} : { cleanup: recoveryCleanup }),
+  });
 
   return (
     <section className="storage-disclosure generation-status" aria-label="Caption generation">
       <h2>Caption generation</h2>
       <p>Private media preparation and model calls run only inside CueBench’s durable workflow. This browser retains the signed recovery receipt and remains the canonical project store.</p>
       <p role="status" aria-live="polite">{stageLabel(stage)}</p>
+      {recoveryState === null ? null : <RecoveryNotice state={recoveryState} track="captions" />}
       {notice === null ? null : <p role="status">{notice}</p>}
       {receipt === null ? null : <p className="generation-status__receipt">Recovery receipt retained for run {receipt.runId}.</p>}
       {!durableStorage ? <p role="status">Caption generation is unavailable in this temporary browser session because CueBench cannot retain a recoverable signed receipt or safely hold the target-track lease.</p> : null}

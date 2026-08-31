@@ -49,17 +49,21 @@ import {
   type MediaProbe,
 } from "./probe";
 import { fixtureMediaPreparationEnabled } from "./media-preparation-fixture";
-import { recordTelemetry, type TelemetrySink } from "./telemetry";
+import { analyticsEngineTelemetrySink, recordTelemetry, type TelemetrySink } from "./telemetry";
 import {
   createGenerationRoutes,
+  R2GenerationRunRecordStore,
   type GenerationRunRecordStore,
   type GenerationWorkflowControl,
 } from "./generation-routes";
 import {
   createAudioDescriptionGenerationRoutes,
+  R2AudioDescriptionGenerationRunRecordStore,
   type AudioDescriptionGenerationRunRecordStore,
   type AudioDescriptionGenerationWorkflowControl,
 } from "./ad-generation-routes";
+import { generationCleanupMarkerKey } from "./generation-cleanup";
+import { reconcilePrivateLifecycleTombstones } from "./lifecycle-reconciler";
 import {
   createNarrationPreviewRoutes,
   type NarrationPreviewRecordStore,
@@ -126,7 +130,47 @@ export interface WorkerDependencies {
   readonly telemetry?: TelemetrySink;
 }
 
+/**
+ * Scheduled events are authenticated by Cloudflare rather than exposed as an
+ * HTTP endpoint. They only recover entries which were written before the
+ * private run record, and every deletion is an explicit server-derived key.
+ */
+export const reconcileWorkerPrivateLifecycle = async (env: WorkerEnv, nowMs = Date.now()) => {
+  if (env.PROCESSING_BUCKET === undefined) return null;
+  const captionRuns = new R2GenerationRunRecordStore(env.PROCESSING_BUCKET);
+  const audioDescriptionRuns = new R2AudioDescriptionGenerationRunRecordStore(env.PROCESSING_BUCKET);
+  const result = await reconcilePrivateLifecycleTombstones({
+    bucket: env.PROCESSING_BUCKET,
+    nowMs,
+    settle: async (entry) => {
+      const runs = entry.targetTrack === "Captions" ? captionRuns : audioDescriptionRuns;
+      const current = await runs.load({ operationKey: entry.operationKey, runId: entry.runId });
+      if (current === null) return { state: "missing" as const };
+      const action = current.cleanup?.action ?? "expired";
+      const cleaned = await runs.cleanup({
+        claims: { operationKey: entry.operationKey, runId: entry.runId },
+        action,
+        nowMs,
+      });
+      if (cleaned?.cleanup?.state !== "completed") return { state: "pending" as const };
+      return {
+        state: "completed" as const,
+        deleteKeys: [entry.recordKey, generationCleanupMarkerKey(entry.operationKey)],
+      };
+    },
+  });
+  recordTelemetry(analyticsEngineTelemetrySink(env.CUEBENCH_TELEMETRY), {
+    stage: "cleanup",
+    status: result.backlog ? "backlog" : result.pending > 0 ? "pending" : "settled",
+    ...(result.backlog ? { errorCode: "LIFECYCLE_BACKLOG" } : {}),
+    usage: { requests: result.scanned },
+  });
+  return result;
+};
+
 type WorkerBindings = { readonly Bindings: WorkerEnv };
+/** Kept structural because the DOM and Workers type bundles expose this under different names. */
+type ScheduledExecutionContext = { readonly waitUntil: (promise: Promise<unknown>) => void };
 type NextAction = "retry" | "resume-upload" | "retry-probe" | "retry-completion" | "retry-cleanup" | "start-new-operation" | "wait-for-status" | "complete-turnstile" | "refresh-browser";
 
 interface StructuredErrorOptions {
@@ -650,6 +694,9 @@ const cleanupOperation = async (input: {
 /** Creates the same-origin Hono API. Tests inject fixture-only verification, storage, probe, and workflow adapters. */
 export const createCueBenchWorker = (env: WorkerEnv, dependencies: WorkerDependencies = {}) => {
   const app = new Hono<WorkerBindings>();
+  // Tests may inject a sink; hosted environments use the concrete Analytics
+  // Engine binding through the same strict redaction boundary.
+  const telemetry = dependencies.telemetry ?? analyticsEngineTelemetrySink(env.CUEBENCH_TELEMETRY);
 
   app.use("*", async (context, next) => {
     securityHeaders(context.res.headers);
@@ -728,7 +775,7 @@ export const createCueBenchWorker = (env: WorkerEnv, dependencies: WorkerDepende
       });
       if (verification.success !== true || verification.hostname !== expectedHostname || verification.action !== settings.turnstileExpectedAction) {
         await quotaLedger.releaseTurnstileSession({ challengeKey, nowMs: currentNow }).catch(() => undefined);
-        recordTelemetry(dependencies.telemetry, { stage: "session", status: "rejected", errorCode: "TURNSTILE_REJECTED" });
+        recordTelemetry(telemetry, { stage: "session", status: "rejected", errorCode: "TURNSTILE_REJECTED" });
         return apiError(403, "TURNSTILE_REJECTED", "CueBench could not verify the anti-abuse check for this site and action. No anonymous session was created.", { nextAction: "complete-turnstile" });
       }
       const verified = await quotaLedger.markTurnstileSessionVerified({ challengeKey, nowMs: currentNow }).catch(() => null);
@@ -742,7 +789,7 @@ export const createCueBenchWorker = (env: WorkerEnv, dependencies: WorkerDepende
       purpose: input.purpose,
       keyRing: settings.keyRing,
     });
-    recordTelemetry(dependencies.telemetry, { stage: "session", status: "accepted", latencyMs: 0 });
+    recordTelemetry(telemetry, { stage: "session", status: "accepted", latencyMs: 0 });
     return context.json({ session, expiresAtMs: replay.expiresAtMs }, 201);
   });
 
@@ -774,7 +821,7 @@ export const createCueBenchWorker = (env: WorkerEnv, dependencies: WorkerDepende
       media = validateUploadMetadata(input.media, settings);
     } catch (error) {
       const code = error instanceof UploadValidationError ? error.code : "UPLOAD_METADATA_INVALID";
-      recordTelemetry(dependencies.telemetry, { stage: "upload", status: "rejected", errorCode: code });
+      recordTelemetry(telemetry, { stage: "upload", status: "rejected", errorCode: code });
       return apiError(422, code, error instanceof UploadValidationError ? error.message : "CueBench could not validate the selected video.", { nextAction: "start-new-operation" });
     }
     const ip = clientIp(context.req.raw);
@@ -798,7 +845,7 @@ export const createCueBenchWorker = (env: WorkerEnv, dependencies: WorkerDepende
     }).catch(() => null);
     if (reservation === null) return apiError(503, "QUOTA_UNAVAILABLE", "CueBench cannot safely enforce anonymous processing limits right now.", { retrySafe: true, nextAction: "retry" });
     if (!reservation.accepted) {
-      recordTelemetry(dependencies.telemetry, { stage: "upload", durationMs: media.durationMs, byteSize: media.byteLength, status: "rejected", errorCode: reservation.code });
+      recordTelemetry(telemetry, { stage: "upload", durationMs: media.durationMs, byteSize: media.byteLength, status: "rejected", errorCode: reservation.code });
       return quotaFailure(reservation.code);
     }
     const begin = await coordinator.begin({
@@ -873,7 +920,7 @@ export const createCueBenchWorker = (env: WorkerEnv, dependencies: WorkerDepende
     }
     const receipt = receiptFromRecord(session.sessionId, { operationId: input.operationId, media }, derived, record);
     const response = await operationResponse({ receipt, settings, currentNow, state: record.state, parts: record.parts, status: begin.kind === "created" ? 201 : 200 });
-    recordTelemetry(dependencies.telemetry, { stage: "upload", durationMs: media.durationMs, byteSize: media.byteLength, status: begin.kind === "created" ? "accepted" : "resumed" });
+    recordTelemetry(telemetry, { stage: "upload", durationMs: media.durationMs, byteSize: media.byteLength, status: begin.kind === "created" ? "accepted" : "resumed" });
     return context.json(response.body, response.status);
   });
 
@@ -978,7 +1025,7 @@ export const createCueBenchWorker = (env: WorkerEnv, dependencies: WorkerDepende
         ? "CueBench fenced a late private multipart write and aborted the affected upload. Start a fresh operation."
         : "CueBench fenced a late private multipart write and is reconciling the exact private cleanup target.", { retrySafe: !cleanup.clean, stateChanged: true, nextAction: cleanup.clean ? "start-new-operation" : "retry-cleanup" });
     }
-    recordTelemetry(dependencies.telemetry, { stage: "upload", byteSize: body.byteLength, status: "part-uploaded" });
+    recordTelemetry(telemetry, { stage: "upload", byteSize: body.byteLength, status: "part-uploaded" });
     return existingPartResponse({ partNumber: requestedPart, etag: uploaded.etag }, 201);
   });
 
@@ -1165,7 +1212,7 @@ export const createCueBenchWorker = (env: WorkerEnv, dependencies: WorkerDepende
               reason: `authoritative-media-${error.code.toLowerCase()}`,
             },
           });
-          recordTelemetry(dependencies.telemetry, {
+          recordTelemetry(telemetry, {
             stage: "processing",
             byteSize: receipt.media.byteLength,
             status: "rejected",
@@ -1193,7 +1240,7 @@ export const createCueBenchWorker = (env: WorkerEnv, dependencies: WorkerDepende
       const factsMatch = facts.byteLength === receipt.media.byteLength && facts.mimeType === receipt.media.contentType;
       if (!factsMatch || !isSupportedAuthoritativeMedia(facts, { maxBytes: settings.maxUploadBytes, maxDurationMs: settings.maxUploadDurationMs })) {
         const cleanup = await cleanupOperation({ record, objectStore, coordinator, quotaLedger, nowMs: currentNow, createId: () => createId(dependencies), target: { objectState: "completed", multipartUploadId: record.multipartUploadId, reason: "authoritative-media-rejected" } });
-        recordTelemetry(dependencies.telemetry, { stage: "processing", byteSize: receipt.media.byteLength, status: "rejected", errorCode: "AUTHORITATIVE_MEDIA_REJECTED" });
+        recordTelemetry(telemetry, { stage: "processing", byteSize: receipt.media.byteLength, status: "rejected", errorCode: "AUTHORITATIVE_MEDIA_REJECTED" });
         return apiError(cleanup.clean ? 422 : 409, cleanup.clean ? "AUTHORITATIVE_MEDIA_REJECTED" : "AUTHORITATIVE_MEDIA_CLEANUP_PENDING", cleanup.clean
           ? "CueBench's authoritative private-media inspection rejected this file. No workflow was started."
           : "CueBench rejected this private media and is reconciling deletion. Keep the receipt and retry cleanup.", { stateChanged: true, retrySafe: !cleanup.clean, nextAction: cleanup.clean ? "start-new-operation" : "retry-cleanup" });
@@ -1268,7 +1315,7 @@ export const createCueBenchWorker = (env: WorkerEnv, dependencies: WorkerDepende
     }
     const queued = await coordinator.markQueued({ nowMs: currentNow, claimId: workflowClaim.claim.id, claimGeneration: workflowClaim.claim.generation }).catch(() => null);
     if (!recordMatchesReceipt(queued, receipt)) return apiError(503, "WORKFLOW_RECONCILIATION_REQUIRED", "CueBench started the deterministic private workflow but could not persist its receipt status. Keep this receipt; do not start another workflow.", { retrySafe: true, stateChanged: true, nextAction: "wait-for-status" });
-    recordTelemetry(dependencies.telemetry, { stage: "processing", durationMs: receipt.media.durationMs, byteSize: receipt.media.byteLength, status: "queued" });
+    recordTelemetry(telemetry, { stage: "processing", durationMs: receipt.media.durationMs, byteSize: receipt.media.byteLength, status: "queued" });
     return context.json({ operationReceipt: receiptToken, status: "queued" }, 202);
   });
 
@@ -1314,7 +1361,7 @@ export const createCueBenchWorker = (env: WorkerEnv, dependencies: WorkerDepende
       },
     });
     if (!cleanup.clean) return apiError(409, "CLEANUP_RECONCILIATION_REQUIRED", "CueBench could not confirm every private-copy cleanup acknowledgement. Keep the receipt and retry cleanup.", { retrySafe: true, stateChanged: cleanup.stateChanged, nextAction: "retry-cleanup" });
-    recordTelemetry(dependencies.telemetry, { stage: "cleanup", byteSize: receipt.media.byteLength, status: "deleted" });
+    recordTelemetry(telemetry, { stage: "cleanup", byteSize: receipt.media.byteLength, status: "deleted" });
     return new Response(null, { status: 204 });
   });
 
@@ -1328,6 +1375,11 @@ export const createCueBenchWorker = (env: WorkerEnv, dependencies: WorkerDepende
 
 const worker = {
   fetch: async (request: Request, env: WorkerEnv): Promise<Response> => createCueBenchWorker(env).fetch(request, env),
+  scheduled: async (_controller: unknown, env: WorkerEnv, context: ScheduledExecutionContext): Promise<void> => {
+    // A storage/list failure must remain observable to the platform scheduler;
+    // swallowing it would make a private-cleanup backlog look successful.
+    context.waitUntil(reconcileWorkerPrivateLifecycle(env).then(() => undefined));
+  },
 };
 
 export default worker;

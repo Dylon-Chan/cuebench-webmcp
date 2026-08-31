@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import * as Dialog from "@radix-ui/react-dialog";
 import { captionEvidenceProjectionForAudioDescription, type CaptionProject } from "@cuebench/domain";
 import type { GenerationRunStatus } from "@cuebench/contracts";
+import { classifyRecoveryState } from "../../../worker/recovery";
 import { loadPersistedCloudUpload, type PersistedCloudUploadRecovery } from "../project/cloud-upload";
 import {
   AudioDescriptionGenerationClient,
@@ -9,6 +10,7 @@ import {
   type AudioDescriptionGenerationProjectStore,
   type AudioDescriptionGenerationReceipt,
 } from "./ad-generation-client";
+import { RecoveryNotice } from "./RecoveryNotice";
 
 const pollingIntervalMs = 1_500;
 
@@ -38,6 +40,10 @@ const hasReplaceableProposedAudioDescriptions = (project: CaptionProject): boole
   item.supersededByRunId === null && item.current.state === "Proposed" && item.current.actor.type === "CueBenchAI"
 ));
 
+const isRetryableFailure = (status: GenerationRunStatus): boolean => (
+  status.stage === "Failed" && status.retryable
+);
+
 const countReplaceableProposedAudioDescriptions = (project: CaptionProject): number => Object.values(project.audioDescriptions.items).filter((item) => (
   item.supersededByRunId === null && item.current.state === "Proposed" && item.current.actor.type === "CueBenchAI"
 )).length;
@@ -53,14 +59,33 @@ const hasPendingAdoptionCleanup = (receipt: AudioDescriptionGenerationReceipt | 
   readonly adoption: NonNullable<AudioDescriptionGenerationReceipt["adoption"]>;
 } => receipt?.adoption?.status === "adopted" && receipt.adoption.cleanupAcknowledgement === "pending";
 
+const hasLifecyclePendingAdoptionCleanup = (receipt: AudioDescriptionGenerationReceipt | null): receipt is AudioDescriptionGenerationReceipt & {
+  readonly adoption: NonNullable<AudioDescriptionGenerationReceipt["adoption"]>;
+} => receipt?.adoption?.status === "adopted" && receipt.adoption.cleanupAcknowledgement === "lifecycle-pending";
+
 const hasPendingCancellationCleanup = (receipt: AudioDescriptionGenerationReceipt | null): receipt is AudioDescriptionGenerationReceipt => (
   receipt?.cancellationRequested?.status === "requested"
   || receipt?.terminalCleanup?.cleanupAcknowledgement === "pending"
   || receipt?.terminalCleanup?.localLeaseRelease === "pending"
 );
 
+const hasLifecyclePendingCancellationCleanup = (receipt: AudioDescriptionGenerationReceipt | null): receipt is AudioDescriptionGenerationReceipt => (
+  receipt?.terminalCleanup?.action === "cancelled" && receipt.terminalCleanup.cleanupAcknowledgement === "lifecycle-pending"
+);
+
+const hasLifecyclePendingExpirySettlement = (receipt: AudioDescriptionGenerationReceipt | null): receipt is AudioDescriptionGenerationReceipt => (
+  receipt?.expirySettlement?.state === "lifecycle-pending"
+);
+
 const hasPendingCleanup = (receipt: AudioDescriptionGenerationReceipt | null): boolean => (
   hasPendingAdoptionCleanup(receipt) || hasPendingCancellationCleanup(receipt)
+);
+
+const hasCleanupRecoveryVisibility = (receipt: AudioDescriptionGenerationReceipt | null): boolean => (
+  hasPendingCleanup(receipt)
+  || hasLifecyclePendingAdoptionCleanup(receipt)
+  || hasLifecyclePendingCancellationCleanup(receipt)
+  || hasLifecyclePendingExpirySettlement(receipt)
 );
 
 const hasUploadAuthorization = (
@@ -97,6 +122,7 @@ export function AudioDescriptionGenerationStatus({ project, store, uploadRecover
   const captionEvidence = captionEvidenceProjectionForAudioDescription(project);
   const [receipt, setReceipt] = useState<AudioDescriptionGenerationReceipt | null>(null);
   const [stage, setStage] = useState<GenerationRunStatus["stage"] | undefined>(undefined);
+  const [failedRetryable, setFailedRetryable] = useState(false);
   const [owner, setOwner] = useState<string | null | undefined>(() => store.getCloudProjectOwnerCapability === undefined ? undefined : null);
   const [localRecovery, setLocalRecovery] = useState<PersistedCloudUploadRecovery | null>(uploadRecovery ?? null);
   const [busy, setBusy] = useState(false);
@@ -137,6 +163,7 @@ export function AudioDescriptionGenerationStatus({ project, store, uploadRecover
   useEffect(() => {
     let disposed = false;
     setConfirmReplacement(false);
+    setFailedRetryable(false);
     void (async () => {
       const candidateIds = runId === null
         ? await store.listAudioDescriptionGenerationReceiptRunIds?.() ?? []
@@ -144,7 +171,7 @@ export function AudioDescriptionGenerationStatus({ project, store, uploadRecover
       const candidates = await Promise.all([...new Set(candidateIds)].map((candidate) => client.loadStoredReceipt(store, project, candidate)));
       if (disposed) return;
       const loaded = runId === null
-        ? candidates.find((candidate) => candidate?.adoption?.cleanupAcknowledgement === "pending" || candidate?.terminalCleanup?.cleanupAcknowledgement === "pending") ?? null
+        ? candidates.find((candidate) => hasCleanupRecoveryVisibility(candidate)) ?? null
         : candidates.find((candidate) => candidate?.runId === runId) ?? null;
       if (!receiptBelongsToCurrentProjectInstance(loaded, owner)) {
         setReceipt(null);
@@ -156,10 +183,17 @@ export function AudioDescriptionGenerationStatus({ project, store, uploadRecover
         setStage("Completed");
         setNotice(loaded.adoption.cleanupAcknowledgement === "acknowledged"
           ? "CueBench confirmed private visual-review cleanup after local adoption."
-          : "Audio-description proposals were adopted locally; private visual-review cleanup remains recoverable.");
+          : loaded.adoption.cleanupAcknowledgement === "lifecycle-pending"
+            ? "Audio-description proposals were adopted locally. The 24-hour lifecycle backstop remains pending and is not an immediate deletion acknowledgement."
+            : "Audio-description proposals were adopted locally; private visual-review cleanup remains recoverable.");
       } else if (loaded?.terminalCleanup?.action === "cancelled") {
         setStage("Cancelled");
-        setNotice("Audio-description review was cancelled. Private visual-review cleanup remains visible until CueBench confirms it.");
+        setNotice(loaded.terminalCleanup.cleanupAcknowledgement === "lifecycle-pending"
+          ? "Audio-description review was cancelled. The 24-hour lifecycle backstop remains pending and is not an immediate deletion acknowledgement."
+          : "Audio-description review was cancelled. Private visual-review cleanup remains visible until CueBench confirms it.");
+      } else if (hasLifecyclePendingExpirySettlement(loaded)) {
+        setStage("Failed");
+        setNotice("This browser's private recovery period ended before CueBench could confirm a terminal AD result. Private deletion is lifecycle-pending, not an immediate acknowledgement.");
       } else if (loaded === null && runId !== null) {
         setNotice("This project has an AD lease but no browser recovery receipt yet. Retry the same durable dispatch; CueBench will not create a second run.");
       }
@@ -179,6 +213,7 @@ export function AudioDescriptionGenerationStatus({ project, store, uploadRecover
         const status = await client.status(receipt);
         if (!disposed) {
           setStage(status.stage);
+          setFailedRetryable(isRetryableFailure(status));
           setError(null);
         }
       } catch (cause) {
@@ -219,7 +254,8 @@ export function AudioDescriptionGenerationStatus({ project, store, uploadRecover
       const started = await client.start({ project, store, upload: freshRecovery });
       setReceipt(started.receipt);
       setStage(started.status.stage);
-      setNotice("CueBench saved the signed AD recovery receipt in this browser before it began polling durable visual review.");
+      setFailedRetryable(isRetryableFailure(started.status));
+      setNotice("CueBench saved this private AD recovery record in the browser before it began polling durable visual review.");
     } catch (cause) {
       setError(errorMessage(cause, "CueBench could not start a recoverable audio-description review."));
     } finally {
@@ -234,6 +270,7 @@ export function AudioDescriptionGenerationStatus({ project, store, uploadRecover
     try {
       const status = await client.cancel({ project, store, receipt });
       setStage(status.stage);
+      setFailedRetryable(false);
       setReceipt(await client.loadStoredReceipt(store, project, receipt.runId) ?? receipt);
       setNotice("CueBench confirmed cancellation. No partial AI audio-description proposal can be adopted.");
     } catch (cause) {
@@ -256,11 +293,33 @@ export function AudioDescriptionGenerationStatus({ project, store, uploadRecover
         return;
       }
       setStage("Completed");
+      setFailedRetryable(false);
       setNotice("CueBench atomically adopted evidence-bound Proposed audio descriptions. Sustain or amend them in the human Court review flow.");
     } catch (cause) {
       setError(errorMessage(cause, "CueBench could not adopt the staged audio-description proposals."));
     } finally {
       setConfirmReplacement(false);
+      setBusy(false);
+    }
+  };
+
+  /**
+   * Uses the existing signed run rather than the generation starter. The
+   * Worker accepts this only for one durable pre-acceptance failure; an
+   * ambiguous provider journal never reaches this button as a replay.
+   */
+  const retryFailedGeneration = async () => {
+    if (receipt === null) return;
+    setBusy(true);
+    setError(null);
+    try {
+      const retried = await client.retry(receipt);
+      setStage(retried.stage);
+      setFailedRetryable(isRetryableFailure(retried));
+      setNotice("CueBench queued the same bounded audio-description review after a known-safe failure. It did not begin another uncertain hosted run.");
+    } catch (cause) {
+      setError(errorMessage(cause, "CueBench could not retry this recoverable audio-description review."));
+    } finally {
       setBusy(false);
     }
   };
@@ -275,7 +334,7 @@ export function AudioDescriptionGenerationStatus({ project, store, uploadRecover
         setReceipt(settled);
         setNotice(settled.adoption?.cleanupAcknowledgement === "acknowledged"
           ? "CueBench confirmed private visual-review cleanup."
-          : "The owner capability expired; R2 lifecycle cleanup remains pending and is not an immediate deletion acknowledgement.");
+          : "This browser's private recovery period ended; R2 lifecycle cleanup remains pending and is not an immediate deletion acknowledgement.");
       } else {
         await client.retryCancellationCleanup({ project, store, receipt });
         setReceipt(await client.loadStoredReceipt(store, project, receipt.runId) ?? receipt);
@@ -289,17 +348,29 @@ export function AudioDescriptionGenerationStatus({ project, store, uploadRecover
 
   const canStart = durableStorage && captionEvidence !== null && !busy && !otherRunActive && !hasPendingCleanup(receipt) && (runId === null || missingReceipt) && hasUploadAuthorization(recovery, project, owner);
   const waitingForAdoption = stage === "AwaitingAdoption";
+  const recoveryCleanup = receipt === null
+    ? undefined
+    : hasCleanupRecoveryVisibility(receipt)
+      ? "pending" as const
+      : receipt?.terminalCleanup?.cleanupAcknowledgement === "acknowledged"
+        ? "completed" as const
+        : undefined;
+  const recoveryState = receipt === null ? null : classifyRecoveryState({
+    stage: stage ?? "Queued",
+    retryable: failedRetryable,
+    ...(recoveryCleanup === undefined ? {} : { cleanup: recoveryCleanup }),
+  });
 
   return (
     <section className="storage-disclosure generation-status ad-generation-status" aria-label="Audio-description generation">
       <div className="ad-generation-status__heading">
-        <p className="ad-generation-status__eyebrow">Visual review</p>
         <h2>Audio descriptions</h2>
       </div>
       <p>Use the same hosted evidence bay to propose descriptions in speech-safe gaps. CueBench sends the workflow only the bounded captions and frame evidence it needs; this card never certifies a beat.</p>
       <p role="status" aria-live="polite">{stageLabel(stage)}</p>
+      {recoveryState === null ? null : <RecoveryNotice state={recoveryState} track="audio descriptions" />}
       {notice === null ? null : <p role="status">{notice}</p>}
-      {receipt === null ? null : <p className="generation-status__receipt">Private AD recovery receipt retained for run {receipt.runId}.</p>}
+      {receipt === null ? null : <p className="generation-status__receipt">Private AD recovery retained for this project.</p>}
       {!durableStorage ? <p role="status">Audio-description generation is unavailable in this temporary browser session because CueBench cannot retain a recoverable signed receipt.</p> : null}
       {captionEvidence === null ? <p role="status">First generate and retain evidence-bound captions. AD review is deliberately blocked without a bounded caption-evidence base.</p> : null}
       {otherRunActive ? <p role="status">Another generation target currently holds CueBench’s one-project lease.</p> : null}
@@ -309,8 +380,9 @@ export function AudioDescriptionGenerationStatus({ project, store, uploadRecover
             {missingReceipt ? "Recover AD review dispatch" : "Propose audio descriptions"}
           </button>
           {uploadRecovery === undefined ? <button type="button" className="button button--outline" disabled={busy} onClick={() => void currentUploadRecovery()}>Refresh cloud operation</button> : null}
+          {receipt !== null && stage === "Failed" && failedRetryable ? <button type="button" className="button button--outline" disabled={busy || otherRunActive} onClick={() => void retryFailedGeneration()}>Retry AD review</button> : null}
           {receipt !== null && stage !== "Completed" && stage !== "Cancelled" ? <button type="button" className="button button--outline" disabled={busy} onClick={() => void cancel()}>
-            {waitingForAdoption ? "Discard staged AD result" : "Cancel AD review"}
+            {waitingForAdoption ? "Discard staged AD result" : stage === "Failed" ? failedRetryable ? "Discard retryable AD run" : "Release failed AD lease" : "Cancel AD review"}
           </button> : null}
           {hasPendingCleanup(receipt) ? <button type="button" className="button button--outline" disabled={busy} onClick={() => void retryCleanup()}>Retry private cleanup</button> : null}
           {waitingForAdoption && !hasReplacement ? <button type="button" className="button button--outline" disabled={busy} onClick={() => void adopt()}>Adopt proposed beats</button> : null}

@@ -8,6 +8,7 @@ import { canonicalSerialize } from "@cuebench/domain";
 import { WorkflowEntrypoint, type WorkflowEvent, type WorkflowStep } from "cloudflare:workers";
 import type { R2Bucket } from "@cloudflare/workers-types";
 import {
+  MAX_AUDIO_DESCRIPTION_WORKFLOW_ATTEMPTS,
   R2AudioDescriptionGenerationRunRecordStore,
   verifyAudioDescriptionGenerationRunReceipt,
   type AudioDescriptionGenerationArtifactReference,
@@ -31,6 +32,7 @@ import {
 } from "../openai/audio-description";
 import { OpenAIProviderError, sha256Hex, type ProviderResult } from "../openai/client";
 import { verifyUploadReceipt } from "../uploads";
+import { redactWorkflowFailure } from "../recovery";
 import {
   buildAudioDescriptionWindows,
   deriveSpeechGaps,
@@ -142,10 +144,12 @@ interface ProviderWindowCheckpoint {
   readonly completedAtMs: number;
 }
 
-const safeMessage = (error: unknown): string => {
-  const source = error instanceof Error ? error.message : "CueBench could not complete audio-description generation.";
-  return source.replaceAll(/[\r\n\t]+/gu, " ").trim().slice(0, 480) || "CueBench could not complete audio-description generation.";
-};
+/**
+ * AD failures take the same categorical redaction path as captions. Provider
+ * bodies can contain video names, signed URLs, and request receipts, so a
+ * truncated exception string is still an unacceptable status payload.
+ */
+export const redactAudioDescriptionWorkflowFailure = (error: unknown): string => redactWorkflowFailure(error);
 
 const providerEnvironment = (env: WorkerEnv) => ({
   ...(env.CUEBENCH_OPENAI_MODE === undefined ? {} : { CUEBENCH_OPENAI_MODE: env.CUEBENCH_OPENAI_MODE }),
@@ -343,10 +347,16 @@ const markFailure = async (
   records: AudioDescriptionGenerationRunRecordStore,
   claims: AudioDescriptionGenerationRunReceiptClaims,
   message: string,
+  retryable = false,
 ): Promise<void> => {
   const record = await records.load(claims);
   if (record === null || record.cancelled || record.status.stage === "Completed") return;
-  await records.save({
+  // A safe provider failure permits at most one fresh Workflow instance. If
+  // attempt two fails safely too, it is terminal: retaining `retryable: true`
+  // would present an impossible browser retry while indefinitely holding the
+  // shared source-media lease.
+  const safelyRetryable = retryable && record.workflowAttempt < MAX_AUDIO_DESCRIPTION_WORKFLOW_ATTEMPTS;
+  const failed = {
     ...record,
     status: GenerationRunStatusSchema.parse({
       contractVersion: 1,
@@ -357,11 +367,20 @@ const markFailure = async (
       stage: "Failed",
       code: "GENERATION_STAGE_FAILED",
       message,
-      retryable: false,
+      retryable: safelyRetryable,
     }),
-    leaseReleasePending: true,
     updatedAtMs: Date.now(),
-  });
+  } as AudioDescriptionGenerationRunRecord;
+  if (safelyRetryable) {
+    // A known-safe pre-acceptance failure still owns the shared project lease
+    // until the same signed run is retried, discarded, or expires. Clear any
+    // legacy marker rather than letting a later status poll release it.
+    const retained = { ...failed } as Record<string, unknown>;
+    Reflect.deleteProperty(retained, "leaseReleasePending");
+    await records.save(retained as unknown as AudioDescriptionGenerationRunRecord);
+    return;
+  }
+  await records.save({ ...failed, leaseReleasePending: true });
 };
 
 const cancelled = async (records: AudioDescriptionGenerationRunRecordStore, claims: AudioDescriptionGenerationRunReceiptClaims): Promise<boolean> => {
@@ -553,7 +572,7 @@ export class AudioDescriptionGenerationWorkflow extends WorkflowEntrypoint<Worke
       if (await cancelled(records, claims)) return;
       await records.stageResult({ claims, result: staged, nowMs: createdAtMs });
     } catch (error) {
-      await markFailure(records, claims, safeMessage(error));
+      await markFailure(records, claims, redactAudioDescriptionWorkflowFailure(error));
       throw error;
     }
   }
@@ -578,7 +597,7 @@ export class AudioDescriptionGenerationWorkflow extends WorkflowEntrypoint<Worke
       return providerCheckpoint(await input.records.readWindowCheckpoint({ claims: input.claims, reference: state.checkpoint }));
     }
     if (state?.state === "accepted-unknown") {
-      await markFailure(input.records, input.claims, "CueBench cannot safely replay a visual-analysis request whose provider outcome is unknown.");
+      await markFailure(input.records, input.claims, "CueBench cannot safely replay a visual-analysis request whose earlier outcome is unknown.");
       return null;
     }
     const label = `audio-description provider ${input.window.windowId}`;
@@ -661,7 +680,12 @@ export class AudioDescriptionGenerationWorkflow extends WorkflowEntrypoint<Worke
     } catch (error) {
       // The state transition above is intentionally stronger than a Workflow
       // retry: any transport/5xx/protocol ambiguity remains accepted-unknown.
-      await markFailure(input.records, input.claims, safeMessage(error));
+      await markFailure(
+        input.records,
+        input.claims,
+        redactAudioDescriptionWorkflowFailure(error),
+        error instanceof OpenAIProviderError && error.safeToReplay,
+      );
       return null;
     }
     return providerCheckpoint(await input.records.readWindowCheckpoint({ claims: input.claims, reference }));

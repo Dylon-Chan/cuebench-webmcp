@@ -1058,7 +1058,7 @@ describe("Backup, relink, and deletion human workflows", () => {
 
     await expect(store.retryCloudCleanup(deletion.receiptId)).resolves.toEqual({
       status: "deleted",
-      message: "Hosted source cleanup confirmed.",
+      message: "CueBench confirmed private cloud cleanup.",
     });
     const receipt = (await database.settings.toArray()).find((setting) => setting.key.includes(deletion.receiptId));
     expect(receipt?.value).toMatchObject({ state: "deleted", attempts: 2 });
@@ -1086,8 +1086,8 @@ describe("Backup, relink, and deletion human workflows", () => {
     expect(cloudCleanup).toHaveBeenCalledTimes(1);
 
     cleanupGate.resolve({ status: "deleted", message: "Hosted cleanup confirmed." });
-    await expect(concurrentRetry).resolves.toEqual({ status: "deleted", message: "Hosted cleanup confirmed." });
-    await expect(store.retryCloudCleanup(deletion.receiptId)).resolves.toEqual({ status: "deleted", message: "Hosted cleanup confirmed." });
+    await expect(concurrentRetry).resolves.toEqual({ status: "deleted", message: "CueBench confirmed private cloud cleanup." });
+    await expect(store.retryCloudCleanup(deletion.receiptId)).resolves.toEqual({ status: "deleted", message: "CueBench confirmed private cloud cleanup." });
     expect(cloudCleanup).toHaveBeenCalledTimes(1);
     await database.delete();
   });
@@ -1116,13 +1116,13 @@ describe("Backup, relink, and deletion human workflows", () => {
 
     const deletion = await first.deleteCurrentProject();
     await waitFor(() => expect(firstCloudCleanup).toHaveBeenCalledTimes(1));
-    await expect(second.retryCloudCleanup(deletion.receiptId)).resolves.toEqual({ status: "deleted", message: "Hosted cleanup confirmed by retry." });
+    await expect(second.retryCloudCleanup(deletion.receiptId)).resolves.toEqual({ status: "deleted", message: "CueBench confirmed private cloud cleanup." });
     firstGate.resolve({ status: "failed", message: "Late hosted cleanup failure." });
     await new Promise((resolve) => setTimeout(resolve, 15));
 
     const receipt = (await database.settings.toArray()).find((setting) => setting.key.includes(deletion.receiptId));
-    expect(receipt?.value).toMatchObject({ state: "deleted", message: "Hosted cleanup confirmed by retry." });
-    await expect(second.retryCloudCleanup(deletion.receiptId)).resolves.toEqual({ status: "deleted", message: "Hosted cleanup confirmed by retry." });
+    expect(receipt?.value).toMatchObject({ state: "deleted", message: "CueBench confirmed private cloud cleanup." });
+    await expect(second.retryCloudCleanup(deletion.receiptId)).resolves.toEqual({ status: "deleted", message: "CueBench confirmed private cloud cleanup." });
     expect(secondCloudCleanup).toHaveBeenCalledTimes(1);
     await database.delete();
   });

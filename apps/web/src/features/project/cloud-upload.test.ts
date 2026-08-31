@@ -321,7 +321,8 @@ describe("resumable cloud upload client", () => {
     expect(screen.getByLabelText("Cloud processing disclosure")).toHaveTextContent(/OpenAI/i);
     expect(screen.getByLabelText("Cloud processing disclosure")).toHaveTextContent(/canonical project store/i);
     expect(screen.getByLabelText("Cloud processing disclosure")).toHaveTextContent(/success or cancellation/i);
-    expect(screen.getByLabelText("Cloud processing disclosure")).toHaveTextContent(/24 hours/i);
+    expect(screen.getByLabelText("Cloud processing disclosure")).toHaveTextContent(/scheduled exact-key cleanup/i);
+    expect(screen.getByLabelText("Cloud processing disclosure")).toHaveTextContent(/24-hour limit/i);
 
     await user.click(screen.getByRole("checkbox", { name: /accept temporary cloud processing/i }));
     expect(onAcceptedChange).toHaveBeenCalledWith(true);

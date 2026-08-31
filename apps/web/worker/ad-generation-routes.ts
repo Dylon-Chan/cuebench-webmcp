@@ -21,6 +21,7 @@ import {
   generationArtifactWriteLeaseKey,
   generationCleanupMarkerKey,
 } from "./generation-cleanup";
+import { registerPrivateLifecycleTombstone } from "./lifecycle-reconciler";
 import { saltedLedgerKey, type QuotaLedgerPort } from "./quota-ledger";
 import {
   SignedTokenError,
@@ -43,6 +44,9 @@ const ORPHAN_ARTIFACT_SCAN_LIMIT = MAX_ARTIFACT_REFS + 1;
 const MAX_PREPARED_THUMBNAILS = 256;
 const MAX_PREPARATION_WRITER_LEASES = 512;
 const MAX_WINDOW_CHECKPOINTS = 32;
+/** Initial dispatch plus one Human-requested retry of a proven pre-acceptance failure. */
+/** Initial dispatch plus one explicitly safe replay; shared with the Workflow's failure transition. */
+export const MAX_AUDIO_DESCRIPTION_WORKFLOW_ATTEMPTS = 2;
 const MAX_PROFILE_RULES_BYTES = 64 * 1024;
 const OPAQUE_ID = /^[A-Za-z0-9_-]{1,128}$/u;
 const SHA256 = /^[0-9a-f]{64}$/iu;
@@ -59,7 +63,18 @@ const jsonBytes = (value: unknown, failure: string): Uint8Array => {
 };
 
 type Bindings = { readonly Bindings: WorkerEnv };
-type SharedLeaseStore = Pick<GenerationRunRecordStore, "acquireActiveLease" | "releaseActiveLease">;
+type SharedLeaseStore = Pick<GenerationRunRecordStore, "acquireActiveLease" | "releaseActiveLease"> & {
+  /** Read-only exact-run fence verification for a bounded AD retry. */
+  readonly ownsActiveLease?: (input: {
+    readonly sessionKey: string;
+    readonly ownerKey?: string;
+    readonly projectKey: string;
+    readonly operationKey: string;
+    readonly runId: string;
+    readonly targetTrack: "Captions" | "AudioDescriptions";
+    readonly nowMs: number;
+  }) => Promise<boolean>;
+};
 
 /** The receipt carries every browser-visible mutable fact that the Workflow must re-check. */
 export type AudioDescriptionGenerationRunReceiptClaims = AudioDescriptionGenerationRunReceipt & SignedTokenFields;
@@ -112,6 +127,8 @@ export interface AudioDescriptionGenerationRunRecord {
   readonly status: GenerationRunStatus;
   readonly cancelled: boolean;
   readonly dispatched: boolean;
+  /** Monotonic Workflow identity; retry never reuses a terminal instance id. */
+  readonly workflowAttempt: number;
   readonly windowCheckpoints: Readonly<Record<string, AudioDescriptionWindowCheckpoint>>;
   readonly stagedResultRef?: AudioDescriptionGenerationArtifactReference;
   readonly artifactRefs: readonly AudioDescriptionGenerationArtifactReference[];
@@ -192,6 +209,11 @@ export interface AudioDescriptionGenerationRunRecordStore {
     readonly nowMs: number;
   }) => Promise<AudioDescriptionGenerationRunRecord | null>;
   readonly markLeaseReleased: (claims: Pick<AudioDescriptionGenerationRunReceiptClaims, "operationKey" | "runId">) => Promise<AudioDescriptionGenerationRunRecord | null>;
+  /** Atomically begins exactly one bounded replay of known-safe window failures. */
+  readonly beginSafeRetry: (input: {
+    readonly claims: Pick<AudioDescriptionGenerationRunReceiptClaims, "operationKey" | "runId">;
+    readonly nowMs: number;
+  }) => Promise<AudioDescriptionGenerationRunRecord | null>;
 }
 
 const sameText = (left: string, right: string): boolean => {
@@ -314,6 +336,7 @@ const parseRecord = (value: unknown): AudioDescriptionGenerationRunRecord | null
     || !GenerationRunStatusSchema.safeParse(record.status).success
     || (record.cancelled !== true && record.cancelled !== false)
     || (record.dispatched !== true && record.dispatched !== false)
+    || (record.workflowAttempt !== undefined && (!Number.isSafeInteger(record.workflowAttempt) || (record.workflowAttempt as number) < 1 || (record.workflowAttempt as number) > MAX_AUDIO_DESCRIPTION_WORKFLOW_ATTEMPTS))
     || typeof record.windowCheckpoints !== "object" || record.windowCheckpoints === null || Array.isArray(record.windowCheckpoints)
     || Object.keys(record.windowCheckpoints as object).length > MAX_WINDOW_CHECKPOINTS
     || !Object.entries(record.windowCheckpoints as Readonly<Record<string, unknown>>).every(([windowId, checkpoint]) => OPAQUE_ID.test(windowId) && validWindowCheckpoint(checkpoint))
@@ -376,6 +399,7 @@ const parseRecord = (value: unknown): AudioDescriptionGenerationRunRecord | null
     status,
     cancelled: record.cancelled,
     dispatched: record.dispatched,
+    workflowAttempt: record.workflowAttempt === undefined ? 1 : record.workflowAttempt as number,
     windowCheckpoints: record.windowCheckpoints as Readonly<Record<string, AudioDescriptionWindowCheckpoint>>,
     ...(record.stagedResultRef === undefined ? {} : { stagedResultRef: record.stagedResultRef as AudioDescriptionGenerationArtifactReference }),
     artifactRefs: artifacts,
@@ -406,6 +430,26 @@ const statusFor = (
 
 const terminalStatus = (status: GenerationRunStatus): boolean =>
   status.stage === "Completed" || status.stage === "Cancelled" || status.stage === "Failed" && status.retryable === false;
+
+type SafeWorkflowRetryEligibility = "ready" | "already-retried" | "not-retryable" | "accepted-unknown";
+
+/**
+ * A durable retry is permitted only after a provider explicitly reported a
+ * pre-acceptance failure. Any ambiguous call journal remains terminal so a
+ * fresh workflow can never replay a request that might have been accepted.
+ */
+const safeWorkflowRetryEligibility = (record: AudioDescriptionGenerationRunRecord): SafeWorkflowRetryEligibility => {
+  if (record.status.stage !== "Failed" || record.status.retryable !== true || record.cancelled || record.cleanup !== undefined) {
+    return "not-retryable";
+  }
+  if (Object.values(record.windowCheckpoints).some((checkpoint) => checkpoint.state === "accepted-unknown" || checkpoint.state === "calling")) {
+    return "accepted-unknown";
+  }
+  if (!Object.values(record.windowCheckpoints).some((checkpoint) => checkpoint.state === "retryable-failed")) {
+    return "not-retryable";
+  }
+  return record.workflowAttempt >= MAX_AUDIO_DESCRIPTION_WORKFLOW_ATTEMPTS ? "already-retried" : "ready";
+};
 
 const appendRef = (
   refs: readonly AudioDescriptionGenerationArtifactReference[],
@@ -528,18 +572,46 @@ const mergeRecord = (
       : stagedResultRef !== undefined && !current.cancelled && !candidate.cancelled && !terminalStatus(winner.status)
         ? statusFor(winner.claims, "AwaitingAdoption")
         : winner.status;
+  const workflowAttempt = Math.max(current.workflowAttempt, candidate.workflowAttempt);
+  // A newly claimed retry attempt must clear the old instance's dispatch bit
+  // atomically; otherwise a terminal first Workflow would suppress the only
+  // approved second instance.
+  const dispatched = candidate.workflowAttempt > current.workflowAttempt
+    ? candidate.dispatched
+    : current.dispatched || candidate.dispatched;
+  // The only permitted new Workflow attempt is a safe retry. It deliberately
+  // clears a stale release marker so a legacy retryable failure cannot let a
+  // later status poll release the shared project lease.
+  // An updater normally spreads the current record and therefore retains the
+  // marker. Its deliberate omission is meaningful only when the candidate
+  // is not a stale pre-terminal snapshot: it either cleared a legacy marker
+  // on a safe retryable failure, cleared it after the terminal lease CAS, or
+  // started the new bounded Workflow attempt below.
+  const preserveCurrentTerminalLeaseMarker = current.leaseReleasePending === true
+    && currentTerminal
+    && !candidateTerminal;
+  const leaseReleasePending = candidate.workflowAttempt > current.workflowAttempt
+    ? false
+    : preserveCurrentTerminalLeaseMarker
+      ? true
+      : candidate.leaseReleasePending === true;
   if (current.contentRedacted === true || candidate.contentRedacted === true) {
     const tombstone = current.contentRedacted === true ? current : candidate;
     const tombstoneCleanup = cleanup ?? tombstone.cleanup;
     if (tombstoneCleanup === undefined) throw new Error("CueBench AD tombstone lost its cleanup state.");
+    // `redactedRecord` deliberately carries only terminal public metadata.
+    // Do not accidentally reintroduce a marker that a successful shared
+    // lease release just removed by spreading the older redacted snapshot.
+    const tombstoneForMerge = { ...tombstone } as Record<string, unknown>;
+    if (!leaseReleasePending) Reflect.deleteProperty(tombstoneForMerge, "leaseReleasePending");
     return {
-      ...redactedRecord({ ...tombstone, status, cancelled: current.cancelled || candidate.cancelled }, tombstoneCleanup, Math.max(current.updatedAtMs, candidate.updatedAtMs)),
+      ...redactedRecord({ ...tombstoneForMerge, status, cancelled: current.cancelled || candidate.cancelled } as AudioDescriptionGenerationRunRecord, tombstoneCleanup, Math.max(current.updatedAtMs, candidate.updatedAtMs)),
       artifactRefs,
       // Exact private-object paths remain only in the cleanup inventory after
       // redaction. A late artifact ref reopens that inventory through the
       // merge above without restoring transcript/receipt content.
       privateObjectKeys: [],
-      ...(current.leaseReleasePending === true || candidate.leaseReleasePending === true ? { leaseReleasePending: true as const } : {}),
+      ...(leaseReleasePending ? { leaseReleasePending: true as const } : {}),
     };
   }
   return {
@@ -549,13 +621,14 @@ const mergeRecord = (
     ...(current.qualityProfileRules === undefined ? {} : { qualityProfileRules: current.qualityProfileRules }),
     status,
     cancelled: current.cancelled || candidate.cancelled,
-    dispatched: current.dispatched || candidate.dispatched,
+    dispatched,
+    workflowAttempt,
     windowCheckpoints,
     ...(stagedResultRef === undefined ? {} : { stagedResultRef }),
     artifactRefs,
     privateObjectKeys,
     ...(cleanup === undefined ? {} : { cleanup }),
-    ...(current.leaseReleasePending === true || candidate.leaseReleasePending === true ? { leaseReleasePending: true as const } : {}),
+    ...(leaseReleasePending ? { leaseReleasePending: true as const } : {}),
     updatedAtMs: Math.max(current.updatedAtMs, candidate.updatedAtMs, other.updatedAtMs),
   };
 };
@@ -587,6 +660,7 @@ const redactedRecord = (
   status: record.status,
   cancelled: record.cancelled,
   dispatched: true,
+  workflowAttempt: record.workflowAttempt,
   windowCheckpoints: {},
   artifactRefs: [],
   privateObjectKeys: [],
@@ -616,6 +690,7 @@ const newRecord = (input: {
   status: statusFor(input.claims, "Queued"),
   cancelled: false,
   dispatched: false,
+  workflowAttempt: 1,
   windowCheckpoints: {},
   artifactRefs: [],
   privateObjectKeys: [input.claims.objectKey],
@@ -831,6 +906,20 @@ export class InMemoryAudioDescriptionGenerationRunRecordStore implements AudioDe
       return next as unknown as AudioDescriptionGenerationRunRecord;
     });
   }
+  public beginSafeRetry(input: { readonly claims: Pick<AudioDescriptionGenerationRunReceiptClaims, "operationKey" | "runId">; readonly nowMs: number }): Promise<AudioDescriptionGenerationRunRecord | null> {
+    return this.update(input.claims, (current) => {
+      if (safeWorkflowRetryEligibility(current) !== "ready") return current;
+      const retried = {
+        ...current,
+        status: statusFor(current.claims, "Queued"),
+        dispatched: false,
+        workflowAttempt: current.workflowAttempt + 1,
+        updatedAtMs: Math.max(current.updatedAtMs, input.nowMs),
+      } as Record<string, unknown>;
+      Reflect.deleteProperty(retried, "leaseReleasePending");
+      return retried as unknown as AudioDescriptionGenerationRunRecord;
+    });
+  }
 }
 
 /** Small SHA-256 helper kept in this Worker file so record writing has no browser dependency. */
@@ -863,6 +952,14 @@ export class R2AudioDescriptionGenerationRunRecordStore implements AudioDescript
   private async write(record: AudioDescriptionGenerationRunRecord, onlyIf: R2Conditional): Promise<boolean> {
     const bytes = jsonBytes(record, "CueBench AD recovery record cannot be encoded as JSON.");
     if (bytes.byteLength === 0 || bytes.byteLength > MAX_RECORD_BYTES) throw new Error("CueBench AD recovery record exceeds its private bound.");
+    await registerPrivateLifecycleTombstone({
+      bucket: this.bucket,
+      targetTrack: "AudioDescriptions",
+      operationKey: record.claims.operationKey,
+      runId: record.claims.runId,
+      recordKey: recordKey(record.claims.operationKey, record.claims.runId),
+      expiresAtMs: record.claims.expiresAtMs,
+    });
     const written = await this.bucket.put(recordKey(record.claims.operationKey, record.claims.runId), bytes, {
       onlyIf,
       httpMetadata: { contentType: "application/json; charset=utf-8" },
@@ -1329,12 +1426,27 @@ export class R2AudioDescriptionGenerationRunRecordStore implements AudioDescript
       return next as unknown as AudioDescriptionGenerationRunRecord;
     });
   }
+  public beginSafeRetry(input: { readonly claims: Pick<AudioDescriptionGenerationRunReceiptClaims, "operationKey" | "runId">; readonly nowMs: number }): Promise<AudioDescriptionGenerationRunRecord | null> {
+    return this.update(input.claims, (current) => {
+      if (safeWorkflowRetryEligibility(current) !== "ready") return current;
+      const retried = {
+        ...current,
+        status: statusFor(current.claims, "Queued"),
+        dispatched: false,
+        workflowAttempt: current.workflowAttempt + 1,
+        updatedAtMs: Math.max(current.updatedAtMs, input.nowMs),
+      } as Record<string, unknown>;
+      Reflect.deleteProperty(retried, "leaseReleasePending");
+      return retried as unknown as AudioDescriptionGenerationRunRecord;
+    });
+  }
 }
 
 export interface AudioDescriptionGenerationWorkflowControl {
   readonly startAudioDescriptionGeneration: (input: {
     readonly operationKey: string;
     readonly runId: string;
+    readonly workflowAttempt: number;
     readonly receipt: string;
     readonly uploadReceipt: string;
   }) => Promise<void>;
@@ -1349,11 +1461,15 @@ export interface AudioDescriptionGenerationWorkflowControl {
  * Keeps the Cloudflare instance identifier opaque and bounded while making an
  * accepted create recoverable with the exact same private AD run identity.
  */
-export const audioDescriptionWorkflowInstanceId = async (operationKey: string, runId: string): Promise<string> => {
-  if (!SHA256.test(operationKey) || !OPAQUE_ID.test(runId)) {
+export const audioDescriptionWorkflowInstanceId = async (operationKey: string, runId: string, workflowAttempt = 1): Promise<string> => {
+  if (!SHA256.test(operationKey) || !OPAQUE_ID.test(runId) || !Number.isSafeInteger(workflowAttempt) || workflowAttempt < 1 || workflowAttempt > MAX_AUDIO_DESCRIPTION_WORKFLOW_ATTEMPTS) {
     throw new Error("CueBench cannot create an invalid audio-description Workflow identity.");
   }
-  const bytes = encoder.encode(`cuebench:audio-description:${operationKey}:${runId}`);
+  // Preserve the original initial-attempt identity for recovery; the only
+  // Human-triggered safe retry receives a distinct Workflow instance.
+  const bytes = encoder.encode(workflowAttempt === 1
+    ? `cuebench:audio-description:${operationKey}:${runId}`
+    : `cuebench:audio-description:${operationKey}:${runId}:attempt:${workflowAttempt}`);
   const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", Uint8Array.from(bytes)));
   const hex = Array.from(digest, (value) => value.toString(16).padStart(2, "0")).join("");
   return `cad-${hex.slice(0, 60)}`;
@@ -1379,8 +1495,8 @@ export const bindingAudioDescriptionWorkflow = (
 ): AudioDescriptionGenerationWorkflowControl | undefined => {
   if (binding === undefined) return undefined;
   return {
-    startAudioDescriptionGeneration: async ({ operationKey, runId, receipt, uploadReceipt }) => {
-      const id = await audioDescriptionWorkflowInstanceId(operationKey, runId);
+    startAudioDescriptionGeneration: async ({ operationKey, runId, workflowAttempt, receipt, uploadReceipt }) => {
+      const id = await audioDescriptionWorkflowInstanceId(operationKey, runId, workflowAttempt);
       try {
         await binding.create({ id, params: { audioDescriptionGenerationReceipt: receipt, uploadReceipt } });
       } catch (error) {
@@ -1569,6 +1685,44 @@ const reconcileTerminal = async (
   currentNow: number,
 ): Promise<AudioDescriptionGenerationRunRecord> => {
   let reconciled = record;
+  // The second Workflow instance has already consumed the one bounded safe
+  // replay. A later pre-acceptance provider failure is still not safe to
+  // offer again: normalize historic/mid-deploy records to a terminal state
+  // before exact cleanup so status, retry, and Human UI tell the same truth.
+  if (
+    reconciled.status.stage === "Failed"
+    && reconciled.status.retryable === true
+    && reconciled.workflowAttempt >= MAX_AUDIO_DESCRIPTION_WORKFLOW_ATTEMPTS
+  ) {
+    const exhausted = {
+      ...reconciled,
+      status: GenerationRunStatusSchema.parse({
+        ...reconciled.status,
+        retryable: false,
+      }),
+      leaseReleasePending: true as const,
+      updatedAtMs: Math.max(reconciled.updatedAtMs, currentNow),
+    } satisfies AudioDescriptionGenerationRunRecord;
+    try {
+      await runs.save(exhausted);
+      reconciled = (await runs.load(reconciled.claims)) ?? exhausted;
+    } catch {
+      // Keep the current record/lease if the terminal marker cannot become
+      // durable. A later authenticated poll can retry this exact transition.
+      return reconciled;
+    }
+  }
+  // A retryable failure is intentionally non-terminal: its exact run keeps
+  // the one shared project/media lease through status polling and the one
+  // approved replay. This also repairs legacy records that carried a stale
+  // lease-release marker before the retry safety rule existed.
+  if (reconciled.status.stage === "Failed" && reconciled.status.retryable === true) {
+    if (reconciled.leaseReleasePending !== true) return reconciled;
+    // This is a state cleanup only: no lease release happens on the
+    // retryable path. It repairs records made before safe retry ownership was
+    // introduced so later polls cannot mistake them for terminal work.
+    try { return (await runs.markLeaseReleased(reconciled.claims)) ?? reconciled; } catch { return reconciled; }
+  }
   // A failed Workflow can never be safely replayed. It still owns this upload
   // operation until its exact private source/preparation inventory is durably
   // tombstoned, otherwise a later run could reuse the upload and an old
@@ -1603,6 +1757,7 @@ const reconcileTerminal = async (
   // fresh-upload requirement instead of racing old terminal cleanup.
   if (reconciled.status.stage === "Failed" && reconciled.status.retryable === false && reconciled.cleanup?.state !== "completed") return reconciled;
   if (reconciled.cleanup !== undefined && reconciled.cleanup.state !== "completed") return reconciled;
+  if (!terminalStatus(reconciled.status) && reconciled.cleanup === undefined) return reconciled;
   if (reconciled.leaseReleasePending !== true) return reconciled;
   try {
     await releaseLease(leases, reconciled.claims, currentNow);
@@ -1627,6 +1782,7 @@ const dispatch = async (
     await workflow.startAudioDescriptionGeneration({
       operationKey: record.claims.operationKey,
       runId: record.claims.runId,
+      workflowAttempt: record.workflowAttempt,
       receipt: record.receipt,
       uploadReceipt: record.uploadReceipt,
     });
@@ -1834,20 +1990,161 @@ export const createAudioDescriptionGenerationRoutes = (
     return { currentNow, settings, receipt, claims, ...available };
   };
 
+  /**
+   * Exact cleanup deliberately erases bearer material from durable state.
+   * A verified receipt can still prove its full signed claims against that
+   * tombstone for idempotent terminal reads/actions; it never restores raw
+   * receipt or upload capability material. The action handler below remains
+   * responsible for requiring the same terminal action before returning 2xx.
+   */
+  const matchesAuthorizedRecord = (
+    record: AudioDescriptionGenerationRunRecord | null,
+    receipt: string,
+    claims: AudioDescriptionGenerationRunReceiptClaims,
+  ): record is AudioDescriptionGenerationRunRecord => record !== null && (
+    record.receipt === receipt
+    || (
+      record.contentRedacted === true
+      && sameClaims(record.claims, claims)
+    )
+  );
+
+  /**
+   * Exact object cleanup and shared-lease release are separate durable
+   * operations. A redacted record may therefore know every object is gone
+   * while a transient lease CAS is still pending; never advertise that as a
+   * completed terminal acknowledgement to the browser.
+   */
+  const cleanupForResponse = (record: AudioDescriptionGenerationRunRecord): AudioDescriptionGenerationCleanup | undefined => {
+    const cleanup = record.cleanup;
+    if (cleanup === undefined || cleanup.state !== "completed" || record.leaseReleasePending !== true) return cleanup;
+    return {
+      version: cleanup.version,
+      state: "pending",
+      action: cleanup.action,
+      artifactKeys: cleanup.artifactKeys,
+      requestedAtMs: cleanup.requestedAtMs,
+    };
+  };
+
+  const terminalResponse = (record: AudioDescriptionGenerationRunRecord) => {
+    const cleanup = cleanupForResponse(record);
+    return {
+      status: record.status,
+      ...(cleanup === undefined ? {} : { cleanup }),
+    };
+  };
+
+  const redactedActionMatches = (
+    record: AudioDescriptionGenerationRunRecord,
+    action: AudioDescriptionGenerationCleanupAction,
+    adoptedProjectRevision?: number,
+  ): boolean => (
+    record.contentRedacted === true
+    && record.cleanup?.action === action
+    && (
+      action !== "adopted"
+      || record.status.stage === "Completed" && record.status.adoptedProjectRevision === adoptedProjectRevision
+    )
+  );
+
+  const reconcileAuthorizedTerminal = async (
+    record: AudioDescriptionGenerationRunRecord,
+    access: { readonly runs: AudioDescriptionGenerationRunRecordStore; readonly leases: SharedLeaseStore; readonly currentNow: number },
+  ): Promise<AudioDescriptionGenerationRunRecord> => (
+    record.leaseReleasePending === true
+    || record.cleanup?.state === "pending"
+    || (
+      record.status.stage === "Failed"
+      && record.status.retryable === true
+      && record.workflowAttempt >= MAX_AUDIO_DESCRIPTION_WORKFLOW_ATTEMPTS
+    )
+      ? reconcileTerminal(access.runs, access.leases, record, access.currentNow)
+      : record
+  );
+
   app.get("/api/audio-description-runs/:runId", async (context) => {
     const access = await authorized(context);
     if ("error" in access) return access.error;
     let record = await access.runs.load(access.claims);
-    if (record === null || record.receipt !== access.receipt) return apiError(404, "NOT_FOUND", "CueBench could not find this private audio-description run.");
-    if (record.leaseReleasePending === true || record.cleanup?.state === "pending") record = await reconcileTerminal(access.runs, access.leases, record, access.currentNow);
-    return context.json({ status: record.status, recovery: record.windowCheckpoints });
+    if (!matchesAuthorizedRecord(record, access.receipt, access.claims)) return apiError(404, "NOT_FOUND", "CueBench could not find this private audio-description run.");
+    record = await reconcileAuthorizedTerminal(record, access);
+    const cleanup = cleanupForResponse(record);
+    return context.json({ status: record.status, recovery: record.windowCheckpoints, ...(cleanup === undefined ? {} : { cleanup }) });
+  });
+
+  /**
+   * Starts one new deterministic Workflow instance only for a durable,
+   * explicitly-safe provider failure. A retry never mints a receipt, never
+   * reacquires another lease, and never replays an accepted-unknown journal.
+   */
+  app.post("/api/audio-description-runs/:runId/retry", async (context) => {
+    const access = await authorized(context);
+    if ("error" in access) return access.error;
+    let record = await access.runs.load(access.claims);
+    if (!matchesAuthorizedRecord(record, access.receipt, access.claims)) return apiError(404, "NOT_FOUND", "CueBench could not find this private audio-description run.");
+    record = await reconcileAuthorizedTerminal(record, access);
+
+    const eligibility = safeWorkflowRetryEligibility(record);
+    if (eligibility === "accepted-unknown") {
+      return apiError(409, "AD_GENERATION_RETRY_UNSAFE", "CueBench cannot safely replay this visual-analysis request because its earlier outcome is unknown.");
+    }
+    if (eligibility === "already-retried") {
+      return apiError(409, "AD_GENERATION_RETRY_EXHAUSTED", "CueBench already used this run's one bounded safe retry. Start a new review only after resolving the retained recovery record.");
+    }
+    if (eligibility === "not-retryable") {
+      // A response may have been lost just after this endpoint committed the
+      // new attempt. Expose its live state idempotently without another start.
+      if (record.status.stage === "Queued" && record.workflowAttempt > 1 && record.dispatched) {
+        return context.json({ status: record.status }, 200);
+      }
+      return apiError(409, "AD_GENERATION_RETRY_NOT_AVAILABLE", "CueBench did not retain a known-safe retry for this audio-description run.");
+    }
+    // Retry is never an acquisition path. The original exact run must still
+    // own the active global project lease, otherwise a terminal transition
+    // may have won and a new Workflow would race a different target.
+    const leaseInput = {
+      sessionKey: record.claims.sessionKey,
+      ...(record.claims.ownerKey === undefined ? {} : { ownerKey: record.claims.ownerKey }),
+      projectKey: record.claims.projectKey,
+      operationKey: record.claims.operationKey,
+      runId: record.claims.runId,
+      targetTrack: "AudioDescriptions" as const,
+      nowMs: access.currentNow,
+    };
+    let stillOwnsLease: boolean;
+    try {
+      stillOwnsLease = await access.leases.ownsActiveLease?.(leaseInput) ?? false;
+    } catch {
+      return apiError(503, "AD_GENERATION_RETRY_LEASE_UNAVAILABLE", "CueBench could not verify the retained project recovery state yet.", true);
+    }
+    if (!stillOwnsLease) {
+      return apiError(409, "AD_GENERATION_RETRY_NOT_AVAILABLE", "CueBench did not retain a known-safe retry for this audio-description run.");
+    }
+    const retried = await access.runs.beginSafeRetry({ claims: access.claims, nowMs: access.currentNow });
+    if (retried === null || retried.receipt !== access.receipt) return apiError(409, "AD_GENERATION_RETRY_NOT_AVAILABLE", "CueBench could not retain a safe retry for this audio-description run.");
+    // A terminal/cleanup transition can win the CAS between the first read
+    // and beginSafeRetry. Never turn that loss into a 202 or dispatch the old
+    // Workflow; only the newly persisted queued attempt is replayable.
+    if (retried.workflowAttempt !== record.workflowAttempt + 1 || retried.status.stage !== "Queued" || retried.cancelled || retried.cleanup !== undefined) {
+      if (retried.status.stage === "Queued" && retried.workflowAttempt > 1 && retried.dispatched) {
+        return context.json({ status: retried.status }, 200);
+      }
+      return apiError(409, "AD_GENERATION_RETRY_NOT_AVAILABLE", "CueBench did not retain a known-safe retry for this audio-description run.");
+    }
+    try {
+      const dispatched = await dispatch(access.runs, access.workflow, retried, access.currentNow);
+      return context.json({ status: dispatched.status }, 202);
+    } catch {
+      return apiError(503, "AD_GENERATION_RETRY_DISPATCH_PENDING", "CueBench retained the bounded retry but could not dispatch its new durable workflow yet. Check this recovery receipt before trying again.", true);
+    }
   });
 
   app.get("/api/audio-description-runs/:runId/staged-result", async (context) => {
     const access = await authorized(context);
     if ("error" in access) return access.error;
     const record = await access.runs.load(access.claims);
-    if (record === null || record.receipt !== access.receipt || record.cancelled || record.status.stage !== "AwaitingAdoption") {
+    if (!matchesAuthorizedRecord(record, access.receipt, access.claims) || record.cancelled || record.status.stage !== "AwaitingAdoption") {
       return apiError(409, "AD_GENERATION_RESULT_PENDING", "CueBench has not completed a staged audio-description result available for adoption.", true);
     }
     const result = await access.runs.readStagedResult(record);
@@ -1869,8 +2166,11 @@ export const createAudioDescriptionGenerationRoutes = (
       || action === "adopted" && (!Number.isSafeInteger(adoptedProjectRevision) || (adoptedProjectRevision as number) <= access.claims.expectedProjectRevision)
       || action === "discarded" && adoptedProjectRevision !== undefined
     ) return apiError(400, "AD_GENERATION_ACKNOWLEDGEMENT_INVALID", "CueBench could not read this terminal audio-description acknowledgement.");
-    const record = await access.runs.load(access.claims);
-    if (record === null || record.receipt !== access.receipt) return apiError(404, "NOT_FOUND", "CueBench could not find this private audio-description run.");
+    let record = await access.runs.load(access.claims);
+    if (!matchesAuthorizedRecord(record, access.receipt, access.claims)) return apiError(404, "NOT_FOUND", "CueBench could not find this private audio-description run.");
+    record = await reconcileAuthorizedTerminal(record, access);
+    if (redactedActionMatches(record, action, action === "adopted" ? adoptedProjectRevision as number : undefined)) return context.json(terminalResponse(record));
+    if (record.contentRedacted === true) return apiError(409, "AD_GENERATION_ACKNOWLEDGEMENT_CONFLICT", "CueBench already recorded a different terminal action for this private audio-description run.");
     if (record.cleanup !== undefined && record.cleanup.action !== action) return apiError(409, "AD_GENERATION_ACKNOWLEDGEMENT_CONFLICT", "CueBench already recorded a different terminal action for this audio-description run.");
     if (action === "adopted" && (record.cancelled || record.status.stage !== "AwaitingAdoption") && record.status.stage !== "Completed") {
       return apiError(409, "AD_GENERATION_ACKNOWLEDGEMENT_INVALID", "Only a staged result adopted through the local expected-revision transaction can be acknowledged.");
@@ -1879,21 +2179,24 @@ export const createAudioDescriptionGenerationRoutes = (
     if (terminal === null || terminal.cleanup !== undefined && terminal.cleanup.action !== action) return apiError(409, "AD_GENERATION_ACKNOWLEDGEMENT_CONFLICT", "CueBench already recorded a different terminal action for this audio-description run.");
     const cleaned = await access.runs.cleanup({ claims: access.claims, action, nowMs: access.currentNow });
     const reconciled = cleaned === null ? terminal : await reconcileTerminal(access.runs, access.leases, cleaned, access.currentNow);
-    return context.json({ status: reconciled.status, cleanup: reconciled.cleanup });
+    return context.json(terminalResponse(reconciled));
   });
 
   app.delete("/api/audio-description-runs/:runId", async (context) => {
     const access = await authorized(context);
     if ("error" in access) return access.error;
-    const record = await access.runs.load(access.claims);
-    if (record === null || record.receipt !== access.receipt) return apiError(404, "NOT_FOUND", "CueBench could not find this private audio-description run.");
+    let record = await access.runs.load(access.claims);
+    if (!matchesAuthorizedRecord(record, access.receipt, access.claims)) return apiError(404, "NOT_FOUND", "CueBench could not find this private audio-description run.");
+    record = await reconcileAuthorizedTerminal(record, access);
+    if (redactedActionMatches(record, "cancelled")) return context.json(terminalResponse(record));
+    if (record.contentRedacted === true) return apiError(409, "AD_GENERATION_ACKNOWLEDGEMENT_CONFLICT", "CueBench already recorded a different terminal action for this private audio-description run.");
     if (record.status.stage === "Completed" || record.cleanup?.action === "adopted") return apiError(409, "AD_GENERATION_ACKNOWLEDGEMENT_CONFLICT", "An adopted audio-description run cannot be cancelled.");
     const terminal = await access.runs.terminal({ claims: access.claims, action: "cancelled", nowMs: access.currentNow });
     if (terminal === null || terminal.cleanup?.action === "adopted") return apiError(409, "AD_GENERATION_ACKNOWLEDGEMENT_CONFLICT", "An adopted audio-description run cannot be cancelled.");
     await access.workflow.cancelAudioDescriptionGeneration({ operationKey: access.claims.operationKey, runId: access.claims.runId, receipt: access.receipt }).catch(() => undefined);
     const cleaned = await access.runs.cleanup({ claims: access.claims, action: "cancelled", nowMs: access.currentNow });
     const reconciled = cleaned === null ? terminal : await reconcileTerminal(access.runs, access.leases, cleaned, access.currentNow);
-    return context.json({ status: reconciled.status, cleanup: reconciled.cleanup });
+    return context.json(terminalResponse(reconciled));
   });
 
   return app;

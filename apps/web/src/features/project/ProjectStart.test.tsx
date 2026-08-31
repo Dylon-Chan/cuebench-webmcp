@@ -118,6 +118,72 @@ describe("ProjectStart", () => {
     expect(project?.media.sha256).toBe("51beba8fbd43cd905d4952f59f4ef507f471f568cf54f86dd3c88130e2667c45");
   });
 
+  it("keeps a deleted project's unconfirmed cloud cleanup visible from the start surface", async () => {
+    const database = new CueBenchDatabase(databaseName());
+    databases.push(database);
+    const store = new ProjectStore({
+      database,
+      browserStorage: browserStorage({ quota: 100_000_000, usage: 0, persisted: true }),
+      objectUrlLease: objectUrlLease("cleanup-status").lease,
+      bundledSampleLoader: bundledSampleFile,
+      cloudCleanup: async () => ({ status: "pending", message: "Provider body must not reach the cleanup surface." }),
+    });
+    await store.openSample();
+    await store.deleteCurrentProject();
+
+    render(<ProjectStart store={store} />);
+
+    expect(await screen.findByRole("region", { name: "Private cloud cleanup" })).toHaveTextContent(/deletion pending/i);
+    await expect(store.listCloudCleanupReceipts()).resolves.toEqual(expect.arrayContaining([
+      expect.objectContaining({ state: "deleting" }),
+    ]));
+  });
+
+  it("keeps the last public cleanup entry and offers accessible retry and reload actions when its status read fails", async () => {
+    const database = new CueBenchDatabase(databaseName());
+    databases.push(database);
+    const store = new ProjectStore({
+      database,
+      browserStorage: browserStorage({ quota: 100_000_000, usage: 0, persisted: true }),
+      objectUrlLease: objectUrlLease("cleanup-read-failure").lease,
+    });
+    const entries = [{
+      receiptId: "opaque-cleanup-status-id",
+      state: "deleting" as const,
+      message: "public lifecycle wording only",
+      attempts: 1,
+    }];
+    const list = vi.spyOn(store, "listCloudCleanupReceipts")
+      .mockResolvedValueOnce(entries)
+      .mockRejectedValueOnce(new Error("private storage read failed"))
+      .mockResolvedValueOnce(entries);
+    vi.spyOn(store, "retryCloudCleanup").mockResolvedValue({
+      status: "pending",
+      message: "public lifecycle wording only",
+    });
+    const reload = vi.fn();
+    const user = userEvent.setup();
+
+    render(<ProjectStart store={store} onReloadCleanupStatus={reload} />);
+    expect(await screen.findByRole("region", { name: "Private cloud cleanup" })).toHaveTextContent(/deletion pending/i);
+
+    await user.click(screen.getByRole("button", { name: "Retry private cleanup" }));
+    const alert = await screen.findByRole("alert", { name: "Private cleanup status unavailable" });
+    expect(alert).toHaveTextContent(/could not refresh private cleanup status/i);
+    // The failed refresh must not erase the last non-sensitive lifecycle
+    // projection or turn a deletion into a misleading blank screen.
+    expect(screen.getByRole("region", { name: "Private cloud cleanup" })).toHaveTextContent(/deletion pending/i);
+    expect(screen.getByRole("button", { name: "Retry cleanup status" })).toBeVisible();
+    expect(screen.getByRole("button", { name: "Reload CueBench" })).toBeVisible();
+
+    await user.click(screen.getByRole("button", { name: "Reload CueBench" }));
+    expect(reload).toHaveBeenCalledTimes(1);
+
+    await user.click(screen.getByRole("button", { name: "Retry cleanup status" }));
+    await waitFor(() => expect(screen.queryByRole("alert", { name: "Private cleanup status unavailable" })).toBeNull());
+    expect(list).toHaveBeenCalledTimes(3);
+  });
+
   it("restores the last durable project into the workbench route", async () => {
     const database = new CueBenchDatabase(databaseName());
     databases.push(database);

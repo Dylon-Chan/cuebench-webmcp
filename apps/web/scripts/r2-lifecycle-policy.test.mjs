@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   LifecyclePolicyError,
   PROCESSING_LIFECYCLE_POLICY,
+  deploymentEnvironmentFromArgs,
   main,
   provisionAndVerifyLifecycle,
   validateProcessingBucketBinding,
@@ -28,6 +29,14 @@ const streamedApiResponse = (result, status = 200) => {
 };
 
 describe("CueBench R2 lifecycle deployment policy", () => {
+  it("accepts one explicit deployment environment and rejects an ambiguous lifecycle target", () => {
+    expect(deploymentEnvironmentFromArgs([])).toBe("local");
+    expect(deploymentEnvironmentFromArgs(["--env", "preview"])).toBe("preview");
+    expect(deploymentEnvironmentFromArgs(["--env=production"])).toBe("production");
+    expect(() => deploymentEnvironmentFromArgs(["--env", "preview", "--env=production"])).toThrow(/conflicting/i);
+    expect(() => deploymentEnvironmentFromArgs(["--env"])).toThrow(/needs an environment/i);
+  });
+
   it("declares enabled processing and prepared deletion plus processing multipart-abort transitions at no more than 24 hours", () => {
     expect(validateLifecyclePolicy(PROCESSING_LIFECYCLE_POLICY)).toEqual(PROCESSING_LIFECYCLE_POLICY);
     expect(() => validateLifecyclePolicy({
@@ -45,6 +54,12 @@ describe("CueBench R2 lifecycle deployment policy", () => {
   it("preflights the checked-in declarative policy without credentials or network access", async () => {
     const noNetwork = async () => { throw new Error("preflight must not call the lifecycle API"); };
     await expect(main({ argv: ["--dry-run"], env: {}, fetcher: noNetwork })).resolves.toEqual(PROCESSING_LIFECYCLE_POLICY);
+    await expect(main({ argv: ["--dry-run", "--env", "preview"], env: {}, fetcher: noNetwork })).resolves.toMatchObject({
+      bucketName: "cuebench-processing-preview",
+    });
+    await expect(main({ argv: ["--dry-run", "--env=production"], env: {}, fetcher: noNetwork })).resolves.toMatchObject({
+      bucketName: "cuebench-processing-production",
+    });
   });
 
   it("fails closed if the declarative lifecycle bucket is not the Wrangler PROCESSING_BUCKET binding", () => {

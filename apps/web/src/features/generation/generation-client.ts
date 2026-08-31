@@ -70,6 +70,31 @@ export interface GenerationReceiptExpirySettlement {
   readonly localLeaseRelease: "pending" | "released";
 }
 
+/**
+ * Private write-ahead identity retained before a potentially durable start
+ * POST. It lets a project deletion win the browser race without ever
+ * restoring the deleted project merely to persist a late signed receipt.
+ */
+export interface PendingGenerationStartReservation {
+  readonly projectId: string;
+  readonly operationId: string;
+  readonly runId: string;
+  readonly targetTrack: "Captions" | "AudioDescriptions";
+  readonly projectOwnerCapability: string;
+  readonly mediaSha256: string;
+  readonly sourceDurationMs: number;
+}
+
+/** A parsed start response is offered to the durable deletion receipt before normal receipt persistence. */
+export interface DeletedGenerationStartRecovery {
+  readonly projectId: string;
+  readonly operationId: string;
+  readonly runId: string;
+  readonly targetTrack: "Captions" | "AudioDescriptions";
+  readonly projectOwnerCapability: string;
+  readonly receipt: unknown;
+}
+
 export interface GenerationClientReceipt {
   readonly version: 1;
   readonly runId: string;
@@ -105,9 +130,15 @@ export interface GenerationProjectStore {
   /** This must complete before the browser starts polling an opaque receipt. */
   readonly persistCaptionGenerationReceipt: (runId: string, receipt: GenerationClientReceipt) => Promise<void>;
   /** Durable ProjectStore reserves a crash-safe slot before server dispatch. */
-  readonly reserveCaptionGenerationReceipt?: (runId: string) => Promise<void>;
+  readonly reserveCaptionGenerationReceipt?: (runId: string, reservation?: PendingGenerationStartReservation) => Promise<void>;
   /** Removes only an unfulfilled internal receipt reservation. */
   readonly releaseCaptionGenerationReceiptReservation?: (runId: string) => Promise<void>;
+  /**
+   * Returns true only when this exact start was deleted while its POST was in
+   * flight. The store durably captures the signed run for exact cleanup and
+   * the client must not persist it back into a removed project.
+   */
+  readonly reconcileDeletedCaptionGenerationStart?: (input: DeletedGenerationStartRecovery) => Promise<boolean>;
   readonly loadCaptionGenerationReceipt: (runId: string) => Promise<unknown | null>;
   /** Optional upgrade path for showing detached pending cleanup after reload. */
   readonly listCaptionGenerationReceiptRunIds?: () => Promise<readonly string[]>;
@@ -458,7 +489,15 @@ export class CaptionGenerationClient implements CaptionGenerationClientPort {
     if (leasedProject.activeGenerationRun === null) {
       runId = this.createRunId();
       if (!opaqueId.test(runId)) throw new GenerationClientError("CueBench generated an invalid caption-generation run identifier.");
-      await input.store.reserveCaptionGenerationReceipt?.(runId);
+      await input.store.reserveCaptionGenerationReceipt?.(runId, {
+        projectId: leasedProject.projectId,
+        operationId: input.upload.operationId,
+        runId,
+        targetTrack: "Captions",
+        projectOwnerCapability: authorization.projectOwnerCapability,
+        mediaSha256: leasedProject.media.sha256,
+        sourceDurationMs: authorization.sourceDurationMs,
+      });
       try {
         throwIfGenerationAborted(input.signal);
       } catch (error) {
@@ -482,7 +521,15 @@ export class CaptionGenerationClient implements CaptionGenerationClientPort {
       notifyGenerationLifecycle(input, { phase: "lease-acquired", runId, targetTrack: "Captions" });
     } else if (isMatchingCaptionLease(leasedProject, leasedProject.activeGenerationRun.runId)) {
       runId = leasedProject.activeGenerationRun.runId;
-      await input.store.reserveCaptionGenerationReceipt?.(runId);
+      await input.store.reserveCaptionGenerationReceipt?.(runId, {
+        projectId: leasedProject.projectId,
+        operationId: input.upload.operationId,
+        runId,
+        targetTrack: "Captions",
+        projectOwnerCapability: authorization.projectOwnerCapability,
+        mediaSha256: leasedProject.media.sha256,
+        sourceDurationMs: authorization.sourceDurationMs,
+      });
       try {
         throwIfGenerationAborted(input.signal);
       } catch (error) {
@@ -533,9 +580,39 @@ export class CaptionGenerationClient implements CaptionGenerationClientPort {
       durableStartMayExist = true;
       notifyGenerationLifecycle(input, { phase: "remote-start-accepted", runId, targetTrack: "Captions" });
       const started = parseStart(await response.json(), leasedProject, leaseBase.expectedProjectRevision, runId, this.clock(), authorization);
+      const deletedStartRecovery = {
+        projectId: leasedProject.projectId,
+        operationId: input.upload.operationId,
+        runId,
+        targetTrack: "Captions",
+        projectOwnerCapability: authorization.projectOwnerCapability,
+        receipt: started.receipt,
+      } as const;
+      const projectDeletedDuringStart = () => new GenerationClientError("This local project was deleted while CueBench started the caption run. CueBench retained the exact run for private cleanup.", {
+          code: "PROJECT_DELETED_DURING_START",
+          lifecycleOutcome: {
+            runId,
+            targetTrack: "Captions",
+            disposition: "lifecycle-pending",
+            operation: "start",
+            receiptState: "available",
+          },
+        });
+      if (await input.store.reconcileDeletedCaptionGenerationStart?.(deletedStartRecovery)) throw projectDeletedDuringStart();
       // This await is intentionally before returning to UI polling. If a tab
       // closes immediately after start, the signed capability still recovers.
-      await input.store.persistCaptionGenerationReceipt(runId, started.receipt);
+      try {
+        await input.store.persistCaptionGenerationReceipt(runId, started.receipt);
+      } catch (persistenceError) {
+        // Deletion can win after the first read above but before its queued
+        // IndexedDB receipt write. Re-read the exact write-ahead intent with
+        // the signed response before surfacing a storage error; otherwise the
+        // browser would retain a hosted run only until the 24-hour backstop.
+        if (await input.store.reconcileDeletedCaptionGenerationStart?.(deletedStartRecovery)) {
+          throw projectDeletedDuringStart();
+        }
+        throw persistenceError;
+      }
       notifyGenerationLifecycle(input, { phase: "receipt-persisted", runId, targetTrack: "Captions" });
       return started;
     } catch (error) {

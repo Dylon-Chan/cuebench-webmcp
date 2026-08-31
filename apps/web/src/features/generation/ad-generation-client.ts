@@ -17,11 +17,13 @@ import {
   notifyGenerationLifecycle,
   throwIfGenerationAborted,
   withGenerationLifecycleOutcome,
+  type DeletedGenerationStartRecovery,
   type GenerationLifecycleObserver,
   type GenerationReceiptAdoption,
   type GenerationReceiptCancellationIntent,
   type GenerationReceiptExpirySettlement,
   type GenerationReceiptTerminalCleanup,
+  type PendingGenerationStartReservation,
 } from "./generation-client";
 
 const aiActor = { type: "CueBenchAI" as const, id: "cuebench-ai" };
@@ -62,8 +64,9 @@ export interface AudioDescriptionGenerationProjectStore {
   readonly executeCommand: (command: DomainCommand, expectedProjectId?: string) => Promise<CommandResult>;
   /** Must complete before the browser polls an AD receipt. */
   readonly persistAudioDescriptionGenerationReceipt: (runId: string, receipt: AudioDescriptionGenerationReceipt) => Promise<void>;
-  readonly reserveAudioDescriptionGenerationReceipt?: (runId: string) => Promise<void>;
+  readonly reserveAudioDescriptionGenerationReceipt?: (runId: string, reservation?: PendingGenerationStartReservation) => Promise<void>;
   readonly releaseAudioDescriptionGenerationReceiptReservation?: (runId: string) => Promise<void>;
+  readonly reconcileDeletedAudioDescriptionGenerationStart?: (input: DeletedGenerationStartRecovery) => Promise<boolean>;
   readonly loadAudioDescriptionGenerationReceipt: (runId: string) => Promise<unknown | null>;
   readonly listAudioDescriptionGenerationReceiptRunIds?: () => Promise<readonly string[]>;
   readonly getCloudProjectOwnerCapability?: (projectId: string) => Promise<string | null>;
@@ -116,6 +119,8 @@ export interface AdoptAudioDescriptionGenerationInput {
 export interface AudioDescriptionGenerationClientPort {
   readonly start: (input: StartAudioDescriptionGenerationInput) => Promise<StartedAudioDescriptionGeneration>;
   readonly status: (receipt: AudioDescriptionGenerationReceipt, signal?: AbortSignal) => Promise<GenerationRunStatus>;
+  /** Reuses the signed run and starts only the server-approved bounded retry. */
+  readonly retry: (receipt: AudioDescriptionGenerationReceipt, signal?: AbortSignal) => Promise<GenerationRunStatus>;
   readonly cancel: (input: CancelAudioDescriptionGenerationInput) => Promise<GenerationRunStatus>;
   readonly adopt: (input: AdoptAudioDescriptionGenerationInput) => Promise<CommandResult>;
   readonly retryAdoptionCleanup: (input: Pick<AdoptAudioDescriptionGenerationInput, "store" | "receipt">) => Promise<AudioDescriptionGenerationReceipt>;
@@ -322,7 +327,15 @@ export class AudioDescriptionGenerationClient implements AudioDescriptionGenerat
     if (leasedProject.activeGenerationRun === null) {
       runId = this.createRunId();
       if (!opaqueId.test(runId)) throw new GenerationClientError("CueBench generated an invalid audio-description run identifier.");
-      await input.store.reserveAudioDescriptionGenerationReceipt?.(runId);
+      await input.store.reserveAudioDescriptionGenerationReceipt?.(runId, {
+        projectId: leasedProject.projectId,
+        operationId: input.upload.operationId,
+        runId,
+        targetTrack: "AudioDescriptions",
+        projectOwnerCapability: authorization.projectOwnerCapability,
+        mediaSha256: leasedProject.media.sha256,
+        sourceDurationMs: authorization.sourceDurationMs,
+      });
       try {
         throwIfGenerationAborted(input.signal);
       } catch (error) {
@@ -346,7 +359,15 @@ export class AudioDescriptionGenerationClient implements AudioDescriptionGenerat
       notifyGenerationLifecycle(input, { phase: "lease-acquired", runId, targetTrack: "AudioDescriptions" });
     } else if (isMatchingAudioDescriptionLease(leasedProject, leasedProject.activeGenerationRun.runId)) {
       runId = leasedProject.activeGenerationRun.runId;
-      await input.store.reserveAudioDescriptionGenerationReceipt?.(runId);
+      await input.store.reserveAudioDescriptionGenerationReceipt?.(runId, {
+        projectId: leasedProject.projectId,
+        operationId: input.upload.operationId,
+        runId,
+        targetTrack: "AudioDescriptions",
+        projectOwnerCapability: authorization.projectOwnerCapability,
+        mediaSha256: leasedProject.media.sha256,
+        sourceDurationMs: authorization.sourceDurationMs,
+      });
       try {
         throwIfGenerationAborted(input.signal);
       } catch (error) {
@@ -400,7 +421,37 @@ export class AudioDescriptionGenerationClient implements AudioDescriptionGenerat
       durableStartMayExist = true;
       notifyGenerationLifecycle(input, { phase: "remote-start-accepted", runId, targetTrack: "AudioDescriptions" });
       const started = parseStart(await response.json(), leasedProject, base, runId, this.clock(), authorization);
-      await input.store.persistAudioDescriptionGenerationReceipt(runId, started.receipt);
+      const deletedStartRecovery = {
+        projectId: leasedProject.projectId,
+        operationId: input.upload.operationId,
+        runId,
+        targetTrack: "AudioDescriptions",
+        projectOwnerCapability: authorization.projectOwnerCapability,
+        receipt: started.receipt,
+      } as const;
+      const projectDeletedDuringStart = () => new GenerationClientError("This local project was deleted while CueBench started the audio-description run. CueBench retained the exact run for private cleanup.", {
+          code: "PROJECT_DELETED_DURING_START",
+          lifecycleOutcome: {
+            runId,
+            targetTrack: "AudioDescriptions",
+            disposition: "lifecycle-pending",
+            operation: "start",
+            receiptState: "available",
+          },
+        });
+      if (await input.store.reconcileDeletedAudioDescriptionGenerationStart?.(deletedStartRecovery)) throw projectDeletedDuringStart();
+      try {
+        await input.store.persistAudioDescriptionGenerationReceipt(runId, started.receipt);
+      } catch (persistenceError) {
+        // The deleted tab may commit between the first recovery check and
+        // this queued durable write. Capture the exact signed run on that
+        // second boundary rather than leaving an otherwise-cleanable AD run
+        // to retention-only cleanup.
+        if (await input.store.reconcileDeletedAudioDescriptionGenerationStart?.(deletedStartRecovery)) {
+          throw projectDeletedDuringStart();
+        }
+        throw persistenceError;
+      }
       notifyGenerationLifecycle(input, { phase: "receipt-persisted", runId, targetTrack: "AudioDescriptions" });
       return started;
     } catch (error) {
@@ -444,6 +495,29 @@ export class AudioDescriptionGenerationClient implements AudioDescriptionGenerat
     const status = parseStatus(record.status);
     if (status.runId !== receipt.runId || status.projectId !== receipt.projectId || status.expectedProjectRevision !== receipt.expectedProjectRevision) {
       throw new GenerationClientError("CueBench returned status for different audio-description evidence.");
+    }
+    return status;
+  }
+
+  public async retry(receipt: AudioDescriptionGenerationReceipt, signal?: AbortSignal): Promise<GenerationRunStatus> {
+    throwIfGenerationAborted(signal);
+    if (this.clock() >= receipt.retentionExpiresAtMs) {
+      throw new GenerationClientError("CueBench cannot replay this audio-description review after its private recovery capability expired.", { code: "RECOVERY_ARTIFACT_EXPIRED" });
+    }
+    const response = await this.fetcher(`/api/audio-description-runs/${encodeURIComponent(receipt.runId)}/retry`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${receipt.session}`,
+        "x-cuebench-audio-description-receipt": receipt.signedAudioDescriptionGenerationReceipt,
+        "x-cuebench-project-owner": receipt.projectOwnerCapability,
+      },
+      ...(signal === undefined ? {} : { signal }),
+    });
+    if (!response.ok) throw await responseError(response, "CueBench could not begin the retained safe audio-description retry.");
+    const record = responseRecord(await response.json(), "CueBench did not return the bounded audio-description retry status.");
+    const status = parseStatus(record.status);
+    if (status.runId !== receipt.runId || status.projectId !== receipt.projectId || status.expectedProjectRevision !== receipt.expectedProjectRevision) {
+      throw new GenerationClientError("CueBench returned retry status for different audio-description evidence.");
     }
     return status;
   }
@@ -523,7 +597,12 @@ export class AudioDescriptionGenerationClient implements AudioDescriptionGenerat
     // This receipt write intentionally comes before local release; a crash
     // cannot strand a local global lease after the Worker accepted DELETE.
     await input.store.persistAudioDescriptionGenerationReceipt(receipt.runId, persisted);
-    await this.settleCancelledLease(input.store, persisted, input.actor ?? humanActor);
+    // Exact R2 object deletion can finish before the independent shared
+    // server lease CAS. Keep the local lease and the visible retry path until
+    // the route explicitly reports that both terminal boundaries settled.
+    if (remote.cleanup === "completed") {
+      await this.settleCancelledLease(input.store, persisted, input.actor ?? humanActor);
+    }
     return remote;
   }
 

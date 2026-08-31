@@ -31,6 +31,7 @@ import {
   releaseRunReceiptReservation,
   reserveRunReceiptSlot,
   saveRunReceipt,
+  runReceiptKey,
   saveNarrationBlob,
   saveSetting,
   settleExpiredAudioDescriptionGenerationReceipt as settlePersistedExpiredAudioDescriptionGenerationReceipt,
@@ -67,7 +68,18 @@ import {
   uploadedSourceProvenance,
   type SourceProvenance,
 } from "./source-provenance";
-import { loadPersistedCloudUpload } from "./cloud-upload";
+import { clearPersistedCloudUpload, loadPersistedCloudUpload } from "./cloud-upload";
+import type { CloudCleanupStatusEntry } from "./CloudCleanupStatus";
+import type {
+  DeletedGenerationStartRecovery,
+  PendingGenerationStartReservation,
+} from "../generation/generation-client";
+import {
+  cleanupProjectCloudArtifacts,
+  type ProjectCloudCleanupAuthorization,
+  type ProjectRunCleanupAuthorization,
+  type ProjectUploadCleanupAuthorization,
+} from "./project-cloud-cleanup";
 
 export type ProjectMode = "durable" | "temporary";
 export type ProjectRoute = "start" | "temporary-choice" | "workbench";
@@ -207,13 +219,15 @@ export interface BoundGenerationProjectStore {
   readonly getSnapshot: () => { readonly project: CaptionProject | null; readonly mode: ProjectMode | null };
   readonly executeCommand: (command: DomainCommand, expectedProjectId?: string) => Promise<CommandResult>;
   readonly persistCaptionGenerationReceipt: (runId: string, receipt: unknown) => Promise<void>;
-  readonly reserveCaptionGenerationReceipt: (runId: string) => Promise<void>;
+  readonly reserveCaptionGenerationReceipt: (runId: string, reservation?: PendingGenerationStartReservation) => Promise<void>;
   readonly releaseCaptionGenerationReceiptReservation: (runId: string) => Promise<void>;
+  readonly reconcileDeletedCaptionGenerationStart: (input: DeletedGenerationStartRecovery) => Promise<boolean>;
   readonly loadCaptionGenerationReceipt: (runId: string) => Promise<unknown | null>;
   readonly listCaptionGenerationReceiptRunIds: () => Promise<readonly string[]>;
   readonly persistAudioDescriptionGenerationReceipt: (runId: string, receipt: unknown) => Promise<void>;
-  readonly reserveAudioDescriptionGenerationReceipt: (runId: string) => Promise<void>;
+  readonly reserveAudioDescriptionGenerationReceipt: (runId: string, reservation?: PendingGenerationStartReservation) => Promise<void>;
   readonly releaseAudioDescriptionGenerationReceiptReservation: (runId: string) => Promise<void>;
+  readonly reconcileDeletedAudioDescriptionGenerationStart: (input: DeletedGenerationStartRecovery) => Promise<boolean>;
   readonly loadAudioDescriptionGenerationReceipt: (runId: string) => Promise<unknown | null>;
   readonly listAudioDescriptionGenerationReceiptRunIds: () => Promise<readonly string[]>;
   readonly settleExpiredAudioDescriptionGenerationReceipt: (runId: string) => Promise<unknown | null>;
@@ -223,6 +237,8 @@ export interface BoundGenerationProjectStore {
 }
 
 const metadataReserveBytes = 16 * 1024 * 1024;
+const cloudCleanupBackstopMs = 24 * 60 * 60 * 1_000;
+const expiredCloudCleanupMessage = "Private cleanup is lifecycle-pending because this browser recovery capability expired. The 24-hour lifecycle backstop remains in effect.";
 const defaultCreateId = (): string => globalThis.crypto.randomUUID();
 const projectModeKey = (projectId: string): string => `project-mode:${projectId}`;
 const projectOwnerKey = (projectId: string): string => `project-owner:${projectId}`;
@@ -238,6 +254,18 @@ const lastDurableProjectKey = "last-durable-project";
 const importSafetyBackupKey = (projectId: string, backupId: string): string => `import-safety-backup:${projectId}:${backupId}`;
 const replacementSafetyBackupKey = (projectId: string, backupId: string): string => `replacement-safety-backup:${projectId}:${backupId}`;
 const deletionReceiptKey = (projectId: string, receiptId: string): string => `project-deletion-receipt:${projectId}:${receiptId}`;
+/**
+ * Kept outside the project namespace cleanup list so a late start response
+ * can attach its exact signed run to the already-committed deletion receipt.
+ * The opaque operation+run suffix prevents a reused upload from aliasing a
+ * later start, and it is deleted on normal receipt persistence, cleanup, or
+ * expiry.
+ */
+const pendingGenerationStartIntentKey = (projectId: string, operationId: string, runId: string): string =>
+  `pending-generation-start:${projectId}:${operationId}:${runId}`;
+const pendingGenerationStartIntentPrefix = (projectId: string): string => `pending-generation-start:${projectId}:`;
+/** A dangling pre-POST write-ahead entry is private recovery material, not durable project state. */
+const PENDING_GENERATION_START_INTENT_MAX_AGE_MS = 24 * 60 * 60 * 1_000;
 const importReplacementHash = (project: CaptionProject): string => canonicalHash("cuebench.web.import-replacement.v1", project);
 
 interface ReplacementImportExpectation {
@@ -253,10 +281,39 @@ interface DeletionReceipt {
   readonly sourceId: string;
   readonly activeRunId: string | null;
   readonly createdAtMs: number;
+  /** Anonymous hosted recovery and the R2 lifecycle backstop are bounded to 24 hours. */
+  readonly expiresAtMs: number;
   readonly attempts: number;
-  readonly state: "pending" | "deleted" | "failed";
+  readonly state: "pending" | "deleted" | "failed" | "lifecycle-pending";
   readonly message: string;
+  /**
+   * Private, bounded recovery capabilities captured before the project rows
+   * disappear. They never enter a snapshot, backup, tool response, or the
+   * start-screen cleanup projection.
+   */
+  readonly authorization?: ProjectCloudCleanupAuthorization;
 }
+
+/** Private only; never copied into snapshots, backups, tool results, or UI. */
+interface PendingDeletedGenerationStartIntent {
+  readonly version: 1;
+  readonly projectId: string;
+  readonly operationId: string;
+  readonly runId: string;
+  readonly targetTrack: "Captions" | "AudioDescriptions";
+  readonly ownerCapability: string;
+  readonly mediaSha256: string;
+  readonly sourceDurationMs: number;
+  readonly createdAtMs: number;
+  /** Written atomically with project deletion before the normal rows vanish. */
+  readonly deletionReceiptId?: string;
+}
+
+const withoutCloudCleanupAuthorization = (receipt: DeletionReceipt): Omit<DeletionReceipt, "authorization"> => {
+  const publicLifecycle = { ...receipt };
+  delete publicLifecycle.authorization;
+  return publicLifecycle;
+};
 
 interface ProjectInstanceOwnerCapability {
   readonly version: 1;
@@ -282,6 +339,371 @@ const readProjectInstanceOwnerCapability = (value: unknown, projectId: string): 
     && /^[0-9a-f]{64}$/i.test(record.capability)
     ? record.capability.toLowerCase()
     : null;
+};
+
+/** Header-safe opaque capability material. This is private persistence only. */
+const privateCredential = (value: unknown): string | null => (
+  typeof value === "string"
+  && value.length > 0
+  && value.length <= 16_384
+  && !/[\r\n]/.test(value)
+) ? value : null;
+
+const privateOpaqueIdentifier = (value: unknown): string | null => (
+  typeof value === "string"
+  && /^[A-Za-z0-9_-]{1,200}$/u.test(value)
+) ? value : null;
+
+const pendingDeletedGenerationStartIntentFrom = (
+  value: unknown,
+): PendingDeletedGenerationStartIntent | null => {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
+  const record = value as Readonly<Record<string, unknown>>;
+  const projectId = privateOpaqueIdentifier(record.projectId);
+  const operationId = privateOpaqueIdentifier(record.operationId);
+  const runId = privateOpaqueIdentifier(record.runId);
+  const ownerCapability = typeof record.ownerCapability === "string" && /^[0-9a-f]{64}$/iu.test(record.ownerCapability)
+    ? record.ownerCapability.toLowerCase()
+    : null;
+  const mediaSha256 = typeof record.mediaSha256 === "string" && /^[0-9a-f]{64}$/iu.test(record.mediaSha256)
+    ? record.mediaSha256.toLowerCase()
+    : null;
+  const deletionReceiptId = record.deletionReceiptId === undefined
+    ? undefined
+    : privateOpaqueIdentifier(record.deletionReceiptId);
+  if (
+    record.version !== 1
+    || projectId === null
+    || operationId === null
+    || runId === null
+    || (record.targetTrack !== "Captions" && record.targetTrack !== "AudioDescriptions")
+    || ownerCapability === null
+    || mediaSha256 === null
+    || !Number.isSafeInteger(record.sourceDurationMs)
+    || (record.sourceDurationMs as number) <= 0
+    || !Number.isSafeInteger(record.createdAtMs)
+    || (record.createdAtMs as number) < 0
+    || (record.deletionReceiptId !== undefined && deletionReceiptId === null)
+  ) return null;
+  return {
+    version: 1,
+    projectId,
+    operationId,
+    runId,
+    targetTrack: record.targetTrack,
+    ownerCapability,
+    mediaSha256,
+    sourceDurationMs: record.sourceDurationMs as number,
+    createdAtMs: record.createdAtMs as number,
+    ...(deletionReceiptId === undefined ? {} : { deletionReceiptId: deletionReceiptId as string }),
+  };
+};
+
+const pendingDeletedGenerationStartIntentFor = (
+  reservation: PendingGenerationStartReservation,
+  nowMs: number,
+): PendingDeletedGenerationStartIntent => {
+  const projectId = privateOpaqueIdentifier(reservation.projectId);
+  const operationId = privateOpaqueIdentifier(reservation.operationId);
+  const runId = privateOpaqueIdentifier(reservation.runId);
+  const ownerCapability = /^[0-9a-f]{64}$/iu.test(reservation.projectOwnerCapability)
+    ? reservation.projectOwnerCapability.toLowerCase()
+    : null;
+  const mediaSha256 = /^[0-9a-f]{64}$/iu.test(reservation.mediaSha256)
+    ? reservation.mediaSha256.toLowerCase()
+    : null;
+  if (
+    projectId === null
+    || operationId === null
+    || runId === null
+    || (reservation.targetTrack !== "Captions" && reservation.targetTrack !== "AudioDescriptions")
+    || ownerCapability === null
+    || mediaSha256 === null
+    || !Number.isSafeInteger(reservation.sourceDurationMs)
+    || reservation.sourceDurationMs <= 0
+  ) throw new Error("CueBench could not reserve an invalid private generation-start recovery intent.");
+  return {
+    version: 1,
+    projectId,
+    operationId,
+    runId,
+    targetTrack: reservation.targetTrack,
+    ownerCapability,
+    mediaSha256,
+    sourceDurationMs: reservation.sourceDurationMs,
+    createdAtMs: nowMs,
+  };
+};
+
+const samePendingDeletedGenerationStartIntent = (
+  left: PendingDeletedGenerationStartIntent,
+  right: PendingDeletedGenerationStartIntent,
+): boolean => (
+  left.projectId === right.projectId
+  && left.operationId === right.operationId
+  && left.runId === right.runId
+  && left.targetTrack === right.targetTrack
+  && left.ownerCapability === right.ownerCapability
+  && left.mediaSha256 === right.mediaSha256
+  && left.sourceDurationMs === right.sourceDurationMs
+);
+
+const pendingDeletedGenerationStartIntentExpired = (
+  intent: PendingDeletedGenerationStartIntent,
+  nowMs: number,
+): boolean => intent.createdAtMs <= nowMs - PENDING_GENERATION_START_INTENT_MAX_AGE_MS;
+
+/**
+ * Validates a late response against the private write-ahead intent. The
+ * caller has already schema-validated the Worker body, but this independent
+ * check keeps a detached/stale tab from attaching a different signed run.
+ */
+const privatePendingStartRunAuthorization = (
+  value: unknown,
+  intent: PendingDeletedGenerationStartIntent,
+  nowMs: number,
+): { readonly run: ProjectRunCleanupAuthorization; readonly expiresAtMs: number } | null => {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
+  const receipt = value as Readonly<Record<string, unknown>>;
+  const signedRunReceipt = intent.targetTrack === "Captions"
+    ? privateCredential(receipt.signedGenerationReceipt)
+    : privateCredential(receipt.signedAudioDescriptionGenerationReceipt);
+  const session = privateCredential(receipt.session);
+  const retentionExpiresAtMs = receipt.retentionExpiresAtMs;
+  if (
+    receipt.version !== 1
+    || receipt.runId !== intent.runId
+    || receipt.projectId !== intent.projectId
+    || signedRunReceipt === null
+    || session === null
+    || typeof receipt.projectOwnerCapability !== "string"
+    || receipt.projectOwnerCapability.toLowerCase() !== intent.ownerCapability
+    || typeof receipt.mediaSha256 !== "string"
+    || receipt.mediaSha256.toLowerCase() !== intent.mediaSha256
+    || receipt.sourceDurationMs !== intent.sourceDurationMs
+    || !Number.isSafeInteger(retentionExpiresAtMs)
+    || (retentionExpiresAtMs as number) <= nowMs
+  ) return null;
+  return {
+    run: {
+      targetTrack: intent.targetTrack,
+      runId: intent.runId,
+      signedRunReceipt,
+      session,
+    },
+    expiresAtMs: retentionExpiresAtMs as number,
+  };
+};
+
+const privateRunCleanupAuthorization = (
+  value: unknown,
+  project: CaptionProject,
+  expectedRun: { readonly runId: string; readonly targetTrack: "Captions" | "AudioDescriptions" },
+  ownerCapability: string,
+  nowMs: number,
+  terminalAction?: ProjectRunCleanupAuthorization["terminalAction"],
+): { readonly run: ProjectRunCleanupAuthorization; readonly expiresAtMs: number } | null => {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
+  const receipt = value as Readonly<Record<string, unknown>>;
+  const signedRunReceipt = expectedRun.targetTrack === "Captions"
+    ? privateCredential(receipt.signedGenerationReceipt)
+    : privateCredential(receipt.signedAudioDescriptionGenerationReceipt);
+  const session = privateCredential(receipt.session);
+  const retentionExpiresAtMs = receipt.retentionExpiresAtMs;
+  if (
+    receipt.version !== 1
+    || receipt.runId !== expectedRun.runId
+    || receipt.projectId !== project.projectId
+    || signedRunReceipt === null
+    || session === null
+    || typeof receipt.mediaSha256 !== "string"
+    || receipt.mediaSha256.toLowerCase() !== project.media.sha256.toLowerCase()
+    || receipt.sourceDurationMs !== project.media.durationMs
+    || typeof receipt.projectOwnerCapability !== "string"
+    || receipt.projectOwnerCapability.toLowerCase() !== ownerCapability
+    || !Number.isSafeInteger(retentionExpiresAtMs)
+    || (retentionExpiresAtMs as number) <= nowMs
+  ) return null;
+  return {
+    run: {
+      targetTrack: expectedRun.targetTrack,
+      runId: expectedRun.runId,
+      signedRunReceipt,
+      session,
+      ...(terminalAction === undefined ? {} : { terminalAction }),
+    },
+    expiresAtMs: retentionExpiresAtMs as number,
+  };
+};
+
+/**
+ * A local target lease can disappear as part of adoption or cancellation
+ * before the server receives its terminal acknowledgement. Keep that intent
+ * attached to the exact signed run, never infer it from a later upload row.
+ */
+const pendingTerminalRunAction = (
+  value: Readonly<Record<string, unknown>>,
+): ProjectRunCleanupAuthorization["terminalAction"] | undefined => {
+  const adoption = value.adoption;
+  if (typeof adoption === "object" && adoption !== null && !Array.isArray(adoption)) {
+    const record = adoption as Readonly<Record<string, unknown>>;
+    if (
+      record.status === "adopted"
+      && record.cleanupAcknowledgement === "pending"
+      && Number.isSafeInteger(record.adoptedProjectRevision)
+      && (record.adoptedProjectRevision as number) > 0
+    ) return { kind: "acknowledge", action: "adopted", adoptedProjectRevision: record.adoptedProjectRevision as number };
+  }
+  // A future/historical client may retain a server-issued discard marker.
+  // Accept only the exact static action vocabulary and never arbitrary body.
+  const acknowledgement = value.terminalAcknowledgement;
+  if (typeof acknowledgement === "object" && acknowledgement !== null && !Array.isArray(acknowledgement)) {
+    const record = acknowledgement as Readonly<Record<string, unknown>>;
+    if (record.action === "discarded" && record.cleanupAcknowledgement === "pending") {
+      return { kind: "acknowledge", action: "discarded" };
+    }
+  }
+  const terminal = value.terminalCleanup;
+  if (typeof terminal === "object" && terminal !== null && !Array.isArray(terminal)) {
+    const record = terminal as Readonly<Record<string, unknown>>;
+    if (record.action === "cancelled" && record.cleanupAcknowledgement === "pending") return { kind: "cancel" };
+  }
+  if (typeof value.cancellationRequested === "object" && value.cancellationRequested !== null && !Array.isArray(value.cancellationRequested)) {
+    if ((value.cancellationRequested as Readonly<Record<string, unknown>>).status === "requested") return { kind: "cancel" };
+  }
+  return undefined;
+};
+
+const privateTerminalRunCleanupAuthorization = (
+  value: unknown,
+  project: CaptionProject,
+  runId: string,
+  ownerCapability: string,
+  nowMs: number,
+): { readonly run: ProjectRunCleanupAuthorization; readonly expiresAtMs: number } | null => {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
+  const receipt = value as Readonly<Record<string, unknown>>;
+  const captionReceipt = privateCredential(receipt.signedGenerationReceipt);
+  const audioDescriptionReceipt = privateCredential(receipt.signedAudioDescriptionGenerationReceipt);
+  if ((captionReceipt === null) === (audioDescriptionReceipt === null)) return null;
+  const terminalAction = pendingTerminalRunAction(receipt);
+  if (terminalAction === undefined) return null;
+  return privateRunCleanupAuthorization(
+    receipt,
+    project,
+    { runId, targetTrack: captionReceipt === null ? "AudioDescriptions" : "Captions" },
+    ownerCapability,
+    nowMs,
+    terminalAction,
+  );
+};
+
+const privateUploadCleanupAuthorization = (
+  project: CaptionProject,
+  ownerCapability: string,
+  nowMs: number,
+): { readonly upload: ProjectUploadCleanupAuthorization; readonly expiresAtMs: number } | null => {
+  let recovery: ReturnType<typeof loadPersistedCloudUpload>;
+  try {
+    recovery = loadPersistedCloudUpload(
+      project.projectId,
+      { sha256: project.media.sha256, durationMs: project.media.durationMs },
+      undefined,
+      ownerCapability,
+    );
+  } catch {
+    // Browser storage can be unavailable after a tab is detached. Treat the
+    // opaque upload receipt as absent; never guess a replacement capability.
+    return null;
+  }
+  const session = privateCredential(recovery?.session);
+  const operationReceipt = privateCredential(recovery?.operationReceipt);
+  if (
+    recovery === null
+    || session === null
+    || operationReceipt === null
+    || !Number.isSafeInteger(recovery.sessionExpiresAtMs)
+    || (recovery.sessionExpiresAtMs as number) <= nowMs
+  ) return null;
+  return {
+    upload: {
+      operationId: recovery.operationId,
+      operationReceipt,
+      session,
+    },
+    expiresAtMs: recovery.sessionExpiresAtMs as number,
+  };
+};
+
+const cleanupAuthorizationFrom = (
+  value: unknown,
+): ProjectCloudCleanupAuthorization | undefined => {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return undefined;
+  const record = value as Readonly<Record<string, unknown>>;
+  if (
+    record.version !== 1
+    || typeof record.ownerCapability !== "string"
+    || !/^[0-9a-f]{64}$/i.test(record.ownerCapability)
+    || !Number.isSafeInteger(record.expiresAtMs)
+    || (record.expiresAtMs as number) <= 0
+  ) return undefined;
+  const runValue = record.run;
+  const run = typeof runValue === "object" && runValue !== null && !Array.isArray(runValue)
+    ? runValue as Readonly<Record<string, unknown>>
+    : null;
+  const uploadValue = record.upload;
+  const upload = typeof uploadValue === "object" && uploadValue !== null && !Array.isArray(uploadValue)
+    ? uploadValue as Readonly<Record<string, unknown>>
+    : null;
+  const terminalActionValue = run?.terminalAction;
+  const terminalAction = typeof terminalActionValue === "object" && terminalActionValue !== null && !Array.isArray(terminalActionValue)
+    ? terminalActionValue as Readonly<Record<string, unknown>>
+    : null;
+  const parsedTerminalAction: ProjectRunCleanupAuthorization["terminalAction"] | undefined = terminalAction?.kind === "cancel"
+    ? { kind: "cancel" }
+    : terminalAction?.kind === "acknowledge"
+      && (terminalAction.action === "adopted" || terminalAction.action === "discarded")
+      && (
+        terminalAction.action === "discarded"
+        || (Number.isSafeInteger(terminalAction.adoptedProjectRevision) && (terminalAction.adoptedProjectRevision as number) > 0)
+      )
+      ? {
+        kind: "acknowledge",
+        action: terminalAction.action,
+        ...(terminalAction.adoptedProjectRevision === undefined ? {} : { adoptedProjectRevision: terminalAction.adoptedProjectRevision as number }),
+      }
+      : undefined;
+  const parsedRun = run !== null
+    && (run.targetTrack === "Captions" || run.targetTrack === "AudioDescriptions")
+    && privateCredential(run.runId) !== null
+    && privateCredential(run.signedRunReceipt) !== null
+    && privateCredential(run.session) !== null
+    ? {
+      targetTrack: run.targetTrack,
+      runId: privateCredential(run.runId)!,
+      signedRunReceipt: privateCredential(run.signedRunReceipt)!,
+      session: privateCredential(run.session)!,
+      ...(parsedTerminalAction === undefined ? {} : { terminalAction: parsedTerminalAction }),
+    } satisfies ProjectRunCleanupAuthorization
+    : undefined;
+  const parsedUpload = upload !== null
+    && privateCredential(upload.operationId) !== null
+    && privateCredential(upload.operationReceipt) !== null
+    && privateCredential(upload.session) !== null
+    ? {
+      operationId: privateCredential(upload.operationId)!,
+      operationReceipt: privateCredential(upload.operationReceipt)!,
+      session: privateCredential(upload.session)!,
+    } satisfies ProjectUploadCleanupAuthorization
+    : undefined;
+  if (parsedRun === undefined && parsedUpload === undefined) return undefined;
+  return {
+    version: 1,
+    ownerCapability: record.ownerCapability.toLowerCase(),
+    expiresAtMs: record.expiresAtMs as number,
+    ...(parsedRun === undefined ? {} : { run: parsedRun }),
+    ...(parsedUpload === undefined ? {} : { upload: parsedUpload }),
+  };
 };
 
 /** Do not let UI/runtime fences retain or expose the durable raw capability. */
@@ -429,13 +851,19 @@ export class ProjectStore {
       },
       executeCommand: (command) => this.executeCommand(command, expectedProject),
       persistCaptionGenerationReceipt: (runId, receipt) => this.persistCaptionGenerationReceipt(runId, receipt, expectedProject),
-      reserveCaptionGenerationReceipt: (runId) => this.reserveCaptionGenerationReceipt(runId, expectedProject),
+      reserveCaptionGenerationReceipt: (runId, reservation) => this.reserveCaptionGenerationReceipt(runId, reservation, expectedProject),
       releaseCaptionGenerationReceiptReservation: (runId) => this.releaseCaptionGenerationReceiptReservation(runId, expectedProject),
+      // Deletion intentionally invalidates this page's visible fence. This
+      // exceptional recovery bridge is instead fenced by the private
+      // write-ahead intent captured before the POST, so it can attach a late
+      // exact receipt without reviving the removed project instance.
+      reconcileDeletedCaptionGenerationStart: (input) => this.reconcileDeletedGenerationStart(input),
       loadCaptionGenerationReceipt: (runId) => this.loadCaptionGenerationReceipt(runId, expectedProject),
       listCaptionGenerationReceiptRunIds: () => this.listCaptionGenerationReceiptRunIds(expectedProject),
       persistAudioDescriptionGenerationReceipt: (runId, receipt) => this.persistAudioDescriptionGenerationReceipt(runId, receipt, expectedProject),
-      reserveAudioDescriptionGenerationReceipt: (runId) => this.reserveAudioDescriptionGenerationReceipt(runId, expectedProject),
+      reserveAudioDescriptionGenerationReceipt: (runId, reservation) => this.reserveAudioDescriptionGenerationReceipt(runId, reservation, expectedProject),
       releaseAudioDescriptionGenerationReceiptReservation: (runId) => this.releaseAudioDescriptionGenerationReceiptReservation(runId, expectedProject),
+      reconcileDeletedAudioDescriptionGenerationStart: (input) => this.reconcileDeletedGenerationStart(input),
       loadAudioDescriptionGenerationReceipt: (runId) => this.loadAudioDescriptionGenerationReceipt(runId, expectedProject),
       listAudioDescriptionGenerationReceiptRunIds: () => this.listAudioDescriptionGenerationReceiptRunIds(expectedProject),
       settleExpiredAudioDescriptionGenerationReceipt: (runId) => this.settleExpiredAudioDescriptionGenerationReceipt(runId, expectedProject),
@@ -541,6 +969,13 @@ export class ProjectStore {
       await this.beforeRestoreLoad?.();
       if (!this.isCurrent(epoch)) return;
       await this.sweepLegacyTemporaryProjects(epoch);
+      if (!this.isCurrent(epoch)) return;
+      // Private pre-POST intents never represent a recoverable project. Sweep
+      // abandoned tabs' capability-bearing entries before hydration can make
+      // them linger indefinitely in browser storage.
+      await this.database.transaction("rw", [this.database.settings], async () => {
+        await this.sweepExpiredPendingGenerationStartIntents(Date.now());
+      });
       if (!this.isCurrent(epoch)) return;
 
       const durableSetting = await loadSetting(this.database, lastDurableProjectKey);
@@ -802,9 +1237,16 @@ export class ProjectStore {
       if (snapshot.project === null || snapshot.mode !== "durable") {
         throw new Error("CueBench needs durable browser storage before it can retain a recoverable caption-generation receipt.");
       }
-      await this.runFencedReceiptOperation(snapshot.project.projectId, expectedProject, (options) => (
-        saveRunReceipt(this.database, snapshot.project!.projectId, runId, { version: 1, payload: receipt }, options)
-      ));
+      await this.runFencedReceiptOperation(snapshot.project.projectId, expectedProject, async (options) => {
+        await this.database.transaction("rw", [this.database.runReceipts, this.database.settings], async () => {
+          await saveRunReceipt(this.database, snapshot.project!.projectId, runId, { version: 1, payload: receipt }, options);
+          // A successful normal local commit supersedes its pre-POST intent.
+          // Remove the private owner material in the same transaction as the
+          // receipt so project deletion cannot later misclassify it as an
+          // unresolved start race.
+          await this.deletePendingGenerationStartIntentsForRun(snapshot.project!.projectId, runId);
+        });
+      });
     };
     const queued = this.commandQueue.then(persist, persist);
     this.commandQueue = queued.then(() => undefined, () => undefined);
@@ -812,15 +1254,37 @@ export class ProjectStore {
   }
 
   /** Reserve the exact opaque receipt row before a server-side generation start. */
-  public reserveCaptionGenerationReceipt(runId: string, expectedProject?: ProjectInstanceFence): Promise<void> {
+  public reserveCaptionGenerationReceipt(
+    runId: string,
+    reservation?: PendingGenerationStartReservation,
+    expectedProject?: ProjectInstanceFence,
+  ): Promise<void> {
     const reserve = async (): Promise<void> => {
       const snapshot = this.snapshot;
       if (snapshot.project === null || snapshot.mode !== "durable") {
         throw new Error("CueBench needs durable browser storage before it can reserve a recoverable caption-generation receipt.");
       }
-      await this.runFencedReceiptOperation(snapshot.project.projectId, expectedProject, (options) => (
-        reserveRunReceiptSlot(this.database, snapshot.project!.projectId, runId, options)
-      ));
+      if (reservation !== undefined && (reservation.projectId !== snapshot.project.projectId || reservation.runId !== runId)) {
+        throw new Error("CueBench generation-start recovery intent did not match the current durable project.");
+      }
+      const reservedAtMs = Date.now();
+      const intent = reservation === undefined ? undefined : pendingDeletedGenerationStartIntentFor(reservation, reservedAtMs);
+      await this.runFencedReceiptOperation(snapshot.project.projectId, expectedProject, async (options) => {
+        await this.database.transaction("rw", [this.database.runReceipts, this.database.settings], async () => {
+          await this.sweepExpiredPendingGenerationStartIntents(reservedAtMs, snapshot.project!.projectId);
+          await reserveRunReceiptSlot(this.database, snapshot.project!.projectId, runId, options);
+          if (intent === undefined) return;
+          const key = pendingGenerationStartIntentKey(intent.projectId, intent.operationId, intent.runId);
+          const existing = await this.database.settings.get(key);
+          const retained = pendingDeletedGenerationStartIntentFrom(existing?.value);
+          if (retained !== null && !samePendingDeletedGenerationStartIntent(retained, intent)) {
+            throw new Error("CueBench found a conflicting private generation-start recovery intent.");
+          }
+          if (retained === null) {
+            await this.database.settings.put({ key, value: intent, updatedAtMs: Date.now() });
+          }
+        });
+      });
     };
     const queued = this.commandQueue.then(reserve, reserve);
     this.commandQueue = queued.then(() => undefined, () => undefined);
@@ -832,9 +1296,12 @@ export class ProjectStore {
     const release = async (): Promise<void> => {
       const snapshot = this.snapshot;
       if (snapshot.project === null || snapshot.mode !== "durable") return;
-      await this.runFencedReceiptOperation(snapshot.project.projectId, expectedProject, (options) => (
-        releaseRunReceiptReservation(this.database, snapshot.project!.projectId, runId, options)
-      ));
+      await this.runFencedReceiptOperation(snapshot.project.projectId, expectedProject, async (options) => {
+        await this.database.transaction("rw", [this.database.runReceipts, this.database.settings], async () => {
+          await releaseRunReceiptReservation(this.database, snapshot.project!.projectId, runId, options);
+          await this.deletePendingGenerationStartIntentsForRun(snapshot.project!.projectId, runId);
+        });
+      });
     };
     const queued = this.commandQueue.then(release, release);
     this.commandQueue = queued.then(() => undefined, () => undefined);
@@ -875,8 +1342,12 @@ export class ProjectStore {
   }
 
   /** Reserve an AD write-ahead receipt slot before a potentially billable dispatch. */
-  public reserveAudioDescriptionGenerationReceipt(runId: string, expectedProject?: ProjectInstanceFence): Promise<void> {
-    return this.reserveCaptionGenerationReceipt(runId, expectedProject);
+  public reserveAudioDescriptionGenerationReceipt(
+    runId: string,
+    reservation?: PendingGenerationStartReservation,
+    expectedProject?: ProjectInstanceFence,
+  ): Promise<void> {
+    return this.reserveCaptionGenerationReceipt(runId, reservation, expectedProject);
   }
 
   /** Release only an unfulfilled AD receipt reservation. */
@@ -887,6 +1358,21 @@ export class ProjectStore {
   /** Reads a project-scoped opaque AD recovery receipt. */
   public loadAudioDescriptionGenerationReceipt(runId: string, expectedProject?: ProjectInstanceFence): Promise<unknown | null> {
     return this.loadCaptionGenerationReceipt(runId, expectedProject);
+  }
+
+  /**
+   * A successful start response can arrive after another tab deleted the
+   * local project. This bridge never reconstructs a project or writes a run
+   * receipt row; it captures only the exact private capability into the
+   * already-committed deletion receipt, then starts exact cleanup.
+   */
+  public reconcileDeletedCaptionGenerationStart(input: DeletedGenerationStartRecovery): Promise<boolean> {
+    return this.reconcileDeletedGenerationStart(input);
+  }
+
+  /** Target-specific alias keeps AD callers from treating caption recovery as interchangeable. */
+  public reconcileDeletedAudioDescriptionGenerationStart(input: DeletedGenerationStartRecovery): Promise<boolean> {
+    return this.reconcileDeletedGenerationStart(input);
   }
 
   /**
@@ -1260,7 +1746,29 @@ export class ProjectStore {
             if (canonical === undefined) {
               throw new Error("CueBench's project was already removed by another browser tab.");
             }
-            deletionReceipt = this.newDeletionReceipt(canonical);
+            const baseReceipt = this.newDeletionReceipt(canonical);
+            const authorization = await this.captureDeletionCleanupAuthorization(
+              canonical,
+              baseReceipt.createdAtMs,
+              baseReceipt.expiresAtMs,
+            );
+            // A browser-held run/upload receipt can expire before the outer
+            // 24-hour cleanup backstop. The deletion record is therefore
+            // usable only until the earlier boundary; once it expires every
+            // private authorization is atomically scrubbed below.
+            deletionReceipt = authorization === undefined
+              ? baseReceipt
+              : {
+                ...baseReceipt,
+                expiresAtMs: Math.min(baseReceipt.expiresAtMs, authorization.expiresAtMs),
+                authorization,
+              };
+            // A start POST may already be durable while only its internal
+            // receipt reservation exists locally. Preserve a tiny, exact
+            // project/operation/run intent before the project rows disappear
+            // so a late signed response can cancel that run rather than
+            // restoring a deleted project to persist its receipt.
+            await this.attachPendingGenerationStartsToDeletionReceipt(canonical, deletionReceipt);
             await this.deleteProjectRows(canonical.projectId);
             await this.deleteProjectSettings(canonical.projectId, true);
             const durablePointer = await this.database.settings.get(lastDurableProjectKey);
@@ -1284,6 +1792,12 @@ export class ProjectStore {
       }
 
       if (deletionReceipt === null) throw new Error("CueBench could not retain the local deletion receipt.");
+      // A committed deletion receipt is the only durable cleanup history. It
+      // replaces every project-scoped upload copy, including a stale duplicate
+      // left behind when a terminal run acknowledgement—not upload cleanup—
+      // owns this deletion. Clearing only after the transaction commits keeps
+      // a crash from erasing the last recovery path.
+      try { clearPersistedCloudUpload(deletionReceipt.projectId); } catch { /* localStorage is best-effort */ }
       this.objectUrlLease?.revoke();
       const cloudCleanup: CloudCleanupResult = {
         status: "pending",
@@ -1311,6 +1825,51 @@ export class ProjectStore {
     this.activeCleanupReceiptId = receipt.receiptId;
     if (receipt.state === "deleted") return this.cloudCleanupResultFor(receipt);
     return this.completeCloudCleanup(receipt);
+  }
+
+  /**
+   * A redacted projection for the Human start surface. It intentionally keeps
+   * opaque hosted authorizations, object keys, and provider error bodies out
+   * of React state and WebMCP-visible project data.
+   */
+  public async listCloudCleanupReceipts(nowMs = Date.now()): Promise<readonly CloudCleanupStatusEntry[]> {
+    await this.database.transaction("rw", [this.database.settings], async () => {
+      await this.sweepExpiredPendingGenerationStartIntents(nowMs);
+    });
+    let settings = await this.database.settings.toArray();
+    let receipts = settings
+      .map((setting) => this.deletionReceiptFrom(setting.value))
+      .filter((receipt): receipt is DeletionReceipt => receipt !== null);
+    const expired = receipts
+      .filter((receipt) => receipt.state !== "deleted" && receipt.expiresAtMs <= nowMs);
+    // Merely reopening a detached tab must not keep a signed session/run
+    // receipt in IndexedDB after we publicly call it lifecycle-pending.
+    // Each helper transaction drops all private authorization atomically.
+    if (expired.length > 0) {
+      await Promise.all(expired.map(async (receipt) => { await this.expireCloudCleanupReceipt(receipt); }));
+      settings = await this.database.settings.toArray();
+      receipts = settings
+        .map((setting) => this.deletionReceiptFrom(setting.value))
+        .filter((receipt): receipt is DeletionReceipt => receipt !== null);
+    }
+    return receipts
+      .map((receipt): CloudCleanupStatusEntry => ({
+        receiptId: receipt.receiptId,
+        state: receipt.state === "deleted"
+          ? "deleted"
+          : receipt.state === "lifecycle-pending" || receipt.expiresAtMs <= nowMs
+            ? "lifecycle-pending"
+            : "deleting",
+        message: receipt.state === "deleted"
+          ? "CueBench confirmed private cloud cleanup."
+          : receipt.state === "lifecycle-pending" || receipt.expiresAtMs <= nowMs
+            ? expiredCloudCleanupMessage
+            : receipt.state === "failed"
+              ? "CueBench could not confirm private cloud cleanup yet. Retry this exact protected cleanup before the lifecycle backstop."
+              : "CueBench requested private cloud cleanup and is waiting for confirmation.",
+        attempts: receipt.attempts,
+      }))
+      .sort((left, right) => right.receiptId.localeCompare(left.receiptId));
   }
 
   /** Cancels stale async continuations and releases the only live local-media URL. */
@@ -1750,6 +2309,84 @@ export class ProjectStore {
     ]);
   }
 
+  /** Called inside a settings transaction; removes no ordinary project metadata. */
+  private async deletePendingGenerationStartIntentsForRun(projectId: string, runId: string): Promise<void> {
+    const keys = (await this.database.settings.toArray())
+      .filter((setting) => {
+        const intent = pendingDeletedGenerationStartIntentFrom(setting.value);
+        return intent?.projectId === projectId && intent.runId === runId;
+      })
+      .map((setting) => setting.key);
+    if (keys.length > 0) await this.database.settings.bulkDelete(keys);
+  }
+
+  /**
+   * Called in a settings transaction. Invalid and expired write-ahead rows
+   * are private leftovers, so they are removed by key prefix as well as by a
+   * parsed value. A malformed row must not become an immortal owner/media
+   * metadata record merely because it can no longer be decoded.
+   */
+  private async sweepExpiredPendingGenerationStartIntents(nowMs: number, projectId?: string): Promise<void> {
+    const prefix = projectId === undefined ? "pending-generation-start:" : pendingGenerationStartIntentPrefix(projectId);
+    const keys = (await this.database.settings.toArray())
+      .filter((setting) => {
+        if (!setting.key.startsWith(prefix)) return false;
+        const intent = pendingDeletedGenerationStartIntentFrom(setting.value);
+        return intent === null || pendingDeletedGenerationStartIntentExpired(intent, nowMs);
+      })
+      .map((setting) => setting.key);
+    if (keys.length > 0) await this.database.settings.bulkDelete(keys);
+  }
+
+  /** Called inside a settings transaction when a deletion receipt becomes terminal or authority expires. */
+  private async deletePendingGenerationStartIntentsForDeletionReceipt(receiptId: string): Promise<void> {
+    const keys = (await this.database.settings.toArray())
+      .filter((setting) => pendingDeletedGenerationStartIntentFrom(setting.value)?.deletionReceiptId === receiptId)
+      .map((setting) => setting.key);
+    if (keys.length > 0) await this.database.settings.bulkDelete(keys);
+  }
+
+  /**
+   * Associates any exact pre-POST reservation with the deletion receipt while
+   * all project ownership facts are still present. No signed run material
+   * exists yet, so this deliberately does not select an upload fallback.
+   */
+  private async attachPendingGenerationStartsToDeletionReceipt(
+    project: CaptionProject,
+    deletionReceipt: DeletionReceipt,
+  ): Promise<void> {
+    const active = project.activeGenerationRun;
+    const ownerSetting = await this.database.settings.get(projectInstanceOwnerCapabilityKey(project.projectId));
+    const ownerCapability = readProjectInstanceOwnerCapability(ownerSetting?.value, project.projectId);
+    const settings = await this.database.settings.toArray();
+    for (const setting of settings) {
+      if (!setting.key.startsWith(pendingGenerationStartIntentPrefix(project.projectId))) continue;
+      const intent = pendingDeletedGenerationStartIntentFrom(setting.value);
+      const canonicalActiveIntent = intent !== null
+        && active !== null
+        && ownerCapability !== null
+        && intent.projectId === project.projectId
+        && intent.runId === active.runId
+        && intent.targetTrack === active.targetTrack
+        && intent.ownerCapability === ownerCapability
+        && intent.deletionReceiptId === undefined
+        && !pendingDeletedGenerationStartIntentExpired(intent, deletionReceipt.createdAtMs);
+      if (!canonicalActiveIntent) {
+        // A deletion cannot safely keep an unmatched operation, prior-track,
+        // malformed, already-attached, or expired private start intent. It
+        // may contain an owner capability/media hash but has no canonical
+        // active receipt to reconcile after the project is gone.
+        await this.database.settings.delete(setting.key);
+        continue;
+      }
+      await this.database.settings.put({
+        key: setting.key,
+        value: { ...intent, deletionReceiptId: deletionReceipt.receiptId },
+        updatedAtMs: deletionReceipt.createdAtMs,
+      });
+    }
+  }
+
   /** Removes local lifecycle metadata and, for a confirmed deletion, retained recovery copies containing project data. */
   private async deleteProjectSettings(projectId: string, includeSafetyBackups: boolean): Promise<void> {
     const keys = (await this.database.settings.toArray())
@@ -1874,13 +2511,80 @@ export class ProjectStore {
     return queued;
   }
 
+  /**
+   * Captures only an existing exact-run or exact-upload capability while its
+   * project namespace is still live. This never mints a cleanup credential,
+   * never reconstructs one from a backup, and never uses a broad R2 prefix.
+   */
+  private async captureDeletionCleanupAuthorization(
+    project: CaptionProject,
+    nowMs: number,
+    deletionExpiresAtMs: number,
+  ): Promise<ProjectCloudCleanupAuthorization | undefined> {
+    const ownerSetting = await this.database.settings.get(projectInstanceOwnerCapabilityKey(project.projectId));
+    const ownerCapability = readProjectInstanceOwnerCapability(ownerSetting?.value, project.projectId);
+    if (ownerCapability === null) return undefined;
+    const activeRun = project.activeGenerationRun;
+    if (activeRun !== null) {
+      const row = await this.database.runReceipts.get(runReceiptKey(project.projectId, activeRun.runId));
+      const parsed = privateRunCleanupAuthorization(
+        row?.receipt.version === 1 ? row.receipt.payload : null,
+        project,
+        { runId: activeRun.runId, targetTrack: activeRun.targetTrack },
+        ownerCapability,
+        nowMs,
+      );
+      if (parsed === null) return undefined;
+      return {
+        version: 1,
+        ownerCapability,
+        expiresAtMs: Math.min(deletionExpiresAtMs, parsed.expiresAtMs),
+        run: parsed.run,
+      };
+    }
+
+    // Local adoption/cancellation can release the active target lease before
+    // its server acknowledgement returns. Inspect the bounded project receipt
+    // rows before falling back to an upload DELETE; otherwise a project delete
+    // would send a conflicting operation-level command instead of the exact
+    // adopted/discarded/cancelled run acknowledgement.
+    const rows = await this.database.runReceipts.where("projectId").equals(project.projectId).toArray();
+    for (const row of [...rows].sort((left, right) => right.savedAtMs - left.savedAtMs || right.runId.localeCompare(left.runId))) {
+      const parsed = privateTerminalRunCleanupAuthorization(
+        row.receipt.version === 1 ? row.receipt.payload : null,
+        project,
+        row.runId,
+        ownerCapability,
+        nowMs,
+      );
+      if (parsed === null) continue;
+      return {
+        version: 1,
+        ownerCapability,
+        expiresAtMs: Math.min(deletionExpiresAtMs, parsed.expiresAtMs),
+        run: parsed.run,
+      };
+    }
+
+    const parsedUpload = privateUploadCleanupAuthorization(project, ownerCapability, nowMs);
+    if (parsedUpload === null) return undefined;
+    return {
+      version: 1,
+      ownerCapability,
+      expiresAtMs: Math.min(deletionExpiresAtMs, parsedUpload.expiresAtMs),
+      upload: parsedUpload.upload,
+    };
+  }
+
   private newDeletionReceipt(project: CaptionProject): DeletionReceipt {
+    const createdAtMs = Date.now();
     return {
       receiptId: `delete-${this.createId()}`,
       projectId: project.projectId,
       sourceId: project.media.sourceId,
       activeRunId: project.activeGenerationRun?.runId ?? null,
-      createdAtMs: Date.now(),
+      createdAtMs,
+      expiresAtMs: createdAtMs + cloudCleanupBackstopMs,
       attempts: 0,
       state: "pending",
       message: "Cloud cleanup is pending lifecycle enforcement.",
@@ -1896,16 +2600,44 @@ export class ProjectStore {
       || typeof record.sourceId !== "string"
       || (record.activeRunId !== null && typeof record.activeRunId !== "string")
       || typeof record.createdAtMs !== "number"
+      || !Number.isSafeInteger(record.createdAtMs)
+      || record.createdAtMs < 0
+      || (record.expiresAtMs !== undefined && (!Number.isSafeInteger(record.expiresAtMs) || (record.expiresAtMs as number) <= 0))
       || typeof record.attempts !== "number"
-      || (record.state !== "pending" && record.state !== "deleted" && record.state !== "failed")
+      || !Number.isSafeInteger(record.attempts)
+      || record.attempts < 0
+      || (record.state !== "pending" && record.state !== "deleted" && record.state !== "failed" && record.state !== "lifecycle-pending")
       || typeof record.message !== "string"
     ) return null;
-    return record as unknown as DeletionReceipt;
+    const authorization = cleanupAuthorizationFrom(record.authorization);
+    const outerExpiry = typeof record.expiresAtMs === "number"
+      ? record.expiresAtMs
+      : (record.createdAtMs as number) + cloudCleanupBackstopMs;
+    // Older records may have persisted their outer expiry before a bounded
+    // run/upload authority was attached. Parse them conservatively too, so a
+    // detached tab never revives that authority past its own signed window.
+    const expiresAtMs = authorization === undefined
+      ? outerExpiry
+      : Math.min(outerExpiry, authorization.expiresAtMs);
+    return {
+      receiptId: record.receiptId,
+      projectId: record.projectId,
+      sourceId: record.sourceId,
+      activeRunId: record.activeRunId,
+      createdAtMs: record.createdAtMs,
+      // Legacy receipts remain conservative. Reconstruct their original
+      // lifecycle cap rather than presenting them as an instant deletion.
+      expiresAtMs,
+      attempts: record.attempts,
+      state: record.state,
+      message: record.message,
+      ...(authorization === undefined ? {} : { authorization }),
+    };
   }
 
   private cloudCleanupResultFor(receipt: DeletionReceipt): CloudCleanupResult {
     return {
-      status: receipt.state,
+      status: receipt.state === "deleted" ? "deleted" : receipt.state === "failed" ? "failed" : "pending",
       message: receipt.message,
     };
   }
@@ -1916,6 +2648,120 @@ export class ProjectStore {
       return value?.receiptId === receiptId;
     });
     return setting === undefined ? null : this.deletionReceiptFrom(setting.value);
+  }
+
+  /**
+   * Reconciles the narrow delete-after-start race across tabs. It relies only
+   * on an exact private intent recorded before POST; normal project rows are
+   * intentionally absent here and are never recreated. A malformed/stale
+   * response is still treated as handled once it names a deleted intent, so
+   * it cannot fall through to normal receipt persistence.
+   */
+  private async reconcileDeletedGenerationStart(input: DeletedGenerationStartRecovery): Promise<boolean> {
+    const projectId = privateOpaqueIdentifier(input.projectId);
+    const operationId = privateOpaqueIdentifier(input.operationId);
+    const runId = privateOpaqueIdentifier(input.runId);
+    const ownerCapability = typeof input.projectOwnerCapability === "string" && /^[0-9a-f]{64}$/iu.test(input.projectOwnerCapability)
+      ? input.projectOwnerCapability.toLowerCase()
+      : null;
+    if (
+      projectId === null
+      || operationId === null
+      || runId === null
+      || (input.targetTrack !== "Captions" && input.targetTrack !== "AudioDescriptions")
+      || ownerCapability === null
+    ) return false;
+
+    const intentKey = pendingGenerationStartIntentKey(projectId, operationId, runId);
+    const nowMs = Date.now();
+    let handled = false;
+    let cleanupReceipt: DeletionReceipt | null = null;
+    await this.database.transaction("rw", [this.database.settings], async () => {
+      const intentSetting = await this.database.settings.get(intentKey);
+      const intent = pendingDeletedGenerationStartIntentFrom(intentSetting?.value);
+      if (intent !== null && pendingDeletedGenerationStartIntentExpired(intent, nowMs)) {
+        // The project may already be gone, but this unfulfilled pre-POST
+        // intent has crossed its browser recovery bound. Scrub it rather than
+        // accepting a late capability into a deletion receipt.
+        handled = intent.deletionReceiptId !== undefined;
+        await this.database.settings.delete(intentKey);
+        return;
+      }
+      if (
+        intent === null
+        || intent.projectId !== projectId
+        || intent.operationId !== operationId
+        || intent.runId !== runId
+        || intent.targetTrack !== input.targetTrack
+        || intent.ownerCapability !== ownerCapability
+      ) return;
+      // It is a normal in-flight start until deletion atomically assigns the
+      // receipt id. Let ordinary persistence proceed in that live-project
+      // case; do not manufacture deletion state from a stale tab.
+      if (intent.deletionReceiptId === undefined) return;
+      handled = true;
+
+      const deletionSetting = await this.database.settings.get(deletionReceiptKey(projectId, intent.deletionReceiptId));
+      const current = deletionSetting === undefined ? null : this.deletionReceiptFrom(deletionSetting.value);
+      if (current === null) {
+        // The deletion receipt is gone or malformed. Scrub the private
+        // write-ahead owner rather than allowing a dead project to return.
+        await this.database.settings.delete(intentKey);
+        return;
+      }
+      if (current.state === "deleted" || current.state === "lifecycle-pending") {
+        await this.deletePendingGenerationStartIntentsForDeletionReceipt(intent.deletionReceiptId);
+        return;
+      }
+      if (current.expiresAtMs <= nowMs) {
+        const lifecyclePending = {
+          ...withoutCloudCleanupAuthorization(current),
+          state: "lifecycle-pending" as const,
+          message: expiredCloudCleanupMessage,
+        };
+        await this.database.settings.put({
+          key: deletionReceiptKey(current.projectId, current.receiptId),
+          value: lifecyclePending,
+          updatedAtMs: nowMs,
+        });
+        await this.deletePendingGenerationStartIntentsForDeletionReceipt(intent.deletionReceiptId);
+        return;
+      }
+      // A response can be corrupted after the Worker committed its start.
+      // Preserve the intent for a later exact response, but never fall
+      // through into normal persistence while the project remains deleted.
+      const parsed = privatePendingStartRunAuthorization(input.receipt, intent, nowMs);
+      if (parsed === null || current.activeRunId !== runId) return;
+
+      const expiresAtMs = Math.min(current.expiresAtMs, parsed.expiresAtMs);
+      const captured: DeletionReceipt = {
+        ...current,
+        expiresAtMs,
+        authorization: {
+          version: 1,
+          ownerCapability: intent.ownerCapability,
+          expiresAtMs,
+          run: parsed.run,
+        },
+      };
+      await this.database.settings.put({
+        key: deletionReceiptKey(captured.projectId, captured.receiptId),
+        value: captured,
+        updatedAtMs: nowMs,
+      });
+      // The signed receipt is now atomically owned by the deletion receipt;
+      // remove the duplicate private write-ahead owner before any network IO.
+      await this.database.settings.delete(intentKey);
+      cleanupReceipt = captured;
+    });
+    if (cleanupReceipt !== null) {
+      // A no-authority background pass may already be in flight from the
+      // deletion itself. Let that pass settle, then re-read the now-captured
+      // exact run authorization and issue its DELETE; merely joining the old
+      // promise would otherwise strand this late POST until a manual retry.
+      void this.runCapturedStartCloudCleanup(cleanupReceipt);
+    }
+    return handled;
   }
 
   private async currentDeletionReceipt(receipt: DeletionReceipt): Promise<DeletionReceipt | null> {
@@ -1929,6 +2775,15 @@ export class ProjectStore {
     } catch {
       // Local deletion already completed. Retained receipt metadata makes a later explicit retry possible.
     }
+  }
+
+  /** Serializes a newly captured late-start receipt behind an earlier no-auth cleanup pass. */
+  private async runCapturedStartCloudCleanup(receipt: DeletionReceipt): Promise<void> {
+    const active = this.cleanupOperations.get(receipt.receiptId);
+    if (active !== undefined) {
+      try { await active; } catch { /* retained receipt remains the recovery boundary */ }
+    }
+    await this.runCloudCleanupInBackground(receipt);
   }
 
   /** Deduplicates same-store retries before an async database or cloud boundary can interleave. */
@@ -1953,12 +2808,37 @@ export class ProjectStore {
       };
     }
     if (current.state === "deleted") return this.cloudCleanupResultFor(current);
+    // `lifecycle-pending` is terminal for browser authority even if a stale
+    // old IndexedDB row somehow retained credentials. Never replay it.
+    if (current.state === "lifecycle-pending") return this.cloudCleanupResultFor(current);
+    // A background continuation or detached-tab retry may arrive after its
+    // bounded browser recovery window. Do not call either the production
+    // exact-delete client or an injected lifecycle seam once the receipt has
+    // expired; the server-side lifecycle backstop is now authoritative.
+    if (current.expiresAtMs <= Date.now()) {
+      const expired = await this.expireCloudCleanupReceipt(current);
+      const expiredResult: CloudCleanupResult = {
+        status: "pending",
+        message: expiredCloudCleanupMessage,
+      };
+      if (
+        this.activeCleanupReceiptId === receipt.receiptId
+        && this.snapshot.route === "start"
+        && this.snapshot.project === null
+      ) {
+        this.setSnapshot({
+          ...this.snapshot,
+          cleanupNotice: `Local project copy deleted. ${expiredResult.message}`,
+        });
+      }
+      return expired === null ? expiredResult : this.cloudCleanupResultFor(expired);
+    }
     const result = await this.requestCloudCleanup({
       projectId: current.projectId,
       sourceId: current.sourceId,
       activeRunId: current.activeRunId,
       cancelActiveWork: true,
-    });
+    }, current.authorization);
     let retained: DeletionReceipt | null;
     try {
       retained = await this.persistCloudCleanupResult(current, result);
@@ -2005,6 +2885,7 @@ export class ProjectStore {
       if (current === null) return;
       if (current.state === "deleted") {
         retained = current;
+        await this.deletePendingGenerationStartIntentsForDeletionReceipt(receipt.receiptId);
         return;
       }
       const state = result.status === "deleted"
@@ -2015,8 +2896,9 @@ export class ProjectStore {
       const message = state === "failed" && result.status === "pending"
         ? current.message
         : result.message;
+      const publicLifecycle = withoutCloudCleanupAuthorization(current);
       retained = {
-        ...current,
+        ...(state === "deleted" ? publicLifecycle : current),
         attempts: current.attempts + 1,
         state,
         message,
@@ -2026,17 +2908,54 @@ export class ProjectStore {
         value: retained,
         updatedAtMs: Date.now(),
       });
+      if (state === "deleted") {
+        // A confirmed exact delete leaves no valid reason to retain a
+        // pre-POST owner/session intent in another tab's IndexedDB view.
+        await this.deletePendingGenerationStartIntentsForDeletionReceipt(receipt.receiptId);
+      }
     });
     return retained;
   }
 
-  private async requestCloudCleanup(request: CloudCleanupRequest): Promise<CloudCleanupResult> {
-    if (this.cloudCleanup === undefined) {
-      return {
-        status: "pending",
-        message: "Cloud cleanup remains pending lifecycle enforcement because no hosted cleanup hook is configured for this browser session.",
+  /**
+   * Expiry is a terminal browser-authority boundary. Persisting the public
+   * lifecycle-pending marker and dropping every owner/session/receipt field
+   * in one IndexedDB transaction prevents a later detached tab from replaying
+   * private cleanup credentials after the disclosed recovery window.
+   */
+  private async expireCloudCleanupReceipt(receipt: DeletionReceipt): Promise<DeletionReceipt | null> {
+    let retained: DeletionReceipt | null = null;
+    await this.database.transaction("rw", [this.database.settings], async () => {
+      const setting = await this.database.settings.get(deletionReceiptKey(receipt.projectId, receipt.receiptId));
+      const current = setting === undefined ? null : this.deletionReceiptFrom(setting.value);
+      if (current === null) return;
+      if (current.state === "deleted") {
+        retained = current;
+        await this.deletePendingGenerationStartIntentsForDeletionReceipt(receipt.receiptId);
+        return;
+      }
+      const publicLifecycle = withoutCloudCleanupAuthorization(current);
+      retained = {
+        ...publicLifecycle,
+        state: "lifecycle-pending",
+        message: expiredCloudCleanupMessage,
       };
-    }
+      await this.database.settings.put({
+        key: deletionReceiptKey(receipt.projectId, receipt.receiptId),
+        value: retained,
+        updatedAtMs: Date.now(),
+      });
+      // Lifecycle-pending is terminal for browser authority. Scrub an
+      // unresolved start race together with any retained run authorization.
+      await this.deletePendingGenerationStartIntentsForDeletionReceipt(receipt.receiptId);
+    });
+    return retained;
+  }
+
+  private async requestCloudCleanup(
+    request: CloudCleanupRequest,
+    authorization: ProjectCloudCleanupAuthorization | undefined,
+  ): Promise<CloudCleanupResult> {
     let timeout: ReturnType<typeof setTimeout> | null = null;
     const timedOut = new Promise<CloudCleanupResult>((resolve) => {
       timeout = setTimeout(() => resolve({
@@ -2045,13 +2964,17 @@ export class ProjectStore {
       }), this.cloudCleanupTimeoutMs);
     });
     const requested = Promise.resolve()
-      .then(() => this.cloudCleanup!(request))
+      .then(() => this.cloudCleanup === undefined
+        ? cleanupProjectCloudArtifacts({ ...request, authorization })
+        : this.cloudCleanup(request))
       .then((result): CloudCleanupResult => {
         if (
           (result.status === "deleted" || result.status === "pending" || result.status === "failed")
           && typeof result.message === "string"
           && result.message.trim().length > 0
-        ) return result;
+        ) return this.cloudCleanup === undefined
+          ? result
+          : this.redactedCloudCleanupResult(result.status);
         return {
           status: "pending",
           message: "Cloud cleanup returned an incomplete status and remains pending lifecycle enforcement.",
@@ -2064,6 +2987,18 @@ export class ProjectStore {
     const result = await Promise.race([requested, timedOut]);
     if (timeout !== null) clearTimeout(timeout);
     return result;
+  }
+
+  /** Hosted hooks may include a provider body or exact private object key; do not surface either after deletion. */
+  private redactedCloudCleanupResult(status: CloudCleanupResult["status"]): CloudCleanupResult {
+    switch (status) {
+      case "deleted":
+        return { status, message: "CueBench confirmed private cloud cleanup." };
+      case "failed":
+        return { status, message: "CueBench could not confirm private cloud cleanup. It remains subject to the 24-hour deletion ceiling." };
+      default:
+        return { status, message: "Cloud cleanup is pending lifecycle enforcement; CueBench will record the hosted result when it is confirmed." };
+    }
   }
 
   private async persistMode(projectId: string, mode: ProjectMode): Promise<void> {

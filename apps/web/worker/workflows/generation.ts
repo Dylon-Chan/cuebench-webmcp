@@ -29,6 +29,7 @@ import {
 import { resolveWorkerSettings, type WorkerEnv } from "../env";
 import { MediaContainerPreparationService } from "../probe";
 import { fixtureMediaPreparation } from "../media-preparation-fixture";
+import { redactWorkflowFailure } from "../recovery";
 import { verifyUploadReceipt } from "../uploads";
 import {
   createOpenAIProvider,
@@ -1473,7 +1474,7 @@ export class CaptionGenerationRunner {
       }
       await appendStage(this.store, current, "Failed", {
         code: "GENERATION_STAGE_FAILED",
-        message: error instanceof Error ? error.message : "CueBench caption generation failed.",
+        message: redactWorkflowFailure(error),
         retryable: typeof error === "object" && error !== null && "retryable" in error && (error as { readonly retryable?: unknown }).retryable === true,
       });
       if (typeof error === "object" && error !== null && "retryable" in error && (error as { readonly retryable?: unknown }).retryable === true) {

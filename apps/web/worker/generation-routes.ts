@@ -22,6 +22,7 @@ import {
   generationCleanupMarkerKey,
   generationPreparationWriteLeaseKey,
 } from "./generation-cleanup";
+import { registerPrivateLifecycleTombstone } from "./lifecycle-reconciler";
 
 const DAY_MS = 24 * 60 * 60 * 1_000;
 const MAX_RECORD_BYTES = 2 * 1024 * 1024;
@@ -95,7 +96,7 @@ export interface GenerationRunArtifactReference {
   readonly byteLength: number;
 }
 
-export type GenerationCleanupAction = "adopted" | "discarded" | "cancelled";
+export type GenerationCleanupAction = "adopted" | "discarded" | "cancelled" | "expired";
 
 /**
  * A compact tombstone keeps cleanup recoverable after rich private artifacts
@@ -336,6 +337,27 @@ export class InMemoryGenerationRunRecordStore implements GenerationRunRecordStor
     return { kind: "acquired", lease: clone(lease) };
   }
 
+  /**
+   * A safe retry may continue only while the original signed run still owns
+   * this active project fence. Unlike acquisition, this never recreates a
+   * released/expired lease.
+   */
+  public async ownsActiveLease(input: {
+    readonly sessionKey: string;
+    readonly ownerKey?: string;
+    readonly projectKey: string;
+    readonly operationKey: string;
+    readonly runId: string;
+    readonly targetTrack: "Captions" | "AudioDescriptions";
+    readonly nowMs: number;
+  }): Promise<boolean> {
+    const existing = this.activeLeases.get(`${activeOwnerKey(input)}:${input.projectKey}`);
+    return existing !== undefined
+      && existing.state === "active"
+      && existing.expiresAtMs > input.nowMs
+      && activeLeaseIdentityMatches(existing, input);
+  }
+
   public async releaseActiveLease(input: {
     readonly sessionKey: string;
     readonly ownerKey?: string;
@@ -540,7 +562,7 @@ const cleanupRecord = (
   if (
     cleanup.version !== 1
     || (cleanup.state !== "pending" && cleanup.state !== "completed")
-    || (cleanup.action !== "adopted" && cleanup.action !== "discarded" && cleanup.action !== "cancelled")
+    || (cleanup.action !== "adopted" && cleanup.action !== "discarded" && cleanup.action !== "cancelled" && cleanup.action !== "expired")
     || !Array.isArray(cleanup.artifactKeys)
     || cleanup.artifactKeys.length > MAX_CLEANUP_ARTIFACT_KEYS
     || cleanup.artifactKeys.some((key) => typeof key !== "string" || !cleanupArtifactKey(key, claims))
@@ -1215,6 +1237,30 @@ export class R2GenerationRunRecordStore implements GenerationRunRecordStore {
       : null;
   }
 
+  /**
+   * The tombstone is intentionally written before the CAS record. A storage
+   * failure therefore fails closed instead of creating a private run which a
+   * scheduled 24-hour sweep could never discover.
+   */
+  private async writeRunRecord(
+    record: GenerationRunRecord,
+    encoded: string,
+    onlyIf: R2Conditional,
+  ) {
+    await registerPrivateLifecycleTombstone({
+      bucket: this.bucket,
+      targetTrack: "Captions",
+      operationKey: record.claims.operationKey,
+      runId: record.claims.runId,
+      recordKey: recordKey(record.claims),
+      expiresAtMs: record.claims.expiresAtMs,
+    });
+    return this.bucket.put(recordKey(record.claims), encoded, {
+      onlyIf,
+      httpMetadata: { contentType: "application/json; charset=utf-8" },
+    });
+  }
+
   private async currentActiveLease(ownerKey: string, projectKey: string): Promise<{ readonly lease: ActiveGenerationLease; readonly etag: string } | null> {
     const object = await this.bucket.get(activeGenerationLeaseKey(ownerKey, projectKey));
     if (object === null || object.size <= 0 || object.size > MAX_ACTIVE_LEASE_BYTES) return null;
@@ -1285,6 +1331,38 @@ export class R2GenerationRunRecordStore implements GenerationRunRecordStore {
     throw error;
   }
 
+  /** Read-only exact-identity check used by a bounded retry; it cannot reacquire a released lease. */
+  public async ownsActiveLease(input: {
+    readonly sessionKey: string;
+    readonly ownerKey?: string;
+    readonly projectKey: string;
+    readonly operationKey: string;
+    readonly runId: string;
+    readonly targetTrack: "Captions" | "AudioDescriptions";
+    readonly nowMs: number;
+  }): Promise<boolean> {
+    if (
+      !SHA256.test(input.sessionKey)
+      || (input.ownerKey !== undefined && !SHA256.test(input.ownerKey))
+      || !SHA256.test(input.projectKey)
+      || !SHA256.test(input.operationKey)
+      || !OPAQUE_ID.test(input.runId)
+      || (input.targetTrack !== "Captions" && input.targetTrack !== "AudioDescriptions")
+    ) return false;
+    const normalized = {
+      ...input,
+      sessionKey: input.sessionKey.toLowerCase(),
+      ...(input.ownerKey === undefined ? {} : { ownerKey: input.ownerKey.toLowerCase() }),
+      projectKey: input.projectKey.toLowerCase(),
+      operationKey: input.operationKey.toLowerCase(),
+    };
+    const current = await this.currentActiveLease(activeOwnerKey(normalized), normalized.projectKey);
+    return current !== null
+      && current.lease.state === "active"
+      && current.lease.expiresAtMs > normalized.nowMs
+      && activeLeaseIdentityMatches(current.lease, normalized);
+  }
+
   public async releaseActiveLease(input: {
     readonly sessionKey: string;
     readonly ownerKey?: string;
@@ -1352,16 +1430,12 @@ export class R2GenerationRunRecordStore implements GenerationRunRecordStore {
   }
 
   public async save(record: GenerationRunRecord): Promise<void> {
-    const key = recordKey(record.claims);
     for (let attempt = 0; attempt < 5; attempt += 1) {
       const current = await this.current(record.claims);
       if (current === null) {
         const candidate = withTerminalLeaseReleasePending(record);
         const compact = await this.compactEncoded(candidate);
-        const created = await this.bucket.put(key, compact.encoded, {
-          onlyIf: onlyIfAbsent(),
-          httpMetadata: { contentType: "application/json; charset=utf-8" },
-        });
+        const created = await this.writeRunRecord(compact.compact, compact.encoded, onlyIfAbsent());
         if (created !== null) {
           await this.releaseIfTerminal(compact.compact);
           return;
@@ -1383,10 +1457,7 @@ export class R2GenerationRunRecordStore implements GenerationRunRecordStore {
         }
         : mergeActiveRecord(current.record, record));
       const compact = await this.compactEncoded(candidate);
-      const saved = await this.bucket.put(key, compact.encoded, {
-        onlyIf: { etagMatches: current.etag },
-        httpMetadata: { contentType: "application/json; charset=utf-8" },
-      });
+      const saved = await this.writeRunRecord(compact.compact, compact.encoded, { etagMatches: current.etag });
       if (saved !== null) {
         await this.reclaimSupersededArtifacts(current.record, compact.compact);
         await this.releaseIfTerminal(compact.compact);
@@ -1613,10 +1684,7 @@ export class R2GenerationRunRecordStore implements GenerationRunRecordStore {
         cleanup: { ...pending, state: "pending", artifactKeys },
         updatedAtMs: Math.max(current.record.updatedAtMs, nowMs),
       };
-      const saved = await this.bucket.put(recordKey(input), await this.encoded(candidate), {
-        onlyIf: { etagMatches: current.etag },
-        httpMetadata: { contentType: "application/json; charset=utf-8" },
-      });
+      const saved = await this.writeRunRecord(candidate, await this.encoded(candidate), { etagMatches: current.etag });
       if (saved !== null) return candidate;
     }
     return null;
@@ -1637,10 +1705,7 @@ export class R2GenerationRunRecordStore implements GenerationRunRecordStore {
         cleanup: { ...current.record.cleanup, state: "completed", completedAtMs: nowMs },
         updatedAtMs: Math.max(current.record.updatedAtMs, nowMs),
       };
-      const saved = await this.bucket.put(recordKey(input), await this.encoded(completed), {
-        onlyIf: { etagMatches: current.etag },
-        httpMetadata: { contentType: "application/json; charset=utf-8" },
-      });
+      const saved = await this.writeRunRecord(completed, await this.encoded(completed), { etagMatches: current.etag });
       if (saved !== null) return completed;
     }
     return fallback;
@@ -1669,10 +1734,7 @@ export class R2GenerationRunRecordStore implements GenerationRunRecordStore {
         cleanup: { ...pending, state: "pending" },
         updatedAtMs: Math.max(current.record.updatedAtMs, nowMs),
       };
-      const saved = await this.bucket.put(recordKey(input), await this.encoded(candidate), {
-        onlyIf: { etagMatches: current.etag },
-        httpMetadata: { contentType: "application/json; charset=utf-8" },
-      });
+      const saved = await this.writeRunRecord(candidate, await this.encoded(candidate), { etagMatches: current.etag });
       if (saved !== null) return candidate;
     }
     return fallback;
@@ -1683,7 +1745,6 @@ export class R2GenerationRunRecordStore implements GenerationRunRecordStore {
     readonly action: GenerationCleanupAction;
     readonly nowMs: number;
   }): Promise<GenerationRunRecord | null> {
-    const key = recordKey(input.claims);
     let detached: GenerationRunRecord | null = null;
     for (let attempt = 0; attempt < 5; attempt += 1) {
       const current = await this.current(input.claims);
@@ -1705,10 +1766,7 @@ export class R2GenerationRunRecordStore implements GenerationRunRecordStore {
         requestedAtMs: input.nowMs,
       };
       const candidate = detachRunArtifacts(current.record, cleanup);
-      const saved = await this.bucket.put(key, await this.encoded(candidate), {
-        onlyIf: { etagMatches: current.etag },
-        httpMetadata: { contentType: "application/json; charset=utf-8" },
-      });
+      const saved = await this.writeRunRecord(candidate, await this.encoded(candidate), { etagMatches: current.etag });
       if (saved !== null) {
         detached = candidate;
         break;

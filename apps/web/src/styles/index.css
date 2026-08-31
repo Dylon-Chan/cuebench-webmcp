@@ -275,7 +275,7 @@ button:disabled { cursor: not-allowed; }
   padding: 0.95rem 1rem 0.9rem 1.14rem;
   color: #425e68;
   border: 1px solid #c6d0d4;
-  border-left: 3px solid #2c7a7b;
+  border-top: 2px solid #2c7a7b;
   border-radius: 5px;
   background: linear-gradient(125deg, #f8fbfb 0%, #f4f8f8 100%);
   font-size: 0.76rem;
@@ -288,9 +288,80 @@ button:disabled { cursor: not-allowed; }
 .generation-status__receipt { color: #5a7180; font-family: "SFMono-Regular", Consolas, monospace; font-size: 0.66rem; }
 .generation-status__confirmation { width: min(34rem, calc(100vw - 2rem)); }
 .generation-status__confirmation [role="dialog"] { outline: none; }
-.ad-generation-status { border-left-color: #6948a4; background: linear-gradient(125deg, #fbfaff 0%, #f6f4fc 100%); }
+.ad-generation-status { border-top-color: #6948a4; background: linear-gradient(125deg, #fbfaff 0%, #f6f4fc 100%); }
 .ad-generation-status__heading { display: flex; align-items: baseline; justify-content: space-between; gap: 0.75rem; }
-.ad-generation-status__eyebrow { margin: 0; color: #6948a4; font-size: 0.61rem; font-weight: 780; letter-spacing: 0.075em; text-transform: uppercase; }
+
+.recovery-notice {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 0.58rem;
+  align-items: start;
+  margin: 0.18rem 0;
+  padding: 0.62rem 0.68rem;
+  color: #234c59;
+  border: 1px solid #9cb7bc;
+  border-radius: 5px;
+  background: #edf5f5;
+}
+.recovery-notice__state { width: 0.58rem; height: 0.58rem; margin-top: 0.24rem; border-radius: 50%; background: #237278; box-shadow: 0 2px 5px rgb(29 94 100 / 25%); }
+.recovery-notice__body { min-width: 0; }
+.recovery-notice__body strong { display: block; color: #173d48; font-size: 0.72rem; font-weight: 790; }
+.recovery-notice__body p { margin: 0.18rem 0 0; color: #315d68; font-size: 0.72rem; line-height: 1.42; overflow-wrap: anywhere; }
+.recovery-notice--processing { border-color: #8daeb7; background: #f0f7f8; }
+.recovery-notice--processing .recovery-notice__state { background: #206f7b; }
+.recovery-notice--failed-retryable { border-color: #c79b43; background: #fff9ed; }
+.recovery-notice--failed-retryable .recovery-notice__state { background: #a46c00; }
+.recovery-notice--failed-terminal { border-color: #c27b5c; background: #fff3ee; }
+.recovery-notice--failed-terminal .recovery-notice__state { background: #a34617; }
+.recovery-notice--deleting { border-color: #a980ba; background: #faf4fc; }
+.recovery-notice--deleting .recovery-notice__state { background: #70458c; }
+.recovery-notice--deleted { border-color: #78ae92; background: #f0faf4; }
+.recovery-notice--deleted .recovery-notice__state { background: #14744c; }
+
+.cloud-cleanup-status {
+  display: grid;
+  gap: 0.72rem;
+  max-width: 48rem;
+  margin-top: 1.25rem;
+  padding: 0.95rem 0;
+  border-top: 1px solid #b9c9cd;
+  border-bottom: 1px solid #b9c9cd;
+}
+.cloud-cleanup-status__heading h2 { margin: 0; color: #123640; font-size: 0.91rem; letter-spacing: -0.015em; }
+.cloud-cleanup-status__heading p { max-width: 65ch; margin: 0.24rem 0 0; color: #526e77; font-size: 0.76rem; line-height: 1.46; }
+.cloud-cleanup-status__list { display: grid; gap: 0.52rem; margin: 0; padding: 0; list-style: none; }
+.cloud-cleanup-status__entry {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 0.8rem;
+  align-items: center;
+  padding: 0.66rem 0.72rem;
+  color: #254c57;
+  border: 1px solid #afc2c6;
+  border-radius: 5px;
+  background: #f5faf9;
+}
+.cloud-cleanup-status__entry > div { min-width: 0; }
+.cloud-cleanup-status__entry strong { color: #193f4a; font-size: 0.75rem; font-weight: 790; }
+.cloud-cleanup-status__entry p { max-width: 65ch; margin: 0.16rem 0 0; color: #496871; font-size: 0.72rem; line-height: 1.42; overflow-wrap: anywhere; }
+.cloud-cleanup-status__entry--lifecycle-pending { border-color: #c69d55; background: #fffaf0; }
+.cloud-cleanup-status__entry--lifecycle-pending strong { color: #704b0c; }
+.cloud-cleanup-status__entry--deleted { border-color: #82b49a; background: #f2fbf6; }
+.cloud-cleanup-status__entry--deleted strong { color: #176144; }
+.cloud-cleanup-status__attempts { color: #657d85 !important; font-feature-settings: "tnum" 1; font-size: 0.67rem !important; }
+.cloud-cleanup-status__error { margin: 0; color: #9a3400; font-size: 0.75rem; font-weight: 690; }
+.cloud-cleanup-refresh-error {
+  display: grid;
+  gap: 0.62rem;
+  padding: 0.82rem 0.9rem;
+  border: 1px solid #c88735;
+  border-radius: 0.72rem;
+  background: #fff8ed;
+  color: #6b3b00;
+}
+.cloud-cleanup-refresh-error p { max-width: 65ch; margin: 0; font-size: 0.77rem; font-weight: 650; line-height: 1.48; }
+.cloud-cleanup-refresh-error__actions { display: flex; flex-wrap: wrap; gap: 0.52rem; }
+.cloud-cleanup-refresh-error__actions .button { min-height: 40px; }
 .region-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 1rem; margin-bottom: 0.65rem; }
 .region-heading h1,
 .region-heading h2,
@@ -494,7 +565,7 @@ button:disabled { cursor: not-allowed; }
 .narration-preview__actions { display: flex; flex-wrap: wrap; align-items: center; gap: 0.46rem 0.62rem; }
 .narration-preview__actions .button { min-height: 30px; padding-inline: 0.5rem; font-size: 0.65rem; }
 .narration-preview__duration { color: #0d5640; font-feature-settings: "tnum" 1; font-size: 0.65rem; font-weight: 760; }
-.narration-preview__fit { margin: 0; padding: 0.36rem 0.44rem; color: #6b4300; border-left: 3px solid #bd7a00; background: #fff8e8; font-feature-settings: "tnum" 1; font-size: 0.64rem; font-weight: 670; line-height: 1.4; }
+.narration-preview__fit { margin: 0; padding: 0.36rem 0.44rem; color: #6b4300; border-top: 2px solid #bd7a00; background: #fff8e8; font-feature-settings: "tnum" 1; font-size: 0.64rem; font-weight: 670; line-height: 1.4; }
 .narration-preview audio { width: 100%; height: 31px; accent-color: #006836; }
 .narration-preview__notice,
 .narration-preview__error { margin: 0; padding: 0.36rem 0.44rem; font-size: 0.64rem; font-weight: 670; line-height: 1.4; }
@@ -645,6 +716,10 @@ button:disabled { cursor: not-allowed; }
   .project-start h1 { max-width: 11ch; font-size: clamp(2.6rem, 14vw, 4.6rem); }
   .project-start__actions { display: grid; grid-template-columns: 1fr; }
   .project-start__actions .button { width: 100%; }
+  .cloud-cleanup-status__entry { grid-template-columns: 1fr; align-items: stretch; }
+  .cloud-cleanup-status__entry .button { width: 100%; min-height: 44px; }
+  .cloud-cleanup-refresh-error__actions { display: grid; grid-template-columns: 1fr; }
+  .cloud-cleanup-refresh-error__actions .button { width: 100%; min-height: 44px; }
   .project-start__actions .button,
   .ruling-panel__actions .button,
   .transport-control { min-height: 44px; }

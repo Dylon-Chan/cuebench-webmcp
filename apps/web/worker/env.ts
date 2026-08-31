@@ -1,4 +1,4 @@
-import type { DurableObjectNamespace, R2Bucket } from "@cloudflare/workers-types";
+import type { AnalyticsEngineDataset, DurableObjectNamespace, R2Bucket } from "@cloudflare/workers-types";
 import type { HmacKeyRing } from "./session";
 import type { MediaJobSigningSettings } from "./probe";
 
@@ -68,6 +68,8 @@ export interface WorkerEnv {
   readonly TURNSTILE_EXPECTED_HOSTNAME?: string;
   readonly TURNSTILE_EXPECTED_ACTION?: string;
   readonly PROCESSING_BUCKET?: R2Bucket;
+  /** Real per-environment Analytics Engine binding; never a string dataset name. */
+  readonly CUEBENCH_TELEMETRY?: AnalyticsEngineDataset;
   readonly QUOTA_LEDGER?: DurableObjectNamespace;
   readonly UPLOAD_COORDINATOR?: DurableObjectNamespace;
   readonly PROCESSING_WORKFLOW?: ProcessingWorkflowBinding;
