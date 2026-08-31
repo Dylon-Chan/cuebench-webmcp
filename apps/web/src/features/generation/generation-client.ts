@@ -1,6 +1,7 @@
 import {
   GenerationRunStatusSchema,
   StagedGenerationResultSchema,
+  type Actor,
   type GenerationRunStatus,
 } from "@cuebench/contracts";
 import type { CaptionProject, CommandResult, DomainCommand } from "@cuebench/domain";
@@ -12,6 +13,14 @@ const humanActor = { type: "Human" as const, id: "human" };
 const opaqueId = /^[A-Za-z0-9_-]{1,128}$/;
 const sha256 = /^[0-9a-f]{64}$/i;
 const maxGenerationRetentionMs = 24 * 60 * 60 * 1_000;
+
+/** Keep an agent cancellation out of every pre-commit durable boundary. */
+export const throwIfGenerationAborted = (signal: AbortSignal | undefined): void => {
+  if (signal?.aborted !== true) return;
+  const error = new Error("CueBench generation request was cancelled before its next durable boundary.");
+  error.name = "AbortError";
+  throw error;
+};
 
 /**
  * The browser commits this state in the same Dexie transaction as adoption.
@@ -91,7 +100,8 @@ export interface GenerationClientReceipt {
 
 export interface GenerationProjectStore {
   readonly getSnapshot: () => { readonly project: CaptionProject | null; readonly mode?: "durable" | "temporary" | null };
-  readonly executeCommand: (command: DomainCommand) => Promise<CommandResult>;
+  /** Optional project-instance owner prevents queued lifecycle commands crossing an import/replacement boundary. */
+  readonly executeCommand: (command: DomainCommand, expectedProjectId?: string) => Promise<CommandResult>;
   /** This must complete before the browser starts polling an opaque receipt. */
   readonly persistCaptionGenerationReceipt: (runId: string, receipt: GenerationClientReceipt) => Promise<void>;
   /** Durable ProjectStore reserves a crash-safe slot before server dispatch. */
@@ -111,7 +121,58 @@ export interface GenerationClientErrorDetails {
   readonly status?: number;
   /** A run could exist server-side, so retain the local target-track lease. */
   readonly dispatchMayBeDurable?: boolean;
+  /** A page adapter must surface this recoverable identity rather than claim no state changed. */
+  readonly lifecycleOutcome?: GenerationLifecycleOutcome;
 }
+
+export interface GenerationLifecycleOutcome {
+  readonly runId: string;
+  readonly targetTrack: "Captions" | "AudioDescriptions";
+  readonly disposition: "accepted-unknown" | "lifecycle-pending";
+  /** Distinguishes a retained start from a cancellation recovery receipt. */
+  readonly operation?: "start" | "cancel";
+  /** Never claim a known cancellation receipt is missing. */
+  readonly receiptState?: "available" | "missing" | "expired";
+}
+
+export type GenerationLifecycleEvent =
+  | { readonly phase: "lease-acquired"; readonly runId: string; readonly targetTrack: "Captions" | "AudioDescriptions" }
+  | { readonly phase: "dispatch-uncertain"; readonly runId: string; readonly targetTrack: "Captions" | "AudioDescriptions" }
+  | { readonly phase: "remote-start-accepted"; readonly runId: string; readonly targetTrack: "Captions" | "AudioDescriptions" }
+  | { readonly phase: "receipt-persisted"; readonly runId: string; readonly targetTrack: "Captions" | "AudioDescriptions" }
+  | { readonly phase: "lease-released"; readonly runId: string; readonly targetTrack: "Captions" | "AudioDescriptions" }
+  | { readonly phase: "cancellation-intent-persisted"; readonly runId: string; readonly targetTrack: "Captions" | "AudioDescriptions" }
+  | { readonly phase: "remote-cancelled"; readonly runId: string; readonly targetTrack: "Captions" | "AudioDescriptions" };
+
+export interface GenerationLifecycleObserver {
+  /** Called synchronously after a durable local or remote lifecycle effect begins. */
+  readonly onLifecycleEvent?: ((event: GenerationLifecycleEvent) => void) | undefined;
+}
+
+export const notifyGenerationLifecycle = (observer: GenerationLifecycleObserver, event: GenerationLifecycleEvent): void => {
+  try {
+    observer.onLifecycleEvent?.(event);
+  } catch {
+    // A UI observer cannot roll back an already-durable receipt, lease, or
+    // remote request. The caller will still return its typed lifecycle state.
+  }
+};
+
+export const withGenerationLifecycleOutcome = (
+  error: unknown,
+  lifecycleOutcome: GenerationLifecycleOutcome,
+): GenerationClientError => {
+  if (error instanceof GenerationClientError) {
+    return new GenerationClientError(error.message, { ...error.details, lifecycleOutcome });
+  }
+  // Keep a local adapter failure intelligible to Human recovery UI while
+  // adding the typed identity that prevents an unsafe retry. This message is
+  // never a hosted/provider body (those are normalized above).
+  const message = error instanceof Error && error.message.trim().length > 0
+    ? error.message
+    : "CueBench generation lifecycle needs recovery before it can be retried.";
+  return new GenerationClientError(message, { lifecycleOutcome });
+};
 
 export class GenerationClientError extends Error {
   public constructor(message: string, public readonly details: GenerationClientErrorDetails = {}) {
@@ -124,6 +185,14 @@ export interface StartCaptionGenerationInput {
   readonly project: CaptionProject;
   readonly store: GenerationProjectStore;
   readonly upload: Pick<PersistedCloudUploadRecovery, "operationId" | "session" | "operationReceipt" | "sourceByteLength" | "sourceSha256" | "durationMs" | "projectOwnerCapability">;
+  /** An agent cancellation stops only before the next durable lifecycle edge. */
+  readonly signal?: AbortSignal;
+  /**
+   * The browser-agent invocation signal only. Once a lease exists, a
+   * registration-family replacement must never cancel the idempotent POST.
+   */
+  readonly postCommitSignal?: AbortSignal;
+  readonly onLifecycleEvent?: GenerationLifecycleObserver["onLifecycleEvent"];
 }
 
 export interface StartedCaptionGeneration {
@@ -135,6 +204,16 @@ export interface CancelCaptionGenerationInput {
   readonly project: CaptionProject;
   readonly store: GenerationProjectStore;
   readonly receipt: GenerationClientReceipt;
+  /** Browser Agent cancellation remains BrowserAgent-attributed in the Court Record. */
+  readonly actor?: Actor;
+  /** An agent cancellation stops only before the cancellation-intent write. */
+  readonly signal?: AbortSignal;
+  /**
+   * The browser-agent invocation signal only. Once the intent is durable,
+   * the old active-run registration cannot cancel its own terminal DELETE.
+   */
+  readonly postCommitSignal?: AbortSignal;
+  readonly onLifecycleEvent?: GenerationLifecycleObserver["onLifecycleEvent"];
 }
 
 export interface AdoptCaptionGenerationInput {
@@ -146,7 +225,7 @@ export interface AdoptCaptionGenerationInput {
 
 export interface CaptionGenerationClientPort {
   readonly start: (input: StartCaptionGenerationInput) => Promise<StartedCaptionGeneration>;
-  readonly status: (receipt: GenerationClientReceipt) => Promise<GenerationRunStatus>;
+  readonly status: (receipt: GenerationClientReceipt, signal?: AbortSignal) => Promise<GenerationRunStatus>;
   readonly cancel: (input: CancelCaptionGenerationInput) => Promise<GenerationRunStatus>;
   readonly adopt: (input: AdoptCaptionGenerationInput) => Promise<CommandResult>;
   /** Idempotently retries the authenticated cloud cleanup after local adoption. */
@@ -155,6 +234,8 @@ export interface CaptionGenerationClientPort {
   /** Retries a cancellation tombstone without releasing its local lease early. */
   readonly retryCancellationCleanup: (input: CancelCaptionGenerationInput) => Promise<void>;
   readonly loadStoredReceipt: (store: GenerationProjectStore, project: CaptionProject, runId: string) => Promise<GenerationClientReceipt | null>;
+  /** Read-only validation for inspectors; unlike loadStoredReceipt it never settles expiry or releases a lease. */
+  readonly peekStoredReceipt?: (store: GenerationProjectStore, project: CaptionProject, runId: string) => Promise<GenerationClientReceipt | null>;
 }
 
 export interface CaptionGenerationClientOptions {
@@ -361,6 +442,7 @@ export class CaptionGenerationClient implements CaptionGenerationClientPort {
   }
 
   public async start(input: StartCaptionGenerationInput): Promise<StartedCaptionGeneration> {
+    throwIfGenerationAborted(input.signal);
     const snapshot = input.store.getSnapshot();
     if (snapshot.mode === "temporary") {
       throw new GenerationClientError("Caption generation needs durable browser storage before CueBench can acquire a recoverable target-track lease.", { code: "DURABLE_STORAGE_REQUIRED" });
@@ -377,21 +459,38 @@ export class CaptionGenerationClient implements CaptionGenerationClientPort {
       runId = this.createRunId();
       if (!opaqueId.test(runId)) throw new GenerationClientError("CueBench generated an invalid caption-generation run identifier.");
       await input.store.reserveCaptionGenerationReceipt?.(runId);
+      try {
+        throwIfGenerationAborted(input.signal);
+      } catch (error) {
+        if (receiptSlotReserved) {
+          try { await input.store.releaseCaptionGenerationReceiptReservation?.(runId); } catch { /* reservation cleanup is best-effort */ }
+        }
+        throw error;
+      }
       const lease = await input.store.executeCommand({
         type: "StartGenerationRun",
         actor: aiActor,
         runId,
         targetTrack: "Captions",
         expectedProjectRevision: leasedProject.projectRevision,
-      });
+      }, input.project.projectId);
       if (lease.error !== undefined) {
         if (receiptSlotReserved) await input.store.releaseCaptionGenerationReceiptReservation?.(runId);
         throw new GenerationClientError(lease.error.message, { code: lease.error.code });
       }
       leasedProject = lease.project;
+      notifyGenerationLifecycle(input, { phase: "lease-acquired", runId, targetTrack: "Captions" });
     } else if (isMatchingCaptionLease(leasedProject, leasedProject.activeGenerationRun.runId)) {
       runId = leasedProject.activeGenerationRun.runId;
       await input.store.reserveCaptionGenerationReceipt?.(runId);
+      try {
+        throwIfGenerationAborted(input.signal);
+      } catch (error) {
+        if (receiptSlotReserved) {
+          try { await input.store.releaseCaptionGenerationReceiptReservation?.(runId); } catch { /* reservation cleanup is best-effort */ }
+        }
+        throw error;
+      }
     } else {
       throw new GenerationClientError("A different generation run currently holds CueBench's target-track lease.", { code: "TARGET_TRACK_LEASE_CONFLICT" });
     }
@@ -403,6 +502,10 @@ export class CaptionGenerationClient implements CaptionGenerationClientPort {
 
     let durableStartMayExist = false;
     try {
+      // StartGenerationRun is the first durable edge. Its Browser Agent
+      // callback synchronously replaces the starter family, which aborts the
+      // group signal that started this operation. From here, use only the
+      // caller's invocation signal: the idempotent POST must not self-cancel.
       const response = await this.fetcher("/api/generation-runs", {
         method: "POST",
         headers: {
@@ -411,6 +514,7 @@ export class CaptionGenerationClient implements CaptionGenerationClientPort {
           "x-cuebench-operation-receipt": authorization.operationReceipt,
           "x-cuebench-project-owner": authorization.projectOwnerCapability,
         },
+        ...(input.postCommitSignal === undefined ? {} : { signal: input.postCommitSignal }),
         body: JSON.stringify({
           projectId: leasedProject.projectId,
           runId,
@@ -427,10 +531,12 @@ export class CaptionGenerationClient implements CaptionGenerationClientPort {
       // private record. Retain the local lease even if a hostile/corrupt body
       // cannot be parsed or IndexedDB fails before saving the browser receipt.
       durableStartMayExist = true;
+      notifyGenerationLifecycle(input, { phase: "remote-start-accepted", runId, targetTrack: "Captions" });
       const started = parseStart(await response.json(), leasedProject, leaseBase.expectedProjectRevision, runId, this.clock(), authorization);
       // This await is intentionally before returning to UI polling. If a tab
       // closes immediately after start, the signed capability still recovers.
       await input.store.persistCaptionGenerationReceipt(runId, started.receipt);
+      notifyGenerationLifecycle(input, { phase: "receipt-persisted", runId, targetTrack: "Captions" });
       return started;
     } catch (error) {
       const current = input.store.getSnapshot().project;
@@ -438,26 +544,43 @@ export class CaptionGenerationClient implements CaptionGenerationClientPort {
       // A transport failure or explicit dispatch-pending response is ambiguous:
       // retain the lease so the same run id can be retried instead of racing a
       // server-side Workflow that already holds its signed receipt.
-      if (!durableStartMayExist && clientError !== null && clientError.details.dispatchMayBeDurable !== true && current !== null && isMatchingCaptionLease(current, runId)) {
-        await input.store.executeCommand({
+      const ambiguous = durableStartMayExist || clientError === null || clientError.details.dispatchMayBeDurable === true;
+      if (ambiguous) notifyGenerationLifecycle(input, { phase: "dispatch-uncertain", runId, targetTrack: "Captions" });
+      if (!ambiguous && current !== null && isMatchingCaptionLease(current, runId)) {
+        const released = await input.store.executeCommand({
           type: "ReleaseGenerationRun",
           actor: aiActor,
           runId,
           expectedProjectRevision: current.projectRevision,
-        }).catch(() => undefined);
-        if (receiptSlotReserved) await input.store.releaseCaptionGenerationReceiptReservation?.(runId).catch(() => undefined);
+        }, input.project.projectId).catch(() => null);
+        if (released?.error === undefined) notifyGenerationLifecycle(input, { phase: "lease-released", runId, targetTrack: "Captions" });
+        if (receiptSlotReserved) {
+          try { await input.store.releaseCaptionGenerationReceiptReservation?.(runId); } catch { /* reservation cleanup is best-effort */ }
+        }
+      }
+      const retained = input.store.getSnapshot().project;
+      if (retained !== null && isMatchingCaptionLease(retained, runId)) {
+        throw withGenerationLifecycleOutcome(error, {
+          runId,
+          targetTrack: "Captions",
+          disposition: ambiguous ? "accepted-unknown" : "lifecycle-pending",
+          operation: "start",
+          receiptState: "missing",
+        });
       }
       throw error;
     }
   }
 
-  public async status(receipt: GenerationClientReceipt): Promise<GenerationRunStatus> {
+  public async status(receipt: GenerationClientReceipt, signal?: AbortSignal): Promise<GenerationRunStatus> {
+    throwIfGenerationAborted(signal);
     const response = await this.fetcher(`/api/generation-runs/${encodeURIComponent(receipt.runId)}`, {
       headers: {
       authorization: `Bearer ${receipt.session}`,
       "x-cuebench-generation-receipt": receipt.signedGenerationReceipt,
       "x-cuebench-project-owner": receipt.projectOwnerCapability,
       },
+      ...(signal === undefined ? {} : { signal }),
     });
     if (!response.ok) throw await responseError(response, "CueBench could not read caption-generation status.");
     const record = responseRecord(await response.json(), "CueBench did not return caption-generation status.");
@@ -468,7 +591,7 @@ export class CaptionGenerationClient implements CaptionGenerationClientPort {
     return status;
   }
 
-  private async requestCancellation(receipt: GenerationClientReceipt): Promise<{
+  private async requestCancellation(receipt: GenerationClientReceipt, signal?: AbortSignal): Promise<{
     readonly status: GenerationRunStatus;
     readonly cleanup: "pending" | "completed";
   }> {
@@ -479,6 +602,7 @@ export class CaptionGenerationClient implements CaptionGenerationClientPort {
         "x-cuebench-generation-receipt": receipt.signedGenerationReceipt,
         "x-cuebench-project-owner": receipt.projectOwnerCapability,
       },
+      ...(signal === undefined ? {} : { signal }),
     });
     if (!response.ok) throw await responseError(response, "CueBench could not cancel this caption-generation run.");
     const record = responseRecord(await response.json(), "CueBench did not confirm caption-generation cancellation.");
@@ -531,7 +655,11 @@ export class CaptionGenerationClient implements CaptionGenerationClientPort {
     readonly status: GenerationRunStatus;
     readonly cleanup: "pending" | "completed";
   }> {
-    const remote = await this.requestCancellation(receipt);
+    // Persisting cancellation intent is the first durable edge. The active
+    // run family may be replaced synchronously after that write, so only an
+    // explicit invocation cancellation may reach the idempotent DELETE.
+    const remote = await this.requestCancellation(receipt, input.postCommitSignal);
+    notifyGenerationLifecycle(input, { phase: "remote-cancelled", runId: receipt.runId, targetTrack: "Captions" });
     // This write is intentionally before local lease release. A pending
     // cleanup response is a durable capability to retry, not a successful
     // cancellation completion that can be forgotten after a reload.
@@ -539,7 +667,7 @@ export class CaptionGenerationClient implements CaptionGenerationClientPort {
     // Server-side Cancelled is the authoritative terminal fence. Browser
     // editability must not be held hostage by an independent private-object
     // drain; its pending receipt remains visible and retryable after release.
-    await this.settleCancelledCaptionLease(input.store, persisted);
+    await this.settleCancelledCaptionLease(input.store, persisted, input.actor ?? humanActor);
     return remote;
   }
 
@@ -547,17 +675,19 @@ export class CaptionGenerationClient implements CaptionGenerationClientPort {
   private async releaseCaptionLease(
     store: GenerationProjectStore,
     runId: string,
+    actor: Actor = humanActor,
   ): Promise<void> {
     const current = store.getSnapshot().project;
     if (current !== null && isMatchingCaptionLease(current, runId)) {
       const released = await store.executeCommand({
         type: "ReleaseGenerationRun",
-        // The same anonymous-session capability that authorized DELETE is a
-        // human discard/release action in the local canonical project.
-        actor: humanActor,
+        // Preserve the caller that initiated this exact cancellation: ordinary
+        // UI cleanup is Human, while a WebMCP request remains BrowserAgent in
+        // the Court Record instead of being silently re-attributed.
+        actor,
         runId,
         expectedProjectRevision: current.projectRevision,
-      });
+      }, current.projectId);
       if (released.error !== undefined && released.error.code !== "STALE_RUN") {
         throw new GenerationClientError("CueBench confirmed cloud cancellation, but the local target-track lease needs recovery before it can be released.", { code: released.error.code });
       }
@@ -588,6 +718,7 @@ export class CaptionGenerationClient implements CaptionGenerationClientPort {
   private async settleCancelledCaptionLease(
     store: GenerationProjectStore,
     receipt: GenerationClientReceipt,
+    actor: Actor = humanActor,
   ): Promise<GenerationClientReceipt> {
     const terminal = receipt.terminalCleanup;
     if (terminal?.action !== "cancelled") {
@@ -597,7 +728,7 @@ export class CaptionGenerationClient implements CaptionGenerationClientPort {
     // Preserve `localLeaseRelease: pending` before invoking the project
     // command. If the tab closes after the cloud acknowledgement but before
     // this command, reload has an explicit safe, idempotent release path.
-    await this.releaseCaptionLease(store, receipt.runId);
+    await this.releaseCaptionLease(store, receipt.runId, actor);
     const settled: GenerationClientReceipt = {
       ...receipt,
       terminalCleanup: {
@@ -669,8 +800,30 @@ export class CaptionGenerationClient implements CaptionGenerationClientPort {
   }
 
   public async cancel(input: CancelCaptionGenerationInput): Promise<GenerationRunStatus> {
-    const requested = await this.persistCancellationIntent(input.store, input.receipt);
-    return (await this.completeCancellationRequest(input, requested)).status;
+    let intentCommitted = input.receipt.cancellationRequested?.status === "requested";
+    try {
+      throwIfGenerationAborted(input.signal);
+      const requested = await this.persistCancellationIntent(input.store, input.receipt);
+      intentCommitted = true;
+      notifyGenerationLifecycle(input, { phase: "cancellation-intent-persisted", runId: requested.runId, targetTrack: "Captions" });
+      return (await this.completeCancellationRequest(input, requested)).status;
+    } catch (error) {
+      // Before the write-ahead intent exists, an explicit browser-agent
+      // cancellation is genuinely unchanged and must not masquerade as a
+      // retained lifecycle operation.
+      if (!intentCommitted && error instanceof Error && error.name === "AbortError") throw error;
+      const current = input.store.getSnapshot().project;
+      if (current !== null && isMatchingCaptionLease(current, input.receipt.runId)) {
+        throw withGenerationLifecycleOutcome(error, {
+          runId: input.receipt.runId,
+          targetTrack: "Captions",
+          disposition: "lifecycle-pending",
+          operation: "cancel",
+          receiptState: "available",
+        });
+      }
+      throw error;
+    }
   }
 
   public async retryCancellationCleanup(input: CancelCaptionGenerationInput): Promise<void> {
@@ -823,7 +976,7 @@ export class CaptionGenerationClient implements CaptionGenerationClientPort {
     return adopted;
   }
 
-  public async loadStoredReceipt(store: GenerationProjectStore, project: CaptionProject, runId: string): Promise<GenerationClientReceipt | null> {
+  public async peekStoredReceipt(store: GenerationProjectStore, project: CaptionProject, runId: string): Promise<GenerationClientReceipt | null> {
     const value = await store.loadCaptionGenerationReceipt(runId);
     if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
     const receipt = value as Partial<GenerationClientReceipt>;
@@ -873,8 +1026,14 @@ export class CaptionGenerationClient implements CaptionGenerationClientPort {
       ...(terminalCleanup === undefined ? {} : { terminalCleanup }),
       ...(expirySettlement === undefined ? {} : { expirySettlement }),
     } as GenerationClientReceipt;
-    return this.clock() >= normalized.retentionExpiresAtMs
-      ? this.settleExpiredReceipt(store, normalized)
-      : normalized;
+    return normalized;
+  }
+
+  /** Human recovery may settle expiry; read-only inspectors must use peekStoredReceipt instead. */
+  public async loadStoredReceipt(store: GenerationProjectStore, project: CaptionProject, runId: string): Promise<GenerationClientReceipt | null> {
+    const normalized = await this.peekStoredReceipt(store, project, runId);
+    return normalized === null || this.clock() < normalized.retentionExpiresAtMs
+      ? normalized
+      : this.settleExpiredReceipt(store, normalized);
   }
 }

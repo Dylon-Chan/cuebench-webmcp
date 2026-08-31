@@ -102,6 +102,23 @@ describe("hosted narration-preview browser gateway", () => {
     expect(JSON.stringify(sent.headers)).not.toMatch(/openai|api[_-]?key/i);
   });
 
+  it("forwards an agent cancellation signal to the hosted narration request", async () => {
+    const bytes = wav();
+    const fixture = setup(new Response(responseBody(bytes), {
+      headers: {
+        "cache-control": "no-store",
+        "content-length": String(bytes.byteLength),
+        "content-type": "audio/wav",
+        "x-cuebench-narration-duration-ms": "1000",
+        "x-cuebench-narration-store": "not-applicable",
+      },
+    }));
+    const controller = new AbortController();
+
+    await fixture.gateway.synthesize(request, { signal: controller.signal });
+    expect(fixture.calls[0]?.init?.signal).toBe(controller.signal);
+  });
+
   it("rejects a hosted WAV receipt whose declared duration does not match the measured bytes", async () => {
     const bytes = wav();
     const fixture = setup(new Response(responseBody(bytes), {

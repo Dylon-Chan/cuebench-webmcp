@@ -106,6 +106,34 @@ describe("domain reducer", () => {
     expect(Object.keys(result.project.captions.items)).toEqual(["c05", "c06"]);
   });
 
+  it("requires the explicit visible-confirmation marker for a BrowserAgent merge when either source cue is Sustained", () => {
+    const sustained = applyCommand(fixtureProject(), {
+      type: "SustainItem",
+      actor: { type: "Human", id: "teacher" },
+      itemId: "c05",
+      expectedItemRevision: 1,
+      expectedProjectRevision: 1,
+    }).project;
+    const command = {
+      type: "MergeCue" as const,
+      actor: { type: "BrowserAgent" as const, id: "browser-agent" },
+      itemId: "c05",
+      cueId: "c05",
+      adjacentCueId: "c06",
+      expectedItemRevision: 2,
+      expectedAdjacentItemRevision: 1,
+      expectedProjectRevision: sustained.projectRevision,
+    };
+    const before = JSON.stringify(sustained);
+    expect(applyCommand(sustained, command).error?.code).toBe("HUMAN_AUTHORITY_REQUIRED");
+    expect(JSON.stringify(sustained)).toBe(before);
+
+    const accepted = applyCommand(sustained, { ...command, confirmedSustainedReopen: true });
+    expect(accepted.error).toBeUndefined();
+    expect(accepted.project.captions.items.c05?.current.state).toBe("Proposed");
+    expect(accepted.project.courtRecord.at(-1)?.actor).toEqual(command.actor);
+  });
+
   it("leases only the target track and blocks profile changes while a run is active", () => {
     const run = applyCommand(fixtureProject(), {
       type: "StartGenerationRun",
@@ -143,6 +171,30 @@ describe("domain reducer", () => {
       expectedProjectRevision: 2,
     });
     expect(profile.error?.code).toBe("TARGET_TRACK_LEASE_CONFLICT");
+  });
+
+  it("records an explicit BrowserAgent caption-run release without fabricating Human authority", () => {
+    const leased = applyCommand(fixtureProject(), {
+      type: "StartGenerationRun",
+      actor: { type: "CueBenchAI", id: "cuebench-ai" },
+      runId: "caption-browser-agent-cancel",
+      targetTrack: "Captions",
+      expectedProjectRevision: 1,
+    }).project;
+
+    const released = applyCommand(leased, {
+      type: "ReleaseGenerationRun",
+      actor: { type: "BrowserAgent", id: "browser-agent" },
+      runId: "caption-browser-agent-cancel",
+      expectedProjectRevision: leased.projectRevision,
+    });
+
+    expect(released.error).toBeUndefined();
+    expect(released.project.activeGenerationRun).toBeNull();
+    expect(released.project.courtRecord.at(-1)).toMatchObject({
+      type: "ReleaseGenerationRun",
+      actor: { type: "BrowserAgent", id: "browser-agent" },
+    });
   });
 
   it("requires confirmation to replace Proposed cues, preserves Sustained cues, and releases only the matching caption lease", () => {

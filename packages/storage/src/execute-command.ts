@@ -44,11 +44,19 @@ export const executePersistentCommand = async (
         db.evidence,
         db.courtRecord,
         db.certifications,
+        db.settings,
       ],
       async () => {
         const project = await loadProjectInTransaction(db, projectId);
         if (project === undefined) throw new PersistentProjectNotFoundError(projectId);
         projectReadForCas = project;
+        if (options.authorizeCommand !== undefined && !(await options.authorizeCommand())) {
+          return {
+            project,
+            events: [],
+            error: domainError("STALE_PROJECT", "The project instance changed in another browser context."),
+          };
+        }
         const result = applyCommand(project, command);
         if (result.error !== undefined) return result;
         await appendAcceptedProjectInTransaction(db, project, result.project, options);
@@ -94,11 +102,19 @@ export const adoptStagedCaptionGenerationResult = async (
         db.courtRecord,
         db.certifications,
         db.runReceipts,
+        db.settings,
       ],
       async () => {
         const project = await loadProjectInTransaction(db, projectId);
         if (project === undefined) throw new PersistentProjectNotFoundError(projectId);
         projectReadForCas = project;
+        if (options.authorizeCommand !== undefined && !(await options.authorizeCommand())) {
+          return {
+            project,
+            events: [],
+            error: domainError("STALE_PROJECT", "The project instance changed in another browser context."),
+          };
+        }
         const receipt = await db.runReceipts.get(runReceiptKey(projectId, command.runId));
         if (receipt === undefined) {
           return {
@@ -184,11 +200,19 @@ export const adoptStagedAudioDescriptionGenerationResult = async (
         db.courtRecord,
         db.certifications,
         db.runReceipts,
+        db.settings,
       ],
       async () => {
         const project = await loadProjectInTransaction(db, projectId);
         if (project === undefined) throw new PersistentProjectNotFoundError(projectId);
         projectReadForCas = project;
+        if (options.authorizeCommand !== undefined && !(await options.authorizeCommand())) {
+          return {
+            project,
+            events: [],
+            error: domainError("STALE_PROJECT", "The project instance changed in another browser context."),
+          };
+        }
         const receipt = await db.runReceipts.get(runReceiptKey(projectId, command.runId));
         if (receipt === undefined) {
           return {
@@ -272,10 +296,14 @@ export const settleExpiredAudioDescriptionGenerationReceipt = async (
       db.courtRecord,
       db.certifications,
       db.runReceipts,
+      db.settings,
     ],
     async () => {
       const project = await loadProjectInTransaction(db, projectId);
       if (project === undefined) throw new PersistentProjectNotFoundError(projectId);
+      if (options.authorizeCommand !== undefined && !(await options.authorizeCommand())) {
+        throw new StorageStaleWriteError(projectId);
+      }
       const row = await db.runReceipts.get(runReceiptKey(projectId, runId));
       if (row === undefined) return { project, receipt: null };
       const payload = asRecord(row.receipt.payload);

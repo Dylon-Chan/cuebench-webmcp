@@ -1,4 +1,4 @@
-import { useCallback, useMemo, useRef, useState, useSyncExternalStore } from "react";
+import { useCallback, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import { Navigate, Route, Routes } from "react-router-dom";
 import type { CaptionProject } from "@cuebench/domain";
 import { VideoEvidenceBay } from "../features/evidence/VideoEvidenceBay";
@@ -20,6 +20,7 @@ import { AdGenerationStatus } from "../features/generation/AdGenerationStatus";
 import type { SourceProvenance } from "../features/project/source-provenance";
 import { CourtRecord } from "../features/review/CourtRecord";
 import { ReviewDocket, ReviewSelectionSummary } from "../features/review/ReviewDocket";
+import { WebMcpBridge, type BoundWebMcpProfileProposal } from "./WebMcpBridge";
 
 export interface AppRoutesProps {
   readonly store: ProjectStore;
@@ -49,8 +50,17 @@ export function WorkbenchShell({ project, mode, sourceObjectUrl, sourceProvenanc
     ? "Validation not run"
     : `${project.validation.blockerCount} blockers · ${project.validation.warningCount} warnings`;
   const [reviewSeekToMediaTime, setReviewSeekToMediaTime] = useState<(mediaTimeMs: number) => void>(() => () => undefined);
+  const [browserAgentFocusSeek, setBrowserAgentFocusSeek] = useState<((input: { readonly playheadMs: number; readonly visualEpoch: number }) => Promise<boolean>) | null>(null);
   const [readNativePlayheadMs, setReadNativePlayheadMs] = useState<(() => number) | null>(null);
   const [reviewDraftActive, setReviewDraftActive] = useState(false);
+  const [agentProfileProposal, setAgentProfileProposal] = useState<BoundWebMcpProfileProposal | null>(null);
+  const [agentProfileProposalOpen, setAgentProfileProposalOpen] = useState(false);
+  const pendingProfilePublicationRef = useRef<{
+    readonly proposalId: string;
+    readonly resolve: () => void;
+    readonly reject: (reason?: unknown) => void;
+    readonly removeAbortListener: () => void;
+  } | null>(null);
   const narrationPreviewGateway = useMemo(() => {
     if (mode !== "durable") return undefined;
     try {
@@ -64,11 +74,94 @@ export function WorkbenchShell({ project, mode, sourceObjectUrl, sourceProvenanc
   const reviewItemNavigationRef = useRef<(itemId: string, sourceLabel: string) => void>(() => undefined);
   const reviewItemRevisionFocusRef = useRef<(itemId: string, itemRevision: number, sourceLabel: string) => void>(() => undefined);
   const reviewTimelineRebaseRef = useRef<(itemId: string, previousItemRevision: number, project: CaptionProject) => void>(() => undefined);
+  const browserAgentFocusRef = useRef<(input: {
+    readonly itemId: string;
+    readonly itemRevision: number;
+    readonly playheadMs: number;
+    readonly evidenceId?: string;
+    readonly signal?: AbortSignal;
+    readonly visualEpoch?: number;
+  }) => Promise<boolean>>(async () => false);
+  const browserAgentSelectionPreflightRef = useRef<(input: {
+    readonly itemId: string;
+    readonly itemRevision: number;
+    readonly playheadMs: number;
+    readonly evidenceId?: string;
+    readonly signal?: AbortSignal;
+  }) => Promise<boolean>>(async () => false);
+  const projectInstanceCapabilityFingerprint = store.getProjectInstanceFence()?.projectInstanceCapabilityFingerprint ?? null;
+  const profileProposalMatchesProject = agentProfileProposal !== null
+    && agentProfileProposal.projectId === project.projectId
+    && agentProfileProposal.baseProjectRevision === project.projectRevision
+    && agentProfileProposal.baseProfileRevision === project.qualityProfile.revision
+    && agentProfileProposal.projectInstanceEpoch === store.getProjectInstanceEpoch()
+    && agentProfileProposal.projectInstanceCapabilityFingerprint === projectInstanceCapabilityFingerprint;
+  const publishAgentProfileProposal = useCallback((proposal: BoundWebMcpProfileProposal, signal: AbortSignal): Promise<void> => new Promise((resolve, reject) => {
+    if (signal.aborted) {
+      reject(new DOMException("Browser Agent profile publication was cancelled.", "AbortError"));
+      return;
+    }
+    const previous = pendingProfilePublicationRef.current;
+    if (previous !== null) {
+      previous.removeAbortListener();
+      previous.reject(new Error("A newer Browser Agent profile proposal replaced the previous pending proposal."));
+    }
+    let settled = false;
+    const settle = (accepted: boolean, reason?: unknown) => {
+      if (settled) return;
+      settled = true;
+      signal.removeEventListener("abort", onAbort);
+      if (pendingProfilePublicationRef.current?.proposalId === proposal.proposalId) pendingProfilePublicationRef.current = null;
+      if (!accepted) {
+        setAgentProfileProposal(null);
+        setAgentProfileProposalOpen(false);
+        reject(reason ?? new DOMException("Browser Agent profile publication was cancelled.", "AbortError"));
+        return;
+      }
+      resolve();
+    };
+    const onAbort = () => settle(false);
+    signal.addEventListener("abort", onAbort, { once: true });
+    pendingProfilePublicationRef.current = {
+      proposalId: proposal.proposalId,
+      resolve: () => settle(true),
+      reject: (reason) => settle(false, reason),
+      removeAbortListener: () => signal.removeEventListener("abort", onAbort),
+    };
+    setAgentProfileProposal(proposal);
+    setAgentProfileProposalOpen(true);
+  }), []);
+  const acknowledgeProfileProposalVisible = useCallback((proposalId: string) => {
+    const pending = pendingProfilePublicationRef.current;
+    if (pending?.proposalId !== proposalId) return;
+    pendingProfilePublicationRef.current = null;
+    pending.removeAbortListener();
+    pending.resolve();
+  }, []);
+
+  useLayoutEffect(() => {
+    if (agentProfileProposal === null || profileProposalMatchesProject) return;
+    const pending = pendingProfilePublicationRef.current;
+    pendingProfilePublicationRef.current = null;
+    pending?.removeAbortListener();
+    pending?.reject(new Error("The Browser Agent profile proposal no longer matches the visible project revision."));
+    setAgentProfileProposal(null);
+    setAgentProfileProposalOpen(false);
+  }, [agentProfileProposal, profileProposalMatchesProject]);
+  useLayoutEffect(() => () => {
+    const pending = pendingProfilePublicationRef.current;
+    pendingProfilePublicationRef.current = null;
+    pending?.removeAbortListener();
+    pending?.reject(new Error("CueBench closed before the Browser Agent profile proposal was visible."));
+  }, []);
   const receiveVideoSeek = useCallback((seekToMediaTime: (mediaTimeMs: number) => void) => {
     setReviewSeekToMediaTime(() => seekToMediaTime);
   }, []);
   const receiveNativePlayhead = useCallback((readMediaTimeMs: () => number) => {
     setReadNativePlayheadMs(() => readMediaTimeMs);
+  }, []);
+  const receiveBrowserAgentFocusSeek = useCallback((seek: (input: { readonly playheadMs: number; readonly visualEpoch: number }) => Promise<boolean>) => {
+    setBrowserAgentFocusSeek(() => seek);
   }, []);
   const receiveReviewItemNavigation = useCallback((navigate: (itemId: string, sourceLabel: string) => void) => {
     reviewItemNavigationRef.current = navigate;
@@ -88,6 +181,71 @@ export function WorkbenchShell({ project, mode, sourceObjectUrl, sourceProvenanc
   const reportTimelineCanonicalRevision = useCallback((itemId: string, previousItemRevision: number, canonicalProject: CaptionProject) => {
     reviewTimelineRebaseRef.current(itemId, previousItemRevision, canonicalProject);
   }, []);
+  const receiveBrowserAgentFocus = useCallback((focus: (input: {
+    readonly itemId: string;
+    readonly itemRevision: number;
+    readonly playheadMs: number;
+    readonly evidenceId?: string;
+    readonly signal?: AbortSignal;
+    readonly visualEpoch?: number;
+  }) => Promise<boolean>) => {
+    browserAgentFocusRef.current = focus;
+  }, []);
+  const receiveBrowserAgentSelectionPreflight = useCallback((prepare: (input: {
+    readonly itemId: string;
+    readonly itemRevision: number;
+    readonly playheadMs: number;
+    readonly evidenceId?: string;
+    readonly signal?: AbortSignal;
+  }) => Promise<boolean>) => {
+    browserAgentSelectionPreflightRef.current = prepare;
+  }, []);
+  const prepareBrowserAgentSelection = useCallback(async (input: {
+    readonly kind: "CaptionCue" | "AudioDescriptionBeat";
+    readonly selectionId: string;
+    readonly selectionRevision: number;
+    readonly playheadMs: number;
+    readonly evidenceId?: string;
+    readonly signal: AbortSignal;
+  }): Promise<boolean> => browserAgentSelectionPreflightRef.current({
+    itemId: input.selectionId,
+    itemRevision: input.selectionRevision,
+    playheadMs: input.playheadMs,
+    ...(input.evidenceId === undefined ? {} : { evidenceId: input.evidenceId }),
+    signal: input.signal,
+  }), []);
+  const revealBrowserAgentSelection = useCallback(async (input: {
+    readonly kind: "CaptionCue" | "AudioDescriptionBeat" | "AudioDescriptionGap";
+    readonly selectionId: string;
+    readonly selectionRevision: number;
+    readonly playheadMs: number;
+    readonly evidenceId?: string;
+    readonly signal?: AbortSignal;
+    readonly visualEpoch: number;
+  }): Promise<boolean> => {
+    const wasAborted = () => input.signal?.aborted === true;
+    if (wasAborted()) return false;
+    if (input.kind === "AudioDescriptionGap") {
+      if (browserAgentFocusSeek === null) return false;
+      return browserAgentFocusSeek({ playheadMs: input.playheadMs, visualEpoch: input.visualEpoch });
+    }
+    const focused = await browserAgentFocusRef.current({
+      itemId: input.selectionId,
+      itemRevision: input.selectionRevision,
+      playheadMs: input.playheadMs,
+      ...(input.evidenceId === undefined ? {} : { evidenceId: input.evidenceId }),
+      ...(input.signal === undefined ? {} : { signal: input.signal }),
+      visualEpoch: input.visualEpoch,
+    });
+    // A dirty-review cancellation must not even seek a different clip span;
+    // the old editor remains the page's visible, protected context.
+    if (!focused) return false;
+    if (wasAborted()) return false;
+    if (browserAgentFocusSeek === null) return false;
+    const visible = await browserAgentFocusSeek({ playheadMs: input.playheadMs, visualEpoch: input.visualEpoch });
+    if (wasAborted()) return false;
+    return visible;
+  }, [browserAgentFocusSeek]);
 
   return (
     <main className="workbench" aria-label="CueBench workbench">
@@ -114,8 +272,15 @@ export function WorkbenchShell({ project, mode, sourceObjectUrl, sourceProvenanc
           <ValidationPanel project={project} onCommand={(command) => store.executeCommand(command)} />
           <ProfileProposalDialog
             project={project}
-            proposal={builtInProfileProposal(project)}
+            projectInstanceEpoch={store.getProjectInstanceEpoch()}
+            projectInstanceCapabilityFingerprint={projectInstanceCapabilityFingerprint}
+            proposal={profileProposalMatchesProject ? agentProfileProposal : builtInProfileProposal(project)}
             onCommand={(command) => store.executeCommand(command)}
+            {...(profileProposalMatchesProject ? {
+              open: agentProfileProposalOpen,
+              onOpenChange: setAgentProfileProposalOpen,
+              onProposalVisible: acknowledgeProfileProposalVisible,
+            } : {})}
           />
           <CertificationReview project={project} onCommand={(command) => store.executeCommand(command)} />
           <ExportDialog
@@ -136,6 +301,7 @@ export function WorkbenchShell({ project, mode, sourceObjectUrl, sourceProvenanc
           onCommand={(command) => store.executeCommand(command)}
           onSeekReady={receiveVideoSeek}
           onPlayheadReady={receiveNativePlayhead}
+          onBrowserAgentFocusSeekReady={receiveBrowserAgentFocusSeek}
           onRequestItemNavigation={requestReviewItemNavigation}
           reviewDraftActive={reviewDraftActive}
           onCanonicalItemRevision={reportTimelineCanonicalRevision}
@@ -152,6 +318,8 @@ export function WorkbenchShell({ project, mode, sourceObjectUrl, sourceProvenanc
           </>}
           onRegisterItemNavigation={receiveReviewItemNavigation}
           onRegisterItemRevisionFocus={receiveReviewItemRevisionFocus}
+          onRegisterBrowserAgentFocus={receiveBrowserAgentFocus}
+          onRegisterBrowserAgentSelectionPreflight={receiveBrowserAgentSelectionPreflight}
           onRegisterCanonicalTimelineEdit={receiveReviewTimelineRebase}
           onDraftStateChange={setReviewDraftActive}
           evidenceContentResolver={projectLocalEvidenceContentResolver(project)}
@@ -168,6 +336,14 @@ export function WorkbenchShell({ project, mode, sourceObjectUrl, sourceProvenanc
         />
         <GenerationStatus project={project} store={store} />
         <AdGenerationStatus project={project} store={store} />
+        {webMcpAvailable ? <WebMcpBridge
+          project={project}
+          store={store}
+          onProfileProposal={publishAgentProfileProposal}
+          onRevealSelection={revealBrowserAgentSelection}
+          onPrepareSelectionFocus={prepareBrowserAgentSelection}
+          {...(readNativePlayheadMs === null ? {} : { onReadNativePlayheadMs: readNativePlayheadMs })}
+        /> : null}
       </div>
     </main>
   );

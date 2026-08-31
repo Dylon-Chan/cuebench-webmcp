@@ -21,6 +21,7 @@ import {
   DEXIE_DATABASE_VERSION,
   StorageImmutableWriteError,
   StorageReadValidationError,
+  StorageStaleWriteError,
   estimateProjectStorage,
   executePersistentCommand,
   initializeProject,
@@ -496,6 +497,24 @@ describe("CueBenchDatabase", () => {
       contentType: "audio/wav",
     });
     await expect(loadNarrationBlob(db, "project-1", "e".repeat(64))).resolves.toBeUndefined();
+  });
+
+  it("fences narration-cache reads and writes before the cache row boundary", async () => {
+    const db = testDatabase();
+    const cacheKey = "f".repeat(64);
+    const denied = { authorizeCommand: vi.fn(async () => false) };
+
+    await expect(loadNarrationBlob(db, "project-1", cacheKey, denied)).rejects.toBeInstanceOf(StorageStaleWriteError);
+    await expect(saveNarrationBlob(db, "project-1", {
+      beatId: "ad01",
+      itemRevision: 2,
+      cacheKey,
+      blob: new Blob(["narration"], { type: "audio/wav" }),
+      measuredDurationMs: 1_750,
+    }, denied)).rejects.toBeInstanceOf(StorageStaleWriteError);
+
+    expect(denied.authorizeCommand).toHaveBeenCalledTimes(2);
+    await expect(loadNarrationBlob(db, "project-1", cacheKey)).resolves.toBeUndefined();
   });
 
   it("persists append-only validation and actual export round-trip history for the Impact Summary", async () => {

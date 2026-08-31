@@ -1,5 +1,5 @@
 import type { CaptionProject } from "@cuebench/domain";
-import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useLayoutEffect, useRef, useState, type ReactNode } from "react";
 import {
   Timeline,
   type TimelineCommandExecutor,
@@ -20,6 +20,14 @@ export interface VideoEvidenceBayProps {
   readonly onSeekReady?: (seekToMediaTime: (mediaTimeMs: number) => void) => void;
   /** Provides a direct native-clock read for a caption split point. */
   readonly onPlayheadReady?: (readMediaTimeMs: () => number) => void;
+  /**
+   * WebMCP focus waits for this exact native-clock/layout acknowledgement;
+   * ordinary Human navigation continues to use the void seek callback above.
+   */
+  readonly onBrowserAgentFocusSeekReady?: (seek: (input: {
+    readonly playheadMs: number;
+    readonly visualEpoch: number;
+  }) => Promise<boolean>) => void;
   /** Routes timeline selection through the review draft authority boundary. */
   readonly onRequestItemNavigation?: (itemId: string, sourceLabel: string) => void;
   /** Prevents a different timeline item from replacing a visible dirty review draft. */
@@ -41,6 +49,7 @@ export function VideoEvidenceBay({
   evidence,
   onSeekReady,
   onPlayheadReady,
+  onBrowserAgentFocusSeekReady,
   onRequestItemNavigation,
   reviewDraftActive = false,
   onCanonicalItemRevision,
@@ -50,6 +59,12 @@ export function VideoEvidenceBay({
   const [isMuted, setIsMuted] = useState(false);
   const [volume, setVolume] = useState(1);
   const [mediaError, setMediaError] = useState<string | null>(null);
+  const [pendingBrowserAgentSeek, setPendingBrowserAgentSeek] = useState<{
+    readonly playheadMs: number;
+    readonly visualEpoch: number;
+    readonly resolve: (visible: boolean) => void;
+  } | null>(null);
+  const pendingBrowserAgentSeekRef = useRef<typeof pendingBrowserAgentSeek>(null);
   const playhead = usePlayhead(videoRef, { durationMs: project.media.durationMs });
   const readNativePlayhead = useCallback(() => clampMediaTime(
     (videoRef.current?.currentTime ?? 0) * 1_000,
@@ -63,6 +78,56 @@ export function VideoEvidenceBay({
   useEffect(() => {
     onPlayheadReady?.(readNativePlayhead);
   }, [onPlayheadReady, readNativePlayhead]);
+
+  const seekBrowserAgentFocus = useCallback((input: {
+    readonly playheadMs: number;
+    readonly visualEpoch: number;
+  }): Promise<boolean> => new Promise((resolve) => {
+    const previous = pendingBrowserAgentSeekRef.current;
+    previous?.resolve(false);
+    const video = videoRef.current;
+    if (video === null) {
+      resolve(false);
+      return;
+    }
+    const next = {
+      playheadMs: clampMediaTime(input.playheadMs, project.media.durationMs),
+      visualEpoch: input.visualEpoch,
+      resolve,
+    };
+    pendingBrowserAgentSeekRef.current = next;
+    setPendingBrowserAgentSeek(next);
+    playhead.seekToMediaTime(next.playheadMs);
+  // `usePlayhead` returns a new projection object as time changes. The seek
+  // method itself is stable for this media source; depending on the complete
+  // projection would continuously republish this port into the parent and
+  // create a render loop even without WebMCP available.
+  }), [playhead.seekToMediaTime, project.media.durationMs]);
+
+  useEffect(() => {
+    onBrowserAgentFocusSeekReady?.(seekBrowserAgentFocus);
+  }, [onBrowserAgentFocusSeekReady, seekBrowserAgentFocus]);
+
+  useLayoutEffect(() => {
+    const pending = pendingBrowserAgentSeek;
+    if (pending === null) return;
+    const nativePlayhead = readNativePlayhead();
+    const renderedTime = document.querySelector<HTMLOutputElement>("output[aria-label='Current media time']");
+    const exactNativeState = Math.abs(nativePlayhead - pending.playheadMs) <= 1
+      && Math.abs(playhead.mediaTimeMs - pending.playheadMs) <= 1
+      && renderedTime?.textContent === formatMediaTime(pending.playheadMs);
+    if (!exactNativeState) return;
+    if (pendingBrowserAgentSeekRef.current !== pending) return;
+    pendingBrowserAgentSeekRef.current = null;
+    setPendingBrowserAgentSeek(null);
+    pending.resolve(true);
+  }, [pendingBrowserAgentSeek, playhead.mediaTimeMs, readNativePlayhead]);
+
+  useEffect(() => () => {
+    const pending = pendingBrowserAgentSeekRef.current;
+    pendingBrowserAgentSeekRef.current = null;
+    pending?.resolve(false);
+  }, []);
 
   const syncNativeAudioState = () => {
     const video = videoRef.current;

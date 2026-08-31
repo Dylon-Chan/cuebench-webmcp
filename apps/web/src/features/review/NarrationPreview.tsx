@@ -49,7 +49,8 @@ export interface CachedNarrationPreview {
 export interface NarrationPreviewGateway {
   readonly loadCached: (input: Pick<NarrationPreviewRequest, "projectId" | "cacheKey">) => Promise<CachedNarrationPreview | undefined>;
   readonly saveCached: (input: NarrationPreviewRequest & CachedNarrationPreview) => Promise<void>;
-  readonly synthesize: (input: NarrationPreviewRequest) => Promise<NarrationPreviewSynthesis>;
+  /** An agent-scoped preview forwards cancellation through the hosted request. */
+  readonly synthesize: (input: NarrationPreviewRequest, options?: { readonly signal?: AbortSignal }) => Promise<NarrationPreviewSynthesis>;
   readonly measureDurationMs: (blob: Blob) => Promise<number>;
   readonly createObjectUrl: (blob: Blob) => string;
   readonly revokeObjectUrl: (url: string) => void;

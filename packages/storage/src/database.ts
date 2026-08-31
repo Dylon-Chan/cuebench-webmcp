@@ -1796,6 +1796,13 @@ const projectTables = (db: CueBenchDatabase) => [
 export interface WriteProjectOptions {
   /** Test-only fault seam. Throwing aborts the whole IndexedDB transaction. */
   readonly beforeCourtRecordWrite?: (event: DomainEvent) => void;
+  /**
+   * Optional caller-owned capability fence. It runs after the canonical
+   * aggregate is read, inside the same IndexedDB transaction that would
+   * append a command. A false result rejects without exposing a write into a
+   * replacement project namespace.
+   */
+  readonly authorizeCommand?: () => boolean | Promise<boolean>;
 }
 
 const rowMaps = (rows: NormalizedProjectRows) => ({

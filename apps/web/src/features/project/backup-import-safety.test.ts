@@ -183,7 +183,10 @@ describe("backup import file safety", () => {
     };
     expect(countJsonNodes(nearNodeLimit)).toBeLessThanOrEqual(MAX_PORTABLE_PROJECT_JSON_NODES);
     expect(() => exportProjectBackup(nearNodeLimit)).toThrow(/10 MB portable import budget/i);
-  }, 20_000);
+  // The legal maximum payload intentionally exercises multiple megabytes of
+  // UTF-8 and the shared JSON-node budget. Give it room when Vitest runs this
+  // independent stress fixture alongside Worker generation tests.
+  }, 60_000);
 
   it("round-trips multiple retained evidence packages at the shared 2,700-word portable budget", async () => {
     const base = createProject({

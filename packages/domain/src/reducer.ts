@@ -1027,7 +1027,10 @@ export const applyCommand = (project: CaptionProject, command: DomainCommand): C
   }
   if (command.type === "ReleaseGenerationRun") {
     if (project.activeGenerationRun?.runId !== command.runId) return fail(project, "STALE_RUN", "The generation run is no longer active.");
-    if (command.actor.type !== "System" && command.actor.type !== "CueBenchAI" && command.actor.type !== "Human") return fail(project, "INVALID_ARGUMENT", "Only CueBench AI, System, or an authenticated Human may release a generation run.");
+    // A Browser Agent may record the cancellation it actually initiated. This
+    // does not grant it any Human-only ruling/certification authority; it
+    // preserves the truthful Court Record actor for a terminal run release.
+    if (command.actor.type !== "System" && command.actor.type !== "CueBenchAI" && command.actor.type !== "Human" && command.actor.type !== "BrowserAgent") return fail(project, "INVALID_ARGUMENT", "Only CueBench AI, System, a Browser Agent cancellation, or an authenticated Human may release a generation run.");
     return commit(project, command, { activeGenerationRun: null });
   }
   if (command.type === "ApplyProfile") {
@@ -1290,7 +1293,11 @@ export const applyCommand = (project: CaptionProject, command: DomainCommand): C
         !hasValidTime(project, item.current.startMs, item.current.endMs)
         || !hasValidTime(project, right.current.startMs, right.current.endMs)
       ) return fail(project, "INVALID_ARGUMENT", "Each source cue must have valid timing before merge.");
-      if (right.current.state === "Sustained" && !hasHumanAuthority(command.actor)) return fail(project, "HUMAN_AUTHORITY_REQUIRED", "Only a human may alter Sustained work.");
+      if (
+        (item.current.state === "Sustained" || right.current.state === "Sustained")
+        && !hasHumanAuthority(command.actor)
+        && command.confirmedSustainedReopen !== true
+      ) return fail(project, "HUMAN_AUTHORITY_REQUIRED", "A visible human confirmation is required before a Browser Agent reopens Sustained work.");
       if (right.current.startMs < item.current.startMs) return fail(project, "INVALID_ARGUMENT", "Merged cues must remain in chronological order.");
       const mergedEndMs = Math.max(item.current.endMs, right.current.endMs);
       if (!hasValidTime(project, item.current.startMs, mergedEndMs)) return fail(project, "INVALID_ARGUMENT", "Merged cue timing must remain within media bounds.");

@@ -3,6 +3,7 @@ import type { LocalCaptionEvidencePackage, StagedAudioDescriptionGenerationResul
 import { describe, expect, it, vi } from "vitest";
 import {
   AudioDescriptionGenerationClient,
+  type AudioDescriptionGenerationReceipt,
   type AudioDescriptionGenerationProjectStore,
 } from "./ad-generation-client";
 
@@ -111,6 +112,185 @@ const stagedResult = (project: CaptionProject, runId: string): StagedAudioDescri
 };
 
 describe("audio-description generation browser boundary", () => {
+  it("honors an agent abort after an awaited reservation and before acquiring an AD lease", async () => {
+    let project = projectFixture();
+    let releaseReservation: () => void = () => { throw new Error("Reservation was not reached."); };
+    const controller = new AbortController();
+    const executeCommand = vi.fn(async (command) => {
+      const result = applyCommand(project, command);
+      project = result.project;
+      return result;
+    });
+    const fetcher = vi.fn();
+    const store: AudioDescriptionGenerationProjectStore = {
+      getSnapshot: () => ({ project, mode: "durable" as const }),
+      executeCommand,
+      persistAudioDescriptionGenerationReceipt: vi.fn(),
+      reserveAudioDescriptionGenerationReceipt: async () => new Promise<void>((resolve) => { releaseReservation = resolve; }),
+      releaseAudioDescriptionGenerationReceiptReservation: vi.fn(),
+      loadAudioDescriptionGenerationReceipt: vi.fn(),
+      adoptStagedAudioDescriptionGenerationResult: vi.fn(),
+    };
+    const client = new AudioDescriptionGenerationClient({ fetcher, createRunId: () => "aborted-ad-run" });
+    const pending = client.start({ project, store, upload, signal: controller.signal });
+    await Promise.resolve();
+    controller.abort();
+    releaseReservation();
+
+    await expect(pending).rejects.toMatchObject({ name: "AbortError" });
+    expect(executeCommand).not.toHaveBeenCalled();
+    expect(fetcher).not.toHaveBeenCalled();
+    expect(project.activeGenerationRun).toBeNull();
+  });
+
+  it("does not let the lease-driven WebMCP family replacement abort its own AD POST", async () => {
+    let project = projectFixture();
+    const groupController = new AbortController();
+    const executeCommand = vi.fn(async (command) => {
+      const result = applyCommand(project, command);
+      project = result.project;
+      return result;
+    });
+    const fetcher = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+      if (init?.signal?.aborted === true) throw new DOMException("aborted", "AbortError");
+      const base = audioDescriptionBase(project);
+      return Response.json({
+        audioDescriptionGenerationReceipt: "opaque-ad-receipt",
+        retentionExpiresAtMs: now + 86_400_000,
+        status: {
+          contractVersion: 1,
+          runId: "self-swap-ad-run",
+          projectId: project.projectId,
+          targetTrack: "AudioDescriptions",
+          expectedProjectRevision: base.expectedProjectRevision,
+          stage: "Queued",
+        },
+      }, { status: 201 });
+    });
+    const store: AudioDescriptionGenerationProjectStore = {
+      getSnapshot: () => ({ project, mode: "durable" as const }),
+      executeCommand,
+      persistAudioDescriptionGenerationReceipt: vi.fn(),
+      loadAudioDescriptionGenerationReceipt: vi.fn(),
+      adoptStagedAudioDescriptionGenerationResult: vi.fn(),
+    };
+    const client = new AudioDescriptionGenerationClient({ fetcher, createRunId: () => "self-swap-ad-run", clock: () => now });
+
+    await expect(client.start({
+      project,
+      store,
+      signal: groupController.signal,
+      upload,
+      onLifecycleEvent: (event) => { if (event.phase === "lease-acquired") groupController.abort(); },
+    })).resolves.toMatchObject({ status: { runId: "self-swap-ad-run", stage: "Queued" } });
+
+    expect(fetcher).toHaveBeenCalledTimes(1);
+    expect(fetcher.mock.calls[0]?.[1]?.signal).toBeUndefined();
+  });
+
+  it("stops AD cancellation before its durable intent when the invocation is already aborted", async () => {
+    const project = applyCommand(projectFixture(), {
+      type: "StartGenerationRun",
+      actor: ai,
+      runId: "cancel-before-intent-ad",
+      targetTrack: "AudioDescriptions",
+      expectedProjectRevision: 1,
+    }).project;
+    const base = audioDescriptionBase(project);
+    const runReceipt: AudioDescriptionGenerationReceipt = {
+      version: 1,
+      runId: "cancel-before-intent-ad",
+      projectId: project.projectId,
+      signedAudioDescriptionGenerationReceipt: "opaque-ad-receipt",
+      session: upload.session,
+      expectedProjectRevision: base.expectedProjectRevision,
+      expectedQualityProfileRevision: base.qualityProfileRevision,
+      mediaSha256: project.media.sha256,
+      captionEvidenceHash: base.captionEvidenceHash,
+      sourceByteLength: upload.sourceByteLength,
+      sourceDurationMs: upload.durationMs,
+      projectOwnerCapability: owner,
+      savedAtMs: now,
+      retentionExpiresAtMs: now + 86_400_000,
+    };
+    const controller = new AbortController();
+    controller.abort();
+    const persistAudioDescriptionGenerationReceipt = vi.fn();
+    const fetcher = vi.fn();
+    const store: AudioDescriptionGenerationProjectStore = {
+      getSnapshot: () => ({ project, mode: "durable" as const }),
+      executeCommand: vi.fn(),
+      persistAudioDescriptionGenerationReceipt,
+      loadAudioDescriptionGenerationReceipt: vi.fn(),
+      adoptStagedAudioDescriptionGenerationResult: vi.fn(),
+    };
+    const client = new AudioDescriptionGenerationClient({ fetcher });
+
+    await expect(client.cancel({ project, store, receipt: runReceipt, signal: controller.signal })).rejects.toMatchObject({ name: "AbortError" });
+    expect(persistAudioDescriptionGenerationReceipt).not.toHaveBeenCalled();
+    expect(fetcher).not.toHaveBeenCalled();
+  });
+
+  it("does not let the cancellation-intent family replacement abort its own AD DELETE", async () => {
+    let project = applyCommand(projectFixture(), {
+      type: "StartGenerationRun",
+      actor: ai,
+      runId: "self-swap-cancel-ad",
+      targetTrack: "AudioDescriptions",
+      expectedProjectRevision: 1,
+    }).project;
+    const base = audioDescriptionBase(project);
+    const runReceipt: AudioDescriptionGenerationReceipt = {
+      version: 1,
+      runId: "self-swap-cancel-ad",
+      projectId: project.projectId,
+      signedAudioDescriptionGenerationReceipt: "opaque-ad-receipt",
+      session: upload.session,
+      expectedProjectRevision: base.expectedProjectRevision,
+      expectedQualityProfileRevision: base.qualityProfileRevision,
+      mediaSha256: project.media.sha256,
+      captionEvidenceHash: base.captionEvidenceHash,
+      sourceByteLength: upload.sourceByteLength,
+      sourceDurationMs: upload.durationMs,
+      projectOwnerCapability: owner,
+      savedAtMs: now,
+      retentionExpiresAtMs: now + 86_400_000,
+    };
+    const groupController = new AbortController();
+    const persistAudioDescriptionGenerationReceipt = vi.fn(async () => { groupController.abort(); });
+    const executeCommand = vi.fn(async (command) => {
+      const result = applyCommand(project, command);
+      project = result.project;
+      return result;
+    });
+    const fetcher = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+      if (init?.signal?.aborted === true) throw new DOMException("aborted", "AbortError");
+      return Response.json({
+        status: {
+          contractVersion: 1,
+          runId: runReceipt.runId,
+          projectId: runReceipt.projectId,
+          targetTrack: "AudioDescriptions",
+          expectedProjectRevision: runReceipt.expectedProjectRevision,
+          stage: "Cancelled",
+        },
+        cleanup: { version: 1, state: "completed", action: "cancelled", artifactKeys: [], requestedAtMs: now, completedAtMs: now + 1 },
+      });
+    });
+    const store: AudioDescriptionGenerationProjectStore = {
+      getSnapshot: () => ({ project, mode: "durable" as const }),
+      executeCommand,
+      persistAudioDescriptionGenerationReceipt,
+      loadAudioDescriptionGenerationReceipt: vi.fn(),
+      adoptStagedAudioDescriptionGenerationResult: vi.fn(),
+    };
+    const client = new AudioDescriptionGenerationClient({ fetcher });
+
+    await expect(client.cancel({ project, store, receipt: runReceipt, signal: groupController.signal })).resolves.toMatchObject({ stage: "Cancelled" });
+    expect(fetcher).toHaveBeenCalledTimes(1);
+    expect(fetcher.mock.calls[0]?.[1]?.signal).toBeUndefined();
+  });
+
   it("persists a signed receipt before status and sends only the canonical bounded caption projection", async () => {
     let project = projectFixture();
     const order: string[] = [];
@@ -177,6 +357,104 @@ describe("audio-description generation browser boundary", () => {
     });
     expect(payload).not.toHaveProperty("video");
     expect(payload).not.toHaveProperty("providerApiKey");
+  });
+
+  it("retains and reports the exact AD run identity when hosted dispatch is ambiguous", async () => {
+    let project = projectFixture();
+    const events: string[] = [];
+    const store: AudioDescriptionGenerationProjectStore = {
+      getSnapshot: () => ({ project, mode: "durable" as const }),
+      executeCommand: async (command) => {
+        const result = applyCommand(project, command);
+        project = result.project;
+        return result;
+      },
+      persistAudioDescriptionGenerationReceipt: vi.fn(),
+      loadAudioDescriptionGenerationReceipt: vi.fn(),
+      adoptStagedAudioDescriptionGenerationResult: vi.fn(),
+    };
+    const client = new AudioDescriptionGenerationClient({
+      createRunId: () => "ambiguous-ad-run",
+      fetcher: async () => { throw new Error("transport interrupted after dispatch"); },
+      clock: () => now,
+    });
+
+    await expect(client.start({
+      project,
+      store,
+      upload,
+      onLifecycleEvent: (event) => events.push(event.phase),
+    })).rejects.toMatchObject({
+      details: { lifecycleOutcome: { runId: "ambiguous-ad-run", targetTrack: "AudioDescriptions", disposition: "accepted-unknown" } },
+    });
+    expect(project.activeGenerationRun).toMatchObject({ runId: "ambiguous-ad-run", targetTrack: "AudioDescriptions" });
+    expect(events).toEqual(["lease-acquired", "dispatch-uncertain"]);
+  });
+
+  it("keeps a BrowserAgent-attributed AD cancellation recoverable when local lease release fails", async () => {
+    let project = applyCommand(projectFixture(), {
+      type: "StartGenerationRun",
+      actor: ai,
+      runId: "cancel-ad-run",
+      targetTrack: "AudioDescriptions",
+      expectedProjectRevision: 1,
+    }).project;
+    const base = audioDescriptionBase(project);
+    const runReceipt: AudioDescriptionGenerationReceipt = {
+      version: 1,
+      runId: "cancel-ad-run",
+      projectId: project.projectId,
+      signedAudioDescriptionGenerationReceipt: "opaque-ad-receipt",
+      session: upload.session,
+      expectedProjectRevision: base.expectedProjectRevision,
+      expectedQualityProfileRevision: base.qualityProfileRevision,
+      mediaSha256: project.media.sha256,
+      captionEvidenceHash: base.captionEvidenceHash,
+      sourceByteLength: upload.sourceByteLength,
+      sourceDurationMs: upload.durationMs,
+      projectOwnerCapability: owner,
+      savedAtMs: now,
+      retentionExpiresAtMs: now + 86_400_000,
+    };
+    let stored = runReceipt;
+    const executeCommand = vi.fn(async (command) => {
+      if (command.type === "ReleaseGenerationRun") throw new Error("local release unavailable");
+      const result = applyCommand(project, command);
+      project = result.project;
+      return result;
+    });
+    const store: AudioDescriptionGenerationProjectStore = {
+      getSnapshot: () => ({ project, mode: "durable" as const }),
+      executeCommand,
+      persistAudioDescriptionGenerationReceipt: async (_runId, value) => { stored = value; },
+      loadAudioDescriptionGenerationReceipt: async () => stored,
+      adoptStagedAudioDescriptionGenerationResult: vi.fn(),
+    };
+    const events: string[] = [];
+    const client = new AudioDescriptionGenerationClient({
+      fetcher: async () => Response.json({
+        status: { contractVersion: 1, runId: runReceipt.runId, projectId: runReceipt.projectId, targetTrack: "AudioDescriptions", expectedProjectRevision: runReceipt.expectedProjectRevision, stage: "Cancelled" },
+        cleanup: { version: 1, state: "completed", action: "cancelled", artifactKeys: [], requestedAtMs: now, completedAtMs: now + 1 },
+      }),
+      clock: () => now,
+    });
+
+    await expect(client.cancel({
+      project,
+      store,
+      receipt: runReceipt,
+      actor: { type: "BrowserAgent", id: "browser-agent" },
+      onLifecycleEvent: (event) => events.push(event.phase),
+    })).rejects.toMatchObject({
+      details: { lifecycleOutcome: { runId: runReceipt.runId, targetTrack: "AudioDescriptions", disposition: "lifecycle-pending" } },
+    });
+    expect(executeCommand).toHaveBeenCalledWith(expect.objectContaining({
+      type: "ReleaseGenerationRun",
+      actor: { type: "BrowserAgent", id: "browser-agent" },
+    }), project.projectId);
+    expect(project.activeGenerationRun?.runId).toBe(runReceipt.runId);
+    expect(stored.terminalCleanup).toMatchObject({ action: "cancelled", localLeaseRelease: "pending" });
+    expect(events).toEqual(["cancellation-intent-persisted", "remote-cancelled"]);
   });
 
   it("refuses staged adoption when the result does not bind to the leased caption-evidence hash", async () => {
@@ -269,5 +547,47 @@ describe("audio-description generation browser boundary", () => {
     });
     expect(settle).toHaveBeenCalledWith(stored.runId);
     expect(store.executeCommand).not.toHaveBeenCalled();
+  });
+
+  it("peeks an expired AD receipt without settling its lease or writing a recovery marker", async () => {
+    const project = applyCommand(projectFixture(), {
+      type: "StartGenerationRun", actor: ai, runId: "ad-peek-expired", targetTrack: "AudioDescriptions", expectedProjectRevision: 1,
+    }).project;
+    const base = audioDescriptionBase(project);
+    const stored: AudioDescriptionGenerationReceipt = {
+      version: 1,
+      runId: "ad-peek-expired",
+      projectId: project.projectId,
+      signedAudioDescriptionGenerationReceipt: "opaque-ad-receipt",
+      session: upload.session,
+      expectedProjectRevision: base.expectedProjectRevision,
+      expectedQualityProfileRevision: base.qualityProfileRevision,
+      mediaSha256: project.media.sha256,
+      captionEvidenceHash: base.captionEvidenceHash,
+      sourceByteLength: upload.sourceByteLength,
+      sourceDurationMs: upload.durationMs,
+      projectOwnerCapability: owner,
+      savedAtMs: now - 1_000,
+      retentionExpiresAtMs: now - 1,
+    };
+    const settle = vi.fn();
+    const persist = vi.fn();
+    const execute = vi.fn();
+    const store: AudioDescriptionGenerationProjectStore = {
+      getSnapshot: () => ({ project, mode: "durable" as const }),
+      executeCommand: execute,
+      persistAudioDescriptionGenerationReceipt: persist,
+      loadAudioDescriptionGenerationReceipt: async () => stored,
+      adoptStagedAudioDescriptionGenerationResult: vi.fn(),
+      settleExpiredAudioDescriptionGenerationReceipt: settle,
+    };
+    const before = project;
+    const client = new AudioDescriptionGenerationClient({ clock: () => now });
+
+    await expect(client.peekStoredReceipt(store, project, stored.runId)).resolves.toMatchObject({ runId: stored.runId });
+    expect(project).toBe(before);
+    expect(settle).not.toHaveBeenCalled();
+    expect(persist).not.toHaveBeenCalled();
+    expect(execute).not.toHaveBeenCalled();
   });
 });

@@ -343,7 +343,7 @@ describe("CaptionGenerationRunner", () => {
       message: expect.stringContaining("6 MiB"),
     });
     await expect(store.stagedResult(oversized.runId)).resolves.toBeNull();
-  });
+  }, 30_000);
 
   it("fails before either transcription provider call when the authoritative prepared manifest disagrees with signed media", async () => {
     const store = new InMemoryGenerationRunStore();

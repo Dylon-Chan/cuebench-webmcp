@@ -66,6 +66,8 @@ export type DomainCommand =
       readonly cueId: string;
       readonly adjacentCueId: string;
       readonly expectedAdjacentItemRevision: number;
+      /** Browser Agents may set this only after an in-page Human confirmation. */
+      readonly confirmedSustainedReopen?: boolean;
     })
   | (ExpectedItemCommandBase & {
       readonly type: "ReviseCue";

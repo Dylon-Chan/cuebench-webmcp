@@ -327,7 +327,9 @@ const courtActors: Readonly<Record<string, readonly Actor["type"][]>> = {
   StartGenerationRun: ["CueBenchAI"],
   AdoptCaptionGenerationResult: ["CueBenchAI"],
   AdoptAudioDescriptionGenerationResult: ["CueBenchAI"],
-  ReleaseGenerationRun: ["CueBenchAI", "System", "Human"],
+  // Keep a Browser Agent cancellation attributable when validating/importing
+  // its Court Record event. This is lifecycle-only, not Human authority.
+  ReleaseGenerationRun: ["CueBenchAI", "System", "Human", "BrowserAgent"],
   ExportRoundTripVerified: ["System"],
   GenerationRunStageChanged: ["System"],
   ProjectSerialized: ["System"],

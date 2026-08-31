@@ -198,6 +198,31 @@ describe("audio-description generation adoption", () => {
     expect(start.error?.code).toBe("INVALID_ARGUMENT");
   });
 
+  it("records an explicit BrowserAgent audio-description-run release without fabricating Human authority", () => {
+    const initial = projectWithCaptionEvidence();
+    const leased = applyCommand(initial, {
+      type: "StartGenerationRun",
+      actor: ai,
+      runId: "ad-browser-agent-cancel",
+      targetTrack: "AudioDescriptions",
+      expectedProjectRevision: initial.projectRevision,
+    }).project;
+
+    const released = applyCommand(leased, {
+      type: "ReleaseGenerationRun",
+      actor: { type: "BrowserAgent", id: "browser-agent" },
+      runId: "ad-browser-agent-cancel",
+      expectedProjectRevision: leased.projectRevision,
+    });
+
+    expect(released.error).toBeUndefined();
+    expect(released.project.activeGenerationRun).toBeNull();
+    expect(released.project.courtRecord.at(-1)).toMatchObject({
+      type: "ReleaseGenerationRun",
+      actor: { type: "BrowserAgent", id: "browser-agent" },
+    });
+  });
+
   it("atomically adopts only an evidence-bound AD result, protects sustained/manual beats, and records deterministic extended-description findings", () => {
     const initial = projectWithCaptionEvidence();
     const started = applyCommand(initial, {

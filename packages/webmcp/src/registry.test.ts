@@ -111,6 +111,25 @@ describe("CueBenchToolRegistry", () => {
     expect(registry.snapshot().selection.scopeId).toBe("ad:ad02");
   });
 
+  it("replaces same-named groups when the page changes project instance at the same revision", async () => {
+    const modelContext = new FakeModelContext();
+    const registry = new CueBenchToolRegistry(modelContext);
+
+    await registry.registerAlways([readTool("inspect_project")], "project-a:r1:always");
+    await registry.select(selection("project-a:r1:CaptionCue:cue-1:r1", "inspect_selected_cue_evidence"));
+    await registry.setRun(null, { alwaysScopeId: "project-b:r1:always" });
+    await registry.select(selection("project-b:r1:CaptionCue:cue-1:r1", "inspect_selected_cue_evidence"));
+
+    expect(registry.snapshot()).toMatchObject({
+      always: { scopeId: "project-b:r1:always", toolNames: ["inspect_project"], registered: true },
+      selection: { scopeId: "project-b:r1:CaptionCue:cue-1:r1", toolNames: ["inspect_selected_cue_evidence"], registered: true },
+    });
+    expect(modelContext.events).toEqual(expect.arrayContaining([
+      "abort:inspect_project",
+      "abort:inspect_selected_cue_evidence",
+    ]));
+  });
+
   it("keeps a reentrant newer selection when an outgoing abort listener selects it", async () => {
     const modelContext = new FakeModelContext();
     const registry = new CueBenchToolRegistry(modelContext);
@@ -205,6 +224,147 @@ describe("CueBenchToolRegistry", () => {
 
     await registry.dispose();
     expect([...modelContext.tools.keys()]).toEqual([]);
+  });
+
+  it("preempts active and queued registration claims when disposed, even if the host never settles", async () => {
+    const modelContext = new DeferredRegistrationModelContext();
+    modelContext.deferredNames.add("inspect_never_settles");
+    const registry = new CueBenchToolRegistry(modelContext);
+
+    const active = registry.registerAlways([readTool("inspect_never_settles")], "pending-scope");
+    // Attach handlers before disposal so the deliberately interrupted
+    // transition cannot become an unhandled rejection while the test verifies
+    // that cleanup is prompt.
+    const activeOutcome = active.then(
+      () => "resolved" as const,
+      (error) => error,
+    );
+    const queued = registry.select(selection("caption:queued", "inspect_queued_evidence"));
+    const queuedOutcome = queued.then(
+      () => "resolved" as const,
+      (error) => error,
+    );
+
+    expect(modelContext.pending.has("inspect_never_settles")).toBe(true);
+    await expect(registry.dispose()).resolves.toBeUndefined();
+    await expect(activeOutcome).resolves.toBeInstanceOf(Error);
+    await expect(queuedOutcome).resolves.toBeInstanceOf(Error);
+    expect(modelContext.events).toContain("abort:inspect_never_settles");
+    expect(modelContext.events).not.toContain("register:inspect_queued_evidence");
+    expect(registry.snapshot()).toEqual({
+      available: false,
+      always: { scopeId: null, toolNames: [], registered: false },
+      run: { scopeId: null, toolNames: [], registered: false },
+      selection: { scopeId: null, toolNames: [], registered: false },
+    });
+
+    // A late host acknowledgement belongs to the aborted generation. It may
+    // not revive metadata, a group owner, or any browser-visible tool.
+    modelContext.pending.get("inspect_never_settles")?.resolve();
+    await Promise.resolve();
+    expect([...modelContext.tools.keys()]).toEqual([]);
+    expect(registry.snapshot().always.toolNames).toEqual([]);
+  });
+
+  it("queues a newer same-scope surface until an older rejected transition has restored metadata", async () => {
+    const modelContext = new DeferredRegistrationModelContext();
+    const registry = new CueBenchToolRegistry(modelContext);
+    await registry.registerAlways([readTool("inspect_prior")], "prior-scope");
+    modelContext.deferredNames.add("inspect_old_pending");
+
+    const older = registry.registerAlways([readTool("inspect_old_pending")], "shared-scope");
+    expect(modelContext.pending.has("inspect_old_pending")).toBe(true);
+    const newer = registry.registerAlways([readTool("inspect_new_live")], "shared-scope");
+    // Metadata transitions are serialized: this newer family must not
+    // register against the old pending surface and then be overwritten by a
+    // late rollback from it.
+    expect(modelContext.events).not.toContain("register:inspect_new_live");
+
+    modelContext.pending.get("inspect_old_pending")?.reject(new Error("old same-scope registration failed"));
+    await expect(older).rejects.toThrow("old same-scope registration failed");
+    await newer;
+
+    expect(registry.snapshot().always).toEqual({
+      scopeId: "shared-scope",
+      toolNames: ["inspect_new_live"],
+      registered: true,
+    });
+    expect([...modelContext.tools.keys()]).toEqual(["inspect_new_live"]);
+  });
+
+  it("waits for a pending always/run transition before selecting against its settled metadata", async () => {
+    const modelContext = new DeferredRegistrationModelContext();
+    const registry = new CueBenchToolRegistry(modelContext);
+    await registry.registerAlways([readTool("inspect_selected_cue_evidence")], "idle-scope");
+
+    modelContext.deferredNames.add("inspect_pending_always");
+    modelContext.rejectedNames.add("inspect_generation_run");
+    const pendingRun = registry.setRun([readTool("inspect_generation_run")], {
+      alwaysTools: [readTool("inspect_pending_always")],
+      alwaysScopeId: "pending-run-scope",
+      runScopeId: "pending-run-scope",
+    });
+    await Promise.resolve();
+    expect(modelContext.pending.has("inspect_pending_always")).toBe(true);
+
+    // This name is absent from the pending replacement but belongs to the
+    // prior always surface that will be restored when registration rejects.
+    // select() must wait rather than register into that transient gap.
+    const pendingSelection = registry.select(selection("caption:c05", "inspect_selected_cue_evidence"));
+    expect(modelContext.events.filter((event) => event === "register:inspect_selected_cue_evidence")).toHaveLength(1);
+
+    modelContext.pending.get("inspect_pending_always")?.reject(new Error("pending always registration failed"));
+    await expect(pendingRun).rejects.toThrow("browser registration rejected: inspect_generation_run");
+    await expect(pendingSelection).rejects.toBeInstanceOf(DuplicateToolNameError);
+
+    expect(registry.snapshot()).toMatchObject({
+      always: { scopeId: "idle-scope", toolNames: ["inspect_selected_cue_evidence"], registered: true },
+      selection: { scopeId: null, toolNames: [], registered: false },
+    });
+    expect([...modelContext.tools.keys()]).toEqual(["inspect_selected_cue_evidence"]);
+  });
+
+  it("claims selection metadata atomically before a later always/run transition can fail", async () => {
+    const modelContext = new DeferredRegistrationModelContext();
+    const registry = new CueBenchToolRegistry(modelContext);
+    await registry.registerAlways([readTool("inspect_project")], "idle-scope");
+
+    // `select()` begins from a stable surface. Its first await used to leave
+    // a window for `setRun()` to claim metadata, then fail its browser
+    // registration after selection had claimed a newer epoch. Keep the
+    // selection registration pending so the interleaving is observable.
+    modelContext.deferredNames.add("inspect_selected_cue_evidence");
+    modelContext.deferredNames.add("inspect_pending_always");
+    modelContext.rejectedNames.add("inspect_generation_run");
+
+    const pendingSelection = registry.select(selection("caption:c05", "inspect_selected_cue_evidence"));
+    const pendingRun = registry.setRun([readTool("inspect_generation_run")], {
+      alwaysTools: [readTool("inspect_pending_always")],
+      alwaysScopeId: "pending-run-scope",
+      runScopeId: "pending-run-scope",
+    });
+
+    // A later run transition must wait for selection's atomic metadata claim;
+    // it cannot register (or later roll back) a competing always surface.
+    expect(modelContext.pending.has("inspect_selected_cue_evidence")).toBe(true);
+    expect(modelContext.pending.has("inspect_pending_always")).toBe(false);
+
+    modelContext.pending.get("inspect_selected_cue_evidence")?.resolve();
+    await pendingSelection;
+    await Promise.resolve();
+    expect(modelContext.pending.has("inspect_pending_always")).toBe(true);
+    modelContext.pending.get("inspect_pending_always")?.resolve();
+    await expect(pendingRun).rejects.toThrow("browser registration rejected: inspect_generation_run");
+
+    expect(registry.snapshot()).toMatchObject({
+      always: { scopeId: "idle-scope", toolNames: ["inspect_project"], registered: true },
+      run: { scopeId: null, toolNames: [], registered: false },
+      selection: { scopeId: "caption:c05", toolNames: ["inspect_selected_cue_evidence"], registered: true },
+    });
+    expect([...modelContext.tools.keys()].sort()).toEqual([
+      "inspect_project",
+      "inspect_selected_cue_evidence",
+    ]);
   });
 
   it("aborts and clears a selection family on deselection", async () => {

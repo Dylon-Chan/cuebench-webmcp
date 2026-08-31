@@ -20,6 +20,27 @@ export interface CueBenchToolRegistryOptions {
   readonly onUnexpectedError?: ToolFaultLogger;
 }
 
+/**
+ * A page can bind its otherwise-identical tool families to an exact visible
+ * project instance. The registry treats these as opaque scope identities; it
+ * never exposes them to an agent or changes any tool contract.
+ */
+export interface RunRegistrationScopes {
+  readonly alwaysScopeId?: string;
+  readonly runScopeId?: string | null;
+  /** Replace captured page runtime closures in the same atomic transition. */
+  readonly alwaysTools?: readonly CueBenchTool[];
+}
+
+/** An exact page surface replacement, registered as one host transition. */
+export interface CueBenchToolSurface {
+  readonly alwaysTools: readonly CueBenchTool[];
+  readonly alwaysScopeId: string;
+  readonly runTools: readonly CueBenchTool[] | null;
+  readonly runScopeId: string | null;
+  readonly selection: SelectionToolFamily | null;
+}
+
 export interface RegistryGroupSnapshot {
   readonly scopeId: string | null;
   readonly toolNames: readonly string[];
@@ -50,6 +71,14 @@ export class InvalidToolDefinitionError extends Error {
   public constructor(message: string) {
     super(message);
     this.name = "InvalidToolDefinitionError";
+  }
+}
+
+/** A disposed bridge has no safe browser-registration surface to revive. */
+export class ToolRegistryDisposedError extends Error {
+  public constructor() {
+    super("CueBench WebMCP registration was disposed before this browser transition settled.");
+    this.name = "ToolRegistryDisposedError";
   }
 }
 
@@ -89,6 +118,17 @@ interface RegistrationStart {
   readonly attempts: readonly RegistrationAttempt[];
   readonly hasSynchronousFailure: boolean;
   readonly synchronousFailure: unknown;
+}
+
+interface SurfaceMetadata {
+  readonly alwaysTools: readonly CueBenchTool[];
+  readonly runTools: readonly CueBenchTool[] | null;
+  readonly alwaysScopeId: string;
+}
+
+interface PendingMetadataTask {
+  readonly start: () => void;
+  readonly interrupt: () => void;
 }
 
 interface JoinedAbortSignal {
@@ -166,8 +206,25 @@ export class CueBenchToolRegistry {
 
   private readonly onUnexpectedError: ToolFaultLogger | undefined;
   private transitionSequence = 0;
+  /** A same textual scope can still belong to a newer async surface transition. */
+  private metadataEpoch = 0;
   private alwaysTools: readonly CueBenchTool[] = [];
   private runTools: readonly CueBenchTool[] | null = null;
+  private alwaysScopeId = "always";
+  /** Disposal is terminal: an unmounted bridge may never revive a late host surface. */
+  private disposed = false;
+  private lifecycleGeneration = 0;
+  private readonly disposalController = new AbortController();
+  /**
+   * Metadata claims must be serialized with their browser-registration
+   * transition. In particular, `select()` cannot observe a stable surface,
+   * yield, and then claim a newer epoch while a later always/run transition
+   * is still eligible to roll metadata back. The first task starts in the
+   * caller's stack so imperative host registrations remain synchronous.
+   */
+  private metadataTransitionActive = false;
+  private activeMetadataTask: PendingMetadataTask | null = null;
+  private readonly pendingMetadataTasks: PendingMetadataTask[] = [];
 
   public constructor(
     private readonly modelContext: ModelContextLike | null | undefined,
@@ -177,89 +234,189 @@ export class CueBenchToolRegistry {
   }
 
   public get available(): boolean {
-    return this.modelContext !== null && this.modelContext !== undefined;
+    return !this.disposed && this.modelContext !== null && this.modelContext !== undefined;
   }
 
   /** Register (or atomically replace) the idle always-available surface. */
-  public async registerAlways(tools: readonly CueBenchTool[]): Promise<void> {
-    assertUsableTools(tools);
-    const nextAlways = [...tools];
-    const visibleAlways = this.visibleAlwaysTools(nextAlways, this.runTools);
-    this.assertNoLiveNameCollisions({
-      always: visibleAlways,
-      run: this.runTools ?? [],
-      selection: this.groups.selection?.tools ?? [],
+  public registerAlways(tools: readonly CueBenchTool[], scopeId = "always"): Promise<void> {
+    return this.runMetadataTransition(async () => {
+      assertUsableTools(tools);
+      if (scopeId.trim().length === 0) {
+        throw new InvalidToolDefinitionError("An always-available WebMCP tool family must have a scope id.");
+      }
+      const nextAlways = [...tools];
+      const visibleAlways = this.visibleAlwaysTools(nextAlways, this.runTools);
+      this.assertNoLiveNameCollisions({
+        always: visibleAlways,
+        run: this.runTools ?? [],
+        selection: this.groups.selection?.tools ?? [],
+      });
+      const previous = this.surfaceMetadata();
+      const claim = this.setSurfaceMetadata({
+        alwaysTools: nextAlways,
+        runTools: this.runTools,
+        alwaysScopeId: scopeId,
+      });
+      try {
+        await this.replaceGroups([{ group: "always", scopeId, tools: visibleAlways }]);
+      } catch (error) {
+        this.restoreSurfaceMetadata(claim, previous);
+        throw error;
+      }
     });
-    const previousAlways = this.alwaysTools;
-    this.alwaysTools = nextAlways;
-    try {
-      await this.replaceGroups([{ group: "always", scopeId: "always", tools: visibleAlways }]);
-    } catch (error) {
-      if (this.alwaysTools === nextAlways) this.alwaysTools = previousAlways;
-      throw error;
-    }
   }
 
   /**
    * Replaces exact idle generation starters with active-run tools, or restores
    * the complete idle always surface when no run is visible.
    */
-  public async setRun(tools: readonly CueBenchTool[] | null): Promise<void> {
-    if (tools !== null) assertUsableTools(tools);
-    const nextRun = tools === null ? null : [...tools];
-    const visibleAlways = this.visibleAlwaysTools(this.alwaysTools, nextRun);
-    this.assertNoLiveNameCollisions({
-      always: visibleAlways,
-      run: nextRun ?? [],
-      selection: this.groups.selection?.tools ?? [],
+  public setRun(tools: readonly CueBenchTool[] | null, scopes: RunRegistrationScopes = {}): Promise<void> {
+    return this.runMetadataTransition(async () => {
+      if (tools !== null) assertUsableTools(tools);
+      if (scopes.alwaysTools !== undefined) assertUsableTools(scopes.alwaysTools);
+      const nextAlwaysScopeId = scopes.alwaysScopeId ?? this.alwaysScopeId;
+      const nextRunScopeId = tools === null ? null : (scopes.runScopeId ?? "active-run");
+      if (nextAlwaysScopeId.trim().length === 0 || (nextRunScopeId !== null && nextRunScopeId.trim().length === 0)) {
+        throw new InvalidToolDefinitionError("A WebMCP registration scope id must not be empty.");
+      }
+      const nextRun = tools === null ? null : [...tools];
+      const nextAlways = scopes.alwaysTools === undefined ? this.alwaysTools : [...scopes.alwaysTools];
+      const visibleAlways = this.visibleAlwaysTools(nextAlways, nextRun);
+      this.assertNoLiveNameCollisions({
+        always: visibleAlways,
+        run: nextRun ?? [],
+        selection: this.groups.selection?.tools ?? [],
+      });
+      const previous = this.surfaceMetadata();
+      const claim = this.setSurfaceMetadata({
+        alwaysTools: nextAlways,
+        runTools: nextRun,
+        alwaysScopeId: nextAlwaysScopeId,
+      });
+      try {
+        await this.replaceGroups([
+          { group: "always", scopeId: nextAlwaysScopeId, tools: visibleAlways },
+          { group: "run", scopeId: nextRunScopeId, tools: nextRun ?? [] },
+        ]);
+      } catch (error) {
+        this.restoreSurfaceMetadata(claim, previous);
+        throw error;
+      }
     });
-    const previousRun = this.runTools;
-    this.runTools = nextRun;
-    try {
-      await this.replaceGroups([
-        { group: "always", scopeId: "always", tools: visibleAlways },
-        { group: "run", scopeId: nextRun === null ? null : "active-run", tools: nextRun ?? [] },
-      ]);
-    } catch (error) {
-      if (this.runTools === nextRun) this.runTools = previousRun;
-      throw error;
-    }
+  }
+
+  /**
+   * Atomically replace every family for one visible page snapshot. This keeps
+   * same-revision project replacements from leaving any stale closure alive,
+   * while starting all browser registrations before awaiting any of them.
+   */
+  public synchronize(surface: CueBenchToolSurface): Promise<void> {
+    return this.runMetadataTransition(async () => {
+      assertUsableTools(surface.alwaysTools);
+      if (surface.runTools !== null) assertUsableTools(surface.runTools);
+      if (surface.alwaysScopeId.trim().length === 0 || (surface.runScopeId !== null && surface.runScopeId.trim().length === 0)) {
+        throw new InvalidToolDefinitionError("A WebMCP registration scope id must not be empty.");
+      }
+      if (surface.selection !== null) {
+        if (surface.selection.scopeId.trim().length === 0) {
+          throw new InvalidToolDefinitionError("A dynamic WebMCP selection must have a scope id.");
+        }
+        assertUsableTools(surface.selection.tools);
+      }
+      if ((surface.runTools === null) !== (surface.runScopeId === null)) {
+        throw new InvalidToolDefinitionError("An active-run tool family and scope must appear together.");
+      }
+      const nextAlways = [...surface.alwaysTools];
+      const nextRun = surface.runTools === null ? null : [...surface.runTools];
+      const nextSelection = surface.selection === null ? [] : [...surface.selection.tools];
+      const visibleAlways = this.visibleAlwaysTools(nextAlways, nextRun);
+      this.assertNoLiveNameCollisions({
+        always: visibleAlways,
+        run: nextRun ?? [],
+        selection: nextSelection,
+      });
+
+      const previous = this.surfaceMetadata();
+      const claim = this.setSurfaceMetadata({
+        alwaysTools: nextAlways,
+        runTools: nextRun,
+        alwaysScopeId: surface.alwaysScopeId,
+      });
+      try {
+        await this.replaceGroups([
+          { group: "always", scopeId: surface.alwaysScopeId, tools: visibleAlways },
+          { group: "run", scopeId: surface.runScopeId, tools: nextRun ?? [] },
+          { group: "selection", scopeId: surface.selection?.scopeId ?? null, tools: nextSelection },
+        ]);
+      } catch (error) {
+        this.restoreSurfaceMetadata(claim, previous);
+        throw error;
+      }
+    });
   }
 
   /** Register exactly one focus-dependent cue, AD beat, or evidence-gap family. */
-  public async select(family: SelectionToolFamily | null): Promise<void> {
-    if (family !== null) {
-      if (family.scopeId.trim().length === 0) {
-        throw new InvalidToolDefinitionError("A dynamic WebMCP selection must have a scope id.");
+  public select(family: SelectionToolFamily | null): Promise<void> {
+    return this.runMetadataTransition(async () => {
+      if (family !== null) {
+        if (family.scopeId.trim().length === 0) {
+          throw new InvalidToolDefinitionError("A dynamic WebMCP selection must have a scope id.");
+        }
+        assertUsableTools(family.tools);
       }
-      assertUsableTools(family.tools);
-    }
-    const nextTools = family === null ? [] : [...family.tools];
-    this.assertNoLiveNameCollisions({
-      always: this.visibleAlwaysTools(this.alwaysTools, this.runTools),
-      run: this.runTools ?? [],
-      selection: nextTools,
+      const nextTools = family === null ? [] : [...family.tools];
+      this.assertNoLiveNameCollisions({
+        always: this.visibleAlwaysTools(this.alwaysTools, this.runTools),
+        run: this.runTools ?? [],
+        selection: nextTools,
+      });
+      // Selection owns a metadata transition even though it does not alter
+      // the always/run values. This fences an older failed transition from
+      // rolling metadata back over an accepted newer selection.
+      const previous = this.surfaceMetadata();
+      const claim = this.setSurfaceMetadata(previous);
+      try {
+        await this.replaceGroups([{
+          group: "selection",
+          scopeId: family?.scopeId ?? null,
+          tools: nextTools,
+        }]);
+      } catch (error) {
+        this.restoreSurfaceMetadata(claim, previous);
+        throw error;
+      }
     });
-    await this.replaceGroups([{
-      group: "selection",
-      scopeId: family?.scopeId ?? null,
-      tools: nextTools,
-    }]);
   }
 
   /** Remove all dynamically registered tools; it does not alter the human interface. */
-  public async dispose(): Promise<void> {
-    const previousAlways = this.alwaysTools;
-    const previousRun = this.runTools;
+  public dispose(): Promise<void> {
+    if (this.disposed) return Promise.resolve();
+    this.disposed = true;
+    this.lifecycleGeneration += 1;
+    this.disposalController.abort();
+
+    // A queued selection/run claim must not start after unmount just because
+    // an older host registration eventually settles. Interrupt it before the
+    // active task, otherwise the active completion could dequeue it.
+    const queued = this.pendingMetadataTasks.splice(0);
+    for (const task of queued) task.interrupt();
+    const active = this.activeMetadataTask;
+    this.activeMetadataTask = null;
+    this.metadataTransitionActive = false;
+    active?.interrupt();
+
+    // Metadata and owner epochs are independently fenced. A late rollback
+    // cannot reclaim either after this terminal generation advance.
+    this.metadataEpoch += 1;
     this.alwaysTools = [];
     this.runTools = null;
-    try {
-      await this.replaceGroups(groupOrder.map((group) => ({ group, scopeId: null, tools: [] })));
-    } catch (error) {
-      this.alwaysTools = previousAlways;
-      this.runTools = previousRun;
-      throw error;
+    const owned = groupOrder.map((name) => ({ name, group: this.groups[name] }));
+    for (const { name } of owned) {
+      this.groups[name] = null;
+      this.groupEpochs[name] += 1;
     }
+    for (const { group } of owned) group?.controller.abort();
+    return Promise.resolve();
   }
 
   public snapshot(): CueBenchToolRegistrySnapshot {
@@ -277,6 +434,119 @@ export class CueBenchToolRegistry {
   ): readonly CueBenchTool[] {
     if (runTools === null) return allAlwaysTools;
     return allAlwaysTools.filter((tool) => !activeRunStarterNames.has(tool.name));
+  }
+
+  private surfaceMetadata(): SurfaceMetadata {
+    return {
+      alwaysTools: this.alwaysTools,
+      runTools: this.runTools,
+      alwaysScopeId: this.alwaysScopeId,
+    };
+  }
+
+  private setSurfaceMetadata(next: SurfaceMetadata): number {
+    const claim = this.metadataEpoch + 1;
+    this.metadataEpoch = claim;
+    this.alwaysTools = next.alwaysTools;
+    this.runTools = next.runTools;
+    this.alwaysScopeId = next.alwaysScopeId;
+    return claim;
+  }
+
+  /** Restore only if no later registration operation claimed the metadata. */
+  private restoreSurfaceMetadata(claim: number, previous: SurfaceMetadata): void {
+    if (this.disposed || this.metadataEpoch !== claim) return;
+    // The rollback receives its own claim so another older deferred failure
+    // cannot reclaim the same scope after this one completes.
+    this.setSurfaceMetadata(previous);
+  }
+
+  /**
+   * Runs the first metadata transition synchronously and queues later work
+   * FIFO. Registration callbacks can therefore re-enter safely without an
+   * old failed transition restoring metadata over a newer family claim.
+   */
+  private runMetadataTransition<T>(operation: () => Promise<T>): Promise<T> {
+    if (this.disposed) return Promise.reject(new ToolRegistryDisposedError());
+    const generation = this.lifecycleGeneration;
+    return new Promise<T>((resolve, reject) => {
+      let started = false;
+      let settled = false;
+      const finish = (): void => {
+        if (this.activeMetadataTask !== task) return;
+        this.activeMetadataTask = null;
+        this.metadataTransitionActive = false;
+        const next = this.pendingMetadataTasks.shift();
+        next?.start();
+      };
+      const rejectTask = (error: unknown): void => {
+        if (settled) return;
+        settled = true;
+        if (started) finish();
+        reject(error);
+      };
+      const task: PendingMetadataTask = {
+        start: () => {
+          if (settled) return;
+          if (!this.isCurrentLifecycleGeneration(generation)) {
+            rejectTask(new ToolRegistryDisposedError());
+            return;
+          }
+          started = true;
+          this.activeMetadataTask = task;
+          this.metadataTransitionActive = true;
+          let pending: Promise<T>;
+          try {
+            // Do not wrap in an extra Promise.resolve callback: browser hosts
+            // expect every member of an initial registration wave synchronously.
+            pending = operation();
+          } catch (error) {
+            pending = Promise.reject(error);
+          }
+          void pending.then(
+            (value) => {
+              // Release/start the next claim before resolving the caller's
+              // await. Otherwise an immediately-following transition observes
+              // a stale busy bit and loses imperative registration synchronicity.
+              if (settled) return;
+              settled = true;
+              finish();
+              resolve(value);
+            },
+            (error) => {
+              rejectTask(error);
+            },
+          );
+        },
+        interrupt: () => rejectTask(new ToolRegistryDisposedError()),
+      };
+      if (!this.metadataTransitionActive && this.pendingMetadataTasks.length === 0) task.start();
+      else this.pendingMetadataTasks.push(task);
+    });
+  }
+
+  private isCurrentLifecycleGeneration(generation: number): boolean {
+    return !this.disposed && generation === this.lifecycleGeneration;
+  }
+
+  private throwIfDisposed(generation: number): void {
+    if (!this.isCurrentLifecycleGeneration(generation)) throw new ToolRegistryDisposedError();
+  }
+
+  /** Race host registration with terminal disposal without waiting for a host promise to settle. */
+  private async awaitCurrentLifecycle<T>(pending: Promise<T>, generation: number): Promise<T> {
+    this.throwIfDisposed(generation);
+    const cleanup = { removeAbortListener: null as (() => void) | null };
+    const disposed = new Promise<never>((_resolve, reject) => {
+      const rejectDisposed = () => reject(new ToolRegistryDisposedError());
+      this.disposalController.signal.addEventListener("abort", rejectDisposed, { once: true });
+      cleanup.removeAbortListener = () => this.disposalController.signal.removeEventListener("abort", rejectDisposed);
+    });
+    try {
+      return await Promise.race([pending, disposed]);
+    } finally {
+      cleanup.removeAbortListener?.();
+    }
   }
 
   private groupSnapshot(group: ToolRegistrationGroup): RegistryGroupSnapshot {
@@ -306,6 +576,8 @@ export class CueBenchToolRegistry {
    * its fresh successor is installed before the listener can re-enter.
    */
   private async replaceGroups(replacements: readonly GroupReplacement[]): Promise<void> {
+    const generation = this.lifecycleGeneration;
+    this.throwIfDisposed(generation);
     const uniqueGroups = new Set<ToolRegistrationGroup>();
     for (const replacement of replacements) {
       if (uniqueGroups.has(replacement.group)) {
@@ -327,24 +599,30 @@ export class CueBenchToolRegistry {
     // then replace a fresh owner, and the stale transition will detect it.
     for (const { previous } of prepared) previous?.controller.abort();
 
+    this.throwIfDisposed(generation);
     if (!this.available) return;
     const registration = this.startRegistrations(prepared);
     const settledRegistration = Promise.allSettled(registration.attempts.map((attempt) => attempt.promise));
     if (registration.hasSynchronousFailure) {
       const rollback = this.abortOwnedGroups(prepared);
-      await settledRegistration;
-      await this.restorePriorGroups(rollback);
+      await this.awaitCurrentLifecycle(settledRegistration, generation);
+      this.throwIfDisposed(generation);
+      await this.restorePriorGroups(rollback, generation);
+      this.throwIfDisposed(generation);
       throw registration.synchronousFailure;
     }
 
     try {
-      await Promise.all(registration.attempts.map((attempt) => attempt.promise));
+      await this.awaitCurrentLifecycle(Promise.all(registration.attempts.map((attempt) => attempt.promise)), generation);
     } catch (error) {
       const rollback = this.abortOwnedGroups(prepared);
-      await settledRegistration;
-      await this.restorePriorGroups(rollback);
+      await this.awaitCurrentLifecycle(settledRegistration, generation);
+      this.throwIfDisposed(generation);
+      await this.restorePriorGroups(rollback, generation);
+      this.throwIfDisposed(generation);
       throw error;
     }
+    this.throwIfDisposed(generation);
     this.markRegistered(prepared);
   }
 
@@ -408,12 +686,12 @@ export class CueBenchToolRegistry {
   }
 
   private ownsGroup(name: ToolRegistrationGroup, group: ActiveGroup): boolean {
-    return this.groups[name] === group && this.groupEpochs[name] === group.owner.epoch;
+    return !this.disposed && this.groups[name] === group && this.groupEpochs[name] === group.owner.epoch;
   }
 
   /** A detached failed group may restore only while no newer epoch owns its slot. */
   private canRestoreGroup(name: ToolRegistrationGroup, group: ActiveGroup): boolean {
-    return this.groups[name] === null && this.groupEpochs[name] === group.owner.epoch;
+    return !this.disposed && this.groups[name] === null && this.groupEpochs[name] === group.owner.epoch;
   }
 
   /** Clear every still-owned slot before firing any of their abort listeners. */
@@ -447,7 +725,8 @@ export class CueBenchToolRegistry {
    * slot. A newer select/setRun/registerAlways always increments the epoch and
    * therefore wins over this late rollback.
    */
-  private async restorePriorGroups(rollback: readonly PreparedGroup[]): Promise<void> {
+  private async restorePriorGroups(rollback: readonly PreparedGroup[], generation: number): Promise<void> {
+    this.throwIfDisposed(generation);
     const transitionId = ++this.transitionSequence;
     const restored: OwnedGroup[] = [];
     for (const failed of rollback) {
@@ -461,21 +740,25 @@ export class CueBenchToolRegistry {
       restored.push({ name: failed.name, group });
     }
 
-    if (!this.available || restored.length === 0) return;
+    if (!this.available || restored.length === 0) {
+      this.throwIfDisposed(generation);
+      return;
+    }
     const registration = this.startRegistrations(restored);
     const settledRegistration = Promise.allSettled(registration.attempts.map((attempt) => attempt.promise));
     if (registration.hasSynchronousFailure) {
       this.abortOwnedGroups(restored);
-      await settledRegistration;
+      await this.awaitCurrentLifecycle(settledRegistration, generation);
       return;
     }
     try {
-      await Promise.all(registration.attempts.map((attempt) => attempt.promise));
+      await this.awaitCurrentLifecycle(Promise.all(registration.attempts.map((attempt) => attempt.promise)), generation);
     } catch {
       this.abortOwnedGroups(restored);
-      await settledRegistration;
+      await this.awaitCurrentLifecycle(settledRegistration, generation);
       return;
     }
+    this.throwIfDisposed(generation);
     this.markRegistered(restored);
   }
 
@@ -495,6 +778,7 @@ export class CueBenchToolRegistry {
             async () => validateToolResult(
               await tool.execute(input, {
                 signal: joined.signal,
+                ...(client?.signal === undefined ? {} : { postCommitSignal: client.signal }),
                 markCommitted: () => { committed = true; },
               }),
               tool.resultDataSchema,

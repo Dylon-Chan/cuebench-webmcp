@@ -109,7 +109,7 @@ export const createNarrationPreviewGateway = (options: NarrationPreviewGatewayOp
       if (measuredDurationMs !== input.measuredDurationMs) throw new NarrationPreviewClientError("CueBench refused to cache a narration preview with an inconsistent measured duration.");
       await options.cache.save(input);
     },
-    synthesize: async (input): Promise<NarrationPreviewSynthesis> => {
+    synthesize: async (input, requestOptions = {}): Promise<NarrationPreviewSynthesis> => {
       const authorization = await options.resolveAuthorization(input.projectId);
       if (!validSession(authorization.session) || !validOwner(authorization.projectOwnerCapability)) {
         throw new NarrationPreviewClientError("CueBench needs a current anti-abuse session and browser-project owner identity before narration preview can start.");
@@ -118,6 +118,7 @@ export const createNarrationPreviewGateway = (options: NarrationPreviewGatewayOp
       try {
         response = await fetcher("/api/narration-preview", {
           method: "POST",
+          ...(requestOptions.signal === undefined ? {} : { signal: requestOptions.signal }),
           headers: {
             authorization: `Bearer ${authorization.session}`,
             "content-type": "application/json",

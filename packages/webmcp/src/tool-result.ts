@@ -5,7 +5,7 @@ import {
   type DomainErrorCode,
   type ProjectRevision,
 } from "@cuebench/contracts";
-import type { DomainError } from "@cuebench/domain";
+import { domainError, type DomainError } from "@cuebench/domain";
 import { z } from "zod";
 import {
   ToolVerificationSchema,
@@ -91,6 +91,38 @@ export class ToolExecutionAbortedError extends Error {
   public constructor() {
     super("CueBench WebMCP tool execution was cancelled.");
     this.name = "ToolExecutionAbortedError";
+  }
+}
+
+/**
+ * The page accepted a domain-side change but could not prove the matching
+ * React/DOM/WebMCP registration state before its bounded settlement deadline.
+ * This is expected, retryable state—not an opaque host exception.
+ */
+export class ToolVisibleStateError extends Error {
+  public constructor() {
+    super("CueBench could not verify the visible Browser Agent tool state. Inspect the project and retry.");
+    this.name = "ToolVisibleStateError";
+  }
+}
+
+/**
+ * A hosted generation-status request failed in a known, recoverable way. The
+ * adapter deliberately carries no gateway/body message across the WebMCP
+ * boundary; the generation tool converts it to a bounded retryable result.
+ */
+export class ToolGenerationInspectionError extends Error {
+  public constructor() {
+    super("CueBench could not inspect this generation run. Retry inspection from the visible run.");
+    this.name = "ToolGenerationInspectionError";
+  }
+}
+
+/** The page's visible run identity changed while an inspector was awaiting I/O. */
+export class ToolStaleRunError extends Error {
+  public constructor() {
+    super("CueBench's visible generation run changed while inspection was loading.");
+    this.name = "ToolStaleRunError";
   }
 }
 
@@ -352,6 +384,20 @@ export const executeTool = async <TData>(
     // legitimately replace its own dynamic registration group before return.
     return await operation();
   } catch (error) {
+    // A scoped mutation may intentionally abort its own old registration
+    // while waiting for the replacement family. Preserve the explicit
+    // visibility-settlement failure rather than collapsing it into a generic
+    // selection abort.
+    if (error instanceof ToolVisibleStateError) {
+      return toolDomainError(domainError(
+        "STALE_PROJECT",
+        "CueBench could not verify the visible Browser Agent tool state. Inspect the project and retry.",
+      ), {
+        retryable: true,
+        changed: committed(),
+        nextActions: ["inspect_project"],
+      }) as CueBenchToolResult<TData>;
+    }
     if (options.signal?.aborted === true || isBrandedCancellation(error)) {
       return aborted("after-start");
     }

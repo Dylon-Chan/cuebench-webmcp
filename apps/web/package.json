@@ -20,6 +20,7 @@
     "@cuebench/contracts": "workspace:*",
     "@cuebench/domain": "workspace:*",
     "@cuebench/storage": "workspace:*",
+    "@cuebench/webmcp": "workspace:*",
     "@radix-ui/react-dialog": "1.1.23",
     "@radix-ui/react-tabs": "1.1.21",
     "@radix-ui/react-tooltip": "1.2.16",

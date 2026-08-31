@@ -28,6 +28,12 @@ export interface ToolAnnotations {
 export interface ToolExecutionClient {
   readonly signal: AbortSignal;
   /**
+   * Browser invocation cancellation without the dynamic registration-family
+   * signal. Consequential operations use this only after their first durable
+   * edge, so replacing their own family cannot abort an idempotent follow-up.
+   */
+  readonly postCommitSignal?: AbortSignal;
+  /**
    * Call immediately after the domain mutation is durably visible. A later
    * cancellation then reports conservative state instead of claiming nothing
    * changed.

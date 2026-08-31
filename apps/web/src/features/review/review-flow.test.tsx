@@ -8,7 +8,7 @@ import {
   type CommandResult,
   type DomainCommand,
 } from "@cuebench/domain";
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { describe, expect, it, vi } from "vitest";
 import { CourtRecord } from "./CourtRecord";
 import type { NarrationPreviewGateway } from "./NarrationPreview";
@@ -161,9 +161,12 @@ interface ReviewHarnessProps {
   ) => void;
   readonly commandOverride?: (command: DomainCommand, result: CommandResult) => CommandResult;
   readonly narrationPreviewGateway?: NarrationPreviewGateway;
+  readonly onBrowserAgentFocusReady?: (focus: (input: { readonly itemId: string; readonly itemRevision: number; readonly playheadMs: number; readonly evidenceId?: string; readonly visualEpoch?: number; readonly signal?: AbortSignal }) => Promise<boolean>) => void;
+  readonly onBrowserAgentSelectionPreflightReady?: (prepare: (input: { readonly itemId: string; readonly itemRevision: number; readonly playheadMs: number; readonly evidenceId?: string; readonly signal?: AbortSignal }) => Promise<boolean>) => void;
+  readonly onProjectReady?: (current: () => CaptionProject, replace: (project: CaptionProject) => void) => void;
 }
 
-function ReviewHarness({ initialProject = reviewProject(), onSeek = vi.fn(), onCommand, onReadNativePlayheadMs, evidenceContentResolver, onTimelineRebaseReady, commandOverride, narrationPreviewGateway }: ReviewHarnessProps) {
+function ReviewHarness({ initialProject = reviewProject(), onSeek = vi.fn(), onCommand, onReadNativePlayheadMs, evidenceContentResolver, onTimelineRebaseReady, commandOverride, narrationPreviewGateway, onBrowserAgentFocusReady, onBrowserAgentSelectionPreflightReady, onProjectReady }: ReviewHarnessProps) {
   const [project, setProject] = useState(initialProject);
   const projectRef = useRef(initialProject);
   const reviewNavigationRef = useRef<(itemId: string, sourceLabel: string) => void>(() => undefined);
@@ -182,6 +185,13 @@ function ReviewHarness({ initialProject = reviewProject(), onSeek = vi.fn(), onC
     return result;
   };
 
+  useEffect(() => {
+    onProjectReady?.(() => projectRef.current, (nextProject) => {
+      projectRef.current = nextProject;
+      setProject(nextProject);
+    });
+  }, [onProjectReady]);
+
   return (
     <>
       <ReviewDocket
@@ -190,6 +200,8 @@ function ReviewHarness({ initialProject = reviewProject(), onSeek = vi.fn(), onC
         onSeekToMediaTime={onSeek}
         onRegisterItemNavigation={(navigate) => { reviewNavigationRef.current = navigate; }}
         onRegisterItemRevisionFocus={(focus) => { reviewRevisionFocusRef.current = focus; }}
+        onRegisterBrowserAgentFocus={(focus) => { onBrowserAgentFocusReady?.(focus); }}
+        onRegisterBrowserAgentSelectionPreflight={(prepare) => { onBrowserAgentSelectionPreflightReady?.(prepare); }}
         onRegisterCanonicalTimelineEdit={(rebase) => onTimelineRebaseReady?.(rebase, (nextProject) => { projectRef.current = nextProject; setProject(nextProject); })}
         {...(evidenceContentResolver === undefined ? {} : { evidenceContentResolver })}
         {...(onReadNativePlayheadMs === undefined ? {} : { onReadNativePlayheadMs })}
@@ -406,6 +418,122 @@ describe("Review docket human-authority flow", () => {
     fireEvent.click(screen.getByRole("button", { name: /select caption c02/i }));
     fireEvent.click(await screen.findByRole("button", { name: /discard draft and continue/i }));
     await waitFor(() => expect(screen.getByRole("heading", { name: /selected caption c02/i })).toBeVisible());
+  });
+
+  it("routes Browser Agent focus through the same dirty-draft guard and fails closed on cancellation", async () => {
+    let focus: ((input: { readonly itemId: string; readonly itemRevision: number; readonly playheadMs: number }) => Promise<boolean>) | null = null;
+    let current: (() => CaptionProject) | null = null;
+    let replace: ((project: CaptionProject) => void) | null = null;
+    const onCommand = vi.fn();
+    render(<ReviewHarness
+      initialProject={selectedProject()}
+      onCommand={onCommand}
+      onBrowserAgentFocusReady={(nextFocus) => { focus = nextFocus; }}
+      onProjectReady={(nextCurrent, nextReplace) => { current = nextCurrent; replace = nextReplace; }}
+    />);
+    await waitFor(() => expect(focus).not.toBeNull());
+    fireEvent.change(screen.getByLabelText("Caption text for C01"), { target: { value: "Preserve this human C01 draft." } });
+
+    const beforeAgentSelection = current!();
+    const agentSelection = applyCommand(beforeAgentSelection, {
+      type: "SelectItem",
+      actor: { type: "BrowserAgent", id: "browser-agent" },
+      itemId: "c02",
+      expectedItemRevision: 1,
+      expectedProjectRevision: beforeAgentSelection.projectRevision,
+    });
+    if (agentSelection.error !== undefined) throw new Error(agentSelection.error.message);
+    act(() => replace!(agentSelection.project));
+
+    const pending = focus!({ itemId: "c02", itemRevision: 1, playheadMs: 3_500 });
+    const dialog = await screen.findByRole("dialog", { name: /unsaved review draft/i });
+    fireEvent.click(within(dialog).getByRole("button", { name: /cancel navigation/i }));
+    await expect(pending).resolves.toBe(false);
+    expect(onCommand).not.toHaveBeenCalled();
+
+    // Returning to the draft proves it remained owned by C01 rather than
+    // being silently rebound to the agent-selected C02 revision.
+    fireEvent.click(screen.getByRole("button", { name: /select caption c01/i }));
+    const returnDialog = await screen.findByRole("dialog", { name: /unsaved review draft/i });
+    fireEvent.click(within(returnDialog).getByRole("button", { name: /save changes and continue/i }));
+    await waitFor(() => expect(onCommand).toHaveBeenCalledWith(expect.objectContaining({
+      type: "ReviseCue",
+      itemId: "c01",
+      patch: expect.objectContaining({ text: "Preserve this human C01 draft." }),
+    }), expect.anything()));
+  });
+
+  it("acknowledges Browser Agent focus only after the requested evidence anchor owns DOM focus", async () => {
+    let focus: ((input: { readonly itemId: string; readonly itemRevision: number; readonly playheadMs: number; readonly evidenceId?: string; readonly visualEpoch?: number }) => Promise<boolean>) | null = null;
+    render(<ReviewHarness
+      initialProject={selectedProject()}
+      onBrowserAgentFocusReady={(nextFocus) => { focus = nextFocus; }}
+    />);
+    await waitFor(() => expect(focus).not.toBeNull());
+
+    const accepted = await focus!({
+      itemId: "c01",
+      itemRevision: 1,
+      playheadMs: 1_000,
+      evidenceId: "evidence-c01-r1",
+      visualEpoch: 41,
+    });
+
+    // No waitFor: this is the layout-ack contract consumed by the route and
+    // then the WebMCP bridge before the tool may report success.
+    expect(accepted).toBe(true);
+    expect(screen.getByRole("button", { name: "All" })).toHaveAttribute("aria-pressed", "true");
+    expect(document.activeElement).toBe(document.getElementById("evidence-evidence-c01-r1"));
+  });
+
+  it("runs Browser Agent focus preflight before selection, preserving the dirty draft and selected family on decline", async () => {
+    let prepare: ((input: { readonly itemId: string; readonly itemRevision: number; readonly playheadMs: number }) => Promise<boolean>) | null = null;
+    let current: (() => CaptionProject) | null = null;
+    const onCommand = vi.fn();
+    render(<ReviewHarness
+      initialProject={selectedProject()}
+      onCommand={onCommand}
+      onBrowserAgentSelectionPreflightReady={(nextPrepare) => { prepare = nextPrepare; }}
+      onProjectReady={(nextCurrent) => { current = nextCurrent; }}
+    />);
+    await waitFor(() => expect(prepare).not.toBeNull());
+    fireEvent.change(screen.getByLabelText("Caption text for C01"), { target: { value: "Keep this draft on C01." } });
+    const before = current!();
+
+    const pending = prepare!({ itemId: "c02", itemRevision: 1, playheadMs: 3_500 });
+    const dialog = await screen.findByRole("dialog", { name: /unsaved review draft/i });
+    expect(current!().selectedItem).toEqual(before.selectedItem);
+    expect(screen.getByLabelText("Caption text for C01")).toHaveValue("Keep this draft on C01.");
+    fireEvent.click(within(dialog).getByRole("button", { name: /cancel navigation/i }));
+
+    await expect(pending).resolves.toBe(false);
+    expect(current!().selectedItem).toEqual(before.selectedItem);
+    expect(onCommand).not.toHaveBeenCalled();
+  });
+
+  it("aborts a pending Browser Agent dirty-draft preflight without leaving its dialog or promise behind", async () => {
+    let prepare: ((input: { readonly itemId: string; readonly itemRevision: number; readonly playheadMs: number; readonly signal?: AbortSignal }) => Promise<boolean>) | null = null;
+    let current: (() => CaptionProject) | null = null;
+    const onCommand = vi.fn();
+    render(<ReviewHarness
+      initialProject={selectedProject()}
+      onCommand={onCommand}
+      onBrowserAgentSelectionPreflightReady={(nextPrepare) => { prepare = nextPrepare; }}
+      onProjectReady={(nextCurrent) => { current = nextCurrent; }}
+    />);
+    await waitFor(() => expect(prepare).not.toBeNull());
+    fireEvent.change(screen.getByLabelText("Caption text for C01"), { target: { value: "Preserve this draft while the agent stops." } });
+    const before = current!();
+    const controller = new AbortController();
+    const pending = prepare!({ itemId: "c02", itemRevision: 1, playheadMs: 3_500, signal: controller.signal });
+    await screen.findByRole("dialog", { name: /unsaved review draft/i });
+
+    await act(async () => { controller.abort(); });
+    await expect(pending).resolves.toBe(false);
+    expect(screen.queryByRole("dialog", { name: /unsaved review draft/i })).not.toBeInTheDocument();
+    expect(current!().selectedItem).toEqual(before.selectedItem);
+    expect(screen.getByLabelText("Caption text for C01")).toHaveValue("Preserve this draft while the agent stops.");
+    expect(onCommand).not.toHaveBeenCalled();
   });
 
   it("replaces the dirty-navigation dialog with one Sustained revision confirmation", async () => {

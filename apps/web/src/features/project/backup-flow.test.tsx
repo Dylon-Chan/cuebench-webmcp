@@ -8,12 +8,22 @@ import {
   type ProjectImportPreview,
 } from "@cuebench/domain";
 import { CueBenchDatabase, loadProject, saveNarrationBlob } from "@cuebench/storage";
+import {
+  createActiveRunTools,
+  createAlwaysTools,
+  createAudioDescriptionSelectionTools,
+  executeTool,
+  ToolVisibleStateError,
+} from "@cuebench/webmcp";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { BackupDialog, type BackupManager } from "./BackupDialog";
 import { DeleteProjectDialog } from "./DeleteProjectDialog";
 import { ObjectUrlLease } from "./local-media";
-import { ProjectStore } from "./project-store";
+import { AudioDescriptionGenerationClient } from "../generation/ad-generation-client";
+import { CaptionGenerationClient } from "../generation/generation-client";
+import { ProjectInstanceFenceError, ProjectStore } from "./project-store";
 import { loadPersistedCloudUpload, type CloudUploadReceiptStore } from "./cloud-upload";
+import { narrationPreviewRequestFor } from "../review/NarrationPreview";
 
 const projectFixture = (): CaptionProject => createProject({
   projectId: "backup-ui",
@@ -317,6 +327,7 @@ describe("Backup, relink, and deletion human workflows", () => {
     await first.openSample();
     const project = first.getSnapshot().project;
     if (project === null) throw new Error("Expected a durable project.");
+    const oldProjectInstanceEpoch = first.getProjectInstanceEpoch();
     const second = new ProjectStore({
       database,
       browserStorage: browserStorage(),
@@ -361,6 +372,10 @@ describe("Backup, relink, and deletion human workflows", () => {
     const freshOwner = await first.getCloudProjectOwnerCapability(project.projectId);
     expect(freshOwner).toMatch(/^[0-9a-f]{64}$/);
     expect(freshOwner).not.toBe(oldOwner);
+    // The bridge receives only this opaque page-local epoch, never the
+    // durable capability itself. It still changes even when the portable
+    // replacement preserves the project id and revision shape.
+    expect(first.getProjectInstanceEpoch()).toBeGreaterThan(oldProjectInstanceEpoch);
     // The second (older) tab bypasses its stale React projection and reads
     // the fresh capability from IndexedDB before any cloud mutation.
     expect(await second.getCloudProjectOwnerCapability(project.projectId)).toBe(freshOwner);
@@ -373,6 +388,379 @@ describe("Backup, relink, and deletion human workflows", () => {
     // Correctness comes from the durable owner comparison, not a best-effort
     // localStorage remove that could race another tab's recovery read.
     expect(values.get(staleReceiptKey)).toMatchObject({ projectOwnerCapability: oldOwner });
+    await database.delete();
+  });
+
+  it("rejects a stale tab's captured WebMCP instance fence after a same-id same-revision import rotates durable ownership", async () => {
+    const database = new CueBenchDatabase(`task-16-webmcp-cross-tab-${crypto.randomUUID()}`);
+    const staleTab = new ProjectStore({
+      database,
+      browserStorage: browserStorage(),
+      objectUrlLease: new ObjectUrlLease({ createObjectURL: vi.fn(() => "blob:cuebench:stale-tab"), revokeObjectURL: vi.fn() }),
+      bundledSampleLoader: bundledFile,
+      mediaDurationProbe: async () => 90_000,
+    });
+    await staleTab.openSample();
+    const before = staleTab.getSnapshot().project;
+    if (before === null) throw new Error("Expected a durable project.");
+    const capturedFence = staleTab.getProjectInstanceFence();
+    if (capturedFence === null) throw new Error("Expected a captured WebMCP project-instance fence.");
+
+    const importingTab = new ProjectStore({
+      database,
+      browserStorage: browserStorage(),
+      objectUrlLease: new ObjectUrlLease({ createObjectURL: vi.fn(() => "blob:cuebench:importing-tab"), revokeObjectURL: vi.fn() }),
+      mediaDurationProbe: async () => 90_000,
+    });
+    await importingTab.restoreLastDurableProject();
+    const portable = await staleTab.exportProjectBackup();
+    await importingTab.previewBackupText(portable.text);
+    await importingTab.relinkImportedMedia(bundledFile());
+    const imported = await importingTab.importPreviewedBackup();
+    expect(imported.project).toMatchObject({
+      projectId: before.projectId,
+      projectRevision: before.projectRevision,
+    });
+
+    const staleValidate = createAlwaysTools({
+      browserAgent: { type: "BrowserAgent", id: "browser-agent" },
+      getProject: () => staleTab.getSnapshot().project,
+      executeCommand: (command) => staleTab.executeCommand(command, capturedFence),
+      getPlayheadMs: () => 0,
+      afterVisibleChange: async () => undefined,
+    }).find((tool) => tool.name === "validate_project");
+    if (staleValidate === undefined) throw new Error("Expected the WebMCP validation tool.");
+    const staleResult = await staleValidate.execute({
+      contractVersion: 1,
+      expectedProjectRevision: before.projectRevision,
+    }, { signal: new AbortController().signal, markCommitted: vi.fn() });
+
+    expect(staleResult).toMatchObject({ ok: false, code: "STALE_PROJECT", changed: false });
+    expect((await loadProject(database, before.projectId))?.projectRevision).toBe(imported.project.projectRevision);
+    expect((await loadProject(database, before.projectId))?.courtRecord).toEqual(imported.project.courtRecord);
+    await database.delete();
+  });
+
+  it("blocks stale WebMCP caption and AD starts before receipt reservation or billed dispatch after a same-id import", async () => {
+    const database = new CueBenchDatabase(`task-16-webmcp-generation-fence-${crypto.randomUUID()}`);
+    const staleTab = new ProjectStore({
+      database,
+      browserStorage: browserStorage(),
+      objectUrlLease: new ObjectUrlLease({ createObjectURL: vi.fn(() => "blob:cuebench:stale-generation-tab"), revokeObjectURL: vi.fn() }),
+      bundledSampleLoader: bundledFile,
+      mediaDurationProbe: async () => 90_000,
+    });
+    await staleTab.openSample();
+    const before = staleTab.getSnapshot().project;
+    const capturedFence = staleTab.getProjectInstanceFence();
+    if (before === null || capturedFence === null) throw new Error("Expected a durable stale-tab project fence.");
+    const staleOwner = await staleTab.getCloudProjectOwnerCapability(before.projectId);
+    if (staleOwner === null) throw new Error("Expected a durable stale-tab owner.");
+
+    const importingTab = new ProjectStore({
+      database,
+      browserStorage: browserStorage(),
+      objectUrlLease: new ObjectUrlLease({ createObjectURL: vi.fn(() => "blob:cuebench:importing-generation-tab"), revokeObjectURL: vi.fn() }),
+      mediaDurationProbe: async () => 90_000,
+    });
+    await importingTab.restoreLastDurableProject();
+    const portable = await staleTab.exportProjectBackup();
+    await importingTab.previewBackupText(portable.text);
+    await importingTab.relinkImportedMedia(bundledFile());
+    const imported = await importingTab.importPreviewedBackup();
+    expect(imported.project).toMatchObject({ projectId: before.projectId, projectRevision: before.projectRevision });
+    expect(await importingTab.getCloudProjectOwnerCapability(before.projectId)).not.toBe(staleOwner);
+
+    const fetcher = vi.fn(async () => Response.json({ unexpected: true }));
+    const start = async (targetTrack: "Captions" | "AudioDescriptions") => {
+      const tool = createAlwaysTools({
+        browserAgent: { type: "BrowserAgent", id: "browser-agent" },
+        getProject: () => staleTab.getSnapshot().project,
+        executeCommand: (command) => staleTab.executeCommand(command, capturedFence),
+        getPlayheadMs: () => 0,
+        afterVisibleChange: async () => undefined,
+        startGeneration: async ({ project, targetTrack: requestedTarget, signal }) => {
+          try {
+            const upload = {
+              operationId: "stale-upload-operation",
+              sourceByteLength: 12,
+              sourceSha256: project.media.sha256,
+              durationMs: project.media.durationMs,
+              projectOwnerCapability: staleOwner,
+              session: "anonymous-session",
+              operationReceipt: "opaque-upload-receipt",
+            };
+            if (requestedTarget === "Captions") {
+              await new CaptionGenerationClient({ fetcher, createRunId: () => "stale-caption-run" }).start({
+                project,
+                store: staleTab.bindGenerationStore(capturedFence),
+                upload,
+                signal,
+              });
+            } else {
+              await new AudioDescriptionGenerationClient({ fetcher, createRunId: () => "stale-ad-run" }).start({
+                project,
+                store: staleTab.bindGenerationStore(capturedFence),
+                upload,
+                signal,
+              });
+            }
+          } catch (error) {
+            if (error instanceof ProjectInstanceFenceError) throw new ToolVisibleStateError();
+            throw error;
+          }
+          throw new Error("The stale generation start must not reach dispatch.");
+        },
+      }).find((candidate) => candidate.name === (targetTrack === "Captions" ? "start_caption_generation" : "start_ad_generation"));
+      if (tool === undefined) throw new Error("Expected a WebMCP generation starter.");
+      return tool.execute({ contractVersion: 1, expectedProjectRevision: before.projectRevision }, {
+        signal: new AbortController().signal,
+        markCommitted: vi.fn(),
+      });
+    };
+
+    await expect(start("Captions")).resolves.toMatchObject({ ok: false, code: "STALE_PROJECT", changed: false });
+    await expect(start("AudioDescriptions")).resolves.toMatchObject({ ok: false, code: "STALE_PROJECT", changed: false });
+    expect(fetcher).not.toHaveBeenCalled();
+    expect((await loadProject(database, before.projectId))?.activeGenerationRun).toBeNull();
+    await database.delete();
+  });
+
+  it("blocks a stale WebMCP cancellation before it can read a receipt or dispatch remote cleanup", async () => {
+    const database = new CueBenchDatabase(`task-16-webmcp-generation-cancel-fence-${crypto.randomUUID()}`);
+    const staleTab = new ProjectStore({
+      database,
+      browserStorage: browserStorage(),
+      objectUrlLease: new ObjectUrlLease({ createObjectURL: vi.fn(() => "blob:cuebench:stale-cancel-tab"), revokeObjectURL: vi.fn() }),
+      bundledSampleLoader: bundledFile,
+      mediaDurationProbe: async () => 90_000,
+    });
+    await staleTab.openSample();
+    const initial = staleTab.getSnapshot().project;
+    if (initial === null) throw new Error("Expected a durable stale-tab project.");
+    const started = await staleTab.executeCommand({
+      type: "StartGenerationRun",
+      actor: { type: "CueBenchAI", id: "cuebench-ai" },
+      runId: "stale-caption-cancel-run",
+      targetTrack: "Captions",
+      expectedProjectRevision: initial.projectRevision,
+    });
+    if (started.error !== undefined) throw new Error(started.error.message);
+    const active = staleTab.getSnapshot().project;
+    const capturedFence = staleTab.getProjectInstanceFence();
+    const staleOwner = await staleTab.getCloudProjectOwnerCapability(initial.projectId);
+    if (active === null || capturedFence === null || staleOwner === null) throw new Error("Expected a stale generation run and durable owner.");
+    const receipt = {
+      version: 1 as const,
+      runId: "stale-caption-cancel-run",
+      projectId: active.projectId,
+      signedGenerationReceipt: "opaque-stale-cancellation-receipt",
+      session: "anonymous-session",
+      expectedProjectRevision: active.projectRevision,
+      expectedQualityProfileRevision: active.qualityProfile.revision,
+      mediaSha256: active.media.sha256,
+      sourceByteLength: 12,
+      sourceDurationMs: active.media.durationMs,
+      projectOwnerCapability: staleOwner,
+      savedAtMs: Date.now(),
+      retentionExpiresAtMs: Date.now() + 60_000,
+    };
+    await staleTab.persistCaptionGenerationReceipt(receipt.runId, receipt);
+
+    const importingTab = new ProjectStore({
+      database,
+      browserStorage: browserStorage(),
+      objectUrlLease: new ObjectUrlLease({ createObjectURL: vi.fn(() => "blob:cuebench:importing-cancel-tab"), revokeObjectURL: vi.fn() }),
+      mediaDurationProbe: async () => 90_000,
+    });
+    await importingTab.restoreLastDurableProject();
+    const portable = await staleTab.exportProjectBackup();
+    await importingTab.previewBackupText(portable.text);
+    await importingTab.relinkImportedMedia(bundledFile());
+    const imported = await importingTab.importPreviewedBackup();
+    expect(imported.project).toMatchObject({ projectId: active.projectId, projectRevision: active.projectRevision });
+
+    const fetcher = vi.fn(async () => Response.json({ unexpected: true }));
+    const cancelTool = createActiveRunTools({
+      browserAgent: { type: "BrowserAgent", id: "browser-agent" },
+      getProject: () => staleTab.getSnapshot().project,
+      executeCommand: (command) => staleTab.executeCommand(command, capturedFence),
+      getPlayheadMs: () => 0,
+      afterVisibleChange: async () => undefined,
+      cancelGeneration: async ({ project, signal }) => {
+        const client = new CaptionGenerationClient({ fetcher });
+        try {
+          // This is the same read-before-cancel boundary as the bridge: the
+          // persisted owner capability must be checked before a DELETE can
+          // be constructed, not merely when its local lease is released.
+          const stored = await client.peekStoredReceipt(
+            staleTab.bindGenerationStore(capturedFence),
+            project,
+            receipt.runId,
+          );
+          if (stored === null) throw new Error("Expected the stale receipt before its durable instance check.");
+          await client.cancel({
+            project,
+            store: staleTab.bindGenerationStore(capturedFence),
+            receipt: stored,
+            actor: { type: "BrowserAgent", id: "browser-agent" },
+            signal,
+          });
+        } catch (error) {
+          if (error instanceof ProjectInstanceFenceError) throw new ToolVisibleStateError();
+          throw error;
+        }
+        throw new Error("The stale cancellation must not reach remote cleanup.");
+      },
+    }).find((candidate) => candidate.name === "cancel_generation_run");
+    if (cancelTool === undefined) throw new Error("Expected the WebMCP generation cancellation tool.");
+
+    const invocationSignal = new AbortController().signal;
+    await expect(executeTool(
+      () => cancelTool.execute({
+        contractVersion: 1,
+        expectedProjectRevision: active.projectRevision,
+        expectedRunId: receipt.runId,
+      }, { signal: invocationSignal, markCommitted: vi.fn() }),
+      { toolName: "cancel_generation_run", signal: invocationSignal, wasCommitted: () => false },
+    )).resolves.toMatchObject({
+      ok: false,
+      code: "STALE_PROJECT",
+      changed: false,
+    });
+    expect(fetcher).not.toHaveBeenCalled();
+    expect((await loadProject(database, active.projectId))?.courtRecord).toEqual(imported.project.courtRecord);
+    await database.delete();
+  });
+
+  it("returns STALE_PROJECT before a stale WebMCP narration preview can read cache, spend quota, or fetch", async () => {
+    const database = new CueBenchDatabase(`task-16-webmcp-narration-fence-${crypto.randomUUID()}`);
+    const staleTab = new ProjectStore({
+      database,
+      browserStorage: browserStorage(),
+      objectUrlLease: new ObjectUrlLease({ createObjectURL: vi.fn(() => "blob:cuebench:stale-narration-tab"), revokeObjectURL: vi.fn() }),
+      bundledSampleLoader: bundledFile,
+      mediaDurationProbe: async () => 90_000,
+    });
+    await staleTab.openSample();
+    const sample = staleTab.getSnapshot().project;
+    if (sample === null) throw new Error("Expected a durable bundled sample.");
+    const withBeat = createProject({
+      projectId: sample.projectId,
+      title: sample.title,
+      media: sample.media,
+      audioDescriptions: [{
+        kind: "AudioDescriptionBeat",
+        itemId: "ad-stale-preview",
+        state: "Proposed",
+        startMs: 200,
+        endMs: 800,
+        description: "A watershed diagram fills the screen.",
+        actor: { type: "CueBenchAI", id: "cuebench-ai" },
+        cause: "fixture",
+      }],
+    });
+    await staleTab.previewBackupText(JSON.stringify(exportProjectBackup(withBeat)));
+    await staleTab.relinkImportedMedia(bundledFile());
+    await staleTab.importPreviewedBackup();
+    const beforeFocus = staleTab.getSnapshot().project;
+    if (beforeFocus === null) throw new Error("Expected imported narration project.");
+    const focused = await staleTab.executeCommand({
+      type: "FocusItem",
+      actor: { type: "BrowserAgent", id: "browser-agent" },
+      itemId: "ad-stale-preview",
+      expectedItemRevision: 1,
+      expectedProjectRevision: beforeFocus.projectRevision,
+    });
+    if (focused.error !== undefined) throw new Error(focused.error.message);
+    const active = staleTab.getSnapshot().project;
+    const capturedFence = staleTab.getProjectInstanceFence();
+    if (active === null || capturedFence === null) throw new Error("Expected selected stale narration state.");
+
+    const importingTab = new ProjectStore({
+      database,
+      browserStorage: browserStorage(),
+      objectUrlLease: new ObjectUrlLease({ createObjectURL: vi.fn(() => "blob:cuebench:importing-narration-tab"), revokeObjectURL: vi.fn() }),
+      mediaDurationProbe: async () => 90_000,
+    });
+    await importingTab.restoreLastDurableProject();
+    const portable = await staleTab.exportProjectBackup();
+    await importingTab.previewBackupText(portable.text);
+    await importingTab.relinkImportedMedia(bundledFile());
+    const imported = await importingTab.importPreviewedBackup();
+    expect(imported.project).toMatchObject({ projectId: active.projectId, projectRevision: active.projectRevision });
+    const freshOwner = await importingTab.getCloudProjectOwnerCapability(active.projectId);
+    if (freshOwner === null) throw new Error("Expected an imported project owner.");
+    localStorage.setItem(`cuebench-cloud-upload:${active.projectId}`, JSON.stringify({
+      version: 1,
+      projectId: active.projectId,
+      operationId: "fresh-owner-narration-operation",
+      sourceByteLength: 12,
+      sourceSha256: active.media.sha256,
+      sourceContentType: "video/mp4",
+      durationMs: active.media.durationMs,
+      projectOwnerCapability: freshOwner,
+      session: "fresh-session",
+      sessionExpiresAtMs: Date.now() + 60_000,
+      operationReceipt: "fresh-owner-operation-receipt",
+      uploadCapability: "fresh-owner-upload-capability",
+      partSize: 12,
+      partCount: 1,
+      partReceipts: {},
+    }));
+
+    const cacheReads = vi.spyOn(database.narrationBlobs, "get");
+    const cacheWrites = vi.spyOn(database.narrationBlobs, "put");
+    const fetcher = vi.spyOn(globalThis, "fetch").mockResolvedValue(Response.json({ unexpected: true }));
+    const markedCommitted = vi.fn();
+    const gateway = (staleTab as unknown as {
+      readonly bindNarrationPreviewGateway: (fence: NonNullable<ReturnType<ProjectStore["getProjectInstanceFence"]>>) => ReturnType<ProjectStore["getNarrationPreviewGateway"]>;
+    }).bindNarrationPreviewGateway(capturedFence);
+    const previewTool = createAudioDescriptionSelectionTools({
+      browserAgent: { type: "BrowserAgent", id: "browser-agent" },
+      getProject: () => staleTab.getSnapshot().project,
+      executeCommand: (command) => staleTab.executeCommand(command, capturedFence),
+      getPlayheadMs: () => 0,
+      afterVisibleChange: async () => undefined,
+      previewNarration: async ({ project, beatId, itemRevision, signal, onCommitted }) => {
+        const beat = project.audioDescriptions.items[beatId];
+        if (beat === undefined || beat.current.itemRevision !== itemRevision) throw new ToolVisibleStateError();
+        const request = narrationPreviewRequestFor(project.projectId, beat);
+        try {
+          const cached = await gateway.loadCached({ projectId: request.projectId, cacheKey: request.cacheKey });
+          if (cached === undefined) {
+            onCommitted?.();
+            const synthesis = await gateway.synthesize(request, { signal });
+            await gateway.saveCached({ ...request, blob: synthesis.blob, contentType: synthesis.contentType, measuredDurationMs: 1_000 });
+          }
+        } catch (error) {
+          if (error instanceof ProjectInstanceFenceError) throw new ToolVisibleStateError();
+          throw error;
+        }
+        throw new Error("The stale narration preview must not reach a cache or hosted request.");
+      },
+    }).find((candidate) => candidate.name === "preview_selected_narration");
+    if (previewTool === undefined) throw new Error("Expected the selected narration-preview WebMCP tool.");
+    const selected = active.selectedItem;
+    if (selected === null || selected.kind !== "AudioDescriptionBeat") throw new Error("Expected selected AD beat.");
+
+    await expect(previewTool.execute({
+      contractVersion: 1,
+      expectedProjectRevision: active.projectRevision,
+      expectedSelectionId: selected.itemId,
+      expectedSelectionRevision: selected.itemRevision,
+      expectedItemRevision: selected.itemRevision,
+    }, { signal: new AbortController().signal, markCommitted: markedCommitted })).resolves.toMatchObject({
+      ok: false,
+      code: "STALE_PROJECT",
+      changed: false,
+    });
+    expect(markedCommitted).not.toHaveBeenCalled();
+    expect(fetcher).not.toHaveBeenCalled();
+    expect(cacheReads).not.toHaveBeenCalled();
+    expect(cacheWrites).not.toHaveBeenCalled();
+    fetcher.mockRestore();
+    localStorage.removeItem(`cuebench-cloud-upload:${active.projectId}`);
     await database.delete();
   });
 

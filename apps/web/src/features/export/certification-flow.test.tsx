@@ -204,6 +204,61 @@ describe("Certification and export human workflows", () => {
     })));
   });
 
+  it("binds a Browser Agent profile proposal to the visible project/profile revision and reports DOM visibility only after the dialog exists", async () => {
+    const project = projectFixture();
+    const onVisible = vi.fn(() => {
+      expect(screen.getByRole("dialog", { name: "Quality profile proposal" })).toBeInTheDocument();
+    });
+    const proposal = {
+      projectId: project.projectId,
+      proposalId: "bound-browser-proposal",
+      createdBy: "Browser Agent",
+      rationale: "A bounded proposal for Human review.",
+      profileId: project.qualityProfile.profileId,
+      name: "Bound quality profile",
+      rules: project.qualityProfile.rules,
+      baseProfileRevision: project.qualityProfile.revision,
+      baseProjectRevision: project.projectRevision,
+      projectInstanceEpoch: 7,
+    };
+    const onCommand = vi.fn(async () => accepted(project));
+    const view = render(<ProfileProposalDialog project={project} projectInstanceEpoch={7} proposal={proposal} open onProposalVisible={onVisible} onCommand={onCommand} />);
+    await waitFor(() => expect(onVisible).toHaveBeenCalledWith("bound-browser-proposal"));
+
+    view.rerender(<ProfileProposalDialog
+      project={{ ...project, projectRevision: project.projectRevision + 1 }}
+      projectInstanceEpoch={7}
+      proposal={proposal}
+      open
+      onProposalVisible={onVisible}
+      onCommand={onCommand}
+    />);
+    await waitFor(() => expect(screen.queryByRole("dialog", { name: "Quality profile proposal" })).not.toBeInTheDocument());
+    expect(onCommand).not.toHaveBeenCalled();
+
+
+    const epochProposal = { ...proposal, proposalId: "bound-browser-proposal-instance", baseProjectRevision: project.projectRevision };
+    const epochView = render(<ProfileProposalDialog
+      project={project}
+      projectInstanceEpoch={7}
+      proposal={epochProposal}
+      open
+      onProposalVisible={onVisible}
+      onCommand={onCommand}
+    />);
+    await waitFor(() => expect(screen.getByRole("dialog", { name: "Quality profile proposal" })).toBeInTheDocument());
+    epochView.rerender(<ProfileProposalDialog
+      project={project}
+      projectInstanceEpoch={8}
+      proposal={epochProposal}
+      open
+      onProposalVisible={onVisible}
+      onCommand={onCommand}
+    />);
+    await waitFor(() => expect(screen.queryByRole("dialog", { name: "Quality profile proposal" })).not.toBeInTheDocument());
+    expect(onCommand).not.toHaveBeenCalled();
+  });
+
   it("supplies an honest built-in profile preset when no agent proposal inbox is configured", async () => {
     const project = projectFixture();
     const onCommand = vi.fn(async () => accepted(project));

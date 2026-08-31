@@ -90,6 +90,201 @@ describe("caption generation browser recovery", () => {
     expect(fetcher).not.toHaveBeenCalled();
   });
 
+  it("honors an agent abort after an awaited reservation and before acquiring a caption lease", async () => {
+    let project = projectFixture();
+    let releaseReservation: () => void = () => { throw new Error("Reservation was not reached."); };
+    const controller = new AbortController();
+    const executeCommand = vi.fn(async (command) => {
+      const result = applyCommand(project, command);
+      project = result.project;
+      return result;
+    });
+    const fetcher = vi.fn();
+    const store: GenerationProjectStore = {
+      getSnapshot: () => ({ project, mode: "durable" as const }),
+      executeCommand,
+      persistCaptionGenerationReceipt: vi.fn(),
+      reserveCaptionGenerationReceipt: async () => new Promise<void>((resolve) => { releaseReservation = resolve; }),
+      releaseCaptionGenerationReceiptReservation: vi.fn(),
+      loadCaptionGenerationReceipt: vi.fn(),
+      adoptStagedCaptionGenerationResult: vi.fn(),
+    };
+    const client = new CaptionGenerationClient({ fetcher, createRunId: () => "aborted-caption-run" });
+    const pending = client.start({
+      project,
+      store,
+      signal: controller.signal,
+      upload: { operationId: "upload-run", session: "anonymous-session", operationReceipt: "opaque-upload-receipt", sourceByteLength: 5, sourceSha256: "a".repeat(64), durationMs: 60_000, projectOwnerCapability },
+    });
+    await Promise.resolve();
+    controller.abort();
+    releaseReservation();
+
+    await expect(pending).rejects.toMatchObject({ name: "AbortError" });
+    expect(executeCommand).not.toHaveBeenCalled();
+    expect(fetcher).not.toHaveBeenCalled();
+    expect(project.activeGenerationRun).toBeNull();
+  });
+
+  it("does not let the lease-driven WebMCP family replacement abort its own caption POST", async () => {
+    let project = projectFixture();
+    const groupController = new AbortController();
+    const executeCommand = vi.fn(async (command) => {
+      const result = applyCommand(project, command);
+      project = result.project;
+      return result;
+    });
+    const fetcher = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+      // This mirrors a browser fetch implementation: a replacement-family
+      // abort must not leak into the durable POST after the lease committed.
+      if (init?.signal?.aborted === true) throw new DOMException("aborted", "AbortError");
+      const base = project.activeGenerationRun?.base;
+      if (base?.targetTrack !== "Captions") throw new Error("expected caption lease");
+      return Response.json({
+        generationRunReceipt: "opaque-generation-receipt",
+        retentionExpiresAtMs: receipt.retentionExpiresAtMs,
+        status: {
+          contractVersion: 1,
+          runId: "self-swap-caption-run",
+          projectId: project.projectId,
+          targetTrack: "Captions",
+          expectedProjectRevision: base.expectedProjectRevision,
+          stage: "Queued",
+        },
+      }, { status: 201 });
+    });
+    const store: GenerationProjectStore = {
+      getSnapshot: () => ({ project, mode: "durable" as const }),
+      executeCommand,
+      persistCaptionGenerationReceipt: vi.fn(),
+      loadCaptionGenerationReceipt: vi.fn(),
+      adoptStagedCaptionGenerationResult: vi.fn(),
+    };
+    const client = new CaptionGenerationClient({ fetcher, createRunId: () => "self-swap-caption-run", clock: () => receipt.savedAtMs });
+
+    await expect(client.start({
+      project,
+      store,
+      signal: groupController.signal,
+      upload: { operationId: "upload-run", session: "anonymous-session", operationReceipt: "opaque-upload-receipt", sourceByteLength: 5, sourceSha256: "a".repeat(64), durationMs: 60_000, projectOwnerCapability },
+      onLifecycleEvent: (event) => { if (event.phase === "lease-acquired") groupController.abort(); },
+    })).resolves.toMatchObject({ status: { runId: "self-swap-caption-run", stage: "Queued" } });
+
+    expect(fetcher).toHaveBeenCalledTimes(1);
+    expect(fetcher.mock.calls[0]?.[1]?.signal).toBeUndefined();
+  });
+
+  it("stops caption cancellation before its durable intent when the invocation is already aborted", async () => {
+    const project = applyCommand(projectFixture(), {
+      type: "StartGenerationRun",
+      actor: { type: "CueBenchAI", id: "cuebench-ai" },
+      runId: receipt.runId,
+      targetTrack: "Captions",
+      expectedProjectRevision: 1,
+    }).project;
+    const runReceipt: GenerationClientReceipt = {
+      ...receipt,
+      expectedProjectRevision: project.projectRevision,
+      expectedQualityProfileRevision: project.qualityProfile.revision,
+    };
+    const controller = new AbortController();
+    controller.abort();
+    const persistCaptionGenerationReceipt = vi.fn();
+    const fetcher = vi.fn();
+    const store: GenerationProjectStore = {
+      getSnapshot: () => ({ project, mode: "durable" as const }),
+      executeCommand: vi.fn(),
+      persistCaptionGenerationReceipt,
+      loadCaptionGenerationReceipt: vi.fn(),
+      adoptStagedCaptionGenerationResult: vi.fn(),
+    };
+    const client = new CaptionGenerationClient({ fetcher });
+
+    await expect(client.cancel({ project, store, receipt: runReceipt, signal: controller.signal })).rejects.toMatchObject({ name: "AbortError" });
+    expect(persistCaptionGenerationReceipt).not.toHaveBeenCalled();
+    expect(fetcher).not.toHaveBeenCalled();
+  });
+
+  it("does not let the cancellation-intent family replacement abort its own caption DELETE", async () => {
+    let project = applyCommand(projectFixture(), {
+      type: "StartGenerationRun",
+      actor: { type: "CueBenchAI", id: "cuebench-ai" },
+      runId: receipt.runId,
+      targetTrack: "Captions",
+      expectedProjectRevision: 1,
+    }).project;
+    const runReceipt: GenerationClientReceipt = {
+      ...receipt,
+      expectedProjectRevision: project.projectRevision,
+      expectedQualityProfileRevision: project.qualityProfile.revision,
+    };
+    const groupController = new AbortController();
+    const persistCaptionGenerationReceipt = vi.fn(async () => { groupController.abort(); });
+    const executeCommand = vi.fn(async (command) => {
+      const result = applyCommand(project, command);
+      project = result.project;
+      return result;
+    });
+    const fetcher = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+      if (init?.signal?.aborted === true) throw new DOMException("aborted", "AbortError");
+      return Response.json({
+        status: {
+          contractVersion: 1,
+          runId: runReceipt.runId,
+          projectId: runReceipt.projectId,
+          targetTrack: "Captions",
+          expectedProjectRevision: runReceipt.expectedProjectRevision,
+          stage: "Cancelled",
+        },
+        cleanup: { version: 1, state: "completed", action: "cancelled", artifactKeys: [], requestedAtMs: receipt.savedAtMs, completedAtMs: receipt.savedAtMs + 1 },
+      });
+    });
+    const store: GenerationProjectStore = {
+      getSnapshot: () => ({ project, mode: "durable" as const }),
+      executeCommand,
+      persistCaptionGenerationReceipt,
+      loadCaptionGenerationReceipt: vi.fn(),
+      adoptStagedCaptionGenerationResult: vi.fn(),
+    };
+    const client = new CaptionGenerationClient({ fetcher });
+
+    await expect(client.cancel({ project, store, receipt: runReceipt, signal: groupController.signal })).resolves.toMatchObject({ stage: "Cancelled" });
+    expect(fetcher).toHaveBeenCalledTimes(1);
+    expect(fetcher.mock.calls[0]?.[1]?.signal).toBeUndefined();
+  });
+
+  it("retains and reports the exact caption run identity when dispatch is ambiguous after lease acquisition", async () => {
+    let project = projectFixture();
+    const events: string[] = [];
+    const store: GenerationProjectStore = {
+      getSnapshot: () => ({ project, mode: "durable" as const }),
+      executeCommand: async (command) => {
+        const result = applyCommand(project, command);
+        project = result.project;
+        return result;
+      },
+      persistCaptionGenerationReceipt: vi.fn(),
+      loadCaptionGenerationReceipt: vi.fn(),
+      adoptStagedCaptionGenerationResult: vi.fn(),
+    };
+    const client = new CaptionGenerationClient({
+      createRunId: () => "ambiguous-caption-run",
+      fetcher: async () => { throw new Error("transport interrupted after dispatch"); },
+      clock: () => receipt.savedAtMs,
+    });
+
+    await expect(client.start({
+      project,
+      store,
+      upload: { operationId: "upload-run", session: "anonymous-session", operationReceipt: "opaque-upload-receipt", sourceByteLength: 5, sourceSha256: "a".repeat(64), durationMs: 60_000, projectOwnerCapability },
+      onLifecycleEvent: (event) => events.push(event.phase),
+    })).rejects.toMatchObject({
+      details: { lifecycleOutcome: { runId: "ambiguous-caption-run", targetTrack: "Captions", disposition: "accepted-unknown" } },
+    });
+    expect(project.activeGenerationRun).toMatchObject({ runId: "ambiguous-caption-run", targetTrack: "Captions" });
+    expect(events).toEqual(["lease-acquired", "dispatch-uncertain"]);
+  });
+
   it("persists the signed receipt after lease acquisition and before the first status poll", async () => {
     let project = projectFixture();
     const order: string[] = [];
@@ -231,7 +426,7 @@ describe("caption generation browser recovery", () => {
 
     expect(project.activeGenerationRun?.runId).toBe("durable-ambiguity-run");
     expect(executeCommand).toHaveBeenCalledTimes(1);
-    expect(executeCommand).toHaveBeenCalledWith(expect.objectContaining({ type: "StartGenerationRun", runId: "durable-ambiguity-run" }));
+    expect(executeCommand).toHaveBeenCalledWith(expect.objectContaining({ type: "StartGenerationRun", runId: "durable-ambiguity-run" }), project.projectId);
   });
 
   it("upgrades an earlier durable receipt with the documented bounded retention deadline", async () => {
@@ -475,7 +670,7 @@ describe("caption generation browser recovery", () => {
     });
 
     await expect(client.cancel({ project, store, receipt: runReceipt })).resolves.toMatchObject({ stage: "Cancelled" });
-    expect(executeCommand).toHaveBeenCalledWith(expect.objectContaining({ type: "ReleaseGenerationRun", runId: runReceipt.runId }));
+    expect(executeCommand).toHaveBeenCalledWith(expect.objectContaining({ type: "ReleaseGenerationRun", runId: runReceipt.runId }), project.projectId);
     expect(project.activeGenerationRun).toBeNull();
     expect(storedReceipt.terminalCleanup?.cleanupAcknowledgement).toBe("pending");
     expect(storedReceipt.terminalCleanup?.localLeaseRelease).toBe("released");
@@ -483,8 +678,62 @@ describe("caption generation browser recovery", () => {
     await client.retryCancellationCleanup({ project, store, receipt: storedReceipt });
     expect(attempts).toBe(2);
     expect(storedReceipt.terminalCleanup?.cleanupAcknowledgement).toBe("acknowledged");
-    expect(executeCommand).toHaveBeenCalledWith(expect.objectContaining({ type: "ReleaseGenerationRun", runId: runReceipt.runId }));
+    expect(executeCommand).toHaveBeenCalledWith(expect.objectContaining({ type: "ReleaseGenerationRun", runId: runReceipt.runId }), project.projectId);
     expect(project.activeGenerationRun).toBeNull();
+  });
+
+  it("keeps a BrowserAgent-attributed caption cancellation recoverable when local lease release fails", async () => {
+    let project = applyCommand(projectFixture(), {
+      type: "StartGenerationRun",
+      actor: { type: "CueBenchAI", id: "cuebench-ai" },
+      runId: receipt.runId,
+      targetTrack: "Captions",
+      expectedProjectRevision: 1,
+    }).project;
+    const runReceipt: GenerationClientReceipt = {
+      ...receipt,
+      expectedProjectRevision: project.projectRevision,
+      expectedQualityProfileRevision: project.qualityProfile.revision,
+    };
+    let stored = runReceipt;
+    const executeCommand = vi.fn(async (command) => {
+      if (command.type === "ReleaseGenerationRun") throw new Error("local release unavailable");
+      const result = applyCommand(project, command);
+      project = result.project;
+      return result;
+    });
+    const store: GenerationProjectStore = {
+      getSnapshot: () => ({ project, mode: "durable" as const }),
+      executeCommand,
+      persistCaptionGenerationReceipt: async (_runId, value) => { stored = value; },
+      loadCaptionGenerationReceipt: async () => stored,
+      adoptStagedCaptionGenerationResult: vi.fn(),
+    };
+    const events: string[] = [];
+    const client = new CaptionGenerationClient({
+      fetcher: async () => Response.json({
+        status: { contractVersion: 1, runId: runReceipt.runId, projectId: runReceipt.projectId, targetTrack: "Captions", expectedProjectRevision: runReceipt.expectedProjectRevision, stage: "Cancelled" },
+        cleanup: { version: 1, state: "completed", action: "cancelled", artifactKeys: [], requestedAtMs: receipt.savedAtMs, completedAtMs: receipt.savedAtMs + 1 },
+      }),
+      clock: () => receipt.savedAtMs,
+    });
+
+    await expect(client.cancel({
+      project,
+      store,
+      receipt: runReceipt,
+      actor: { type: "BrowserAgent", id: "browser-agent" },
+      onLifecycleEvent: (event) => events.push(event.phase),
+    })).rejects.toMatchObject({
+      details: { lifecycleOutcome: { runId: runReceipt.runId, targetTrack: "Captions", disposition: "lifecycle-pending" } },
+    });
+    expect(executeCommand).toHaveBeenCalledWith(expect.objectContaining({
+      type: "ReleaseGenerationRun",
+      actor: { type: "BrowserAgent", id: "browser-agent" },
+    }), project.projectId);
+    expect(project.activeGenerationRun?.runId).toBe(runReceipt.runId);
+    expect(stored.terminalCleanup).toMatchObject({ action: "cancelled", localLeaseRelease: "pending" });
+    expect(events).toEqual(["cancellation-intent-persisted", "remote-cancelled"]);
   });
 
   it("recovers a local caption-lease release after cleanup was acknowledged but the browser crashed before release", async () => {
@@ -626,6 +875,38 @@ describe("caption generation browser recovery", () => {
     });
     expect(project.activeGenerationRun).toBeNull();
     expect(storedReceipt.expirySettlement).toMatchObject({ localLeaseRelease: "released" });
+  });
+
+  it("peeks an expired caption receipt without settling, releasing, or writing recovery state", async () => {
+    const project = applyCommand(projectFixture(), {
+      type: "StartGenerationRun",
+      actor: { type: "CueBenchAI", id: "cuebench-ai" },
+      runId: receipt.runId,
+      targetTrack: "Captions",
+      expectedProjectRevision: 1,
+    }).project;
+    const expired: GenerationClientReceipt = {
+      ...receipt,
+      expectedProjectRevision: project.projectRevision,
+      expectedQualityProfileRevision: project.qualityProfile.revision,
+      retentionExpiresAtMs: receipt.savedAtMs + 1,
+    };
+    const persist = vi.fn();
+    const execute = vi.fn();
+    const store: GenerationProjectStore = {
+      getSnapshot: () => ({ project, mode: "durable" as const }),
+      executeCommand: execute,
+      persistCaptionGenerationReceipt: persist,
+      loadCaptionGenerationReceipt: async () => expired,
+      adoptStagedCaptionGenerationResult: vi.fn(),
+    };
+    const before = project;
+    const client = new CaptionGenerationClient({ clock: () => expired.retentionExpiresAtMs });
+
+    await expect(client.peekStoredReceipt(store, project, expired.runId)).resolves.toMatchObject({ runId: expired.runId });
+    expect(project).toBe(before);
+    expect(execute).not.toHaveBeenCalled();
+    expect(persist).not.toHaveBeenCalled();
   });
 
   it("settles pending adoption cleanup and an unconfirmed cancellation intent truthfully at owner-capability expiry", async () => {

@@ -2,6 +2,7 @@ import type { MediaSourceSnapshot } from "@cuebench/contracts";
 import {
   CueBenchDatabase,
   StorageReadValidationError,
+  StorageStaleWriteError,
   narrationBlobKey,
   runReceiptKey,
   sourceBlobKey,
@@ -45,6 +46,26 @@ export interface NarrationBlobInput {
   readonly contentType?: string;
   /** Actual decoded/rendered preview duration; callers must not guess this from text. */
   readonly measuredDurationMs: number;
+}
+
+/**
+ * Optional caller-owned fence for opaque generation receipts. Receipt rows
+ * can authorize a billed/cleanup lifecycle just as surely as a project
+ * reducer command, so their transaction must reject a replaced project
+ * instance before it reads or writes any row.
+ */
+export interface RunReceiptAccessOptions {
+  readonly authorizeCommand?: () => boolean | Promise<boolean>;
+}
+
+/**
+ * Optional caller-owned fence for disposable narration-cache rows. A cached
+ * preview is not merely a convenience: reading it can publish audio and
+ * writing it retains browser data. Both boundaries must reject a replaced
+ * project instance before touching the row.
+ */
+export interface NarrationBlobAccessOptions {
+  readonly authorizeCommand?: () => boolean | Promise<boolean>;
 }
 
 const sourceInputFrom = (
@@ -186,6 +207,7 @@ export const saveNarrationBlob = async (
   db: CueBenchDatabase,
   projectId: string,
   input: NarrationBlobInput,
+  options: NarrationBlobAccessOptions = {},
 ): Promise<NarrationBlobRow> => {
   if (
     !isIdentifier(projectId)
@@ -212,7 +234,8 @@ export const saveNarrationBlob = async (
     measuredDurationMs: input.measuredDurationMs,
     savedAtMs: now(),
   });
-  await db.transaction("rw", db.narrationBlobs, async () => {
+  await db.transaction("rw", [db.narrationBlobs, db.settings], async () => {
+    await assertStorageAuthorized(projectId, options);
     await db.narrationBlobs.put(row);
   });
   return row;
@@ -222,10 +245,12 @@ export const loadNarrationBlob = async (
   db: CueBenchDatabase,
   projectId: string,
   cacheKey: string,
-): Promise<NarrationBlobRow | undefined> => db.transaction("r", db.narrationBlobs, async () => {
+  options: NarrationBlobAccessOptions = {},
+): Promise<NarrationBlobRow | undefined> => db.transaction("r", [db.narrationBlobs, db.settings], async () => {
   if (!isIdentifier(projectId) || !isSha256(cacheKey)) {
     throw new TypeError("Narration cache lookup needs a canonical project id and full-input cache key.");
   }
+  await assertStorageAuthorized(projectId, options);
   const row = await db.narrationBlobs.get(narrationBlobKey(projectId, cacheKey));
   return row === undefined ? undefined : validateNarrationBlobRow(row);
 });
@@ -335,6 +360,15 @@ const activeReceiptCount = async (db: CueBenchDatabase, projectId: string, exclu
   )).length
 );
 
+const assertStorageAuthorized = async (
+  projectId: string,
+  options: Pick<RunReceiptAccessOptions, "authorizeCommand"> | Pick<NarrationBlobAccessOptions, "authorizeCommand">,
+): Promise<void> => {
+  if (options.authorizeCommand !== undefined && !(await options.authorizeCommand())) {
+    throw new StorageStaleWriteError(projectId);
+  }
+};
+
 /**
  * Reserves an exact receipt primary key before a server start. A successful
  * `saveRunReceipt` for the same run atomically replaces this opaque marker;
@@ -346,10 +380,12 @@ export const reserveRunReceiptSlot = async (
   db: CueBenchDatabase,
   projectId: string,
   runId: string,
+  options: RunReceiptAccessOptions = {},
 ): Promise<void> => {
   if (!isIdentifier(projectId) || !isIdentifier(runId)) throw new TypeError("Run receipt reservations need project and run ids.");
   const key = runReceiptKey(projectId, runId);
-  await db.transaction("rw", db.runReceipts, async () => {
+  await db.transaction("rw", [db.runReceipts, db.settings], async () => {
+    await assertStorageAuthorized(projectId, options);
     const existing = await db.runReceipts.get(key);
     if (existing !== undefined) return;
     await pruneNonActionableReceipts(db, projectId);
@@ -381,10 +417,12 @@ export const releaseRunReceiptReservation = async (
   db: CueBenchDatabase,
   projectId: string,
   runId: string,
+  options: RunReceiptAccessOptions = {},
 ): Promise<void> => {
   if (!isIdentifier(projectId) || !isIdentifier(runId)) throw new TypeError("Run receipt reservations need project and run ids.");
   const key = runReceiptKey(projectId, runId);
-  await db.transaction("rw", db.runReceipts, async () => {
+  await db.transaction("rw", [db.runReceipts, db.settings], async () => {
+    await assertStorageAuthorized(projectId, options);
     const existing = await db.runReceipts.get(key);
     if (existing !== undefined && isReceiptReservation(existing.receipt.payload)) await db.runReceipts.delete(key);
   });
@@ -396,10 +434,12 @@ export const saveRunReceipt = async (
   projectId: string,
   runId: string,
   receipt: unknown,
+  options: RunReceiptAccessOptions = {},
 ): Promise<RunReceiptRow> => {
   if (!isIdentifier(projectId) || !isIdentifier(runId)) throw new TypeError("Run receipts need project and run ids.");
   const row = validateRunReceiptRow({ key: runReceiptKey(projectId, runId), projectId, runId, receipt, savedAtMs: now() });
-  await db.transaction("rw", db.runReceipts, async () => {
+  await db.transaction("rw", [db.runReceipts, db.settings], async () => {
+    await assertStorageAuthorized(projectId, options);
     const existing = await db.runReceipts.get(row.key);
     await pruneNonActionableReceipts(db, projectId, row.key);
     if (existing === undefined && receiptNeedsRecovery(row.receipt.payload) && await activeReceiptCount(db, projectId, row.key) >= MAX_RUN_RECEIPTS_PER_PROJECT) {
@@ -415,7 +455,9 @@ export const loadRunReceipt = async (
   db: CueBenchDatabase,
   projectId: string,
   runId: string,
-): Promise<RunReceiptRow | undefined> => db.transaction("r", db.runReceipts, async () => {
+  options: RunReceiptAccessOptions = {},
+): Promise<RunReceiptRow | undefined> => db.transaction("r", [db.runReceipts, db.settings], async () => {
+  await assertStorageAuthorized(projectId, options);
   const row = await db.runReceipts.get(runReceiptKey(projectId, runId));
   return row === undefined ? undefined : validateRunReceiptRow(row);
 });
@@ -429,8 +471,10 @@ export const loadRunReceipt = async (
 export const listRunReceipts = async (
   db: CueBenchDatabase,
   projectId: string,
-): Promise<readonly RunReceiptRow[]> => db.transaction("r", db.runReceipts, async () => {
+  options: RunReceiptAccessOptions = {},
+): Promise<readonly RunReceiptRow[]> => db.transaction("r", [db.runReceipts, db.settings], async () => {
   if (!isIdentifier(projectId)) throw new TypeError("Run receipts need a project id.");
+  await assertStorageAuthorized(projectId, options);
   const rows = await db.runReceipts
     .where("[projectId+savedAtMs]")
     .between([projectId, 0], [projectId, Number.MAX_SAFE_INTEGER])

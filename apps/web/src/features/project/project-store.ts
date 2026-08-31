@@ -3,6 +3,7 @@ import {
   createProject,
   buildProjectBackupFilename,
   canonicalHash,
+  domainError,
   exportProjectBackup as exportProjectBackupManifest,
   prepareTrackExport as prepareDomainTrackExport,
   previewProjectImport,
@@ -34,6 +35,7 @@ import {
   saveSetting,
   settleExpiredAudioDescriptionGenerationReceipt as settlePersistedExpiredAudioDescriptionGenerationReceipt,
   sourceBlobKey,
+  StorageStaleWriteError,
   type SourceBlobRow,
 } from "@cuebench/storage";
 import {
@@ -141,6 +143,36 @@ export interface ProjectStoreSnapshot {
   readonly cleanupNotice: string | null;
 }
 
+/**
+ * Page-internal ownership fence for a non-portable browser project instance.
+ * This deliberately never contains the durable owner capability itself: the
+ * bridge needs only an opaque epoch to reject work retained from a replaced
+ * import, while hosted capability material remains private to this store.
+ */
+export interface ProjectInstanceFence {
+  readonly projectId: string;
+  readonly projectInstanceEpoch: number;
+  /**
+   * A one-way, page-internal fingerprint of the persisted non-portable owner
+   * capability. It is never serialized into a backup or returned to an
+   * agent; it only prevents a stale tab from mutating a same-id replacement.
+   */
+  readonly projectInstanceCapabilityFingerprint?: string;
+}
+
+/**
+ * A page captured a nonportable owner binding that no longer authorizes this
+ * project namespace. This is intentionally distinct from a normal expected
+ * revision rejection: a Browser Agent must never continue lifecycle work
+ * across a same-id import from another tab.
+ */
+export class ProjectInstanceFenceError extends Error {
+  public constructor() {
+    super("CueBench's browser project instance changed before this lifecycle action could continue.");
+    this.name = "ProjectInstanceFenceError";
+  }
+}
+
 export interface ProjectStoreOptions {
   readonly database?: CueBenchDatabase;
   readonly browserStorage?: BrowserStorageManager | null;
@@ -165,6 +197,30 @@ export type CaptionGenerationAdoptionCommand = Extract<DomainCommand, {
 export type AudioDescriptionGenerationAdoptionCommand = Extract<DomainCommand, {
   readonly type: "AdoptAudioDescriptionGenerationResult";
 }>;
+
+/**
+ * Capability-bound port handed only to a WebMCP generation invocation. The
+ * raw ProjectStore remains available to ordinary Human UI flows, while every
+ * lifecycle/receipt operation here carries one captured instance fence.
+ */
+export interface BoundGenerationProjectStore {
+  readonly getSnapshot: () => { readonly project: CaptionProject | null; readonly mode: ProjectMode | null };
+  readonly executeCommand: (command: DomainCommand, expectedProjectId?: string) => Promise<CommandResult>;
+  readonly persistCaptionGenerationReceipt: (runId: string, receipt: unknown) => Promise<void>;
+  readonly reserveCaptionGenerationReceipt: (runId: string) => Promise<void>;
+  readonly releaseCaptionGenerationReceiptReservation: (runId: string) => Promise<void>;
+  readonly loadCaptionGenerationReceipt: (runId: string) => Promise<unknown | null>;
+  readonly listCaptionGenerationReceiptRunIds: () => Promise<readonly string[]>;
+  readonly persistAudioDescriptionGenerationReceipt: (runId: string, receipt: unknown) => Promise<void>;
+  readonly reserveAudioDescriptionGenerationReceipt: (runId: string) => Promise<void>;
+  readonly releaseAudioDescriptionGenerationReceiptReservation: (runId: string) => Promise<void>;
+  readonly loadAudioDescriptionGenerationReceipt: (runId: string) => Promise<unknown | null>;
+  readonly listAudioDescriptionGenerationReceiptRunIds: () => Promise<readonly string[]>;
+  readonly settleExpiredAudioDescriptionGenerationReceipt: (runId: string) => Promise<unknown | null>;
+  readonly getCloudProjectOwnerCapability: (projectId: string) => Promise<string | null>;
+  readonly adoptStagedCaptionGenerationResult: (command: CaptionGenerationAdoptionCommand) => Promise<CommandResult>;
+  readonly adoptStagedAudioDescriptionGenerationResult: (command: AudioDescriptionGenerationAdoptionCommand) => Promise<CommandResult>;
+}
 
 const metadataReserveBytes = 16 * 1024 * 1024;
 const defaultCreateId = (): string => globalThis.crypto.randomUUID();
@@ -227,6 +283,10 @@ const readProjectInstanceOwnerCapability = (value: unknown, projectId: string): 
     ? record.capability.toLowerCase()
     : null;
 };
+
+/** Do not let UI/runtime fences retain or expose the durable raw capability. */
+const projectInstanceCapabilityFingerprint = (projectId: string, capability: string): string =>
+  canonicalHash("cuebench.web.project-instance-owner-capability-fingerprint.v1", { projectId, capability });
 
 const emptySnapshot = (): ProjectStoreSnapshot => ({
   route: "start",
@@ -305,6 +365,15 @@ export class ProjectStore {
   private readonly cleanupOperations = new Map<string, Promise<CloudCleanupResult>>();
   private narrationPreviewGatewayInstance: NarrationPreviewGateway | null = null;
   private operationEpoch = 0;
+  /**
+   * Rotates only when this page replaces the logical project instance (for
+   * example a same-id backup import whose non-portable capability rotates).
+   * Regular domain revisions retain this epoch so queued commands can advance
+   * a revision without losing their page-owned instance identity.
+   */
+  private projectInstanceEpoch = 0;
+  /** One-way identity of the durable capability captured by this page. */
+  private projectInstanceCapabilityFingerprint: string | null = null;
   /** Keeps page-originated domain writes ordered just like the durable CAS boundary. */
   private commandQueue: Promise<void> = Promise.resolve();
 
@@ -324,6 +393,58 @@ export class ProjectStore {
 
   public getSnapshot = (): ProjectStoreSnapshot => this.snapshot;
 
+  /** Internal bridge-only identity; it is never serialized into a tool result. */
+  public getProjectInstanceEpoch = (): number => this.projectInstanceEpoch;
+
+  /**
+   * Internal bridge-only capability fence. The raw durable capability stays
+   * in IndexedDB/private hosted ports; callers receive only its one-way
+   * fingerprint and must never place it in a WebMCP result.
+   */
+  public getProjectInstanceFence = (): ProjectInstanceFence | null => {
+    const project = this.snapshot.project;
+    if (project === null) return null;
+    return {
+      projectId: project.projectId,
+      projectInstanceEpoch: this.projectInstanceEpoch,
+      ...(this.projectInstanceCapabilityFingerprint === null
+        ? {}
+        : { projectInstanceCapabilityFingerprint: this.projectInstanceCapabilityFingerprint }),
+    };
+  };
+
+  /**
+   * Binds every generation lease, recovery receipt, and adoption operation to
+   * one exact page-visible project instance. This facade deliberately ignores
+   * the generation clients' legacy project-id argument: only the captured
+   * opaque fence can authorize its queued storage work.
+   */
+  public bindGenerationStore = (expectedProject: ProjectInstanceFence): BoundGenerationProjectStore => {
+    const assertCurrent = (): void => this.assertExpectedProjectInstance(expectedProject);
+    return {
+      getSnapshot: () => {
+        assertCurrent();
+        const snapshot = this.getSnapshot();
+        return { project: snapshot.project, mode: snapshot.mode };
+      },
+      executeCommand: (command) => this.executeCommand(command, expectedProject),
+      persistCaptionGenerationReceipt: (runId, receipt) => this.persistCaptionGenerationReceipt(runId, receipt, expectedProject),
+      reserveCaptionGenerationReceipt: (runId) => this.reserveCaptionGenerationReceipt(runId, expectedProject),
+      releaseCaptionGenerationReceiptReservation: (runId) => this.releaseCaptionGenerationReceiptReservation(runId, expectedProject),
+      loadCaptionGenerationReceipt: (runId) => this.loadCaptionGenerationReceipt(runId, expectedProject),
+      listCaptionGenerationReceiptRunIds: () => this.listCaptionGenerationReceiptRunIds(expectedProject),
+      persistAudioDescriptionGenerationReceipt: (runId, receipt) => this.persistAudioDescriptionGenerationReceipt(runId, receipt, expectedProject),
+      reserveAudioDescriptionGenerationReceipt: (runId) => this.reserveAudioDescriptionGenerationReceipt(runId, expectedProject),
+      releaseAudioDescriptionGenerationReceiptReservation: (runId) => this.releaseAudioDescriptionGenerationReceiptReservation(runId, expectedProject),
+      loadAudioDescriptionGenerationReceipt: (runId) => this.loadAudioDescriptionGenerationReceipt(runId, expectedProject),
+      listAudioDescriptionGenerationReceiptRunIds: () => this.listAudioDescriptionGenerationReceiptRunIds(expectedProject),
+      settleExpiredAudioDescriptionGenerationReceipt: (runId) => this.settleExpiredAudioDescriptionGenerationReceipt(runId, expectedProject),
+      getCloudProjectOwnerCapability: (projectId) => this.getCloudProjectOwnerCapability(projectId, expectedProject),
+      adoptStagedCaptionGenerationResult: (command) => this.adoptStagedCaptionGenerationResult(command, expectedProject),
+      adoptStagedAudioDescriptionGenerationResult: (command) => this.adoptStagedAudioDescriptionGenerationResult(command, expectedProject),
+    };
+  };
+
   /**
    * Resolves the current non-portable project-instance capability directly
    * from IndexedDB before any cloud mutation. This is intentionally a fresh
@@ -331,12 +452,20 @@ export class ProjectStore {
    * import can atomically rotate the capability while an older tab remains
    * open with an obsolete opaque upload receipt.
    */
-  public getCloudProjectOwnerCapability = async (projectId: string): Promise<string | null> => {
+  public getCloudProjectOwnerCapability = async (projectId: string, expectedProject?: ProjectInstanceFence): Promise<string | null> => {
+    this.assertExpectedProjectInstance(expectedProject);
+    let observedReplacementFingerprint: string | null | undefined;
     return this.database.transaction("rw", [this.database.projectHeaders, this.database.settings], async () => {
       const header = await this.database.projectHeaders.get(projectId);
       if (header === undefined) return null;
       const existing = await this.database.settings.get(projectInstanceOwnerCapabilityKey(projectId));
       const capability = readProjectInstanceOwnerCapability(existing?.value, projectId);
+      if (!await this.isExpectedProjectInstanceDurablyAuthorized(projectId, expectedProject, (fingerprint) => {
+        observedReplacementFingerprint = fingerprint;
+      })) {
+        this.reconcileProjectInstanceFenceMismatch(projectId, observedReplacementFingerprint);
+        throw new ProjectInstanceFenceError();
+      }
       if (capability !== null) return capability;
       // Compatibility migration for durable projects saved before this
       // capability existed. The record is born transactionally with the
@@ -362,14 +491,19 @@ export class ProjectStore {
    */
   public getNarrationPreviewGateway = (): NarrationPreviewGateway => {
     if (this.narrationPreviewGatewayInstance !== null) return this.narrationPreviewGatewayInstance;
-    this.narrationPreviewGatewayInstance = createNarrationPreviewGateway({
-      resolveAuthorization: async (projectId) => this.narrationPreviewAuthorization(projectId),
-      cache: {
-        load: async (input) => this.loadNarrationPreview(input),
-        save: async (input) => this.saveNarrationPreview(input),
-      },
-    });
+    this.narrationPreviewGatewayInstance = this.createNarrationPreviewGateway();
     return this.narrationPreviewGatewayInstance;
+  };
+
+  /**
+   * Creates a one-invocation narration gateway tied to the exact visible
+   * project instance captured by a Browser Agent tool. Unlike the Human UI
+   * gateway above, this port carries the nonportable owner fence through
+   * cache reads, cache writes, and hosted authorization.
+   */
+  public bindNarrationPreviewGateway = (expectedProject: ProjectInstanceFence): NarrationPreviewGateway => {
+    this.assertExpectedProjectInstance(expectedProject);
+    return this.createNarrationPreviewGateway(expectedProject);
   };
 
   public subscribe = (listener: () => void): (() => void) => {
@@ -468,7 +602,7 @@ export class ProjectStore {
    * commit through the IndexedDB CAS transaction; temporary projects retain the
    * exact command semantics in their explicitly in-memory session.
    */
-  public executeCommand(command: DomainCommand): Promise<CommandResult> {
+  public executeCommand(command: DomainCommand, expectedProject?: string | ProjectInstanceFence): Promise<CommandResult> {
     const execute = async (): Promise<CommandResult> => {
       const snapshot = this.snapshot;
       if (snapshot.project === null || snapshot.mode === null) {
@@ -477,10 +611,47 @@ export class ProjectStore {
       if (snapshot.activity !== null) {
         throw new Error("CueBench cannot edit a project while another local operation is in progress.");
       }
+      const expectedProjectId = typeof expectedProject === "string" ? expectedProject : expectedProject?.projectId;
+      const expectedProjectInstanceEpoch = typeof expectedProject === "string"
+        ? undefined
+        : expectedProject?.projectInstanceEpoch;
+      const expectedProjectInstanceCapabilityFingerprint = typeof expectedProject === "string"
+        ? undefined
+        : expectedProject?.projectInstanceCapabilityFingerprint;
+      if (
+        (expectedProjectId !== undefined && snapshot.project.projectId !== expectedProjectId)
+        || (expectedProjectInstanceEpoch !== undefined && this.projectInstanceEpoch !== expectedProjectInstanceEpoch)
+        || (
+          expectedProjectInstanceCapabilityFingerprint !== undefined
+          && this.projectInstanceCapabilityFingerprint !== expectedProjectInstanceCapabilityFingerprint
+        )
+      ) {
+        return {
+          project: snapshot.project,
+          events: [],
+          error: domainError("STALE_PROJECT", "The visible CueBench project was replaced before this command could run."),
+        };
+      }
       const projectId = snapshot.project.projectId;
+      let observedReplacementFingerprint: string | null | undefined;
       try {
         const result = snapshot.mode === "durable"
-          ? await executePersistentCommand(this.database, projectId, command)
+          ? await executePersistentCommand(this.database, projectId, command, {
+            ...(expectedProjectInstanceCapabilityFingerprint === undefined ? {} : {
+              authorizeCommand: async () => {
+                const setting = await this.database.settings.get(projectInstanceOwnerCapabilityKey(projectId));
+                const capability = readProjectInstanceOwnerCapability(setting?.value, projectId);
+                const actualFingerprint = capability === null
+                  ? null
+                  : projectInstanceCapabilityFingerprint(projectId, capability);
+                if (actualFingerprint !== expectedProjectInstanceCapabilityFingerprint) {
+                  observedReplacementFingerprint = actualFingerprint;
+                  return false;
+                }
+                return true;
+              },
+            }),
+          })
           : applyCommand(snapshot.project, command);
 
         // Rejected durable writes can carry newer canonical state from the
@@ -491,6 +662,12 @@ export class ProjectStore {
             ...this.snapshot,
             project: result.project,
             error: result.error?.message ?? null,
+          }, observedReplacementFingerprint === undefined ? {} : {
+            // A same-id/same-revision import can otherwise leave this page's
+            // old closure live. Rotate its local epoch only after the
+            // transaction observed the persisted replacement capability.
+            rotateProjectInstance: true,
+            projectInstanceCapabilityFingerprint: observedReplacementFingerprint,
           });
         }
         return result;
@@ -511,7 +688,10 @@ export class ProjectStore {
    * signed run receipt. Keeping that work here prevents a React component
    * from accidentally splitting the expected-revision CAS across writes.
    */
-  public adoptStagedCaptionGenerationResult(command: CaptionGenerationAdoptionCommand): Promise<CommandResult> {
+  public adoptStagedCaptionGenerationResult(
+    command: CaptionGenerationAdoptionCommand,
+    expectedProject?: ProjectInstanceFence,
+  ): Promise<CommandResult> {
     const execute = async (): Promise<CommandResult> => {
       const snapshot = this.snapshot;
       if (snapshot.project === null || snapshot.mode === null) {
@@ -523,18 +703,29 @@ export class ProjectStore {
       if (snapshot.mode !== "durable") {
         throw new Error("CueBench needs durable browser storage before it can retain a recoverable caption-generation receipt.");
       }
+      this.assertExpectedProjectInstance(expectedProject);
       const projectId = snapshot.project.projectId;
+      let observedReplacementFingerprint: string | null | undefined;
       try {
-        const result = await adoptPersistedCaptionGenerationResult(this.database, projectId, command);
+        const result = await adoptPersistedCaptionGenerationResult(this.database, projectId, command, this.projectInstanceWriteOptions(
+          projectId,
+          expectedProject,
+          (fingerprint) => { observedReplacementFingerprint = fingerprint; },
+        ));
         if (this.snapshot.project?.projectId === projectId) {
           this.setSnapshot({
             ...this.snapshot,
             project: result.project,
             error: result.error?.message ?? null,
+          }, observedReplacementFingerprint === undefined ? {} : {
+            rotateProjectInstance: true,
+            projectInstanceCapabilityFingerprint: observedReplacementFingerprint,
           });
         }
         return result;
       } catch (error) {
+        this.reconcileProjectInstanceFenceMismatch(projectId, observedReplacementFingerprint);
+        if (expectedProject !== undefined && error instanceof StorageStaleWriteError) throw new ProjectInstanceFenceError();
         if (this.snapshot.project?.projectId === projectId) {
           this.setSnapshot({ ...this.snapshot, error: userFacingError(error, "CueBench could not adopt the staged caption evidence.") });
         }
@@ -551,7 +742,10 @@ export class ProjectStore {
    * IndexedDB transaction. Human certification remains a separate UI-only
    * decision; this only stages CueBench-AI Proposed beats and requirements.
    */
-  public adoptStagedAudioDescriptionGenerationResult(command: AudioDescriptionGenerationAdoptionCommand): Promise<CommandResult> {
+  public adoptStagedAudioDescriptionGenerationResult(
+    command: AudioDescriptionGenerationAdoptionCommand,
+    expectedProject?: ProjectInstanceFence,
+  ): Promise<CommandResult> {
     const execute = async (): Promise<CommandResult> => {
       const snapshot = this.snapshot;
       if (snapshot.project === null || snapshot.mode === null) {
@@ -563,18 +757,29 @@ export class ProjectStore {
       if (snapshot.mode !== "durable") {
         throw new Error("CueBench needs durable browser storage before it can retain a recoverable audio-description generation receipt.");
       }
+      this.assertExpectedProjectInstance(expectedProject);
       const projectId = snapshot.project.projectId;
+      let observedReplacementFingerprint: string | null | undefined;
       try {
-        const result = await adoptPersistedAudioDescriptionGenerationResult(this.database, projectId, command);
+        const result = await adoptPersistedAudioDescriptionGenerationResult(this.database, projectId, command, this.projectInstanceWriteOptions(
+          projectId,
+          expectedProject,
+          (fingerprint) => { observedReplacementFingerprint = fingerprint; },
+        ));
         if (this.snapshot.project?.projectId === projectId) {
           this.setSnapshot({
             ...this.snapshot,
             project: result.project,
             error: result.error?.message ?? null,
+          }, observedReplacementFingerprint === undefined ? {} : {
+            rotateProjectInstance: true,
+            projectInstanceCapabilityFingerprint: observedReplacementFingerprint,
           });
         }
         return result;
       } catch (error) {
+        this.reconcileProjectInstanceFenceMismatch(projectId, observedReplacementFingerprint);
+        if (expectedProject !== undefined && error instanceof StorageStaleWriteError) throw new ProjectInstanceFenceError();
         if (this.snapshot.project?.projectId === projectId) {
           this.setSnapshot({ ...this.snapshot, error: userFacingError(error, "CueBench could not adopt the staged audio-description evidence.") });
         }
@@ -587,13 +792,19 @@ export class ProjectStore {
   }
 
   /** Persist the opaque signed recovery receipt before a browser polls it. */
-  public persistCaptionGenerationReceipt(runId: string, receipt: unknown): Promise<void> {
+  public persistCaptionGenerationReceipt(
+    runId: string,
+    receipt: unknown,
+    expectedProject?: ProjectInstanceFence,
+  ): Promise<void> {
     const persist = async (): Promise<void> => {
       const snapshot = this.snapshot;
       if (snapshot.project === null || snapshot.mode !== "durable") {
         throw new Error("CueBench needs durable browser storage before it can retain a recoverable caption-generation receipt.");
       }
-      await saveRunReceipt(this.database, snapshot.project.projectId, runId, { version: 1, payload: receipt });
+      await this.runFencedReceiptOperation(snapshot.project.projectId, expectedProject, (options) => (
+        saveRunReceipt(this.database, snapshot.project!.projectId, runId, { version: 1, payload: receipt }, options)
+      ));
     };
     const queued = this.commandQueue.then(persist, persist);
     this.commandQueue = queued.then(() => undefined, () => undefined);
@@ -601,13 +812,15 @@ export class ProjectStore {
   }
 
   /** Reserve the exact opaque receipt row before a server-side generation start. */
-  public reserveCaptionGenerationReceipt(runId: string): Promise<void> {
+  public reserveCaptionGenerationReceipt(runId: string, expectedProject?: ProjectInstanceFence): Promise<void> {
     const reserve = async (): Promise<void> => {
       const snapshot = this.snapshot;
       if (snapshot.project === null || snapshot.mode !== "durable") {
         throw new Error("CueBench needs durable browser storage before it can reserve a recoverable caption-generation receipt.");
       }
-      await reserveRunReceiptSlot(this.database, snapshot.project.projectId, runId);
+      await this.runFencedReceiptOperation(snapshot.project.projectId, expectedProject, (options) => (
+        reserveRunReceiptSlot(this.database, snapshot.project!.projectId, runId, options)
+      ));
     };
     const queued = this.commandQueue.then(reserve, reserve);
     this.commandQueue = queued.then(() => undefined, () => undefined);
@@ -615,11 +828,13 @@ export class ProjectStore {
   }
 
   /** Release only an internal unfulfilled write-ahead reservation. */
-  public releaseCaptionGenerationReceiptReservation(runId: string): Promise<void> {
+  public releaseCaptionGenerationReceiptReservation(runId: string, expectedProject?: ProjectInstanceFence): Promise<void> {
     const release = async (): Promise<void> => {
       const snapshot = this.snapshot;
       if (snapshot.project === null || snapshot.mode !== "durable") return;
-      await releaseRunReceiptReservation(this.database, snapshot.project.projectId, runId);
+      await this.runFencedReceiptOperation(snapshot.project.projectId, expectedProject, (options) => (
+        releaseRunReceiptReservation(this.database, snapshot.project!.projectId, runId, options)
+      ));
     };
     const queued = this.commandQueue.then(release, release);
     this.commandQueue = queued.then(() => undefined, () => undefined);
@@ -627,18 +842,22 @@ export class ProjectStore {
   }
 
   /** Reads only the recovery receipt belonging to the currently visible project. */
-  public async loadCaptionGenerationReceipt(runId: string): Promise<unknown | null> {
+  public async loadCaptionGenerationReceipt(runId: string, expectedProject?: ProjectInstanceFence): Promise<unknown | null> {
     const snapshot = this.snapshot;
     if (snapshot.project === null || snapshot.mode !== "durable") return null;
-    const row = await loadRunReceipt(this.database, snapshot.project.projectId, runId);
+    const row = await this.runFencedReceiptOperation(snapshot.project.projectId, expectedProject, (options) => (
+      loadRunReceipt(this.database, snapshot.project!.projectId, runId, options)
+    ));
     return row?.receipt.version === 1 ? row.receipt.payload : null;
   }
 
   /** Lists opaque receipt ids so detached terminal cleanup can recover on reload. */
-  public async listCaptionGenerationReceiptRunIds(): Promise<readonly string[]> {
+  public async listCaptionGenerationReceiptRunIds(expectedProject?: ProjectInstanceFence): Promise<readonly string[]> {
     const snapshot = this.snapshot;
     if (snapshot.project === null || snapshot.mode !== "durable") return [];
-    return (await listRunReceipts(this.database, snapshot.project.projectId)).map((row) => row.runId);
+    return (await this.runFencedReceiptOperation(snapshot.project.projectId, expectedProject, (options) => (
+      listRunReceipts(this.database, snapshot.project!.projectId, options)
+    ))).map((row) => row.runId);
   }
 
   /**
@@ -647,23 +866,27 @@ export class ProjectStore {
    * an AD capability as a caption capability. The opaque row is shared only at
    * this storage boundary; each client validates its own signed receipt shape.
    */
-  public persistAudioDescriptionGenerationReceipt(runId: string, receipt: unknown): Promise<void> {
-    return this.persistCaptionGenerationReceipt(runId, receipt);
+  public persistAudioDescriptionGenerationReceipt(
+    runId: string,
+    receipt: unknown,
+    expectedProject?: ProjectInstanceFence,
+  ): Promise<void> {
+    return this.persistCaptionGenerationReceipt(runId, receipt, expectedProject);
   }
 
   /** Reserve an AD write-ahead receipt slot before a potentially billable dispatch. */
-  public reserveAudioDescriptionGenerationReceipt(runId: string): Promise<void> {
-    return this.reserveCaptionGenerationReceipt(runId);
+  public reserveAudioDescriptionGenerationReceipt(runId: string, expectedProject?: ProjectInstanceFence): Promise<void> {
+    return this.reserveCaptionGenerationReceipt(runId, expectedProject);
   }
 
   /** Release only an unfulfilled AD receipt reservation. */
-  public releaseAudioDescriptionGenerationReceiptReservation(runId: string): Promise<void> {
-    return this.releaseCaptionGenerationReceiptReservation(runId);
+  public releaseAudioDescriptionGenerationReceiptReservation(runId: string, expectedProject?: ProjectInstanceFence): Promise<void> {
+    return this.releaseCaptionGenerationReceiptReservation(runId, expectedProject);
   }
 
   /** Reads a project-scoped opaque AD recovery receipt. */
-  public loadAudioDescriptionGenerationReceipt(runId: string): Promise<unknown | null> {
-    return this.loadCaptionGenerationReceipt(runId);
+  public loadAudioDescriptionGenerationReceipt(runId: string, expectedProject?: ProjectInstanceFence): Promise<unknown | null> {
+    return this.loadCaptionGenerationReceipt(runId, expectedProject);
   }
 
   /**
@@ -672,12 +895,14 @@ export class ProjectStore {
    * the release command and receipt lifecycle marker in one IndexedDB
    * transaction prevents a crash between those two durable facts.
    */
-  public settleExpiredAudioDescriptionGenerationReceipt(runId: string): Promise<unknown | null> {
+  public settleExpiredAudioDescriptionGenerationReceipt(runId: string, expectedProject?: ProjectInstanceFence): Promise<unknown | null> {
     const settle = async (): Promise<unknown | null> => {
       const snapshot = this.snapshot;
       if (snapshot.project === null || snapshot.mode !== "durable") return null;
       const projectId = snapshot.project.projectId;
-      const result = await settlePersistedExpiredAudioDescriptionGenerationReceipt(this.database, projectId, runId);
+      const result = await this.runFencedReceiptOperation(projectId, expectedProject, (options) => (
+        settlePersistedExpiredAudioDescriptionGenerationReceipt(this.database, projectId, runId, options)
+      ));
       if (this.snapshot.project?.projectId === projectId) {
         this.setSnapshot({ ...this.snapshot, project: result.project, error: null });
       }
@@ -689,8 +914,8 @@ export class ProjectStore {
   }
 
   /** Lists opaque receipt ids for AD terminal-cleanup recovery after reload. */
-  public listAudioDescriptionGenerationReceiptRunIds(): Promise<readonly string[]> {
-    return this.listCaptionGenerationReceiptRunIds();
+  public listAudioDescriptionGenerationReceiptRunIds(expectedProject?: ProjectInstanceFence): Promise<readonly string[]> {
+    return this.listCaptionGenerationReceiptRunIds(expectedProject);
   }
 
   /** Produces a portable manifest only; source video remains in browser storage and is never serialized. */
@@ -982,6 +1207,12 @@ export class ProjectStore {
         activity: null,
         error: postCommitIssue === null ? null : `Imported project recovered locally: ${postCommitIssue}`,
         cleanupNotice,
+      }, {
+        rotateProjectInstance: true,
+        projectInstanceCapabilityFingerprint: projectInstanceCapabilityFingerprint(
+          importedProject.projectId,
+          importedProjectOwnerCapability.capability,
+        ),
       });
       return { project: importedProject, cleanupNotice };
     } catch (error) {
@@ -1227,7 +1458,7 @@ export class ProjectStore {
     try {
       previousDurableProjectId = await this.readLastDurableProjectId();
       if (!this.isCurrent(epoch)) return;
-      await this.claimProjectOwnership(pendingUpload.projectId);
+      const instanceCapability = await this.claimProjectOwnership(pendingUpload.projectId);
       ownershipClaimed = true;
       if (!this.isCurrent(epoch)) {
         await this.rollbackProjectLifecycle(pendingUpload.projectId);
@@ -1288,6 +1519,8 @@ export class ProjectStore {
         activity: null,
         error: null,
         cleanupNotice: null,
+      }, {
+        projectInstanceCapabilityFingerprint: projectInstanceCapabilityFingerprint(pendingUpload.projectId, instanceCapability),
       });
     } catch (error) {
       if (objectUrl !== null) objectUrlLease.revokeIfCurrent(objectUrl);
@@ -1321,12 +1554,13 @@ export class ProjectStore {
   }
 
   private async activateExistingProject(projectId: string, expectedMode: ProjectMode, epoch: number): Promise<boolean> {
-    const [project, mode, sourceProvenanceSetting] = await Promise.all([
+    const [project, mode, sourceProvenanceSetting, instanceCapability] = await Promise.all([
       loadProject(this.database, projectId),
       loadProjectMode(this.database, projectId),
       loadSetting(this.database, projectSourceProvenanceKey(projectId)),
+      this.getCloudProjectOwnerCapability(projectId),
     ]);
-    if (!this.isCurrent(epoch) || project === undefined || mode !== expectedMode) return false;
+    if (!this.isCurrent(epoch) || project === undefined || mode !== expectedMode || instanceCapability === null) return false;
     const sourceProvenance = sourceProvenanceSetting === undefined
       ? uploadedSourceProvenance
       : sourceProvenanceFrom(sourceProvenanceSetting.value) ?? uploadedSourceProvenance;
@@ -1351,6 +1585,8 @@ export class ProjectStore {
       activity: null,
       error: null,
       cleanupNotice: null,
+    }, {
+      projectInstanceCapabilityFingerprint: projectInstanceCapabilityFingerprint(projectId, instanceCapability),
     });
     return true;
   }
@@ -1532,7 +1768,12 @@ export class ProjectStore {
   }
 
   /** Reads the durable authority at the cache boundary, not a stale React projection. */
-  private async currentNarrationProject(projectId: string, waitForQueuedCommands = true): Promise<CaptionProject> {
+  private async currentNarrationProject(
+    projectId: string,
+    waitForQueuedCommands = true,
+    expectedProject?: ProjectInstanceFence,
+  ): Promise<CaptionProject> {
+    this.assertExpectedProjectInstance(expectedProject);
     const snapshot = this.snapshot;
     if (
       snapshot.project === null
@@ -1546,7 +1787,9 @@ export class ProjectStore {
     // the queue from inside that queued task would await the task currently
     // being resolved, so it explicitly opts out after its turn begins.
     if (waitForQueuedCommands) await this.commandQueue;
+    this.assertExpectedProjectInstance(expectedProject);
     const project = await loadProject(this.database, projectId);
+    this.assertExpectedProjectInstance(expectedProject);
     if (project === undefined || this.snapshot.project?.projectId !== projectId || this.snapshot.mode !== "durable" || this.snapshot.activity !== null) {
       throw new Error("CueBench's narration-preview project changed while the request was pending. Select the current beat and try again.");
     }
@@ -1564,9 +1807,22 @@ export class ProjectStore {
     }
   }
 
-  private async narrationPreviewAuthorization(projectId: string): Promise<NarrationPreviewAuthorization> {
-    const project = await this.currentNarrationProject(projectId);
-    const owner = await this.getCloudProjectOwnerCapability(projectId);
+  private createNarrationPreviewGateway(expectedProject?: ProjectInstanceFence): NarrationPreviewGateway {
+    return createNarrationPreviewGateway({
+      resolveAuthorization: async (projectId) => this.narrationPreviewAuthorization(projectId, expectedProject),
+      cache: {
+        load: async (input) => this.loadNarrationPreview(input, expectedProject),
+        save: async (input) => this.saveNarrationPreview(input, expectedProject),
+      },
+    });
+  }
+
+  private async narrationPreviewAuthorization(
+    projectId: string,
+    expectedProject?: ProjectInstanceFence,
+  ): Promise<NarrationPreviewAuthorization> {
+    const project = await this.currentNarrationProject(projectId, true, expectedProject);
+    const owner = await this.getCloudProjectOwnerCapability(projectId, expectedProject);
     if (owner === null) throw new Error("CueBench needs the durable browser-project owner identity before narration preview can start.");
     const recovery = loadPersistedCloudUpload(
       projectId,
@@ -1580,27 +1836,38 @@ export class ProjectStore {
     return { session: recovery.session, projectOwnerCapability: owner };
   }
 
-  private async loadNarrationPreview(input: Pick<NarrationPreviewRequest, "projectId" | "cacheKey">) {
+  private async loadNarrationPreview(
+    input: Pick<NarrationPreviewRequest, "projectId" | "cacheKey">,
+    expectedProject?: ProjectInstanceFence,
+  ) {
+    this.assertExpectedProjectInstance(expectedProject);
     const snapshot = this.snapshot;
     if (snapshot.project?.projectId !== input.projectId || snapshot.mode !== "durable" || snapshot.activity !== null) return undefined;
-    const row = await loadNarrationBlob(this.database, input.projectId, input.cacheKey);
+    const row = await this.runFencedReceiptOperation(input.projectId, expectedProject, (options) => (
+      loadNarrationBlob(this.database, input.projectId, input.cacheKey, options)
+    ));
     return row === undefined
       ? undefined
       : { blob: row.blob, contentType: row.contentType, measuredDurationMs: row.measuredDurationMs };
   }
 
-  private saveNarrationPreview(input: NarrationPreviewRequest & { readonly blob: Blob; readonly contentType: string; readonly measuredDurationMs: number }): Promise<void> {
+  private saveNarrationPreview(
+    input: NarrationPreviewRequest & { readonly blob: Blob; readonly contentType: string; readonly measuredDurationMs: number },
+    expectedProject?: ProjectInstanceFence,
+  ): Promise<void> {
     const save = async (): Promise<void> => {
-      const project = await this.currentNarrationProject(input.projectId, false);
+      const project = await this.currentNarrationProject(input.projectId, false, expectedProject);
       this.assertCurrentNarrationBeat(project, input);
-      await saveNarrationBlob(this.database, input.projectId, {
-        beatId: input.beatId,
-        itemRevision: input.itemRevision,
-        cacheKey: input.cacheKey,
-        blob: input.blob,
-        contentType: input.contentType,
-        measuredDurationMs: input.measuredDurationMs,
-      });
+      await this.runFencedReceiptOperation(input.projectId, expectedProject, (options) => (
+        saveNarrationBlob(this.database, input.projectId, {
+          beatId: input.beatId,
+          itemRevision: input.itemRevision,
+          cacheKey: input.cacheKey,
+          blob: input.blob,
+          contentType: input.contentType,
+          measuredDurationMs: input.measuredDurationMs,
+        }, options)
+      ));
     };
     const queued = this.commandQueue.then(save, save);
     this.commandQueue = queued.then(() => undefined, () => undefined);
@@ -1893,7 +2160,120 @@ export class ProjectStore {
     }
   }
 
-  private setSnapshot(nextSnapshot: ProjectStoreSnapshot): void {
+  /** Reject a captured WebMCP lifecycle port before it can touch a new page instance. */
+  private assertExpectedProjectInstance(expectedProject?: ProjectInstanceFence): void {
+    if (expectedProject === undefined) return;
+    const project = this.snapshot.project;
+    if (
+      project === null
+      || project.projectId !== expectedProject.projectId
+      || this.projectInstanceEpoch !== expectedProject.projectInstanceEpoch
+      || (
+        expectedProject.projectInstanceCapabilityFingerprint !== undefined
+        && this.projectInstanceCapabilityFingerprint !== expectedProject.projectInstanceCapabilityFingerprint
+      )
+    ) throw new ProjectInstanceFenceError();
+  }
+
+  /**
+   * Re-reads the persisted nonportable owner inside the caller's Dexie
+   * transaction. Page-local epochs catch React/closure replacement; this
+   * durable comparison catches a second tab importing the same id/revision.
+   */
+  private async isExpectedProjectInstanceDurablyAuthorized(
+    projectId: string,
+    expectedProject: ProjectInstanceFence | undefined,
+    onMismatch?: (fingerprint: string | null) => void,
+  ): Promise<boolean> {
+    if (expectedProject === undefined) return true;
+    if (
+      expectedProject.projectId !== projectId
+      || this.projectInstanceEpoch !== expectedProject.projectInstanceEpoch
+      || (
+        expectedProject.projectInstanceCapabilityFingerprint !== undefined
+        && this.projectInstanceCapabilityFingerprint !== expectedProject.projectInstanceCapabilityFingerprint
+      )
+    ) return false;
+    if (expectedProject.projectInstanceCapabilityFingerprint === undefined) return true;
+    const setting = await this.database.settings.get(projectInstanceOwnerCapabilityKey(projectId));
+    const capability = readProjectInstanceOwnerCapability(setting?.value, projectId);
+    const fingerprint = capability === null
+      ? null
+      : projectInstanceCapabilityFingerprint(projectId, capability);
+    if (fingerprint !== expectedProject.projectInstanceCapabilityFingerprint) {
+      onMismatch?.(fingerprint);
+      return false;
+    }
+    return true;
+  }
+
+  private projectInstanceWriteOptions(
+    projectId: string,
+    expectedProject: ProjectInstanceFence | undefined,
+    onMismatch?: (fingerprint: string | null) => void,
+  ): { readonly authorizeCommand?: () => Promise<boolean> } {
+    if (expectedProject === undefined) return {};
+    return {
+      authorizeCommand: () => this.isExpectedProjectInstanceDurablyAuthorized(projectId, expectedProject, onMismatch),
+    };
+  }
+
+  /** Rotate this page's internal identity after a durable fence rejects it. */
+  private reconcileProjectInstanceFenceMismatch(
+    projectId: string,
+    observedReplacementFingerprint: string | null | undefined,
+  ): void {
+    if (observedReplacementFingerprint === undefined || this.snapshot.project?.projectId !== projectId) return;
+    this.setSnapshot({
+      ...this.snapshot,
+      error: "CueBench's visible project instance changed in another browser context.",
+    }, {
+      rotateProjectInstance: true,
+      projectInstanceCapabilityFingerprint: observedReplacementFingerprint,
+    });
+  }
+
+  /** Run one opaque receipt read/write through the same durable owner fence. */
+  private async runFencedReceiptOperation<T>(
+    projectId: string,
+    expectedProject: ProjectInstanceFence | undefined,
+    operation: (options: { readonly authorizeCommand?: () => Promise<boolean> }) => Promise<T>,
+  ): Promise<T> {
+    this.assertExpectedProjectInstance(expectedProject);
+    let observedReplacementFingerprint: string | null | undefined;
+    try {
+      return await operation(this.projectInstanceWriteOptions(
+        projectId,
+        expectedProject,
+        (fingerprint) => { observedReplacementFingerprint = fingerprint; },
+      ));
+    } catch (error) {
+      this.reconcileProjectInstanceFenceMismatch(projectId, observedReplacementFingerprint);
+      if (expectedProject !== undefined && error instanceof StorageStaleWriteError) {
+        throw new ProjectInstanceFenceError();
+      }
+      throw error;
+    }
+  }
+
+  private setSnapshot(
+    nextSnapshot: ProjectStoreSnapshot,
+    options: {
+      readonly rotateProjectInstance?: boolean;
+      readonly projectInstanceCapabilityFingerprint?: string | null;
+    } = {},
+  ): void {
+    const priorProjectId = this.snapshot.project?.projectId ?? null;
+    const nextProjectId = nextSnapshot.project?.projectId ?? null;
+    const replacedInstance = options.rotateProjectInstance === true || priorProjectId !== nextProjectId;
+    if (replacedInstance) {
+      this.projectInstanceEpoch += 1;
+      this.projectInstanceCapabilityFingerprint = nextProjectId === null
+        ? null
+        : options.projectInstanceCapabilityFingerprint ?? null;
+    } else if (options.projectInstanceCapabilityFingerprint !== undefined) {
+      this.projectInstanceCapabilityFingerprint = options.projectInstanceCapabilityFingerprint;
+    }
     this.snapshot = nextSnapshot;
     for (const listener of this.listeners) {
       try {

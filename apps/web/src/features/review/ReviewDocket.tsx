@@ -55,6 +55,17 @@ interface PendingNavigation {
   readonly itemRevision?: number;
   /** A save was accepted; only retry selection, never save again. */
   readonly savedProject?: CaptionProject;
+  /** Agent focus follows its already-accepted BrowserAgent selection; never reissues a Human selection command. */
+  readonly browserAgentFocus?: BrowserAgentDocketFocus;
+  /** Resolves the agent invocation only after the same draft guard accepts navigation. */
+  readonly resolveBrowserAgentFocus?: (accepted: boolean) => void;
+  /**
+   * A preflight intentionally runs before WebMCP persists SelectItem. It uses
+   * the identical draft guard but resolves without changing canonical
+   * selection, keeping the old scoped family valid while the dialog is open.
+   */
+  readonly browserAgentSelectionPreflight?: BrowserAgentDocketFocus;
+  readonly resolveBrowserAgentSelectionPreflight?: (accepted: boolean) => void;
 }
 
 interface PendingSustainedCommand {
@@ -67,6 +78,25 @@ interface FocusAfterSelection {
   readonly itemId: string;
   readonly evidenceId?: string;
   readonly itemRevision?: number;
+  /** Browser Agent focus is acknowledged only from the matching layout effect. */
+  readonly browserAgentFocus?: BrowserAgentDocketFocus;
+  readonly resolveBrowserAgentFocus?: (accepted: boolean) => void;
+}
+
+/**
+ * Browser Agent focus follows a successful page-owned selection command. It
+ * never reissues that command as a Human action; it moves the already-visible
+ * docket/evidence focus after the workbench has sought the native video.
+ */
+export interface BrowserAgentDocketFocus {
+  readonly itemId: string;
+  readonly itemRevision: number;
+  readonly playheadMs: number;
+  readonly evidenceId?: string;
+  /** The exact page-owned visual publication this request waits to observe. */
+  readonly visualEpoch?: number;
+  /** A pending dirty-draft dialog must close if the Browser Agent cancels. */
+  readonly signal?: AbortSignal;
 }
 
 export interface ReviewDocketProps {
@@ -82,6 +112,10 @@ export interface ReviewDocketProps {
   readonly onRegisterItemNavigation?: (navigate: (itemId: string, sourceLabel: string) => void) => void;
   /** Court Record links can target an immutable item revision instead of a generic heading. */
   readonly onRegisterItemRevisionFocus?: (focus: (itemId: string, itemRevision: number, sourceLabel: string) => void) => void;
+  /** WebMCP uses this after its own successful BrowserAgent selection command. */
+  readonly onRegisterBrowserAgentFocus?: (focus: (input: BrowserAgentDocketFocus) => Promise<boolean>) => void;
+  /** WebMCP uses this before it persists a BrowserAgent selection command. */
+  readonly onRegisterBrowserAgentSelectionPreflight?: (prepare: (input: BrowserAgentDocketFocus) => Promise<boolean>) => void;
   /** The native timeline reports accepted timing revisions through this review boundary. */
   readonly onRegisterCanonicalTimelineEdit?: (rebase: (itemId: string, previousItemRevision: number, project: CaptionProject) => void) => void;
   /** Lets the native timeline disable commands while this docket owns a draft. */
@@ -191,7 +225,7 @@ export function ReviewSelectionSummary({ project }: { readonly project: CaptionP
  * The docket owns the draft and all review navigation. A visible dirty draft
  * cannot be silently abandoned by selecting a finding, an item, or evidence.
  */
-export function ReviewDocket({ project, onCommand, onSeekToMediaTime, footer, evidenceContentResolver, onRegisterItemNavigation, onRegisterItemRevisionFocus, onRegisterCanonicalTimelineEdit, onDraftStateChange, onReadNativePlayheadMs, narrationPreviewGateway }: ReviewDocketProps) {
+export function ReviewDocket({ project, onCommand, onSeekToMediaTime, footer, evidenceContentResolver, onRegisterItemNavigation, onRegisterItemRevisionFocus, onRegisterBrowserAgentFocus, onRegisterBrowserAgentSelectionPreflight, onRegisterCanonicalTimelineEdit, onDraftStateChange, onReadNativePlayheadMs, narrationPreviewGateway }: ReviewDocketProps) {
   const [filter, setFilter] = useState<DocketFilter>("all");
   const [isCommandPending, setIsCommandPending] = useState(false);
   const commandPendingRef = useRef(false);
@@ -212,6 +246,7 @@ export function ReviewDocket({ project, onCommand, onSeekToMediaTime, footer, ev
   const [draft, setDraft] = useState<ReviewDraft | null>(() => selectedItem === null ? null : reviewDraftForItem(selectedItem));
   const draftRef = useRef(draft);
   const pendingTimelineRebaseRef = useRef<{ readonly itemId: string; readonly itemRevision: number; readonly projectRevision: number } | null>(null);
+  const browserAgentNavigationSettlersRef = useRef(new Set<(accepted: boolean) => void>());
   draftRef.current = draft;
   const replaceDraft = useCallback((nextDraft: ReviewDraft | null) => {
     draftRef.current = nextDraft;
@@ -234,12 +269,22 @@ export function ReviewDocket({ project, onCommand, onSeekToMediaTime, footer, ev
     : selectedItem !== null && draft !== null && draft.itemId === selectedItem.itemId
       ? draft
     : selectedItem === null ? null : reviewDraftForItem(selectedItem);
-  const structuralDraftIsDirty = reviewDraftHasStructuralChanges(selectedItem, draftForSelectedItem);
-  const draftSaveCommand = selectedItem === null || draftForSelectedItem === null || structuralDraftIsDirty || !reviewDraftHasContentChanges(selectedItem, draftForSelectedItem)
+  // A BrowserAgent may have selected a new canonical item while the Human is
+  // still editing another item. Save/discard must remain bound to the draft's
+  // immutable source revision, never silently reinterpret it as the new
+  // selection.
+  const draftTargetItem = draft === null ? selectedItem : draftItem;
+  const draftForTargetItem = draftTargetItem === null
     ? null
-    : draftForSelectedItem.itemRevision !== selectedItem.current.itemRevision
+    : draft !== null && draft.itemId === draftTargetItem.itemId
+      ? draft
+      : reviewDraftForItem(draftTargetItem);
+  const structuralDraftIsDirty = reviewDraftHasStructuralChanges(draftTargetItem, draftForTargetItem);
+  const draftSaveCommand = draftTargetItem === null || draftForTargetItem === null || structuralDraftIsDirty || !reviewDraftHasContentChanges(draftTargetItem, draftForTargetItem)
+    ? null
+    : draftForTargetItem.itemRevision !== draftTargetItem.current.itemRevision
       ? null
-      : semanticRevisionCommand(project, selectedItem, draftForSelectedItem);
+      : semanticRevisionCommand(project, draftTargetItem, draftForTargetItem);
   const windowed = filteredItems.length > windowThreshold;
   const virtualLayout = useMemo(() => createDocketWindowLayout(filteredItems, measuredRowHeights), [filteredItems, measuredRowHeights]);
   const renderedDocketIndexes = useMemo(() => {
@@ -328,10 +373,58 @@ export function ReviewDocket({ project, onCommand, onSeekToMediaTime, footer, ev
   }, [replaceDraft]);
 
   const performNavigation = useCallback(async (navigation: PendingNavigation, baseProject: CaptionProject): Promise<boolean> => {
+    if (navigation.browserAgentFocus?.signal?.aborted === true || navigation.browserAgentSelectionPreflight?.signal?.aborted === true) {
+      navigation.resolveBrowserAgentFocus?.(false);
+      navigation.resolveBrowserAgentSelectionPreflight?.(false);
+      setPendingNavigation((pending) => pending === navigation ? null : pending);
+      return false;
+    }
     const target = reviewItemForId(baseProject, navigation.itemId);
     if (target === null) {
       setErrorAnnouncement("The requested review item is not available in the current project state.");
+      navigation.resolveBrowserAgentFocus?.(false);
+      navigation.resolveBrowserAgentSelectionPreflight?.(false);
       return false;
+    }
+    if (navigation.browserAgentSelectionPreflight !== undefined) {
+      if (target.current.itemRevision !== navigation.browserAgentSelectionPreflight.itemRevision) {
+        setErrorAnnouncement("The Browser Agent focus target is no longer the current visible revision.");
+        navigation.resolveBrowserAgentSelectionPreflight?.(false);
+        setPendingNavigation(null);
+        return false;
+      }
+      // Do not select or seek here. This is solely the page-owned Human draft
+      // guard that must settle before the agent can issue its own SelectItem.
+      setPendingNavigation(null);
+      navigation.resolveBrowserAgentSelectionPreflight?.(true);
+      return true;
+    }
+    if (navigation.browserAgentFocus !== undefined) {
+      const selected = baseProject.selectedItem;
+      if (
+        target.current.itemRevision !== navigation.browserAgentFocus.itemRevision
+        || selected?.kind === "AudioDescriptionGap"
+        || selected === null
+        || selected.itemId !== target.itemId
+        || selected.itemRevision !== navigation.browserAgentFocus.itemRevision
+      ) {
+        setErrorAnnouncement("The Browser Agent focus target is no longer the current visible revision.");
+        navigation.resolveBrowserAgentFocus?.(false);
+        setPendingNavigation(null);
+        return false;
+      }
+      setFilter("all");
+      setFocusAfterSelection({
+        itemId: target.itemId,
+        ...(navigation.browserAgentFocus.evidenceId === undefined ? {} : { evidenceId: navigation.browserAgentFocus.evidenceId }),
+        itemRevision: navigation.browserAgentFocus.itemRevision,
+        browserAgentFocus: navigation.browserAgentFocus,
+        ...(navigation.resolveBrowserAgentFocus === undefined ? {} : { resolveBrowserAgentFocus: navigation.resolveBrowserAgentFocus }),
+      });
+      setPendingNavigation(null);
+      // The Browser Agent must not return until this exact docket anchor has
+      // been mounted, filtered, and focused by the layout effect below.
+      return true;
     }
     setFilter("all");
     const result = await executeCommand({
@@ -408,6 +501,114 @@ export function ReviewDocket({ project, onCommand, onSeekToMediaTime, footer, ev
     void performNavigation(navigation, project);
   }, [hasUnsavedDraft, performNavigation, project]);
 
+  const requestBrowserAgentFocus = useCallback((input: BrowserAgentDocketFocus): Promise<boolean> => new Promise((resolve) => {
+    let settled = false;
+    let navigation: PendingNavigation | null = null;
+    const settle = (accepted: boolean) => {
+      if (settled) return;
+      settled = true;
+      input.signal?.removeEventListener("abort", onAbort);
+      browserAgentNavigationSettlersRef.current.delete(settle);
+      resolve(accepted);
+    };
+    const onAbort = () => {
+      setPendingNavigation((pending) => pending === navigation ? null : pending);
+      setFocusAfterSelection((focus) => focus?.browserAgentFocus === input ? null : focus);
+      settle(false);
+    };
+    if (input.signal?.aborted === true) {
+      settle(false);
+      return;
+    }
+    input.signal?.addEventListener("abort", onAbort, { once: true });
+    browserAgentNavigationSettlersRef.current.add(settle);
+    const item = reviewItemForId(project, input.itemId);
+    const selected = project.selectedItem;
+    if (
+      item === null
+      || item.current.itemRevision !== input.itemRevision
+      || selected === null
+      || selected.kind === "AudioDescriptionGap"
+      || selected.itemId !== input.itemId
+      || selected.itemRevision !== input.itemRevision
+    ) {
+      setErrorAnnouncement("The Browser Agent focus target is no longer the current visible revision.");
+      settle(false);
+      return;
+    }
+    navigation = {
+      itemId: input.itemId,
+      itemRevision: input.itemRevision,
+      label: `Browser Agent selection ${itemAccessibleLabel(item)}`,
+      browserAgentFocus: input,
+      resolveBrowserAgentFocus: settle,
+    };
+    if (hasUnsavedDraft) {
+      setPendingNavigation(navigation);
+      return;
+    }
+    void performNavigation(navigation, project);
+  }), [hasUnsavedDraft, performNavigation, project]);
+
+  const requestBrowserAgentSelectionPreflight = useCallback((input: BrowserAgentDocketFocus): Promise<boolean> => new Promise((resolve) => {
+    let settled = false;
+    let navigation: PendingNavigation | null = null;
+    const settle = (accepted: boolean) => {
+      if (settled) return;
+      settled = true;
+      input.signal?.removeEventListener("abort", onAbort);
+      browserAgentNavigationSettlersRef.current.delete(settle);
+      resolve(accepted);
+    };
+    const onAbort = () => {
+      setPendingNavigation((pending) => pending === navigation ? null : pending);
+      settle(false);
+    };
+    if (input.signal?.aborted === true) {
+      settle(false);
+      return;
+    }
+    input.signal?.addEventListener("abort", onAbort, { once: true });
+    browserAgentNavigationSettlersRef.current.add(settle);
+    const item = reviewItemForId(project, input.itemId);
+    if (item === null || item.current.itemRevision !== input.itemRevision) {
+      setErrorAnnouncement("The Browser Agent focus target is no longer the current visible revision.");
+      settle(false);
+      return;
+    }
+    // Revealing the already-selected editor never discards its own draft.
+    const selected = project.selectedItem;
+    if (selected !== null && selected.kind !== "AudioDescriptionGap" && selected.itemId === input.itemId && selected.itemRevision === input.itemRevision) {
+      settle(true);
+      return;
+    }
+    navigation = {
+      itemId: input.itemId,
+      itemRevision: input.itemRevision,
+      label: `Browser Agent selection ${itemAccessibleLabel(item)}`,
+      browserAgentSelectionPreflight: input,
+      resolveBrowserAgentSelectionPreflight: settle,
+    };
+    if (hasUnsavedDraft) {
+      setPendingNavigation(navigation);
+      return;
+    }
+    void performNavigation(navigation, project);
+  }), [hasUnsavedDraft, performNavigation, project]);
+
+  const cancelPendingNavigation = useCallback(() => {
+    setPendingNavigation((pending) => {
+      pending?.resolveBrowserAgentFocus?.(false);
+      pending?.resolveBrowserAgentSelectionPreflight?.(false);
+      return null;
+    });
+  }, []);
+
+  useEffect(() => () => {
+    for (const settle of browserAgentNavigationSettlersRef.current) settle(false);
+    browserAgentNavigationSettlersRef.current.clear();
+  }, []);
+
   useEffect(() => {
     onDraftStateChange?.(hasUnsavedDraft);
   }, [hasUnsavedDraft, onDraftStateChange]);
@@ -434,6 +635,14 @@ export function ReviewDocket({ project, onCommand, onSeekToMediaTime, footer, ev
       requestNavigation({ itemId, itemRevision, label: sourceLabel || `${itemAccessibleLabel(item)} r${itemRevision}` });
     });
   }, [onRegisterItemRevisionFocus, project, requestNavigation]);
+
+  useLayoutEffect(() => {
+    onRegisterBrowserAgentFocus?.(requestBrowserAgentFocus);
+  }, [onRegisterBrowserAgentFocus, requestBrowserAgentFocus]);
+
+  useLayoutEffect(() => {
+    onRegisterBrowserAgentSelectionPreflight?.(requestBrowserAgentSelectionPreflight);
+  }, [onRegisterBrowserAgentSelectionPreflight, requestBrowserAgentSelectionPreflight]);
 
   useEffect(() => {
     onRegisterCanonicalTimelineEdit?.((itemId, previousItemRevision, canonicalProject) => {
@@ -539,6 +748,11 @@ export function ReviewDocket({ project, onCommand, onSeekToMediaTime, footer, ev
 
   useLayoutEffect(() => {
     if (focusAfterSelection === null || isCommandPending) return;
+    if (focusAfterSelection.browserAgentFocus?.signal?.aborted === true) {
+      focusAfterSelection.resolveBrowserAgentFocus?.(false);
+      setFocusAfterSelection(null);
+      return;
+    }
     const index = filteredItems.findIndex((item) => item.itemId === focusAfterSelection.itemId);
     if (index === -1) return;
     if (windowed) {
@@ -557,6 +771,15 @@ export function ReviewDocket({ project, onCommand, onSeekToMediaTime, footer, ev
       : document.getElementById(evidenceAnchorId(focusAfterSelection.evidenceId));
     if (target instanceof HTMLElement) {
       target.focus();
+      const browserAgentFocus = focusAfterSelection.browserAgentFocus;
+      if (
+        browserAgentFocus !== undefined
+        && document.activeElement !== target
+      ) return;
+      // This layout effect is the exact per-focus/evidence acknowledgment:
+      // the active filter is All, the requested anchor exists, and focus has
+      // moved before the route seeks and verifies the one native video clock.
+      if (browserAgentFocus !== undefined) focusAfterSelection.resolveBrowserAgentFocus?.(true);
       setFocusAfterSelection(null);
     }
   }, [filter, filteredItems, focusAfterSelection, isCommandPending, virtualLayout, virtualScrollTop, windowed]);
@@ -566,7 +789,7 @@ export function ReviewDocket({ project, onCommand, onSeekToMediaTime, footer, ev
   }, [replaceDraft, selectedItem]);
 
   const saveDraftAndContinue = () => {
-    if (pendingNavigation === null || selectedItem === null || structuralDraftIsDirty || draftSaveCommand === null) {
+    if (pendingNavigation === null || draftTargetItem === null || structuralDraftIsDirty || draftSaveCommand === null) {
       setErrorAnnouncement("Apply the split or discard structural changes first. A caption revision cannot include a changed split point or new caption identifier.");
       return;
     }
@@ -577,12 +800,12 @@ export function ReviewDocket({ project, onCommand, onSeekToMediaTime, footer, ev
       setPendingNavigation(null);
       setPendingSustainedCommand({
         command: draftSaveCommand,
-        acceptedMessage: `Saved the reviewed revision for ${itemAccessibleLabel(selectedItem)}.`,
+        acceptedMessage: `Saved the reviewed revision for ${itemAccessibleLabel(draftTargetItem)}.`,
         afterSuccessNavigation: navigation,
       });
       return;
     }
-    requestSemanticCommand(draftSaveCommand, `Saved the reviewed revision for ${itemAccessibleLabel(selectedItem)}.`, pendingNavigation);
+    requestSemanticCommand(draftSaveCommand, `Saved the reviewed revision for ${itemAccessibleLabel(draftTargetItem)}.`, pendingNavigation);
   };
 
   const executeRuling = useCallback(async (command: DomainCommand, acceptedMessage: string): Promise<CommandResult | null> => {
@@ -675,7 +898,7 @@ export function ReviewDocket({ project, onCommand, onSeekToMediaTime, footer, ev
       {footer}
       {acceptedAnnouncement === null ? null : <p className="review-accepted-feedback" role="status" aria-live="polite">{acceptedAnnouncement}</p>}
       {errorAnnouncement === null ? null : <p className="review-command-feedback" role="alert" aria-live="assertive">{errorAnnouncement}</p>}
-      <Dialog.Root open={pendingNavigation !== null} onOpenChange={(open) => { if (!open) setPendingNavigation(null); }}>
+      <Dialog.Root open={pendingNavigation !== null} onOpenChange={(open) => { if (!open) cancelPendingNavigation(); }}>
         <Dialog.Portal>
           <Dialog.Overlay className="dialog-overlay" />
           <Dialog.Content className="storage-dialog review-dialog" aria-describedby="unsaved-draft-description">
