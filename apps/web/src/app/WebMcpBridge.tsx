@@ -32,6 +32,12 @@ import {
 } from "../features/generation/generation-client";
 import { narrationPreviewRequestFor } from "../features/review/NarrationPreview";
 import { loadPersistedCloudUpload, type PersistedCloudUploadRecovery } from "../features/project/cloud-upload";
+import { WebMcpDebugDrawer } from "../features/webmcp/WebMcpDebugDrawer";
+import {
+  createWebMcpDebugStore,
+  isWebMcpDebugEnabled,
+  type WebMcpDebugStore,
+} from "../features/webmcp/debug-store";
 import {
   ProjectInstanceFenceError,
   type ProjectStore,
@@ -153,6 +159,12 @@ export interface WebMcpBridgeProps {
   readonly onReadNativePlayheadMs?: () => number;
   /** Test seam only; production waits a bounded interval for exact host registration settlement. */
   readonly registrationTimeoutMs?: number;
+  /**
+   * The app passes this only from `?webmcpDebug=1`; a supplied store exists
+   * solely to make the opt-in boundary directly testable.
+   */
+  readonly debugEnabled?: boolean;
+  readonly debugStore?: WebMcpDebugStore;
 }
 
 const DEFAULT_REGISTRATION_SETTLEMENT_TIMEOUT_MS = 2_000;
@@ -462,7 +474,7 @@ const narrationMatchesProject = (
  * Browser Agent the same persistent command boundary, visible timeline, and
  * explicit confirmation dialogs already used by the ordinary workbench.
  */
-export function WebMcpBridge({ project, store, modelContext, onProfileProposal, onRevealSelection, onPrepareSelectionFocus, onReadNativePlayheadMs, registrationTimeoutMs }: WebMcpBridgeProps) {
+export function WebMcpBridge({ project, store, modelContext, onProfileProposal, onRevealSelection, onPrepareSelectionFocus, onReadNativePlayheadMs, registrationTimeoutMs, debugEnabled, debugStore: suppliedDebugStore }: WebMcpBridgeProps) {
   const projectRef = useRef(project);
   const storeRef = useRef(store);
   const profileProposalRef = useRef(onProfileProposal);
@@ -495,6 +507,16 @@ export function WebMcpBridge({ project, store, modelContext, onProfileProposal, 
   const revisionRegistrationWaitersRef = useRef(new Map<string, Deferred<RegistrationTarget>>());
   const registryRef = useRef<CueBenchToolRegistry | null>(null);
   const runtimeRef = useRef<CueBenchWebMcpRuntime | null>(null);
+  const debugStoreRef = useRef<WebMcpDebugStore | null>(null);
+  const debugRequested = debugEnabled ?? isWebMcpDebugEnabled();
+
+  // The explicit query/prop gate is authoritative. In particular, a supplied
+  // test store never turns diagnostics on by itself: without the exact opt-in
+  // there is no observer, drawer, or metadata capture seam at all.
+  if (debugRequested && debugStoreRef.current === null) {
+    debugStoreRef.current = suppliedDebugStore ?? createWebMcpDebugStore(true);
+  }
+  const debugStore = debugRequested ? debugStoreRef.current : null;
 
   projectRef.current = project;
   storeRef.current = store;
@@ -1003,11 +1025,25 @@ export function WebMcpBridge({ project, store, modelContext, onProfileProposal, 
     const resolvedModelContext = modelContext === undefined
       ? (typeof document === "undefined" ? null : featureDetectModelContext(document))
       : modelContext;
-    registryRef.current = new CueBenchToolRegistry(resolvedModelContext);
+    registryRef.current = new CueBenchToolRegistry(resolvedModelContext, {
+      ...(debugStore === null ? {} : { debugObserver: debugStore }),
+    });
   }
 
   const runtime = runtimeRef.current;
   const registry = registryRef.current;
+
+  // A query/prop change must revoke diagnostics without changing the WebMCP
+  // surface. Existing host callbacks read the registry's current observer at
+  // invocation time, so a retained callback cannot repopulate a cleared log.
+  useLayoutEffect(() => {
+    registry.setDebugObserver(debugStore ?? undefined);
+    if (debugStore !== null) return;
+    const retainedStore = debugStoreRef.current;
+    if (retainedStore === null) return;
+    retainedStore.dispose();
+    debugStoreRef.current = null;
+  }, [debugStore, registry]);
 
   useLayoutEffect(() => {
     const desiredProject = project;
@@ -1184,7 +1220,13 @@ export function WebMcpBridge({ project, store, modelContext, onProfileProposal, 
           waiter.reject(new ToolVisibleStateError());
         }
         narrationPublicationWaitersRef.current.clear();
+        registry.setDebugObserver(undefined);
         void registry.dispose();
+        // The development-only record belongs to this mounted page surface.
+        // Disposing first lets its terminal aborts settle, then guarantees an
+        // externally retained test reference cannot carry the record forward.
+        debugStoreRef.current?.dispose();
+        debugStoreRef.current = null;
       });
     };
   }, [registry, settleConfirmation]);
@@ -1270,7 +1312,7 @@ export function WebMcpBridge({ project, store, modelContext, onProfileProposal, 
     waiter.resolve();
   }, [visibleNarration]);
 
-  if (registry.available === false && confirmation === null && visibleDownload === null && visibleNarration === null) return null;
+  if (registry.available === false && confirmation === null && visibleDownload === null && visibleNarration === null && debugStore === null) return null;
 
   return (
     <>
@@ -1296,6 +1338,7 @@ export function WebMcpBridge({ project, store, modelContext, onProfileProposal, 
           <audio controls preload="metadata" src={visibleNarration.href} data-cuebench-narration-epoch={visibleNarration.visualEpoch} aria-label={`Narration preview for ${visibleNarration.beatId}`} />
         </section>
       )}
+      {debugStore === null ? null : <WebMcpDebugDrawer store={debugStore} />}
     </>
   );
 }

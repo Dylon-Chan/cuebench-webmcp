@@ -4,6 +4,7 @@ import {
   validateToolResult,
   type ToolFaultLogger,
 } from "./tool-result";
+import { CONTRACT_VERSION } from "@cuebench/contracts";
 import {
   isStrictToolDataSchema,
   type CueBenchTool,
@@ -12,12 +13,24 @@ import {
   type ModelContextTool,
   type SelectionToolFamily,
   type ToolAnnotations,
+  type ToolRegistrationGroup,
+  type WebMcpDebugArgumentKind,
+  type WebMcpDebugArguments,
+  type WebMcpDebugEvent,
+  type WebMcpDebugObserver,
+  type WebMcpDebugRevisions,
+  type WebMcpDebugResultCode,
+  type WebMcpDebugToolName,
+  isWebMcpDebugResultCode,
+  isWebMcpDebugToolName,
 } from "./types";
 
-export type ToolRegistrationGroup = "always" | "run" | "selection";
+export type { ToolRegistrationGroup } from "./types";
 
 export interface CueBenchToolRegistryOptions {
   readonly onUnexpectedError?: ToolFaultLogger;
+  /** Provided only by CueBench's `?webmcpDebug=1` in-memory inspector. */
+  readonly debugObserver?: WebMcpDebugObserver;
 }
 
 /**
@@ -147,6 +160,142 @@ const activeRunStarterNames = new Set([
 
 const namesOf = (tools: readonly CueBenchTool[]): readonly string[] => tools.map((tool) => tool.name);
 
+const MAX_DEBUG_ARGUMENT_FIELDS = 16;
+const MAX_DEBUG_ENUMERATION_ATTEMPTS = 32;
+const MAX_DEBUG_DURATION_MS = 10 * 60 * 1_000;
+
+interface DebugCallCapture {
+  readonly observer: WebMcpDebugObserver;
+  readonly toolName: WebMcpDebugToolName;
+  readonly group: ToolRegistrationGroup;
+  readonly args: WebMcpDebugArguments;
+  readonly startedAt: number;
+}
+
+interface DebugDuration {
+  readonly durationMs: number;
+  readonly durationCapped: boolean;
+}
+
+const debugArgumentKind = (value: unknown): WebMcpDebugArgumentKind => {
+  if (value === null) return "null";
+  if (Array.isArray(value)) return "array";
+  switch (typeof value) {
+    case "string": return "string";
+    case "number": return "number";
+    case "boolean": return "boolean";
+    case "object": return "object";
+    default: return "other";
+  }
+};
+
+/**
+ * This intentionally never returns an argument value or argument name. It
+ * stops after a tiny bounded sample so the debug-only observer cannot become
+ * a context, telemetry, or memory side channel.
+ */
+const debugArguments = (input: unknown): WebMcpDebugArguments => {
+  try {
+    // Keep *every* reflection operation inside this fail-closed boundary. A
+    // revoked Proxy can throw from Array.isArray, iteration, or descriptors;
+    // diagnostics must never change the tool's normal outcome.
+    const kind = debugArgumentKind(input);
+    if (kind !== "object" && kind !== "array") {
+      return { kind, fieldCount: 0, valueKinds: [], truncated: false };
+    }
+    const candidate = input as Record<string, unknown>;
+    const valueKinds = new Set<WebMcpDebugArgumentKind>();
+    let fieldCount = 0;
+    let truncated = false;
+    let enumerationAttempts = 0;
+    // Do not materialize Object.keys/Reflect.ownKeys: both can allocate an
+    // unbounded list. This loop caps *all* enumeration attempts, including
+    // inherited properties, while descriptors avoid evaluating getters.
+    for (const key in candidate) {
+      enumerationAttempts += 1;
+      if (enumerationAttempts > MAX_DEBUG_ENUMERATION_ATTEMPTS) {
+        truncated = true;
+        break;
+      }
+      if (!Object.prototype.hasOwnProperty.call(candidate, key)) continue;
+      if (fieldCount >= MAX_DEBUG_ARGUMENT_FIELDS) {
+        truncated = true;
+        break;
+      }
+      fieldCount += 1;
+      const descriptor = Object.getOwnPropertyDescriptor(candidate, key);
+      if (descriptor === undefined || "get" in descriptor || "set" in descriptor) {
+        valueKinds.add("uninspectable");
+      } else {
+        valueKinds.add(debugArgumentKind(descriptor.value));
+      }
+    }
+    return {
+      kind,
+      fieldCount,
+      valueKinds: [...valueKinds].sort(),
+      truncated,
+    };
+  } catch {
+    return { kind: "uninspectable", fieldCount: 0, valueKinds: [], truncated: false };
+  }
+};
+
+const safeDebugRevision = (value: unknown): number | null => (
+  typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : null
+);
+
+const ownValue = (candidate: unknown, key: string): unknown => {
+  try {
+    if (candidate === null || typeof candidate !== "object") return undefined;
+    const descriptor = Object.getOwnPropertyDescriptor(candidate, key);
+    return descriptor === undefined || "get" in descriptor || "set" in descriptor ? undefined : descriptor.value;
+  } catch {
+    return undefined;
+  }
+};
+
+const debugRevisions = (result: unknown): WebMcpDebugRevisions => {
+  const projectRevision = safeDebugRevision(ownValue(result, "projectRevision"));
+  const data = ownValue(result, "data");
+  const verification = ownValue(data, "verification");
+  const selection = ownValue(verification, "selection");
+  const changedItem = ownValue(verification, "changedItem");
+  return {
+    projectRevision,
+    selectionRevision: safeDebugRevision(ownValue(selection, "selectionRevision")),
+    itemRevision: safeDebugRevision(ownValue(changedItem, "itemRevision")),
+  };
+};
+
+const debugResultCode = (result: unknown): WebMcpDebugResultCode => {
+  if (ownValue(result, "ok") === true) return "OK";
+  const code = ownValue(result, "code");
+  return isWebMcpDebugResultCode(code) ? code : "UNEXPECTED_ERROR";
+};
+
+const debugDuration = (startedAt: number): DebugDuration => {
+  const elapsed = Date.now() - startedAt;
+  const exact = Number.isSafeInteger(elapsed) && elapsed >= 0 && elapsed <= MAX_DEBUG_DURATION_MS;
+  if (!exact) {
+    return {
+      durationMs: typeof elapsed === "number" && Number.isFinite(elapsed)
+        ? Math.min(MAX_DEBUG_DURATION_MS, Math.max(0, Math.trunc(elapsed)))
+        : 0,
+      durationCapped: true,
+    };
+  }
+  return { durationMs: elapsed, durationCapped: false };
+};
+
+const debugObserverEnabled = (observer: WebMcpDebugObserver | undefined): boolean => {
+  try {
+    return observer !== undefined && (observer.isEnabled?.() ?? true);
+  } catch {
+    return false;
+  }
+};
+
 const joinedAbortSignal = (signals: readonly (AbortSignal | undefined)[]): JoinedAbortSignal => {
   const uniqueSignals = [...new Set(signals.filter((signal): signal is AbortSignal => signal !== undefined))];
   if (uniqueSignals.length === 0) {
@@ -205,6 +354,7 @@ export class CueBenchToolRegistry {
   };
 
   private readonly onUnexpectedError: ToolFaultLogger | undefined;
+  private debugObserver: WebMcpDebugObserver | undefined;
   private transitionSequence = 0;
   /** A same textual scope can still belong to a newer async surface transition. */
   private metadataEpoch = 0;
@@ -231,10 +381,20 @@ export class CueBenchToolRegistry {
     options: CueBenchToolRegistryOptions = {},
   ) {
     this.onUnexpectedError = options.onUnexpectedError;
+    this.debugObserver = options.debugObserver;
   }
 
   public get available(): boolean {
     return !this.disposed && this.modelContext !== null && this.modelContext !== undefined;
+  }
+
+  /**
+   * The page may turn its development-only inspector on or off without
+   * changing any human UI or browser registrations. Existing wrappers read
+   * this current observer at invocation time, so disabling is immediate.
+   */
+  public setDebugObserver(observer: WebMcpDebugObserver | undefined): void {
+    this.debugObserver = observer;
   }
 
   /** Register (or atomically replace) the idle always-available surface. */
@@ -415,7 +575,9 @@ export class CueBenchToolRegistry {
       this.groups[name] = null;
       this.groupEpochs[name] += 1;
     }
-    for (const { group } of owned) group?.controller.abort();
+    for (const { name, group } of owned) {
+      if (group !== null) this.abortGroup(name, group);
+    }
     return Promise.resolve();
   }
 
@@ -426,6 +588,93 @@ export class CueBenchToolRegistry {
       run: this.groupSnapshot("run"),
       selection: this.groupSnapshot("selection"),
     };
+  }
+
+  /** Debug observation is explicitly best-effort and never changes a tool outcome. */
+  private recordDebug(observer: WebMcpDebugObserver, event: WebMcpDebugEvent): void {
+    try {
+      if (!debugObserverEnabled(observer)) return;
+      observer.record(event);
+    } catch {
+      // The opt-in judge drawer must never become a source of execution faults.
+    }
+  }
+
+  private recordGroupStatus(
+    group: ToolRegistrationGroup,
+    tools: readonly CueBenchTool[],
+    status: "registered" | "aborted" | "registration-failed",
+  ): void {
+    const observer = this.debugObserver;
+    if (observer === undefined || !debugObserverEnabled(observer)) return;
+    for (const tool of tools) {
+      const toolName = isWebMcpDebugToolName(tool.name) ? tool.name : null;
+      if (toolName === null) continue;
+      this.recordDebug(observer, {
+        kind: "registration",
+        toolName,
+        schemaVersion: CONTRACT_VERSION,
+        group,
+        status,
+      });
+    }
+  }
+
+  /** Begin capture inside one fail-closed boundary before tool execution. */
+  private beginDebugCapture(
+    toolName: string,
+    group: ToolRegistrationGroup,
+    input: unknown,
+  ): DebugCallCapture | null {
+    try {
+      const observer = this.debugObserver;
+      const approvedToolName = isWebMcpDebugToolName(toolName) ? toolName : null;
+      if (approvedToolName === null || !debugObserverEnabled(observer) || observer === undefined) return null;
+      return {
+        observer,
+        toolName: approvedToolName,
+        group,
+        args: debugArguments(input),
+        startedAt: Date.now(),
+      };
+    } catch {
+      return null;
+    }
+  }
+
+  /** Finish capture under the same fail-closed boundary, retaining no raw result. */
+  private finishDebugCapture(
+    capture: DebugCallCapture | null,
+    result: unknown,
+    cancelled: boolean,
+  ): void {
+    if (capture === null) return;
+    try {
+      const duration = debugDuration(capture.startedAt);
+      this.recordDebug(capture.observer, {
+        kind: "call",
+        toolName: capture.toolName,
+        schemaVersion: CONTRACT_VERSION,
+        group: capture.group,
+        args: capture.args,
+        ...duration,
+        resultCode: debugResultCode(result),
+        revisions: debugRevisions(result),
+        cancelled,
+      });
+    } catch {
+      // The opt-in judge drawer must never become a source of execution faults.
+    }
+  }
+
+  private abortGroup(name: ToolRegistrationGroup, group: ActiveGroup): void {
+    if (group.controller.signal.aborted) return;
+    group.controller.abort();
+    this.recordGroupStatus(name, group.tools, "aborted");
+  }
+
+  private recordRegistrationFailure(groups: readonly OwnedGroup[]): void {
+    for (const owned of groups) this.recordGroupStatus(owned.name, owned.group.tools, "registration-failed");
   }
 
   private visibleAlwaysTools(
@@ -597,13 +846,16 @@ export class CueBenchToolRegistry {
 
     // Do this only after every new owner is installed. A reentrant callback can
     // then replace a fresh owner, and the stale transition will detect it.
-    for (const { previous } of prepared) previous?.controller.abort();
+    for (const { name, previous } of prepared) {
+      if (previous !== null) this.abortGroup(name, previous);
+    }
 
     this.throwIfDisposed(generation);
     if (!this.available) return;
     const registration = this.startRegistrations(prepared);
     const settledRegistration = Promise.allSettled(registration.attempts.map((attempt) => attempt.promise));
     if (registration.hasSynchronousFailure) {
+      this.recordRegistrationFailure(prepared);
       const rollback = this.abortOwnedGroups(prepared);
       await this.awaitCurrentLifecycle(settledRegistration, generation);
       this.throwIfDisposed(generation);
@@ -615,6 +867,7 @@ export class CueBenchToolRegistry {
     try {
       await this.awaitCurrentLifecycle(Promise.all(registration.attempts.map((attempt) => attempt.promise)), generation);
     } catch (error) {
+      this.recordRegistrationFailure(prepared);
       const rollback = this.abortOwnedGroups(prepared);
       await this.awaitCurrentLifecycle(settledRegistration, generation);
       this.throwIfDisposed(generation);
@@ -648,7 +901,7 @@ export class CueBenchToolRegistry {
           attempts.push({
             ...owned,
             promise: Promise.resolve(modelContext.registerTool(
-              this.wrapTool(tool, owned.group),
+              this.wrapTool(tool, owned.group, owned.name),
               { signal: owned.group.controller.signal },
             )),
           });
@@ -704,7 +957,7 @@ export class CueBenchToolRegistry {
       cleared.push(owned);
       if ("previous" in owned) detached.push(owned as PreparedGroup);
     }
-    for (const owned of cleared) owned.group.controller.abort();
+    for (const owned of cleared) this.abortGroup(owned.name, owned.group);
     return detached;
   }
 
@@ -716,6 +969,7 @@ export class CueBenchToolRegistry {
         && owned.group.tools.length > 0
       ) {
         owned.group.registered = true;
+        this.recordGroupStatus(owned.name, owned.group.tools, "registered");
       }
     }
   }
@@ -747,6 +1001,7 @@ export class CueBenchToolRegistry {
     const registration = this.startRegistrations(restored);
     const settledRegistration = Promise.allSettled(registration.attempts.map((attempt) => attempt.promise));
     if (registration.hasSynchronousFailure) {
+      this.recordRegistrationFailure(restored);
       this.abortOwnedGroups(restored);
       await this.awaitCurrentLifecycle(settledRegistration, generation);
       return;
@@ -754,6 +1009,7 @@ export class CueBenchToolRegistry {
     try {
       await this.awaitCurrentLifecycle(Promise.all(registration.attempts.map((attempt) => attempt.promise)), generation);
     } catch {
+      this.recordRegistrationFailure(restored);
       this.abortOwnedGroups(restored);
       await this.awaitCurrentLifecycle(settledRegistration, generation);
       return;
@@ -762,7 +1018,11 @@ export class CueBenchToolRegistry {
     this.markRegistered(restored);
   }
 
-  private wrapTool(tool: CueBenchTool, group: ActiveGroup): ModelContextTool {
+  private wrapTool(
+    tool: CueBenchTool,
+    group: ActiveGroup,
+    registrationGroup: ToolRegistrationGroup,
+  ): ModelContextTool {
     const annotations = browserAnnotations(tool.annotations);
     return {
       name: tool.name,
@@ -773,8 +1033,9 @@ export class CueBenchToolRegistry {
       execute: async (input: unknown, client?: ModelContextInvocationClient) => {
         const joined = joinedAbortSignal([group.controller.signal, client?.signal]);
         let committed = false;
+        const debugCapture = this.beginDebugCapture(tool.name, registrationGroup, input);
         try {
-          return await executeTool(
+          const result = await executeTool(
             async () => validateToolResult(
               await tool.execute(input, {
                 signal: joined.signal,
@@ -790,6 +1051,11 @@ export class CueBenchToolRegistry {
               ...(this.onUnexpectedError === undefined ? {} : { onUnexpectedError: this.onUnexpectedError }),
             },
           );
+          this.finishDebugCapture(debugCapture, result, joined.signal.aborted);
+          return result;
+        } catch (error) {
+          this.finishDebugCapture(debugCapture, undefined, joined.signal.aborted);
+          throw error;
         } finally {
           joined.dispose();
         }

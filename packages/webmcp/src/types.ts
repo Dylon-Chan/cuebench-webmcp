@@ -20,6 +20,156 @@ export interface ToolAnnotations {
   readonly untrustedContentHint?: boolean;
 }
 
+/** The one visible WebMCP family that owned a browser registration. */
+export type ToolRegistrationGroup = "always" | "run" | "selection";
+
+/**
+ * The debug inspector is intentionally constrained to the fixed Core surface.
+ * Do not fall back to a permissive identifier check here: a future dynamic
+ * name could itself disclose a filename, speaker, or model diagnostic.
+ */
+export const WEBMCP_DEBUG_TOOL_NAMES = [
+  "inspect_project",
+  "inspect_timeline_window",
+  "list_quality_findings",
+  "focus_quality_finding",
+  "start_caption_generation",
+  "start_ad_generation",
+  "validate_project",
+  "export_track",
+  "propose_profile_patch",
+  "prepare_certification_review",
+  "inspect_generation_run",
+  "cancel_generation_run",
+  "inspect_selected_cue_evidence",
+  "adjust_selected_cue_timing",
+  "split_selected_cue",
+  "merge_selected_cue",
+  "revise_selected_cue",
+  "mark_selected_cue_agent_ready",
+  "inspect_selected_ad_evidence",
+  "adjust_selected_ad_timing",
+  "revise_selected_ad_beat",
+  "preview_selected_narration",
+  "mark_selected_ad_agent_ready",
+  "inspect_selected_gap_evidence",
+  "propose_ad_beat_in_gap",
+] as const;
+
+export type WebMcpDebugToolName = typeof WEBMCP_DEBUG_TOOL_NAMES[number];
+
+const webMcpDebugToolNameSet = new Set<string>(WEBMCP_DEBUG_TOOL_NAMES);
+
+export const isWebMcpDebugToolName = (value: unknown): value is WebMcpDebugToolName => (
+  typeof value === "string" && webMcpDebugToolNameSet.has(value)
+);
+
+/**
+ * A result code is similarly a closed protocol field, never arbitrary server
+ * or model text. `UNEXPECTED_ERROR` is the only fallback sentinel.
+ */
+export const WEBMCP_DEBUG_RESULT_CODES = [
+  "OK",
+  "UNEXPECTED_ERROR",
+  "UNSUPPORTED_MEDIA",
+  "INVALID_MEDIA",
+  "FILE_SIZE_LIMIT_EXCEEDED",
+  "DURATION_LIMIT_EXCEEDED",
+  "STORAGE_INSUFFICIENT",
+  "TURNSTILE_SESSION_FAILED",
+  "QUOTA_EXCEEDED",
+  "SPEND_BREAKER_OPEN",
+  "UPLOAD_EXPIRED",
+  "UPLOAD_OWNERSHIP_MISMATCH",
+  "GENERATION_STAGE_FAILED",
+  "GENERATION_CANCELLED",
+  "STALE_PROJECT",
+  "STALE_ITEM",
+  "STALE_SELECTION",
+  "STALE_RUN",
+  "CONFIRMATION_DECLINED",
+  "TARGET_TRACK_LEASE_CONFLICT",
+  "VALIDATION_BLOCKER",
+  "CERTIFICATION_OUT_OF_DATE",
+  "EXPORT_ROUND_TRIP_MISMATCH",
+  "BACKUP_SCHEMA_UNSUPPORTED",
+  "MEDIA_HASH_MISMATCH",
+  "RECOVERY_ARTIFACT_EXPIRED",
+  "HUMAN_AUTHORITY_REQUIRED",
+  "INVALID_ARGUMENT",
+  "NOT_FOUND",
+] as const satisfies readonly (DomainErrorCode | "OK" | "UNEXPECTED_ERROR")[];
+
+export type WebMcpDebugResultCode = typeof WEBMCP_DEBUG_RESULT_CODES[number];
+
+const webMcpDebugResultCodeSet = new Set<string>(WEBMCP_DEBUG_RESULT_CODES);
+
+export const isWebMcpDebugResultCode = (value: unknown): value is WebMcpDebugResultCode => (
+  typeof value === "string" && webMcpDebugResultCodeSet.has(value)
+);
+
+/**
+ * Debug capture deliberately records shape, never input values or property
+ * names. This means caption prose, speaker labels, evidence URLs, filenames,
+ * frames, and raw model output cannot enter the judge drawer by design.
+ */
+export type WebMcpDebugArgumentKind =
+  | "null"
+  | "array"
+  | "object"
+  | "string"
+  | "number"
+  | "boolean"
+  | "other"
+  | "uninspectable";
+
+export interface WebMcpDebugArguments {
+  readonly kind: WebMcpDebugArgumentKind;
+  /** A bounded count: at most 16 observed fields/items plus truncation. */
+  readonly fieldCount: number;
+  /** Bounded primitive/container kinds only; no values or property names. */
+  readonly valueKinds: readonly WebMcpDebugArgumentKind[];
+  readonly truncated: boolean;
+}
+
+export interface WebMcpDebugRevisions {
+  readonly projectRevision: number | null;
+  readonly selectionRevision: number | null;
+  readonly itemRevision: number | null;
+}
+
+export interface WebMcpDebugRegistrationEvent {
+  readonly kind: "registration";
+  readonly toolName: WebMcpDebugToolName;
+  readonly schemaVersion: ContractVersion;
+  readonly group: ToolRegistrationGroup;
+  readonly status: "registered" | "aborted" | "registration-failed";
+}
+
+export interface WebMcpDebugCallEvent {
+  readonly kind: "call";
+  readonly toolName: WebMcpDebugToolName;
+  readonly schemaVersion: ContractVersion;
+  readonly group: ToolRegistrationGroup;
+  readonly args: WebMcpDebugArguments;
+  readonly durationMs: number;
+  /** True when `durationMs` is a conservative capped lower bound, not exact. */
+  readonly durationCapped: boolean;
+  /** `OK`, a fixed structured domain-error code, or `UNEXPECTED_ERROR` only. */
+  readonly resultCode: WebMcpDebugResultCode;
+  readonly revisions: WebMcpDebugRevisions;
+  readonly cancelled: boolean;
+}
+
+export type WebMcpDebugEvent = WebMcpDebugRegistrationEvent | WebMcpDebugCallEvent;
+
+/** Optional opt-in sink; failures from diagnostics must never affect a tool. */
+export interface WebMcpDebugObserver {
+  /** Optional runtime gate; throwing or false means capture must fail closed. */
+  readonly isEnabled?: () => boolean;
+  record: (event: WebMcpDebugEvent) => void;
+}
+
 /**
  * Chrome supplies an execution signal to imperative WebMCP tools. CueBench
  * forwards it together with the registration-family signal so a tool can stop

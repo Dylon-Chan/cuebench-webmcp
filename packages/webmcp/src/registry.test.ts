@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { domainError } from "@cuebench/domain";
 import { z } from "zod";
 import {
@@ -15,6 +15,7 @@ import {
   type ModelContextLike,
   type ModelContextTool,
   type ModelContextInvocationClient,
+  type WebMcpDebugEvent,
 } from "./index";
 
 class FakeModelContext implements ModelContextLike {
@@ -84,6 +85,234 @@ const selection = (scopeId: string, toolName: string) => ({
 const noSignal: ModelContextInvocationClient = {};
 
 describe("CueBenchToolRegistry", () => {
+  it("emits bounded redacted registration and call metadata only for an opt-in observer", async () => {
+    const modelContext = new FakeModelContext();
+    const events: WebMcpDebugEvent[] = [];
+    const registry = new CueBenchToolRegistry(modelContext, {
+      debugObserver: { record: (event) => events.push(event) },
+    });
+    const tool: CueBenchTool = {
+      name: "revise_selected_cue",
+      description: "Revise one selected cue.",
+      inputSchema: { type: "object", additionalProperties: false },
+      resultDataSchema: strictToolDataSchema({ name: z.string().trim().min(1).max(128) }),
+      execute: async () => toolSuccess({
+        projectRevision: 7,
+        data: { name: "safe" },
+        nextActions: ["inspect_project"],
+      }),
+    };
+
+    await registry.select({ scopeId: "caption:cue-1", tools: [tool] });
+    const registered = modelContext.tools.get("revise_selected_cue");
+    await registered?.execute({
+      text: "Dr. Nguyen private caption text",
+      speaker: "Professor Private",
+      evidenceFrame: "data:image/png;base64,private",
+      sourceUrl: "https://private.example/video.mov",
+    });
+
+    expect(events).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        kind: "registration",
+        toolName: "revise_selected_cue",
+        group: "selection",
+        schemaVersion: 1,
+        status: "registered",
+      }),
+      expect.objectContaining({
+        kind: "call",
+        toolName: "revise_selected_cue",
+        group: "selection",
+        resultCode: "OK",
+        args: expect.objectContaining({ kind: "object", fieldCount: 4 }),
+      }),
+    ]));
+    expect(JSON.stringify(events)).not.toContain("Nguyen");
+    expect(JSON.stringify(events)).not.toContain("Professor");
+    expect(JSON.stringify(events)).not.toContain("private.example");
+  });
+
+  it("records an actual aborted scoped invocation as cancelled metadata", async () => {
+    const modelContext = new FakeModelContext();
+    const events: WebMcpDebugEvent[] = [];
+    const registry = new CueBenchToolRegistry(modelContext, {
+      debugObserver: { record: (event) => events.push(event) },
+    });
+
+    await registry.select(selection("caption:cue-1", "inspect_selected_cue_evidence"));
+    const retained = modelContext.tools.get("inspect_selected_cue_evidence");
+    if (retained === undefined) throw new Error("Expected the scoped tool registration.");
+    await registry.select(null);
+
+    await expect(retained.execute({}, noSignal)).resolves.toMatchObject({
+      ok: false,
+      code: "STALE_SELECTION",
+      changed: false,
+    });
+    expect(events).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        kind: "registration",
+        toolName: "inspect_selected_cue_evidence",
+        group: "selection",
+        status: "aborted",
+      }),
+      expect.objectContaining({
+        kind: "call",
+        toolName: "inspect_selected_cue_evidence",
+        group: "selection",
+        resultCode: "STALE_SELECTION",
+        cancelled: true,
+        revisions: { projectRevision: null, selectionRevision: null, itemRevision: null },
+      }),
+    ]));
+  });
+
+  it("marks an over-cap diagnostic duration as capped rather than exact", async () => {
+    const modelContext = new FakeModelContext();
+    const events: WebMcpDebugEvent[] = [];
+    const registry = new CueBenchToolRegistry(modelContext, {
+      debugObserver: { record: (event) => events.push(event) },
+    });
+    await registry.select(selection("caption:duration", "inspect_project"));
+    const tool = modelContext.tools.get("inspect_project");
+    if (tool === undefined) throw new Error("Expected the approved inspection tool.");
+    const now = vi.spyOn(Date, "now")
+      .mockReturnValueOnce(0)
+      .mockReturnValueOnce(700_000);
+
+    await expect(tool.execute({})).resolves.toMatchObject({ ok: true });
+    now.mockRestore();
+    expect(events).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        kind: "call",
+        toolName: "inspect_project",
+        durationMs: 600_000,
+        durationCapped: true,
+      }),
+    ]));
+  });
+
+  it("fails closed when diagnostic sampling receives a revoked Proxy without changing the tool result", async () => {
+    const modelContext = new FakeModelContext();
+    const events: WebMcpDebugEvent[] = [];
+    const registry = new CueBenchToolRegistry(modelContext, {
+      debugObserver: { record: (event) => events.push(event) },
+    });
+    await registry.select(selection("caption:proxy", "inspect_project"));
+    const tool = modelContext.tools.get("inspect_project");
+    if (tool === undefined) throw new Error("Expected the approved inspection tool.");
+    const { proxy, revoke } = Proxy.revocable({ expectedProjectRevision: 7 }, {});
+    revoke();
+
+    await expect(tool.execute(proxy)).resolves.toMatchObject({ ok: true });
+    expect(events).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        kind: "call",
+        toolName: "inspect_project",
+        args: { kind: "uninspectable", fieldCount: 0, valueKinds: [], truncated: false },
+      }),
+    ]));
+  });
+
+  it("bounds debug enumeration attempts even across a long inherited property chain", async () => {
+    const modelContext = new FakeModelContext();
+    const events: WebMcpDebugEvent[] = [];
+    const registry = new CueBenchToolRegistry(modelContext, {
+      debugObserver: { record: (event) => events.push(event) },
+    });
+    let prototype: Record<string, unknown> | null = null;
+    for (let index = 0; index < 256; index += 1) {
+      const next = Object.create(prototype) as Record<string, unknown>;
+      next[`inherited_${index}`] = index;
+      prototype = next;
+    }
+    const hostileInput = Object.create(prototype);
+    await registry.select(selection("caption:prototype", "inspect_project"));
+    const tool = modelContext.tools.get("inspect_project");
+    if (tool === undefined) throw new Error("Expected the approved inspection tool.");
+
+    await expect(tool.execute(hostileInput)).resolves.toMatchObject({ ok: true });
+    expect(events).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        kind: "call",
+        toolName: "inspect_project",
+        args: expect.objectContaining({ fieldCount: 0, truncated: true }),
+      }),
+    ]));
+  });
+
+  it("never places hostile args, result prose, or error prose in a debug event", async () => {
+    const modelContext = new FakeModelContext();
+    const events: WebMcpDebugEvent[] = [];
+    const registry = new CueBenchToolRegistry(modelContext, {
+      onUnexpectedError: () => undefined,
+      debugObserver: { record: (event) => events.push(event) },
+    });
+    const privateCaption = "Dr. Nguyen's private caption text.";
+    const privateSpeaker = "Professor Nguyen";
+    const privateFile = "private-lecture.mov";
+    const privateUrl = "https://private.example/media";
+    const privateFrame = "data:image/png;base64,private-frame";
+    const privateModelOutput = "The model's private untrusted output.";
+    const privateError = "Provider error: the private caption could not be generated.";
+    const successfulTool: CueBenchTool = {
+      name: "inspect_project",
+      description: "A test-only bounded inspection tool.",
+      inputSchema: { type: "object", additionalProperties: false },
+      resultDataSchema: strictToolDataSchema({ rawModelOutput: z.string().min(1).max(1_000) }),
+      execute: async () => toolSuccess({
+        projectRevision: 7,
+        data: { rawModelOutput: privateModelOutput },
+        nextActions: ["inspect_project"],
+      }),
+    };
+    const domainErrorTool: CueBenchTool = {
+      name: "inspect_timeline_window",
+      description: "A test-only domain-error tool.",
+      inputSchema: { type: "object", additionalProperties: false },
+      resultDataSchema: strictToolDataSchema({}),
+      execute: async () => toolDomainError(domainError("INVALID_ARGUMENT", privateError)),
+    };
+    const unexpectedErrorTool: CueBenchTool = {
+      name: "list_quality_findings",
+      description: "A test-only unexpected-error tool.",
+      inputSchema: { type: "object", additionalProperties: false },
+      resultDataSchema: strictToolDataSchema({}),
+      execute: async () => { throw new Error(privateError); },
+    };
+    const hostileInput = {
+      text: privateCaption,
+      speaker: privateSpeaker,
+      filename: privateFile,
+      url: privateUrl,
+      evidenceFrame: privateFrame,
+      rawModelOutput: privateModelOutput,
+    };
+
+    await registry.select({ scopeId: "caption:private", tools: [successfulTool] });
+    await expect(modelContext.tools.get(successfulTool.name)?.execute(hostileInput)).resolves.toMatchObject({ ok: true });
+    await registry.select({ scopeId: "caption:private-error", tools: [domainErrorTool] });
+    await expect(modelContext.tools.get(domainErrorTool.name)?.execute(hostileInput)).resolves.toMatchObject({
+      ok: false,
+      code: "INVALID_ARGUMENT",
+    });
+    await registry.select({ scopeId: "caption:private-throw", tools: [unexpectedErrorTool] });
+    await expect(modelContext.tools.get(unexpectedErrorTool.name)?.execute(hostileInput)).rejects.toMatchObject({
+      name: "CueBenchToolExecutionError",
+    });
+
+    const serialized = JSON.stringify(events);
+    for (const value of [privateCaption, privateSpeaker, privateFile, privateUrl, privateFrame, privateModelOutput, privateError]) {
+      expect(serialized).not.toContain(value);
+    }
+    expect(events).toEqual(expect.arrayContaining([
+      expect.objectContaining({ kind: "call", toolName: successfulTool.name, resultCode: "OK" }),
+      expect.objectContaining({ kind: "call", toolName: domainErrorTool.name, resultCode: "INVALID_ARGUMENT" }),
+      expect.objectContaining({ kind: "call", toolName: unexpectedErrorTool.name, resultCode: "UNEXPECTED_ERROR" }),
+    ]));
+  });
+
   it("feature-detects WebMCP without mutating an unavailable host", async () => {
     const host: { modelContext?: unknown } = {};
     const registry = new CueBenchToolRegistry(featureDetectModelContext(host));

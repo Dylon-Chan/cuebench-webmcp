@@ -16,6 +16,7 @@ import type {
 } from "@cuebench/webmcp";
 import type { BoundGenerationProjectStore, ProjectStore } from "../features/project/project-store";
 import type { NarrationPreviewGateway, NarrationPreviewSynthesis } from "../features/review/NarrationPreview";
+import { createWebMcpDebugStore } from "../features/webmcp/debug-store";
 import { WebMcpBridge, type WebMcpBridgeProps } from "./WebMcpBridge";
 
 const browserAgent = { type: "BrowserAgent" as const, id: "browser-agent" };
@@ -307,6 +308,99 @@ afterEach(() => {
 });
 
 describe("WebMcpBridge", () => {
+  it("keeps WebMCP diagnostics opt-in, redacted, in-memory, and cleared on unmount", async () => {
+    const initial = selectItem(baseProject({ cueState: "Objected" }), "cue-1");
+    const storageSetItem = vi.spyOn(Storage.prototype, "setItem");
+    // A caller cannot bypass the query/flag boundary by injecting an enabled
+    // test store while diagnostics are disabled.
+    const disabledStore = createWebMcpDebugStore(true);
+    const disabledContext = new FakeModelContext();
+    let disabledBridgeStore: MutableBridgeStore | null = null;
+    const disabledView = render(<BridgeHarness
+      initial={initial}
+      modelContext={disabledContext}
+      debugEnabled={false}
+      debugStore={disabledStore}
+      onStore={(next) => { disabledBridgeStore = next; }}
+    />);
+    await waitFor(() => expect(disabledContext.tools.has("inspect_project")).toBe(true));
+    await act(async () => {
+      await expect(disabledContext.invoke("inspect_project", { contractVersion: 1 })).resolves.toMatchObject({ ok: true });
+    });
+    expect(disabledBridgeStore).not.toBeNull();
+    expect(disabledStore.getSnapshot().events).toEqual([]);
+    expect(screen.queryByRole("complementary", { name: "WebMCP inspection drawer" })).not.toBeInTheDocument();
+    disabledView.unmount();
+
+    const enabledStore = createWebMcpDebugStore(true);
+    const enabledContext = new FakeModelContext();
+    let enabledBridgeStore: MutableBridgeStore | null = null;
+    const enabledView = render(<BridgeHarness
+      initial={initial}
+      modelContext={enabledContext}
+      debugEnabled
+      debugStore={enabledStore}
+      onStore={(next) => { enabledBridgeStore = next; }}
+    />);
+    await waitFor(() => expect(enabledContext.tools.has("inspect_project")).toBe(true));
+    await act(async () => {
+      await expect(enabledContext.invoke("inspect_project", { contractVersion: 1 })).resolves.toMatchObject({ ok: true });
+    });
+    expect(enabledBridgeStore).not.toBeNull();
+    expect(screen.getByRole("complementary", { name: "WebMCP inspection drawer" })).toBeInTheDocument();
+    expect(enabledStore.getSnapshot().events).toEqual(expect.arrayContaining([
+      expect.objectContaining({ kind: "registration", toolName: "inspect_project" }),
+      expect.objectContaining({ kind: "call", toolName: "inspect_project", resultCode: "OK" }),
+    ]));
+    expect(JSON.stringify(enabledStore.getSnapshot())).not.toContain("A reviewable caption.");
+    expect(storageSetItem).not.toHaveBeenCalled();
+    const retainedTool = enabledContext.registrations.find((registration) => registration.tool.name === "inspect_project")?.tool;
+    if (retainedTool === undefined) throw new Error("Expected the original inspection registration.");
+
+    enabledView.unmount();
+    await waitFor(() => expect(enabledStore.getSnapshot().events).toEqual([]));
+    expect(enabledStore.getSnapshot().enabled).toBe(false);
+    await expect(retainedTool.execute({ contractVersion: 1 })).resolves.toMatchObject({ ok: false, code: "STALE_SELECTION" });
+    expect(enabledStore.getSnapshot().events).toEqual([]);
+    expect(storageSetItem).not.toHaveBeenCalled();
+  });
+
+  it("detaches diagnostics immediately when the explicit debug flag turns off", async () => {
+    const initial = selectItem(baseProject({ cueState: "Objected" }), "cue-1");
+    const debugStore = createWebMcpDebugStore(true);
+    const modelContext = new FakeModelContext();
+    let store: MutableBridgeStore | null = null;
+    const view = render(<BridgeHarness
+      initial={initial}
+      modelContext={modelContext}
+      debugEnabled
+      debugStore={debugStore}
+      onStore={(next) => { store = next; }}
+    />);
+    await waitFor(() => expect(modelContext.tools.has("inspect_project")).toBe(true));
+    await act(async () => {
+      await expect(modelContext.invoke("inspect_project", { contractVersion: 1 })).resolves.toMatchObject({ ok: true });
+    });
+    expect(debugStore.getSnapshot().events.length).toBeGreaterThan(0);
+    const retainedTool = modelContext.registrations.find((registration) => registration.tool.name === "inspect_project")?.tool;
+    if (retainedTool === undefined) throw new Error("Expected the original inspection registration.");
+
+    view.rerender(<BridgeHarness
+      initial={initial}
+      modelContext={modelContext}
+      debugEnabled={false}
+      debugStore={debugStore}
+      onStore={(next) => { store = next; }}
+    />);
+    await waitFor(() => expect(screen.queryByRole("complementary", { name: "WebMCP inspection drawer" })).not.toBeInTheDocument());
+    expect(debugStore.getSnapshot()).toEqual({ enabled: false, events: [] });
+    await act(async () => {
+      await expect(retainedTool.execute({ contractVersion: 1 })).resolves.toMatchObject({ ok: true });
+    });
+    expect(debugStore.getSnapshot()).toEqual({ enabled: false, events: [] });
+    expect(store).not.toBeNull();
+  });
+
   it("waits for the exact replacement selection family to register before reporting a visible mutation", async () => {
     const modelContext = new ControllableModelContext();
     let store: MutableBridgeStore | null = null;

@@ -25,6 +25,7 @@ import { WebMcpBridge, type BoundWebMcpProfileProposal } from "./WebMcpBridge";
 export interface AppRoutesProps {
   readonly store: ProjectStore;
   readonly webMcpAvailable: boolean;
+  readonly webMcpDebugEnabled?: boolean;
 }
 
 export const formatDuration = (durationMs: number): string => {
@@ -42,10 +43,11 @@ interface WorkbenchShellProps {
   readonly sourceObjectUrl: string;
   readonly sourceProvenance: SourceProvenance;
   readonly webMcpAvailable: boolean;
+  readonly webMcpDebugEnabled: boolean;
   readonly store: ProjectStore;
 }
 
-export function WorkbenchShell({ project, mode, sourceObjectUrl, sourceProvenance, webMcpAvailable, store }: WorkbenchShellProps) {
+export function WorkbenchShell({ project, mode, sourceObjectUrl, sourceProvenance, webMcpAvailable, webMcpDebugEnabled, store }: WorkbenchShellProps) {
   const validationLabel = project.validation.status === "NotRun"
     ? "Validation not run"
     : `${project.validation.blockerCount} blockers · ${project.validation.warningCount} warnings`;
@@ -336,9 +338,10 @@ export function WorkbenchShell({ project, mode, sourceObjectUrl, sourceProvenanc
         />
         <GenerationStatus project={project} store={store} />
         <AdGenerationStatus project={project} store={store} />
-        {webMcpAvailable ? <WebMcpBridge
+        {webMcpAvailable || webMcpDebugEnabled ? <WebMcpBridge
           project={project}
           store={store}
+          debugEnabled={webMcpDebugEnabled}
           onProfileProposal={publishAgentProfileProposal}
           onRevealSelection={revealBrowserAgentSelection}
           onPrepareSelectionFocus={prepareBrowserAgentSelection}
@@ -349,7 +352,7 @@ export function WorkbenchShell({ project, mode, sourceObjectUrl, sourceProvenanc
   );
 }
 
-function ProjectRoute({ store, webMcpAvailable }: AppRoutesProps) {
+function ProjectRoute({ store, webMcpAvailable, webMcpDebugEnabled = false }: AppRoutesProps) {
   const snapshot = useSyncExternalStore(store.subscribe, store.getSnapshot, store.getSnapshot);
   if (snapshot.project === null || snapshot.sourceObjectUrl === null || snapshot.sourceProvenance === null) return <ProjectStart store={store} />;
   return <WorkbenchShell
@@ -358,14 +361,15 @@ function ProjectRoute({ store, webMcpAvailable }: AppRoutesProps) {
     sourceObjectUrl={snapshot.sourceObjectUrl}
     sourceProvenance={snapshot.sourceProvenance}
     webMcpAvailable={webMcpAvailable}
+    webMcpDebugEnabled={webMcpDebugEnabled}
     store={store}
   />;
 }
 
-export function AppRoutes({ store, webMcpAvailable }: AppRoutesProps) {
+export function AppRoutes({ store, webMcpAvailable, webMcpDebugEnabled = false }: AppRoutesProps) {
   return (
     <Routes>
-      <Route path="/" element={<ProjectRoute store={store} webMcpAvailable={webMcpAvailable} />} />
+      <Route path="/" element={<ProjectRoute store={store} webMcpAvailable={webMcpAvailable} webMcpDebugEnabled={webMcpDebugEnabled} />} />
       <Route path="*" element={<Navigate to="/" replace />} />
     </Routes>
   );
