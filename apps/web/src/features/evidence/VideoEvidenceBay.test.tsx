@@ -83,6 +83,7 @@ describe("VideoEvidenceBay", () => {
 
   it("uses trusted source provenance instead of a project title to decide audio presence", () => {
     expect(projectMediaEvidence({ sourceKind: "bundled-fixture", audioPresence: "absent" }).audioState).toBe("no-audio");
+    expect(projectMediaEvidence({ sourceKind: "bundled-fixture", audioPresence: "present" }).audioState).toBe("pending");
     expect(projectMediaEvidence({ sourceKind: "uploaded", audioPresence: "unknown" }).audioState).toBe("pending");
   });
 

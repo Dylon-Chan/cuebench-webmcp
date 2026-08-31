@@ -1,0 +1,185 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="5760" viewBox="0 0 1280 5760" role="img" aria-labelledby="title description">
+  <title id="title">CueBench Gibbs free energy lesson slide strip</title>
+  <desc id="description">Eight original 1280 by 720 lesson slides arranged vertically for deterministic video assembly.</desc>
+  <defs>
+    <linearGradient id="night" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#101a28"/>
+      <stop offset="1" stop-color="#243d4a"/>
+    </linearGradient>
+    <linearGradient id="paper" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#fff9e9"/>
+      <stop offset="1" stop-color="#e9f2ec"/>
+    </linearGradient>
+    <linearGradient id="water" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#6bc5c8"/>
+      <stop offset="1" stop-color="#167c86"/>
+    </linearGradient>
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="10" stdDeviation="12" flood-color="#0a1720" flood-opacity="0.24"/>
+    </filter>
+    <style>
+      .kicker { font: 700 22px Arial, sans-serif; letter-spacing: 4px; text-transform: uppercase; fill: #d79055; }
+      .title { font: 700 68px Arial, sans-serif; fill: #14212d; }
+      .title-light { font: 700 68px Arial, sans-serif; fill: #f7f3e8; }
+      .display { font: 700 98px Arial, sans-serif; fill: #14212d; }
+      .body { font: 400 34px Arial, sans-serif; fill: #31434b; }
+      .body-light { font: 400 34px Arial, sans-serif; fill: #dbe8e4; }
+      .small { font: 600 24px Arial, sans-serif; fill: #47616a; }
+      .badge { font: 700 22px Arial, sans-serif; fill: #fff9e9; }
+      .formula { font: 700 88px Georgia, serif; fill: #fff9e9; }
+      .sign { font: 700 54px Arial, sans-serif; fill: #14212d; }
+    </style>
+  </defs>
+
+  <!-- Slide 1 · 00:00–00:10 -->
+  <g id="slide-01" transform="translate(0 0)">
+    <rect width="1280" height="720" fill="url(#paper)"/>
+    <circle cx="1085" cy="112" r="190" fill="#dcebe1"/>
+    <circle cx="1165" cy="610" r="260" fill="#f0d6bd" opacity="0.6"/>
+    <text x="84" y="102" class="kicker">CueBench chemistry minute</text>
+    <text x="84" y="235" class="title">Gibbs free energy</text>
+    <text x="84" y="315" class="body">A 90-second intuition calibration</text>
+    <g transform="translate(84 420)">
+      <rect width="430" height="126" rx="24" fill="#162b36"/>
+      <circle cx="62" cy="63" r="33" fill="#d79055"/>
+      <path d="M50 66l9 9 18-24" fill="none" stroke="#fff9e9" stroke-width="7" stroke-linecap="round" stroke-linejoin="round"/>
+      <text x="116" y="57" class="badge">DR. NGUYEN</text>
+      <text x="116" y="91" class="body-light" style="font-size:24px">Thermodynamics</text>
+    </g>
+    <text x="84" y="657" class="small">Direction is not speed.</text>
+  </g>
+
+  <!-- Slide 2 · 00:10–00:27 -->
+  <g id="slide-02" transform="translate(0 720)">
+    <rect width="1280" height="720" fill="url(#night)"/>
+    <text x="80" y="90" class="kicker">The energy balance</text>
+    <g transform="translate(80 144)">
+      <rect width="1120" height="235" rx="32" fill="#203944" stroke="#72958d" stroke-width="2"/>
+      <text x="560" y="145" text-anchor="middle" class="formula">ΔG = ΔH − TΔS</text>
+    </g>
+    <g transform="translate(80 452)">
+      <circle cx="20" cy="20" r="20" fill="#d79055"/>
+      <text x="60" y="31" class="body-light">Negative ΔG → a spontaneous direction</text>
+      <text x="60" y="86" class="body-light">under the stated conditions</text>
+    </g>
+    <text x="80" y="666" class="small" style="fill:#a9c2bb">Thermodynamics describes favorability, not a stopwatch.</text>
+  </g>
+
+  <!-- Slide 3 · 00:27–00:35 -->
+  <g id="slide-03" transform="translate(0 1440)">
+    <rect width="1280" height="720" fill="#edf4ef"/>
+    <text x="80" y="90" class="kicker">A student objects</text>
+    <g transform="translate(108 150)">
+      <path d="M0 0h1000a36 36 0 0 1 36 36v250a36 36 0 0 1-36 36H245l-105 92 28-92H36A36 36 0 0 1 0 286z" fill="#fff9e9"/>
+      <text x="64" y="96" class="title" style="font-size:50px">Does spontaneous mean</text>
+      <text x="64" y="170" class="title" style="font-size:50px">the reaction happens fast?</text>
+      <text x="64" y="250" class="body">Like the moment we mix the chemicals?</text>
+    </g>
+    <g transform="translate(80 610)">
+      <circle cx="24" cy="-5" r="24" fill="#167c86"/>
+      <text x="65" y="5" class="small">STUDENT</text>
+    </g>
+  </g>
+
+  <!-- Slide 4 · 00:35–00:50 -->
+  <g id="slide-04" transform="translate(0 2160)">
+    <rect width="1280" height="720" fill="#162b36"/>
+    <text x="80" y="90" class="kicker">The useful distinction</text>
+    <text x="80" y="210" class="title-light" style="font-size:58px">“Spontaneous is willing,</text>
+    <text x="80" y="285" class="title-light" style="font-size:58px">not necessarily speedy.”</text>
+    <g transform="translate(815 390) rotate(45)">
+      <rect x="-105" y="-105" width="210" height="210" rx="28" fill="#a9d9d0" stroke="#fff9e9" stroke-width="8"/>
+      <path d="M-72-20L0-92 72-20 0 92z" fill="#dff5ef" stroke="#167c86" stroke-width="5"/>
+    </g>
+    <path d="M80 430h525" stroke="#d79055" stroke-width="5"/>
+    <text x="80" y="490" class="body-light">Diamond → graphite is favored.</text>
+    <text x="80" y="548" class="body-light">The activation barrier makes it slow.</text>
+    <text x="80" y="652" class="small" style="fill:#a9c2bb">A thermodynamic yes can still be a kinetic “not yet.”</text>
+  </g>
+
+  <!-- Slide 5 · 00:50–01:05 -->
+  <g id="slide-05" transform="translate(0 2880)">
+    <rect width="1280" height="720" fill="#eef6f3"/>
+    <text x="80" y="85" class="kicker">Reaction progress</text>
+    <text x="80" y="145" class="body">A watershed-style energy diagram</text>
+    <g transform="translate(120 200)">
+      <path d="M0 390C120 360 170 250 245 162C320 74 390 46 470 118C565 204 640 315 745 332C845 349 950 302 1030 245V420H0z" fill="url(#water)" opacity="0.28"/>
+      <path d="M0 390C120 360 170 250 245 162C320 74 390 46 470 118C565 204 640 315 745 332C845 349 950 302 1030 245" fill="none" stroke="#167c86" stroke-width="10" stroke-linecap="round"/>
+      <path d="M0 420H1050M0 420V25" stroke="#31434b" stroke-width="3"/>
+      <text x="445" y="52" class="small">activation-energy crest</text>
+      <circle cx="470" cy="118" r="10" fill="#d79055"/>
+      <path d="M925 275v108" stroke="#d79055" stroke-width="6"/>
+      <path d="M910 288l15-22 15 22M910 370l15 22 15-22" fill="none" stroke="#d79055" stroke-width="6" stroke-linecap="round" stroke-linejoin="round"/>
+      <text x="950" y="342" class="sign">ΔG &lt; 0</text>
+      <text x="5" y="465" class="small">reactants</text>
+      <text x="885" y="465" class="small">products</text>
+    </g>
+    <g transform="translate(80 650)">
+      <circle cx="10" cy="-7" r="10" fill="#d79055"/>
+      <text x="34" y="0" class="small">15-second speech pause reserved for visual judgment</text>
+    </g>
+  </g>
+
+  <!-- Slide 6 · 01:05–01:20 -->
+  <g id="slide-06" transform="translate(0 3600)">
+    <rect width="1280" height="720" fill="url(#paper)"/>
+    <text x="80" y="90" class="kicker">Read the sign</text>
+    <g transform="translate(80 170)">
+      <rect width="340" height="390" rx="30" fill="#cfe8df"/>
+      <text x="170" y="95" text-anchor="middle" class="display" style="font-size:70px">ΔG &lt; 0</text>
+      <text x="170" y="185" text-anchor="middle" class="sign">products</text>
+      <text x="170" y="235" text-anchor="middle" class="body">favored</text>
+      <path d="M95 305h150m-38-38l38 38-38 38" fill="none" stroke="#167c86" stroke-width="9" stroke-linecap="round" stroke-linejoin="round"/>
+    </g>
+    <g transform="translate(470 170)">
+      <rect width="340" height="390" rx="30" fill="#f2e1bd"/>
+      <text x="170" y="95" text-anchor="middle" class="display" style="font-size:70px">ΔG = 0</text>
+      <text x="170" y="185" text-anchor="middle" class="sign">equilibrium</text>
+      <text x="170" y="235" text-anchor="middle" class="body">balanced</text>
+      <path d="M85 290h170m-170 55h170" stroke="#b2753f" stroke-width="9" stroke-linecap="round"/>
+      <path d="M110 262l-25 28 25 28M230 317l25 28-25 28" fill="none" stroke="#b2753f" stroke-width="9" stroke-linecap="round" stroke-linejoin="round"/>
+    </g>
+    <g transform="translate(860 170)">
+      <rect width="340" height="390" rx="30" fill="#ead2c8"/>
+      <text x="170" y="95" text-anchor="middle" class="display" style="font-size:70px">ΔG &gt; 0</text>
+      <text x="170" y="185" text-anchor="middle" class="sign">reactants</text>
+      <text x="170" y="235" text-anchor="middle" class="body">favored</text>
+      <path d="M245 305H95m38-38l-38 38 38 38" fill="none" stroke="#a45745" stroke-width="9" stroke-linecap="round" stroke-linejoin="round"/>
+    </g>
+    <text x="80" y="650" class="small">The sign gives a favored direction—not a clock speed.</text>
+  </g>
+
+  <!-- Slide 7 · 01:20–01:25 -->
+  <g id="slide-07" transform="translate(0 4320)">
+    <rect width="1280" height="720" fill="#edf4ef"/>
+    <text x="80" y="90" class="kicker">Student recap</text>
+    <text x="80" y="255" class="title">Direction, not speed.</text>
+    <text x="80" y="340" class="body">That distinction is the useful part.</text>
+    <g transform="translate(80 460)">
+      <path d="M0 55h960" stroke="#b7ccc4" stroke-width="4"/>
+      <circle cx="80" cy="55" r="23" fill="#167c86"/>
+      <circle cx="490" cy="55" r="23" fill="#d79055"/>
+      <circle cx="900" cy="55" r="23" fill="#167c86"/>
+      <text x="80" y="125" text-anchor="middle" class="small">ΔG</text>
+      <text x="490" y="125" text-anchor="middle" class="small">barrier</text>
+      <text x="900" y="125" text-anchor="middle" class="small">rate</text>
+    </g>
+  </g>
+
+  <!-- Slide 8 · 01:25–01:30 -->
+  <g id="slide-08" transform="translate(0 5040)">
+    <rect width="1280" height="720" fill="url(#night)"/>
+    <circle cx="1080" cy="360" r="250" fill="#2b5360"/>
+    <circle cx="1080" cy="360" r="175" fill="#d79055" opacity="0.85"/>
+    <text x="80" y="95" class="kicker">Calibration complete</text>
+    <text x="80" y="245" class="title-light">Favorability</text>
+    <text x="80" y="325" class="title-light">is not speed.</text>
+    <text x="80" y="430" class="body-light">Dr. Nguyen · Gibbs free energy</text>
+    <g transform="translate(80 535)">
+      <rect width="530" height="72" rx="36" fill="#f7f3e8"/>
+      <text x="265" y="47" text-anchor="middle" class="small" style="fill:#14212d">Review the evidence. Make the ruling.</text>
+    </g>
+    <text x="1068" y="388" text-anchor="middle" class="formula" style="font-size:86px">ΔG</text>
+  </g>
+</svg>

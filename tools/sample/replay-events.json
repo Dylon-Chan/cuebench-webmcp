@@ -1,0 +1,149 @@
+{
+  "schemaVersion": 1,
+  "label": "Demonstration replay",
+  "provider": {
+    "kind": "deterministic-replay",
+    "live": false
+  },
+  "runId": "demonstration-replay-captions-v1",
+  "fixtureContentSha256": "ba6fd19490842e7b5979b7366b298af608a020a1a66deb06cbe5957e27b9cabc",
+  "recordedCreatedAtMs": 1787961600000,
+  "recordedExpiresAtMs": 1788048000000,
+  "stages": [
+    { "stage": "Queued" },
+    { "stage": "PreparingMedia", "progress": 0.18 },
+    { "stage": "Transcribing", "progress": 0.42 },
+    { "stage": "AligningEvidence", "progress": 0.58 },
+    { "stage": "ReconcilingTranscript", "progress": 0.72 },
+    { "stage": "SegmentingCaptions", "progress": 0.9 },
+    { "stage": "AwaitingAdoption" },
+    { "stage": "Completed" }
+  ],
+  "expectedFindingRuleIds": [
+    "caption.duration",
+    "caption.reading-speed",
+    "review.unreviewed-revision"
+  ],
+  "captions": [
+    {
+      "cueId": "gibbs-cue-01",
+      "startMs": 500,
+      "endMs": 5000,
+      "text": "I'm Dr. Wynn. In the next ninety seconds,",
+      "speaker": "Dr. Nguyen",
+      "segmentIds": ["segment-01"]
+    },
+    {
+      "cueId": "gibbs-cue-02",
+      "startMs": 5000,
+      "endMs": 9500,
+      "text": "we'll calibrate our intuition for Gibbs free energy.",
+      "speaker": "Dr. Nguyen",
+      "segmentIds": ["segment-01"]
+    },
+    {
+      "cueId": "gibbs-cue-03",
+      "startMs": 10000,
+      "endMs": 14000,
+      "text": "Delta G equals delta H minus temperature times delta S.",
+      "speaker": "Dr. Nguyen",
+      "segmentIds": ["segment-02"]
+    },
+    {
+      "cueId": "gibbs-cue-04",
+      "startMs": 14000,
+      "endMs": 18000,
+      "text": "It compares the energy available before and after a change.",
+      "speaker": "Dr. Nguyen",
+      "segmentIds": ["segment-02"]
+    },
+    {
+      "cueId": "gibbs-cue-05",
+      "startMs": 18000,
+      "endMs": 22500,
+      "text": "When delta G is negative, the change is",
+      "speaker": "Dr. Nguyen",
+      "segmentIds": ["segment-03"]
+    },
+    {
+      "cueId": "gibbs-cue-06",
+      "startMs": 22500,
+      "endMs": 27000,
+      "text": "thermodynamically spontaneous under those conditions.",
+      "speaker": "Dr. Nguyen",
+      "segmentIds": ["segment-03"]
+    },
+    {
+      "cueId": "gibbs-cue-07",
+      "startMs": 27500,
+      "endMs": 35000,
+      "text": "Does spontaneous mean the reaction happens fast, like the moment we mix the chemicals?",
+      "speaker": "Unknown",
+      "segmentIds": ["segment-04"]
+    },
+    {
+      "cueId": "gibbs-cue-08",
+      "startMs": 35000,
+      "endMs": 37500,
+      "text": "Good question. Spontaneous is willing, not necessarily speedy.",
+      "speaker": "Dr. Nguyen",
+      "segmentIds": ["segment-05"]
+    },
+    {
+      "cueId": "gibbs-cue-09",
+      "startMs": 42000,
+      "endMs": 46000,
+      "text": "A diamond is willing to become graphite,",
+      "speaker": "Dr. Nguyen",
+      "segmentIds": ["segment-06"]
+    },
+    {
+      "cueId": "gibbs-cue-10",
+      "startMs": 46000,
+      "endMs": 50000,
+      "text": "but it takes its time about it.",
+      "speaker": "Dr. Nguyen",
+      "segmentIds": ["segment-06"]
+    },
+    {
+      "cueId": "gibbs-cue-11",
+      "startMs": 65000,
+      "endMs": 69000,
+      "text": "Negative delta G favors products. At zero, the system is at equilibrium.",
+      "speaker": "Dr. Nguyen",
+      "segmentIds": ["segment-08"]
+    },
+    {
+      "cueId": "gibbs-cue-12",
+      "startMs": 69000,
+      "endMs": 73000,
+      "text": "Positive delta G favors reactants.",
+      "speaker": "Dr. Nguyen",
+      "segmentIds": ["segment-08"]
+    },
+    {
+      "cueId": "gibbs-cue-13",
+      "startMs": 73000,
+      "endMs": 80000,
+      "text": "So the sign tells us the favored direction, not the clock speed.",
+      "speaker": "Dr. Nguyen",
+      "segmentIds": ["segment-09"]
+    },
+    {
+      "cueId": "gibbs-cue-14",
+      "startMs": 80500,
+      "endMs": 85000,
+      "text": "Direction, not speed. That distinction is the useful part.",
+      "speaker": "Student",
+      "segmentIds": ["segment-10"]
+    },
+    {
+      "cueId": "gibbs-cue-15",
+      "startMs": 85000,
+      "endMs": 89900,
+      "text": "Exactly. I'm Dr. Nguyen, and that's your Gibbs free energy calibration.",
+      "speaker": "Dr. Nguyen",
+      "segmentIds": ["segment-11"]
+    }
+  ]
+}

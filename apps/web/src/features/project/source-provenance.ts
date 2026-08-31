@@ -4,7 +4,7 @@
  * workbench must not claim that an upload has no audio before it is known.
  */
 export type SourceKind = "bundled-fixture" | "uploaded";
-export type SourceAudioPresence = "absent" | "unknown";
+export type SourceAudioPresence = "absent" | "present" | "unknown";
 
 export interface SourceProvenance {
   readonly sourceKind: SourceKind;
@@ -13,7 +13,7 @@ export interface SourceProvenance {
 
 export const bundledFixtureSourceProvenance: SourceProvenance = {
   sourceKind: "bundled-fixture",
-  audioPresence: "absent",
+  audioPresence: "present",
 };
 
 export const uploadedSourceProvenance: SourceProvenance = {
@@ -26,6 +26,6 @@ export const sourceProvenanceFrom = (value: unknown): SourceProvenance | null =>
   if (typeof value !== "object" || value === null || !("sourceKind" in value) || !("audioPresence" in value)) return null;
   const { sourceKind, audioPresence } = value;
   if (sourceKind !== "bundled-fixture" && sourceKind !== "uploaded") return null;
-  if (audioPresence !== "absent" && audioPresence !== "unknown") return null;
+  if (audioPresence !== "absent" && audioPresence !== "present" && audioPresence !== "unknown") return null;
   return { sourceKind, audioPresence };
 };

@@ -1,0 +1,98 @@
+{
+  "schemaVersion": 1,
+  "sampleId": "gibbs-free-energy-sample-v1",
+  "language": "en-US",
+  "durationMs": 90000,
+  "timingBasis": "Authored segment bounds with deterministic token timing for the demonstration replay.",
+  "segments": [
+    {
+      "id": "segment-01",
+      "startMs": 500,
+      "endMs": 9500,
+      "speaker": "Dr. Nguyen",
+      "text": "I'm Dr. Nguyen. In the next ninety seconds, we'll calibrate our intuition for Gibbs free energy.",
+      "spoken": true
+    },
+    {
+      "id": "segment-02",
+      "startMs": 10000,
+      "endMs": 18000,
+      "speaker": "Dr. Nguyen",
+      "text": "Delta G equals delta H minus temperature times delta S. It compares the energy available before and after a change.",
+      "spoken": true
+    },
+    {
+      "id": "segment-03",
+      "startMs": 18000,
+      "endMs": 27000,
+      "speaker": "Dr. Nguyen",
+      "text": "When delta G is negative, the change is thermodynamically spontaneous under those conditions.",
+      "spoken": true
+    },
+    {
+      "id": "segment-04",
+      "startMs": 27500,
+      "endMs": 35000,
+      "speaker": "Student",
+      "text": "Does spontaneous mean the reaction happens fast, like the moment we mix the chemicals?",
+      "spoken": true
+    },
+    {
+      "id": "segment-05",
+      "startMs": 35000,
+      "endMs": 42000,
+      "speaker": "Dr. Nguyen",
+      "text": "Good question. Spontaneous is willing, not necessarily speedy.",
+      "spoken": true
+    },
+    {
+      "id": "segment-06",
+      "startMs": 42000,
+      "endMs": 50000,
+      "speaker": "Dr. Nguyen",
+      "text": "A diamond is willing to become graphite, but it takes its time about it.",
+      "spoken": true
+    },
+    {
+      "id": "segment-07",
+      "startMs": 50000,
+      "endMs": 65000,
+      "speaker": null,
+      "text": "",
+      "spoken": false,
+      "visual": "A reaction-progress diagram rises to an activation-energy crest and settles lower. A vertical arrow labels the energy difference as negative delta G."
+    },
+    {
+      "id": "segment-08",
+      "startMs": 65000,
+      "endMs": 73000,
+      "speaker": "Dr. Nguyen",
+      "text": "Negative delta G favors products. At zero, the system is at equilibrium. Positive delta G favors reactants.",
+      "spoken": true
+    },
+    {
+      "id": "segment-09",
+      "startMs": 73000,
+      "endMs": 80000,
+      "speaker": "Dr. Nguyen",
+      "text": "So the sign tells us the favored direction, not the clock speed.",
+      "spoken": true
+    },
+    {
+      "id": "segment-10",
+      "startMs": 80500,
+      "endMs": 85000,
+      "speaker": "Student",
+      "text": "Direction, not speed. That distinction is the useful part.",
+      "spoken": true
+    },
+    {
+      "id": "segment-11",
+      "startMs": 85000,
+      "endMs": 89900,
+      "speaker": "Dr. Nguyen",
+      "text": "Exactly. I'm Dr. Nguyen, and that's your Gibbs free energy calibration.",
+      "spoken": true
+    }
+  ]
+}

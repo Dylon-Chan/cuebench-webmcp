@@ -19,6 +19,7 @@ import {
   adoptStagedCaptionGenerationResult,
   CueBenchDatabase,
   DEXIE_DATABASE_VERSION,
+  deleteRunReceipt,
   StorageImmutableWriteError,
   StorageReadValidationError,
   StorageStaleWriteError,
@@ -1432,6 +1433,32 @@ describe("CueBenchDatabase", () => {
       payload: { signedGenerationReceipt: "opaque-overflow" },
     })).rejects.toThrow(/too many pending private generation receipts/i);
     expect(await listRunReceipts(db, "project-1")).toHaveLength(16);
+  });
+
+  it("retains an acknowledged local replay checkpoint until deterministic completion deletes it", async () => {
+    const db = testDatabase();
+    await saveRunReceipt(db, "project-1", "demonstration-replay-captions-v1", {
+      version: 1,
+      payload: {
+        runId: "demonstration-replay-captions-v1",
+        signedGenerationReceipt: "demonstration-replay-no-cloud-receipt",
+        session: "demonstration-replay-no-cloud-session",
+        hostedArtifact: false,
+        adoption: {
+          status: "adopted",
+          cleanupAcknowledgement: "acknowledged",
+        },
+        demonstrationReplay: {
+          version: 1,
+          phase: "acknowledged",
+          fixtureContentSha256: "a".repeat(64),
+        },
+      },
+    });
+
+    await expect(loadRunReceipt(db, "project-1", "demonstration-replay-captions-v1")).resolves.toBeDefined();
+    await deleteRunReceipt(db, "project-1", "demonstration-replay-captions-v1");
+    await expect(loadRunReceipt(db, "project-1", "demonstration-replay-captions-v1")).resolves.toBeUndefined();
   });
 
   it("evicts non-actionable lifecycle tombstones before reserving a durable receipt slot", async () => {

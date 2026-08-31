@@ -5,6 +5,15 @@ import type { CaptionProject, CommandResult } from "@cuebench/domain";
 import { classifyRecoveryState } from "../../../worker/recovery";
 import { loadPersistedCloudUpload, type PersistedCloudUploadRecovery } from "../project/cloud-upload";
 import {
+  DEMONSTRATION_REPLAY_LABEL,
+  DEMONSTRATION_REPLAY_RUN_ID,
+  SAMPLE_MEDIA_DURATION_MS,
+  SAMPLE_MEDIA_SHA256,
+  createDemonstrationReplay,
+  hasCompletedDemonstrationReplay,
+  hasResumableDemonstrationReplay,
+} from "../project/replay-generation";
+import {
   CaptionGenerationClient,
   type CaptionGenerationClientPort,
   type GenerationClientReceipt,
@@ -159,6 +168,8 @@ export interface GenerationStatusProps {
   /** Test seam; production refreshes opaque upload recovery from browser storage. */
   readonly uploadRecovery?: PersistedCloudUploadRecovery | null;
   readonly client?: CaptionGenerationClientPort;
+  /** Test seam; production visibly paces each recorded replay stage. */
+  readonly demonstrationReplayStageDelayMs?: number;
 }
 
 /**
@@ -166,7 +177,13 @@ export interface GenerationStatusProps {
  * access: its only capability is the opaque receipt persisted in Dexie before
  * it asks the same-origin Worker for stage status.
  */
-export function GenerationStatus({ project, store, uploadRecovery, client: suppliedClient }: GenerationStatusProps) {
+export function GenerationStatus({
+  project,
+  store,
+  uploadRecovery,
+  client: suppliedClient,
+  demonstrationReplayStageDelayMs = 500,
+}: GenerationStatusProps) {
   const ownedClient = useMemo(() => new CaptionGenerationClient(), []);
   const client = suppliedClient ?? ownedClient;
   const runId = activeCaptionRunId(project);
@@ -177,12 +194,34 @@ export function GenerationStatus({ project, store, uploadRecovery, client: suppl
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [confirmReplacement, setConfirmReplacement] = useState(false);
+  const [replayRunning, setReplayRunning] = useState(false);
+  const [replayPresentation, setReplayPresentation] = useState(false);
+  const [replayResumeAvailable, setReplayResumeAvailable] = useState(false);
+  const [replayAnnouncement, setReplayAnnouncement] = useState<string | null>(null);
   const [projectOwnerCapability, setProjectOwnerCapability] = useState<string | null | undefined>(() => (
     store.getCloudProjectOwnerCapability === undefined ? undefined : null
   ));
   const [localRecovery, setLocalRecovery] = useState<PersistedCloudUploadRecovery | null>(() => uploadRecovery ?? null);
   const recovery = uploadRecovery === undefined ? localRecovery : uploadRecovery;
   const hasProposed = hasProposedCaptions(project);
+  const isDemonstrationSample = project.media.sha256.toLowerCase() === SAMPLE_MEDIA_SHA256
+    && project.media.durationMs === SAMPLE_MEDIA_DURATION_MS;
+  const replayCompleted = isDemonstrationSample && hasCompletedDemonstrationReplay(project);
+  const visibleStage = stage ?? (replayCompleted ? "Completed" : undefined);
+
+  useEffect(() => {
+    let disposed = false;
+    if (!isDemonstrationSample) {
+      setReplayResumeAvailable(false);
+      return () => { disposed = true; };
+    }
+    void hasResumableDemonstrationReplay(project, store).then((resumable) => {
+      if (!disposed) setReplayResumeAvailable(resumable);
+    }).catch(() => {
+      if (!disposed) setReplayResumeAvailable(false);
+    });
+    return () => { disposed = true; };
+  }, [isDemonstrationSample, project, store]);
 
   useEffect(() => {
     let disposed = false;
@@ -212,6 +251,10 @@ export function GenerationStatus({ project, store, uploadRecovery, client: suppl
     let disposed = false;
     setConfirmReplacement(false);
     setFailedRetryable(false);
+    if (runId === DEMONSTRATION_REPLAY_RUN_ID) {
+      setReceipt(null);
+      return () => { disposed = true; };
+    }
     void (async () => {
       const receiptRunIds = await store.listCaptionGenerationReceiptRunIds?.() ?? [];
       const candidateRunIds = runId === null
@@ -313,8 +356,37 @@ export function GenerationStatus({ project, store, uploadRecovery, client: suppl
     if (uploadRecovery === undefined) void currentUploadRecovery();
   };
 
+  const runDemonstrationReplay = async () => {
+    setBusy(true);
+    setReplayRunning(true);
+    setReplayPresentation(true);
+    setError(null);
+    setNotice(null);
+    setReplayAnnouncement("Demonstration replay started. Recorded stages are shown visually while CueBench uses the browser adoption path.");
+    try {
+      await createDemonstrationReplay({
+        project,
+        store,
+        stageDelayMs: demonstrationReplayStageDelayMs,
+        onStatus: (status) => {
+          setStage(status.stage);
+          setFailedRetryable(false);
+        },
+      });
+      setReplayResumeAvailable(false);
+      setReplayAnnouncement("Demonstration replay complete. Proposed captions were adopted and deterministic validation ran; Human rulings remain unchanged.");
+    } catch (cause) {
+      setError(errorMessage(cause, "CueBench could not complete the deterministic demonstration replay."));
+    } finally {
+      setReplayRunning(false);
+      setBusy(false);
+    }
+  };
+
   const start = async () => {
     setBusy(true);
+    setReplayPresentation(false);
+    setReplayAnnouncement(null);
     setError(null);
     try {
       const freshRecovery = await currentUploadRecovery();
@@ -447,6 +519,11 @@ export function GenerationStatus({ project, store, uploadRecovery, client: suppl
   const missingRecovery = runId !== null && receipt === null;
   const durableStorage = store.getSnapshot().mode !== "temporary";
   const canStart = durableStorage && !pendingCleanup && !busy && (runId === null || missingRecovery) && hasUploadAuthorization(recovery, project, projectOwnerCapability);
+  const canReplay = isDemonstrationSample
+    && durableStorage
+    && !busy
+    && (project.activeGenerationRun === null || runId === DEMONSTRATION_REPLAY_RUN_ID)
+    && (Object.keys(project.captions.items).length === 0 || replayResumeAvailable);
   const otherRunActive = project.activeGenerationRun !== null && project.activeGenerationRun.targetTrack !== "Captions";
   const recoveryCleanup = receipt === null
     ? undefined
@@ -465,12 +542,36 @@ export function GenerationStatus({ project, store, uploadRecovery, client: suppl
     <section className="storage-disclosure generation-status" aria-label="Caption generation">
       <h2>Caption generation</h2>
       <p>Private media preparation and model calls run only inside CueBench’s durable workflow. This browser retains the signed recovery receipt and remains the canonical project store.</p>
-      <p role="status" aria-live="polite">{stageLabel(stage)}</p>
+      <p
+        data-testid="caption-generation-stage"
+        {...(replayPresentation ? {} : { role: "status", "aria-live": "polite" as const })}
+      >{stageLabel(visibleStage)}</p>
+      {replayAnnouncement === null ? null : (
+        <p role="status" aria-live="polite" aria-atomic="true" aria-label={replayAnnouncement}>{replayAnnouncement}</p>
+      )}
       {recoveryState === null ? null : <RecoveryNotice state={recoveryState} track="captions" />}
       {notice === null ? null : <p role="status">{notice}</p>}
       {receipt === null ? null : <p className="generation-status__receipt">Recovery receipt retained for run {receipt.runId}.</p>}
       {!durableStorage ? <p role="status">Caption generation is unavailable in this temporary browser session because CueBench cannot retain a recoverable signed receipt or safely hold the target-track lease.</p> : null}
       {otherRunActive ? <p role="status">Another generation target currently holds the project lease.</p> : null}
+      {isDemonstrationSample ? (
+        <section className="generation-status__replay" aria-labelledby="demonstration-replay-heading" aria-busy={replayRunning}>
+          <h3 id="demonstration-replay-heading">{DEMONSTRATION_REPLAY_LABEL}</h3>
+          <p>A recorded, deterministic fixture that uses CueBench’s real staged-adoption, revision, validation, and Court Record path. It is not live provider output.</p>
+          <p>The replay proposes deliberately imperfect captions for review; it cannot Sustain, Object, or certify them for you.</p>
+          <button type="button" className="button button--outline" disabled={!canReplay} onClick={() => void runDemonstrationReplay()}>
+            {replayRunning
+              ? "Running demonstration replay…"
+              : runId === DEMONSTRATION_REPLAY_RUN_ID || replayResumeAvailable
+                ? "Resume demonstration replay"
+                : replayCompleted
+                  ? "Demonstration replay complete"
+                  : Object.keys(project.captions.items).length > 0
+                    ? "Resume demonstration replay"
+                : "Run demonstration replay"}
+          </button>
+        </section>
+      ) : null}
       <Dialog.Root open={confirmReplacement} onOpenChange={(open) => { if (!busy) setConfirmReplacement(open); }}>
         <div className="cloud-processing-panel__actions">
           <button type="button" className="button button--outline" disabled={!canStart || otherRunActive} onClick={() => void start()}>

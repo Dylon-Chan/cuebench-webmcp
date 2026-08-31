@@ -33,8 +33,8 @@ const videoFile = (contents = "small lesson", name = "lesson.webm"): File => Obj
 ) as File;
 
 const bundledSampleFile = (): File => Object.assign(
-  new Blob([readFileSync(`${process.cwd()}/src/features/project/bundled-sample.mp4`)], { type: "video/mp4" }),
-  { name: "cuebench-bundled-fixture.mp4", lastModified: 0 },
+  new Blob([readFileSync(`${process.cwd()}/public/sample/gibbs-free-energy.mp4`)], { type: "video/mp4" }),
+  { name: "gibbs-free-energy.mp4", lastModified: 0 },
 ) as File;
 
 const objectUrlLease = (prefix = "preview") => {
@@ -102,20 +102,20 @@ describe("ProjectStart", () => {
     const user = userEvent.setup();
 
     render(<ProjectStart store={store} />);
-    await user.click(screen.getByRole("button", { name: "Open bundled media fixture" }));
+    await user.click(screen.getByRole("button", { name: "Open Gibbs lesson" }));
 
     await waitFor(() => expect(store.getSnapshot().route).toBe("workbench"));
-    expect(store.getSnapshot().project?.title).toBe("CueBench bundled media fixture");
+    expect(store.getSnapshot().project?.title).toBe("Gibbs free energy: a 90-second calibration");
     expect(store.getSnapshot().sourceObjectUrl).toBe("blob:cuebench:preview-1");
-    expect(store.getSnapshot().sourceProvenance).toEqual({ sourceKind: "bundled-fixture", audioPresence: "absent" });
+    expect(store.getSnapshot().sourceProvenance).toEqual({ sourceKind: "bundled-fixture", audioPresence: "present" });
     const project = store.getSnapshot().project;
     expect(project?.projectId).toMatch(/^sample-/);
     expect(project?.projectId).not.toBe("sample-gibbs-free-energy");
     expect(await loadProject(database, project?.projectId ?? "")).toBeDefined();
     const saved = project === null ? undefined : await loadSourceMedia(database, project.projectId, project.media.sha256);
-    expect(saved?.blob.size).toBe(2_754);
+    expect(saved?.blob.size).toBe(2_631_010);
     expect(saved?.contentType).toBe("video/mp4");
-    expect(project?.media.sha256).toBe("51beba8fbd43cd905d4952f59f4ef507f471f568cf54f86dd3c88130e2667c45");
+    expect(project?.media.sha256).toBe("5ee0de5b26fa550da40bf4806b7c2e38dd9ec7457eeda770273e2500c6d1204a");
   });
 
   it("keeps a deleted project's unconfirmed cloud cleanup visible from the start surface", async () => {
@@ -206,7 +206,7 @@ describe("ProjectStart", () => {
     expect(resumedStore.getSnapshot().project?.projectId).toBe(firstStore.getSnapshot().project?.projectId);
     expect(resumedStore.getSnapshot().mode).toBe("durable");
     expect(resumedStore.getSnapshot().sourceObjectUrl).toBe("blob:cuebench:restored-1");
-    expect(resumedStore.getSnapshot().sourceProvenance).toEqual({ sourceKind: "bundled-fixture", audioPresence: "absent" });
+    expect(resumedStore.getSnapshot().sourceProvenance).toEqual({ sourceKind: "bundled-fixture", audioPresence: "present" });
   });
 
   it("serializes rapid durable commands and reconciles a stale result to canonical project state", async () => {
@@ -356,11 +356,11 @@ describe("ProjectStart", () => {
     const user = userEvent.setup();
     render(<ProjectStart store={store} />);
 
-    await user.click(screen.getByRole("button", { name: "Open bundled media fixture" }));
+    await user.click(screen.getByRole("button", { name: "Open Gibbs lesson" }));
     expect(await screen.findByRole("status")).toHaveTextContent(/preparing bundled media/i);
-    expect(screen.getByRole("button", { name: "Open bundled media fixture" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Open Gibbs lesson" })).toBeDisabled();
     await waitFor(() => expect(sampleLoader).toHaveBeenCalledTimes(1));
-    await user.click(screen.getByRole("button", { name: "Open bundled media fixture" }));
+    await user.click(screen.getByRole("button", { name: "Open Gibbs lesson" }));
     expect(sampleLoader).toHaveBeenCalledTimes(1);
 
     sampleGate.resolve(bundledSampleFile());

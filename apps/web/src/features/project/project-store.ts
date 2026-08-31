@@ -19,6 +19,7 @@ import {
   adoptStagedAudioDescriptionGenerationResult as adoptPersistedAudioDescriptionGenerationResult,
   adoptStagedCaptionGenerationResult as adoptPersistedCaptionGenerationResult,
   describeImportedProject,
+  deleteRunReceipt,
   executePersistentCommand,
   initializeProject,
   loadProject,
@@ -219,6 +220,7 @@ export interface BoundGenerationProjectStore {
   readonly getSnapshot: () => { readonly project: CaptionProject | null; readonly mode: ProjectMode | null };
   readonly executeCommand: (command: DomainCommand, expectedProjectId?: string) => Promise<CommandResult>;
   readonly persistCaptionGenerationReceipt: (runId: string, receipt: unknown) => Promise<void>;
+  readonly deleteCaptionGenerationReceipt: (runId: string) => Promise<void>;
   readonly reserveCaptionGenerationReceipt: (runId: string, reservation?: PendingGenerationStartReservation) => Promise<void>;
   readonly releaseCaptionGenerationReceiptReservation: (runId: string) => Promise<void>;
   readonly reconcileDeletedCaptionGenerationStart: (input: DeletedGenerationStartRecovery) => Promise<boolean>;
@@ -851,6 +853,7 @@ export class ProjectStore {
       },
       executeCommand: (command) => this.executeCommand(command, expectedProject),
       persistCaptionGenerationReceipt: (runId, receipt) => this.persistCaptionGenerationReceipt(runId, receipt, expectedProject),
+      deleteCaptionGenerationReceipt: (runId) => this.deleteCaptionGenerationReceipt(runId, expectedProject),
       reserveCaptionGenerationReceipt: (runId, reservation) => this.reserveCaptionGenerationReceipt(runId, reservation, expectedProject),
       releaseCaptionGenerationReceiptReservation: (runId) => this.releaseCaptionGenerationReceiptReservation(runId, expectedProject),
       // Deletion intentionally invalidates this page's visible fence. This
@@ -953,11 +956,11 @@ export class ProjectStore {
         durationMs: inspected.durationMs,
         projectId: `sample-${this.createId()}`,
         sourceId: `source-${this.createId()}`,
-        title: "CueBench bundled media fixture",
+        title: "Gibbs free energy: a 90-second calibration",
         sourceProvenance: bundledFixtureSourceProvenance,
       }, epoch);
     } catch (error) {
-      this.failCurrentOperation(epoch, userFacingError(error, "CueBench could not open the bundled media fixture."));
+      this.failCurrentOperation(epoch, userFacingError(error, "CueBench could not open the bundled Gibbs lesson."));
     }
   }
 
@@ -1249,6 +1252,27 @@ export class ProjectStore {
       });
     };
     const queued = this.commandQueue.then(persist, persist);
+    this.commandQueue = queued.then(() => undefined, () => undefined);
+    return queued;
+  }
+
+  /** Deletes one completed local caption receipt without touching hosted state. */
+  public deleteCaptionGenerationReceipt(
+    runId: string,
+    expectedProject?: ProjectInstanceFence,
+  ): Promise<void> {
+    const snapshot = this.snapshot;
+    const capturedProject = snapshot.project;
+    const operationFence = expectedProject ?? this.getProjectInstanceFence();
+    if (capturedProject === null || snapshot.mode !== "durable" || operationFence === null) {
+      return Promise.reject(new Error("CueBench needs durable browser storage before it can delete a caption-generation receipt."));
+    }
+    const remove = async (): Promise<void> => {
+      await this.runFencedReceiptOperation(capturedProject.projectId, operationFence, (options) => (
+        deleteRunReceipt(this.database, capturedProject.projectId, runId, options)
+      ));
+    };
+    const queued = this.commandQueue.then(remove, remove);
     this.commandQueue = queued.then(() => undefined, () => undefined);
     return queued;
   }

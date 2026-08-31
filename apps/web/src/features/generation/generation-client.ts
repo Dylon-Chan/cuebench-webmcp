@@ -113,6 +113,8 @@ export interface GenerationClientReceipt {
   /** Worker-attested expiry from the signed generation receipt claims. */
   readonly retentionExpiresAtMs: number;
   readonly savedAtMs: number;
+  /** False only for an explicitly local replay that created no hosted artifact. */
+  readonly hostedArtifact?: false;
   /** Present only after the canonical local adoption transaction commits. */
   readonly adoption?: GenerationReceiptAdoption;
   /** Present after the browser asks to cancel, before Worker cleanup is known. */
@@ -129,6 +131,8 @@ export interface GenerationProjectStore {
   readonly executeCommand: (command: DomainCommand, expectedProjectId?: string) => Promise<CommandResult>;
   /** This must complete before the browser starts polling an opaque receipt. */
   readonly persistCaptionGenerationReceipt: (runId: string, receipt: GenerationClientReceipt) => Promise<void>;
+  /** Optional local-only completion seam; it never requests hosted cleanup. */
+  readonly deleteCaptionGenerationReceipt?: (runId: string) => Promise<void>;
   /** Durable ProjectStore reserves a crash-safe slot before server dispatch. */
   readonly reserveCaptionGenerationReceipt?: (runId: string, reservation?: PendingGenerationStartReservation) => Promise<void>;
   /** Removes only an unfulfilled internal receipt reservation. */
@@ -278,6 +282,17 @@ export interface CaptionGenerationClientOptions {
 const defaultFetcher = (): CloudUploadFetch => {
   if (typeof globalThis.fetch !== "function") throw new GenerationClientError("Caption generation is unavailable in this browser.");
   return globalThis.fetch.bind(globalThis);
+};
+
+const isLocalOnlyDemonstrationReplayReceipt = (receipt: GenerationClientReceipt): boolean => {
+  const checkpoint = (receipt as unknown as Readonly<Record<string, unknown>>).demonstrationReplay;
+  return receipt.hostedArtifact === false
+    && receipt.runId === "demonstration-replay-captions-v1"
+    && receipt.signedGenerationReceipt === "demonstration-replay-no-cloud-receipt"
+    && receipt.session === "demonstration-replay-no-cloud-session"
+    && typeof checkpoint === "object"
+    && checkpoint !== null
+    && !Array.isArray(checkpoint);
 };
 
 const responseError = async (response: Response, fallback: string): Promise<GenerationClientError> => {
@@ -1088,6 +1103,7 @@ export class CaptionGenerationClient implements CaptionGenerationClientPort {
       || receipt.mediaSha256.toLowerCase() !== project.media.sha256.toLowerCase()
       || receipt.sourceDurationMs !== project.media.durationMs
       || typeof savedAtMs !== "number" || !Number.isSafeInteger(savedAtMs) || savedAtMs < 0
+      || (receipt.hostedArtifact !== undefined && receipt.hostedArtifact !== false)
       || typeof retentionExpiresAtMs !== "number" || !Number.isSafeInteger(retentionExpiresAtMs) || retentionExpiresAtMs <= savedAtMs || retentionExpiresAtMs > savedAtMs + maxGenerationRetentionMs
       || (receipt.adoption !== undefined && adoption === null)
       || (receipt.cancellationRequested !== undefined && cancellationRequested === null)
@@ -1109,7 +1125,7 @@ export class CaptionGenerationClient implements CaptionGenerationClientPort {
   /** Human recovery may settle expiry; read-only inspectors must use peekStoredReceipt instead. */
   public async loadStoredReceipt(store: GenerationProjectStore, project: CaptionProject, runId: string): Promise<GenerationClientReceipt | null> {
     const normalized = await this.peekStoredReceipt(store, project, runId);
-    return normalized === null || this.clock() < normalized.retentionExpiresAtMs
+    return normalized === null || isLocalOnlyDemonstrationReplayReceipt(normalized) || this.clock() < normalized.retentionExpiresAtMs
       ? normalized
       : this.settleExpiredReceipt(store, normalized);
   }

@@ -305,6 +305,17 @@ const receiptNeedsRecovery = (payload: unknown): boolean => {
   if (isReceiptReservation(payload) || isLifecycleTombstone(payload)) return false;
   const receipt = objectValue(payload);
   if (receipt === null) return true;
+  // A local-only demonstration replay has no hosted cleanup lifecycle, but
+  // its checkpoint is still crash recovery until validation completes. Keep
+  // that exact row even after local adoption is acknowledged; the replay
+  // completion path deletes it explicitly after deterministic validation.
+  if (
+    receipt.hostedArtifact === false
+    && receipt.runId === "demonstration-replay-captions-v1"
+    && receipt.signedGenerationReceipt === "demonstration-replay-no-cloud-receipt"
+    && receipt.session === "demonstration-replay-no-cloud-session"
+    && objectValue(receipt.demonstrationReplay) !== null
+  ) return true;
   const adoption = objectValue(receipt.adoption);
   if (adoption?.status === "adopted") return adoption.cleanupAcknowledgement !== "acknowledged";
   const terminal = objectValue(receipt.terminalCleanup);
@@ -425,6 +436,20 @@ export const releaseRunReceiptReservation = async (
     await assertStorageAuthorized(projectId, options);
     const existing = await db.runReceipts.get(key);
     if (existing !== undefined && isReceiptReservation(existing.receipt.payload)) await db.runReceipts.delete(key);
+  });
+};
+
+/** Delete one exact local receipt after its caller-owned recovery is complete. */
+export const deleteRunReceipt = async (
+  db: CueBenchDatabase,
+  projectId: string,
+  runId: string,
+  options: RunReceiptAccessOptions = {},
+): Promise<void> => {
+  if (!isIdentifier(projectId) || !isIdentifier(runId)) throw new TypeError("Run receipts need project and run ids.");
+  await db.transaction("rw", [db.runReceipts, db.settings], async () => {
+    await assertStorageAuthorized(projectId, options);
+    await db.runReceipts.delete(runReceiptKey(projectId, runId));
   });
 };
 

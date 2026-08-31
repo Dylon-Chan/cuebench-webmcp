@@ -946,6 +946,51 @@ describe("caption generation browser recovery", () => {
     expect(storedReceipt.expirySettlement).toMatchObject({ localLeaseRelease: "released" });
   });
 
+  it("never settles an expired local-only replay checkpoint as hosted cleanup", async () => {
+    const project = projectFixture();
+    const expiredReplayReceipt: GenerationClientReceipt & { readonly hostedArtifact: false; readonly demonstrationReplay: unknown } = {
+      ...receipt,
+      runId: "demonstration-replay-captions-v1",
+      signedGenerationReceipt: "demonstration-replay-no-cloud-receipt",
+      session: "demonstration-replay-no-cloud-session",
+      retentionExpiresAtMs: receipt.savedAtMs + 1,
+      hostedArtifact: false,
+      adoption: {
+        status: "adopted",
+        adoptedProjectRevision: project.projectRevision,
+        localEvidencePackageId: "generation-demonstration-replay-captions-v1",
+        cleanupAcknowledgement: "acknowledged",
+      },
+      demonstrationReplay: {
+        version: 1,
+        phase: "acknowledged",
+        fixtureContentSha256: "a".repeat(64),
+      },
+    };
+    const persist = vi.fn();
+    const execute = vi.fn();
+    const providerRequest = vi.fn();
+    const store: GenerationProjectStore = {
+      getSnapshot: () => ({ project, mode: "durable" as const }),
+      executeCommand: execute,
+      persistCaptionGenerationReceipt: persist,
+      loadCaptionGenerationReceipt: async () => expiredReplayReceipt,
+      adoptStagedCaptionGenerationResult: vi.fn(),
+    };
+    const client = new CaptionGenerationClient({
+      fetcher: providerRequest,
+      clock: () => expiredReplayReceipt.retentionExpiresAtMs,
+    });
+
+    await expect(client.loadStoredReceipt(store, project, expiredReplayReceipt.runId)).resolves.toMatchObject({
+      hostedArtifact: false,
+      demonstrationReplay: { phase: "acknowledged" },
+    });
+    expect(persist).not.toHaveBeenCalled();
+    expect(execute).not.toHaveBeenCalled();
+    expect(providerRequest).not.toHaveBeenCalled();
+  });
+
   it("peeks an expired caption receipt without settling, releasing, or writing recovery state", async () => {
     const project = applyCommand(projectFixture(), {
       type: "StartGenerationRun",

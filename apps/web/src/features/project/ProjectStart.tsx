@@ -71,11 +71,11 @@ export function ProjectStart({ store, onReloadCleanupStatus }: ProjectStartProps
         <div className="instrument-mark" aria-hidden="true"><span /><span /><span /></div>
         <h1 id="project-start-heading">Set the evidence on the bench.</h1>
         <p>
-          Open the bundled media fixture or bring a video you are ready to review. CueBench keeps the human judgment in view from the first cue.
+          Open the original 90-second Gibbs lesson or bring a video you are ready to review. CueBench keeps the human judgment in view from the first cue.
         </p>
         <div className="project-start__actions">
           <button className="button button--signal" type="button" disabled={busy} onClick={() => void store.openSample()}>
-            Open bundled media fixture
+            Open Gibbs lesson
           </button>
           <button className="button button--outline" type="button" disabled={busy} onClick={() => uploadInput.current?.click()}>
             Upload local video
