@@ -55,7 +55,9 @@ test("authenticated hosted processing cancels and project deletion reaches a tru
   await expect(gateReady).toBeVisible({ timeout: 5 * 60_000 });
   const hostedPanel = page.getByRole("region", { name: "Optional cloud processing" });
   const startCloud = hostedPanel.getByRole("button", { name: "Start cloud processing" });
-  await expect(startCloud).toBeEnabled();
+  // The widget being ready only means the Human can act; an interactive
+  // challenge may still require their attention before a token is issued.
+  await expect(startCloud).toBeEnabled({ timeout: 5 * 60_000 });
   await startCloud.click();
   await expect(hostedPanel.getByRole("status")).toContainText(/queued|Cloud processing state:/iu, { timeout: 5 * 60_000 });
 

@@ -1,7 +1,18 @@
+import { readFile } from "node:fs/promises";
+import { dirname, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import { lifecycleArgsFor, runDeploy, wranglerArgsFor } from "./deploy.mjs";
 
+const scriptDirectory = dirname(fileURLToPath(import.meta.url));
+
 describe("deploy wrapper argument isolation", () => {
+  it("publishes the Cloudflare Vite client build instead of the server environment bundle", async () => {
+    const config = JSON.parse(await readFile(resolve(scriptDirectory, "../wrangler.jsonc"), "utf8"));
+
+    expect(config.assets.directory).toBe("./dist/client");
+  });
+
   it("keeps wrapper-only preflight in the lifecycle policy and omits local from Wrangler", () => {
     expect(lifecycleArgsFor(["--preflight", "--dry-run", "--env", "local", "--name", "cuebench"])).toEqual([
       "--dry-run",
