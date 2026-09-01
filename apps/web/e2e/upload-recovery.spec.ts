@@ -56,6 +56,10 @@ const openDurableUpload = async (page: Page): Promise<void> => {
 
 test("a durable local upload restores its verified media after a page reload", async ({ page }) => {
   test.setTimeout(60_000);
+  const bundledWaveformRequests: string[] = [];
+  page.on("request", (request) => {
+    if (request.url().includes("bundled-sample-waveform")) bundledWaveformRequests.push(request.url());
+  });
   await installDurableStorage(page);
   await page.goto("/");
   await expect(page.getByRole("button", { name: "Upload local video" })).toBeEnabled();
@@ -64,6 +68,8 @@ test("a durable local upload restores its verified media after a page reload", a
   await expect(page.getByRole("main", { name: "CueBench workbench" })).toBeVisible();
   await expect(page.getByText("gibbs-free-energy.mp4", { exact: true })).toBeVisible();
   await expect(page.getByText("Browser durable", { exact: true })).toBeVisible();
+  await expect(page.getByTestId("media-evidence-status")).toHaveText("Waveform pending local evidence preparation.");
+  expect(bundledWaveformRequests).toEqual([]);
   const sourceVideo = page.getByLabel("Verified local source media");
   await expect(sourceVideo).toHaveAttribute("src", /^blob:/u);
   const initialObjectUrl = await sourceVideo.getAttribute("src");
@@ -75,6 +81,8 @@ test("a durable local upload restores its verified media after a page reload", a
   await expect(page.getByText("Browser durable", { exact: true })).toBeVisible();
   await expect(sourceVideo).toHaveAttribute("src", /^blob:/u);
   expect(await sourceVideo.getAttribute("src")).not.toBe(initialObjectUrl);
+  await expect(page.getByTestId("media-evidence-status")).toHaveText("Waveform pending local evidence preparation.");
+  expect(bundledWaveformRequests).toEqual([]);
   await expect(page.getByRole("list", { name: "Review items" }).getByRole("listitem")).toHaveCount(0);
 });
 

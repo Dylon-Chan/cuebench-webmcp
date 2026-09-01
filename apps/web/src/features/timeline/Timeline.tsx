@@ -1,5 +1,6 @@
 import type {
   AudioDescriptionBeat,
+  AudioDescriptionGap,
   CaptionCue,
   CaptionProject,
   CommandResult,
@@ -88,6 +89,9 @@ const audioDescriptionBeats = (project: CaptionProject): readonly AudioDescripti
   .map((itemId) => project.audioDescriptions.items[itemId])
   .filter(defined);
 
+const availableAudioDescriptionGaps = (project: CaptionProject): readonly AudioDescriptionGap[] => Object.values(project.audioDescriptionGaps)
+  .filter((gap) => gap.state === "Available");
+
 const itemForFinding = (project: CaptionProject, finding: QualityFinding): TimelineLaneItem | null => {
   const target = finding.target;
   const itemId = target.type === "item" ? target.itemId : target.type === "pair" ? target.first.itemId : null;
@@ -133,17 +137,26 @@ const normalizeViewport = (viewport: TimelineViewport, durationMs: number): Time
   };
 };
 
-function useTimelineWidth(surfaceRef: React.RefObject<HTMLDivElement | null>, viewportWidth: number | undefined): number {
-  const [measuredWidth, setMeasuredWidth] = useState(viewportWidth ?? 720);
+function useTimelineWidth(
+  surfaceRef: React.RefObject<HTMLDivElement | null>,
+  viewportWidth: number | undefined,
+): { readonly widthPx: number; readonly isMeasured: boolean } {
+  const [measurement, setMeasurement] = useState({
+    widthPx: viewportWidth ?? 720,
+    isMeasured: viewportWidth !== undefined,
+  });
 
   useLayoutEffect(() => {
     if (viewportWidth !== undefined) {
-      setMeasuredWidth(Math.max(1, Math.trunc(viewportWidth)));
+      setMeasurement({ widthPx: Math.max(1, Math.trunc(viewportWidth)), isMeasured: true });
       return undefined;
     }
     const surface = surfaceRef.current;
     if (surface === null) return undefined;
-    const measure = () => setMeasuredWidth(Math.max(1, Math.round(surface.getBoundingClientRect().width) || 720));
+    const measure = () => setMeasurement({
+      widthPx: Math.max(1, Math.round(surface.getBoundingClientRect().width) || 720),
+      isMeasured: true,
+    });
     measure();
     if (typeof ResizeObserver === "undefined") return undefined;
     const observer = new ResizeObserver(measure);
@@ -151,7 +164,7 @@ function useTimelineWidth(surfaceRef: React.RefObject<HTMLDivElement | null>, vi
     return () => observer.disconnect();
   }, [surfaceRef, viewportWidth]);
 
-  return measuredWidth;
+  return measurement;
 }
 
 /**
@@ -175,9 +188,11 @@ export function Timeline({
   const itemButtonRefs = useRef(new Map<string, HTMLButtonElement>());
   const dragRef = useRef<PointerDrag | null>(null);
   const editPreviewRef = useRef<TimelineEditPreview | null>(null);
+  const mobileOverviewAppliedRef = useRef(false);
+  const previousMobileSelectionRef = useRef<string | null>(null);
   const commandPendingRef = useRef(false);
   const commandEpochRef = useRef(0);
-  const widthPx = useTimelineWidth(surfaceRef, viewportWidth);
+  const { widthPx, isMeasured: timelineWidthIsMeasured } = useTimelineWidth(surfaceRef, viewportWidth);
   const [viewport, setViewport] = useState<TimelineViewport>({ zoom: 1, viewportStartMs: 0 });
   const [editPreview, setEditPreviewState] = useState<TimelineEditPreview | null>(null);
   const [isCommandPending, setIsCommandPending] = useState(false);
@@ -192,6 +207,7 @@ export function Timeline({
   }), [project.media.durationMs, viewport, widthPx]);
   const captions = useMemo(() => captionCues(project), [project]);
   const beats = useMemo(() => audioDescriptionBeats(project), [project]);
+  const gaps = useMemo(() => availableAudioDescriptionGaps(project), [project]);
   const selectedItemId = project.selectedItem?.itemId ?? null;
   const ticks = useMemo(
     () => timelineTicks(transform.visibleDurationMs, transform.visibleStartMs, transform.visibleEndMs),
@@ -204,6 +220,35 @@ export function Timeline({
       return next.zoom === current.zoom && next.viewportStartMs === current.viewportStartMs ? current : next;
     });
   }, [project.media.durationMs]);
+
+  useEffect(() => {
+    if (!timelineWidthIsMeasured) return;
+    if (mobileOverviewAppliedRef.current) return;
+    if (widthPx >= 540) {
+      // A deliberate desktop-to-mobile resize keeps the full-track overview;
+      // only a timeline whose first measured layout is mobile starts at 3×.
+      mobileOverviewAppliedRef.current = true;
+      return;
+    }
+    mobileOverviewAppliedRef.current = true;
+    setViewport(normalizeViewport({ zoom: 3, viewportStartMs: 0 }, project.media.durationMs));
+  }, [project.media.durationMs, timelineWidthIsMeasured, widthPx]);
+
+  useEffect(() => {
+    if (widthPx >= 540 || selectedItemId === null) {
+      previousMobileSelectionRef.current = null;
+      return;
+    }
+    if (previousMobileSelectionRef.current === selectedItemId) return;
+    previousMobileSelectionRef.current = selectedItemId;
+    const selectedItem = itemForProject(project, selectedItemId);
+    if (selectedItem === null) return;
+    setViewport((current) => normalizeViewport({
+      zoom: current.zoom,
+      viewportStartMs: Math.floor((selectedItem.current.startMs + selectedItem.current.endMs) / 2)
+        - Math.floor(visibleTimelineDurationMs(project.media.durationMs, current.zoom) / 2),
+    }, project.media.durationMs));
+  }, [project, selectedItemId, widthPx]);
 
   useEffect(() => {
     if (isCommandPending || focusAfterAcceptedItemId === null) return;
@@ -498,6 +543,7 @@ export function Timeline({
         />
         <AdLane
           beats={beats}
+          gaps={gaps}
           transform={transform}
           selectedItemId={selectedItemId}
           editPreview={editPreview}

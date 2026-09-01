@@ -899,14 +899,6 @@ export function ReviewDocket({ project, onCommand, onSeekToMediaTime, footer, ev
           <button key={option.value} type="button" aria-pressed={filter === option.value} onClick={() => setFilter(option.value)}>{option.label}</button>
         ))}
       </div>
-      <QualityFindings project={project} indexes={indexes} onFocusFinding={focusFinding} disabled={isCommandPending} />
-      <AudioDescriptionGapComposer
-        project={project}
-        isCommandPending={isCommandPending}
-        hasUnsavedDraft={hasUnsavedDraft}
-        onExecuteCommand={executeCommand}
-        onAcceptedBeat={acceptGapBeat}
-      />
       <div className={`docket-content${windowed ? " docket-content--windowed" : ""}`}>
         {filteredItems.length === 0 ? (
           <p className="empty-docket">{items.length === 0 ? "Caption generation will place proposed cues here for human review." : "No items match this review-state filter."}</p>
@@ -938,6 +930,14 @@ export function ReviewDocket({ project, onCommand, onSeekToMediaTime, footer, ev
         {...(narrationPreviewGateway === undefined ? {} : { narrationPreviewGateway })}
       />
       <HumanRulingControls item={selectedItem} project={project} isCommandPending={isCommandPending} hasUnsavedDraft={hasUnsavedDraft} commandError={errorAnnouncement} onExecuteCommand={executeRuling} />
+      <QualityFindings project={project} indexes={indexes} onFocusFinding={focusFinding} disabled={isCommandPending} />
+      <AudioDescriptionGapComposer
+        project={project}
+        isCommandPending={isCommandPending}
+        hasUnsavedDraft={hasUnsavedDraft}
+        onExecuteCommand={executeCommand}
+        onAcceptedBeat={acceptGapBeat}
+      />
       {footer}
       {acceptedAnnouncement === null ? null : <p className="review-accepted-feedback" role="status" aria-live="polite">{acceptedAnnouncement}</p>}
       {errorAnnouncement === null ? null : <p className="review-command-feedback" role="alert" aria-live="assertive">{errorAnnouncement}</p>}

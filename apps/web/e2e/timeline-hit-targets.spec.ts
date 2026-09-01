@@ -103,3 +103,24 @@ test("the bundled first and last cue edges remain reachable at desktop and 320px
     pointerKind: "touch",
   });
 });
+
+test("mobile starts at 3× and recenters a cue after its timeline selection is cleared", async ({ page }) => {
+  test.setTimeout(120_000);
+  await page.setViewportSize({ width: 390, height: 844 });
+  await installDurableStorage(page);
+  await openGibbsLesson(page);
+  await runDemonstrationReplay(page);
+
+  const surface = page.getByTestId("timeline-surface");
+  await expect(page.getByLabel("Timeline zoom")).toHaveText("3×");
+  await page.getByRole("button", { name: /^Caption GIBBS-CUE-01:/u }).click();
+  await expect(surface).toHaveAttribute("data-viewport-start-ms", "0");
+
+  // Focusing the non-timeline gap clears the caption selection from the lanes.
+  await page.getByRole("button", { name: "Select audio-description gap GIBBS-DIAGRAM-GAP" }).click();
+  await page.getByRole("button", { name: "Pan timeline later" }).click();
+  await expect(surface).toHaveAttribute("data-viewport-start-ms", "15000");
+
+  await page.getByRole("button", { name: /^Select Caption GIBBS-CUE-01:/u }).click();
+  await expect(surface).toHaveAttribute("data-viewport-start-ms", "0");
+});

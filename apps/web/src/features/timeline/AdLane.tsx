@@ -1,4 +1,4 @@
-import type { AudioDescriptionBeat } from "@cuebench/domain";
+import type { AudioDescriptionBeat, AudioDescriptionGap } from "@cuebench/domain";
 import type { KeyboardEvent, PointerEvent } from "react";
 import type { TimeTransform } from "./time-transform";
 import { formatMediaTime } from "./time-transform";
@@ -8,6 +8,7 @@ const maximumHandleTargetPx = 44;
 
 export interface AdLaneProps {
   readonly beats: readonly AudioDescriptionBeat[];
+  readonly gaps: readonly AudioDescriptionGap[];
   readonly transform: TimeTransform;
   readonly selectedItemId: string | null;
   readonly editPreview: TimelineEditPreview | null;
@@ -28,6 +29,7 @@ const previewTiming = (beat: AudioDescriptionBeat, preview: TimelineEditPreview 
 
 export function AdLane({
   beats,
+  gaps,
   transform,
   selectedItemId,
   editPreview,
@@ -43,8 +45,23 @@ export function AdLane({
 }: AdLaneProps) {
   return (
     <section className="timeline-lane timeline-lane--audio-description" aria-labelledby="ad-lane-heading">
-      <div className="timeline-lane__label"><h3 id="ad-lane-heading">Audio description</h3><span>{beats.length} beats</span></div>
+      <div className="timeline-lane__label"><h3 id="ad-lane-heading">Audio description</h3><span>{beats.length} beats · {gaps.length} open gaps</span></div>
       <ol className="timeline-lane__items" aria-label="Audio-description beat timing controls">
+        {gaps.map((gap) => {
+          const left = transform.msToX(gap.startMs);
+          const width = transform.msToX(gap.endMs) - left;
+          return (
+            <li
+              key={gap.gapId}
+              className="timeline-gap"
+              style={{ left: `${left}px`, width: `${width}px` }}
+              aria-label={`Available audio-description gap ${gap.gapId.toUpperCase()}, ${formatMediaTime(gap.startMs)} to ${formatMediaTime(gap.endMs)}`}
+            >
+              <strong>AD gap</strong>
+              <span>{formatMediaTime(gap.startMs)}–{formatMediaTime(gap.endMs)}</span>
+            </li>
+          );
+        })}
         {beats.map((beat) => {
           const timing = previewTiming(beat, editPreview);
           const left = transform.msToX(timing.startMs);

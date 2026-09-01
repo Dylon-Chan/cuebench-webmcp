@@ -41,6 +41,7 @@ Both environments require `CUEBENCH_SMOKE_TURNSTILE_MODE=human`, plus `CLOUDFLAR
 
 Start with:
 
+- [Visual design system](DESIGN.md)
 - [Core design](docs/superpowers/specs/2026-08-29-cuebench-core-design.md)
 - [Product definition](PRODUCT.md)
 - [Core domain glossary](CONTEXT.md)
@@ -51,3 +52,11 @@ Start with:
 - [Demo runbook](docs/runbooks/demo.md)
 
 CueBench does not claim automated WCAG or legal conformance. Its deterministic Quality Profile finds likely technical and readability problems; Human review remains authoritative.
+
+## Hackathon submission status
+
+The local production build, deterministic replay, WebMCP collaboration, accessibility, recovery, and export paths are documented in [the submission package](docs/submission/devpost.md). The public production release is intentionally represented by the token `{{CUEBENCH_PRODUCTION_URL}}` until Cloudflare authentication, Human Turnstile completion, the hosted Playwright/smoke matrix, real provider generation, and the cleanup drill pass against the exact origin. Current hosted status: **BLOCKED — external operator credentials and Human verification required**.
+
+- [Devpost draft](docs/submission/devpost.md)
+- [Sub-three-minute demo script](docs/submission/demo-script.md)
+- [Verification record](docs/submission/verification.md)

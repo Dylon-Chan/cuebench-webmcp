@@ -2,7 +2,7 @@ import { useCallback, useLayoutEffect, useMemo, useRef, useState, useSyncExterna
 import { Navigate, Route, Routes } from "react-router-dom";
 import type { CaptionProject } from "@cuebench/domain";
 import { VideoEvidenceBay } from "../features/evidence/VideoEvidenceBay";
-import { projectMediaEvidence } from "../features/evidence/project-media-evidence";
+import { useProjectMediaEvidence } from "../features/evidence/project-media-evidence";
 import { projectLocalEvidenceContentResolver } from "../features/evidence/project-local-evidence";
 import { CertificationReview } from "../features/export/CertificationReview";
 import { ExportDialog } from "../features/export/ExportDialog";
@@ -48,6 +48,7 @@ interface WorkbenchShellProps {
 }
 
 export function WorkbenchShell({ project, mode, sourceObjectUrl, sourceProvenance, webMcpAvailable, webMcpDebugEnabled, store }: WorkbenchShellProps) {
+  const mediaEvidence = useProjectMediaEvidence(project, sourceProvenance);
   const validationLabel = project.validation.status === "NotRun"
     ? "Validation not run"
     : `${project.validation.blockerCount} blockers · ${project.validation.warningCount} warnings`;
@@ -299,7 +300,7 @@ export function WorkbenchShell({ project, mode, sourceObjectUrl, sourceProvenanc
         <VideoEvidenceBay
           project={project}
           sourceObjectUrl={sourceObjectUrl}
-          evidence={projectMediaEvidence(sourceProvenance)}
+          evidence={mediaEvidence}
           onCommand={(command) => store.executeCommand(command)}
           onSeekReady={receiveVideoSeek}
           onPlayheadReady={receiveNativePlayhead}

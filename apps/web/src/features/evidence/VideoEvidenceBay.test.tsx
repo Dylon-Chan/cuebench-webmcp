@@ -1,7 +1,11 @@
 import { fireEvent, render, screen } from "@testing-library/react";
 import { createProject } from "@cuebench/domain";
 import { describe, expect, it, vi } from "vitest";
-import { projectMediaEvidence, type PreparedMediaEvidence } from "./project-media-evidence";
+import {
+  BUNDLED_SAMPLE_MEDIA_SHA256,
+  loadProjectMediaEvidence,
+  type PreparedMediaEvidence,
+} from "./project-media-evidence";
 import { VideoEvidenceBay } from "./VideoEvidenceBay";
 
 const evidenceProject = (title = "Uploaded lesson"): ReturnType<typeof createProject> => createProject({
@@ -81,10 +85,78 @@ describe("VideoEvidenceBay", () => {
     expect(screen.getByTestId("media-evidence-status")).toHaveTextContent("Waveform evidence preparation failed: Audio decode did not complete.");
   });
 
-  it("uses trusted source provenance instead of a project title to decide audio presence", () => {
-    expect(projectMediaEvidence({ sourceKind: "bundled-fixture", audioPresence: "absent" }).audioState).toBe("no-audio");
-    expect(projectMediaEvidence({ sourceKind: "bundled-fixture", audioPresence: "present" }).audioState).toBe("pending");
-    expect(projectMediaEvidence({ sourceKind: "uploaded", audioPresence: "unknown" }).audioState).toBe("pending");
+  it("binds prepared waveform evidence to the exact project media and artifact hashes", async () => {
+    const artifactLoader = vi.fn(async () => ({
+      default: {
+        schemaVersion: 1,
+        mediaSha256: BUNDLED_SAMPLE_MEDIA_SHA256,
+        durationMs: 90_000,
+        baseResolutionMs: 10,
+        baseBucketCount: 2,
+        levelCounts: [2, 1],
+        levelResolutionsMs: [10, 20],
+        encoding: "int16le-min-max-pairs-base64",
+        peaksBase64: "AYD/fwAA/38=",
+      },
+    }));
+    expect((await loadProjectMediaEvidence(
+      { media: { sha256: BUNDLED_SAMPLE_MEDIA_SHA256, durationMs: 90_000 } },
+      { sourceKind: "bundled-fixture", audioPresence: "absent" },
+      artifactLoader,
+    )).audioState).toBe("no-audio");
+    expect(artifactLoader).not.toHaveBeenCalled();
+
+    const bundledEvidence = await loadProjectMediaEvidence(
+      { media: { sha256: BUNDLED_SAMPLE_MEDIA_SHA256, durationMs: 90_000 } },
+      { sourceKind: "bundled-fixture", audioPresence: "present" },
+      artifactLoader,
+    );
+    expect(bundledEvidence.audioState).toBe("ready");
+    expect(bundledEvidence.peakPyramid?.baseResolutionMs).toBe(10);
+    expect(bundledEvidence.peakPyramid?.levels.map((level) => level.peaks.length)).toEqual([2, 1]);
+  });
+
+  it("never imports bundled waveform bytes for uploads or replaced bundled media", async () => {
+    const artifactLoader = vi.fn();
+    expect((await loadProjectMediaEvidence(
+      { media: { sha256: "a".repeat(64), durationMs: 90_000 } },
+      { sourceKind: "uploaded", audioPresence: "unknown" },
+      artifactLoader,
+    )).audioState).toBe("pending");
+    expect((await loadProjectMediaEvidence(
+      { media: { sha256: "b".repeat(64), durationMs: 90_000 } },
+      { sourceKind: "bundled-fixture", audioPresence: "present" },
+      artifactLoader,
+    )).audioState).toBe("failed");
+    expect(artifactLoader).not.toHaveBeenCalled();
+  });
+
+  it("rejects stale or malformed bundled artifacts instead of rendering decorative peaks", async () => {
+    const baseArtifact = {
+      schemaVersion: 1,
+      mediaSha256: BUNDLED_SAMPLE_MEDIA_SHA256,
+      durationMs: 90_000,
+      baseResolutionMs: 10,
+      baseBucketCount: 2,
+      levelCounts: [2, 1],
+      levelResolutionsMs: [10, 20],
+      encoding: "int16le-min-max-pairs-base64",
+      peaksBase64: "AYD/fwAA/38=",
+    };
+    const project = { media: { sha256: BUNDLED_SAMPLE_MEDIA_SHA256, durationMs: 90_000 } };
+    const provenance = { sourceKind: "bundled-fixture", audioPresence: "present" } as const;
+
+    const stale = await loadProjectMediaEvidence(project, provenance, async () => ({
+      default: { ...baseArtifact, mediaSha256: "c".repeat(64) },
+    }));
+    expect(stale).toMatchObject({ audioState: "failed", peakPyramid: null });
+    expect(stale.failureMessage).toMatch(/hash/i);
+
+    const malformed = await loadProjectMediaEvidence(project, provenance, async () => ({
+      default: { ...baseArtifact, levelCounts: [3, 1] },
+    }));
+    expect(malformed).toMatchObject({ audioState: "failed", peakPyramid: null });
+    expect(malformed.failureMessage).toMatch(/level/i);
   });
 
   it("exposes the one native video clock for a semantic split control", () => {

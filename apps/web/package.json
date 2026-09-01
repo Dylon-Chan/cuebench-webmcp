@@ -10,6 +10,8 @@
     "test:unit": "vitest run",
     "test:workerd": "vitest run --config vitest.workerd.config.ts",
     "typecheck": "tsc -p tsconfig.json --noEmit",
+    "waveform:generate": "node scripts/generate-sample-waveform.mjs",
+    "waveform:verify": "node scripts/verify-sample-waveform.mjs",
     "e2e": "playwright test",
     "deploy": "node scripts/deploy.mjs",
     "deploy:dry-run": "node scripts/deploy.mjs --dry-run",

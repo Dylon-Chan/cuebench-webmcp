@@ -381,4 +381,46 @@ describe("Timeline", () => {
     fireEvent.click(screen.getByRole("button", { name: "Pan timeline earlier" }));
     expect(surface).toHaveAttribute("data-viewport-start-ms", "0");
   });
+
+  it("initializes mobile at 3× and recenters the same item after deselect, pan, and reselect", async () => {
+    const base = timelineProject();
+    const selected = applyCommand(base, {
+      type: "SelectItem",
+      actor: { type: "Human", id: "human" },
+      itemId: "c01",
+      expectedItemRevision: 1,
+      expectedProjectRevision: base.projectRevision,
+    }).project;
+    const deselected: CaptionProject = { ...selected, selectedItem: null };
+    const onCommand = vi.fn();
+    const seekToMediaTime = vi.fn();
+    const { rerender } = renderTimeline({ project: selected, viewportWidth: 390, onCommand, seekToMediaTime });
+    const surface = screen.getByTestId("timeline-surface");
+
+    await waitFor(() => expect(screen.getByLabelText("Timeline zoom")).toHaveTextContent("3×"));
+    expect(surface).toHaveAttribute("data-viewport-start-ms", "0");
+
+    rerender(
+      <Timeline
+        project={deselected}
+        playheadMs={12_000}
+        seekToMediaTime={seekToMediaTime}
+        onCommand={onCommand}
+        viewportWidth={390}
+      />,
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Pan timeline later" }));
+    expect(surface).toHaveAttribute("data-viewport-start-ms", "15000");
+
+    rerender(
+      <Timeline
+        project={selected}
+        playheadMs={12_000}
+        seekToMediaTime={seekToMediaTime}
+        onCommand={onCommand}
+        viewportWidth={390}
+      />,
+    );
+    await waitFor(() => expect(surface).toHaveAttribute("data-viewport-start-ms", "0"));
+  });
 });

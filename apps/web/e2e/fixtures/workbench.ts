@@ -29,7 +29,7 @@ export const openGibbsLesson = async (page: Page): Promise<void> => {
   await open.click();
   await expect(page.getByRole("main", { name: "CueBench workbench" })).toBeVisible();
   await expect(page.getByLabel("Verified local source media")).toHaveAttribute("src", /^blob:/u);
-  await expect(page.getByText("Browser durable", { exact: true })).toBeVisible();
+  await expect(page.locator(".header-reading:visible, .header-compact-status:visible").filter({ hasText: "Browser durable" })).toBeVisible();
 };
 
 export const runDemonstrationReplay = async (page: Page): Promise<void> => {
