@@ -7,7 +7,7 @@ This record separates repository-local evidence from hosted release evidence. A 
 | Evidence | Value | Status |
 | --- | --- | --- |
 | Branch | `codex/cuebench-core` | Recorded |
-| Preview URL | `https://cuebench-web-preview.wengsiong22.workers.dev` | Deployed; repeatable hosted Playwright recorded 15 passed, 1 Human-processing test skipped with Human mode disabled |
+| Preview URL | `https://cuebench-web-preview.wengsiong22.workers.dev` | Clean `HEAD` `a690929` deployed as version `a3ba1178-d0b9-4923-9aca-94fd0bd8de4c`; repeatable hosted Playwright recorded 15 passed, 1 Human-processing test skipped with Human mode disabled |
 | Production URL | `{{CUEBENCH_PRODUCTION_URL}}` | **BLOCKED — complete preview Human processing/cleanup and preview breaker restoration first; then deploy production and pass its live OpenAI/Human smoke** |
 | Repository URL | `{{CUEBENCH_REPOSITORY_URL}}` | Placeholder; GitHub CLI authentication is currently unavailable for publication/PR verification |
 | Demo video URL | `{{CUEBENCH_DEMO_VIDEO_URL}}` | **BLOCKED — record only after real hosted generation passes** |
@@ -69,10 +69,9 @@ Repository tests assert:
 
 ## Deployed preview evidence
 
-- The preview origin above is deployed. Preview and production deployment dry-runs both pass, but a production dry-run is not a production deployment.
+- Clean `HEAD` `a690929` was redeployed to the preview origin above as Cloudflare version `a3ba1178-d0b9-4923-9aca-94fd0bd8de4c`. The repeatable hosted suite reran against that exact version and recorded **15 passed, 1 Human-processing test skipped** when Human mode was disabled. Preview and production deployment dry-runs both pass, but a production dry-run is not a production deployment.
 - Authenticated Cloudflare R2 privacy preflight passed for the exact preview and production processing buckets: `r2.dev` is disabled and neither bucket has an enabled public custom domain.
 - The Browser plugin loaded the hosted app, its waveform/audio peak evidence, and its live WebMCP tools; `inspect_project` returned successfully.
-- The repeatable hosted Playwright suite against preview recorded **15 passed, 1 Human-processing test skipped** when Human mode was disabled.
 - A headed, real-Turnstile attempt reached the checkbox but did not receive a Human completion. It did not start processing or establish cancellation/deletion evidence, and is not counted as a hosted-processing pass.
 
 ## Hosted evidence that remains blocked
