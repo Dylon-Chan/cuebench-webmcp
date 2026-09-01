@@ -27,6 +27,28 @@ describe("deploy wrapper argument isolation", () => {
     ]);
     expect(wranglerArgsFor(["--env=local", "--preflight"])).toEqual([]);
     expect(wranglerArgsFor(["--env=preview"])).toEqual(["--env=preview"]);
+    expect(lifecycleArgsFor(["--dry-run", "--env=production"])).toEqual(["--dry-run", "--env=production"]);
+  });
+
+  it("rejects an argument terminator before either deployment runner can start", () => {
+    const calls = [];
+    const errors = [];
+    const status = runDeploy({
+      args: ["--", "--dry-run", "--env", "production"],
+      nodePath: "node-test",
+      run: (command, args) => {
+        calls.push([command, args]);
+        return { status: 0 };
+      },
+      writeError: (message) => errors.push(message),
+    });
+
+    expect(status).not.toBe(0);
+    expect(calls).toEqual([]);
+    expect(errors).toEqual([
+      expect.stringContaining("literal `--` argument"),
+    ]);
+    expect(errors[0]).toContain("node scripts/deploy.mjs --dry-run --env production");
   });
 
   it("runs a real preflight only through the lifecycle script", () => {
@@ -59,5 +81,36 @@ describe("deploy wrapper argument isolation", () => {
     expect(calls[1]?.[1]).toEqual(expect.arrayContaining(["deploy", "--config", "wrangler.jsonc", "--dry-run", "--tag", "candidate"]));
     expect(calls[1]?.[1]).not.toContain("--preflight");
     expect(calls[1]?.[1]).not.toContain("local");
+  });
+
+  it("routes a production dry run and emergency container rollout through both runners", () => {
+    const calls = [];
+    const status = runDeploy({
+      args: ["--dry-run", "--env", "production", "--containers-rollout=none"],
+      nodePath: "node-test",
+      run: (command, args) => {
+        calls.push([command, args]);
+        return { status: 0 };
+      },
+    });
+
+    expect(status).toBe(0);
+    expect(calls).toHaveLength(2);
+    expect(calls[0]?.[1]).toEqual([
+      expect.stringContaining("r2-lifecycle-policy.mjs"),
+      "--dry-run",
+      "--env",
+      "production",
+    ]);
+    expect(calls[1]?.[1]).toEqual([
+      expect.stringContaining("wrangler.js"),
+      "deploy",
+      "--config",
+      "wrangler.jsonc",
+      "--dry-run",
+      "--env",
+      "production",
+      "--containers-rollout=none",
+    ]);
   });
 });

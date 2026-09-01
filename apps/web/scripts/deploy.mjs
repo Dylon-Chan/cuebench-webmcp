@@ -6,6 +6,7 @@ const scriptPath = fileURLToPath(import.meta.url);
 const scriptDirectory = dirname(scriptPath);
 const appDirectory = resolve(scriptDirectory, "..");
 const runtime = globalThis.process;
+const unsafeArgumentTerminatorError = "CueBench refused to deploy because the literal `--` argument can hide deployment safety flags. Remove it and pass arguments directly, for example: node scripts/deploy.mjs --dry-run --env production.";
 
 /** Arguments consumed by the checked-in lifecycle policy wrapper. */
 export const lifecycleArgsFor = (args) => {
@@ -61,8 +62,17 @@ export const runDeploy = ({
     env: runtime.env,
     stdio: "inherit",
   }),
+  writeError = (message) => runtime.stderr.write(`${message}\n`),
   nodePath = runtime.execPath,
 } = {}) => {
+  // Do this before the lifecycle policy runs. Both runners must see the same
+  // argument semantics; a terminator could otherwise make Wrangler ignore a
+  // policy-validated flag and turn an intended dry run into a deployment.
+  if (args.includes("--")) {
+    writeError(unsafeArgumentTerminatorError);
+    return 1;
+  }
+
   const lifecycle = run(nodePath, [resolve(scriptDirectory, "r2-lifecycle-policy.mjs"), ...lifecycleArgsFor(args)]);
   if (lifecycle.status !== 0) return lifecycle.status ?? 1;
   // A preflight validates the exact lifecycle configuration and stops. It is
