@@ -7,9 +7,9 @@ This record separates repository-local evidence from hosted release evidence. A 
 | Evidence | Value | Status |
 | --- | --- | --- |
 | Branch | `codex/cuebench-core` | Recorded |
-| Preview URL | `https://cuebench-web-preview.wengsiong22.workers.dev` | Clean `HEAD` `a690929` deployed as version `a3ba1178-d0b9-4923-9aca-94fd0bd8de4c`; repeatable hosted Playwright recorded 15 passed, 1 Human-processing test skipped with Human mode disabled |
+| Preview URL | `https://cuebench-web-preview.wengsiong22.workers.dev` | Clean `HEAD` `a98b1b9` deployed as version `1bedd0c6-c922-4ff5-960e-48eeba1c4f35`; repeatable hosted Playwright recorded 15 passed, 1 Human-processing test skipped with Human mode disabled |
 | Production URL | `{{CUEBENCH_PRODUCTION_URL}}` | **BLOCKED — complete preview Human processing/cleanup and preview breaker restoration first; then deploy production and pass its live OpenAI/Human smoke** |
-| Repository URL | `{{CUEBENCH_REPOSITORY_URL}}` | Placeholder; GitHub CLI authentication is currently unavailable for publication/PR verification |
+| Repository URL | `https://github.com/Dylon-Chan/cuebench-webmcp` | Public repository confirmed through the authorized GitHub connector; feature branch and PR publication remain a final release step |
 | Demo video URL | `{{CUEBENCH_DEMO_VIDEO_URL}}` | **BLOCKED — record only after real hosted generation passes** |
 | Approved composition | `.impeccable/mocks/decision/calibration-bench.png` | Approved Option 1 |
 
@@ -19,7 +19,7 @@ This record separates repository-local evidence from hosted release evidence. A 
 | --- | --- | --- |
 | Impeccable detector sequence | Initial detector returned `[]`; the surface was then rebuilt; an independent final detector found the one-sided `.ruling-panel` treatment at `index.css` and it was replaced by a fully enclosed inset/material treatment | Finding fixed; do not interpret the pre-rebuild `[]` as a final detector result |
 | Shipping-raster provenance scan | `apps/web/public`, `apps/web/src` → `0 rasters, 0 missing` | Pass |
-| Production build | `pnpm --filter @cuebench/web build` | Pass; 444.24 kB workbench chunk and separate 48.86 kB lazy waveform chunk; no client chunk exceeds 500 kB |
+| Production build | `pnpm --filter @cuebench/web build` | Pass; 448.86 kB workbench chunk and separate 48.86 kB lazy waveform chunk; no client chunk exceeds 500 kB |
 | Waveform determinism | `pnpm --filter @cuebench/web waveform:verify` | Pass; exact repository MP4 SHA matched and an independent temporary regeneration was byte-for-byte equal to the checked-in 48,626-byte artifact |
 | Approved-size capture | `.impeccable/review/hero-repro.png` | 1536×1024; opened and visually checked |
 | Desktop capture | `.impeccable/review/desktop.png` | 1440×1844 full page; opened and visually checked |
@@ -27,7 +27,7 @@ This record separates repository-local evidence from hosted release evidence. A 
 | Impeccable finish review | Definitive fresh reviewer disposition after the detector finding was fixed and all three recaptures were opened | `ship`; full enclosure removed the side-tab ambiguity and mobile retained the centered 3× instrument without page overflow |
 | Design system document | `DESIGN.md` and `.impeccable/design.json` | Generated from the shipped render and actual CSS |
 
-The review screenshots use the repository's local production Vite/Cloudflare preview. Separately, the Browser plugin loaded the deployed hosted preview, confirmed its audio peak evidence and live WebMCP tools, and successfully called `inspect_project`. Its in-app profile may enter CueBench's explicitly disclosed Temporary Session mode; the deterministic Demonstration replay remains available there for the open page only and creates no media upload, provider request, or cloud recovery receipt. Reload/recovery captures continue to use the repository's release Playwright runtime and exact E2E durable-storage shim against that local production preview. Reduced motion was enabled and the page settled for 1.5 seconds before capture.
+The review screenshots use the repository's local production Vite/Cloudflare preview. Separately, the Browser plugin loaded deployed version `1bedd0c6-c922-4ff5-960e-48eeba1c4f35`, confirmed its audio peak evidence and live WebMCP tools, and ran the local Demonstration replay in CueBench's explicitly disclosed Temporary Session mode. The visible page adopted 15 caption cues, recorded 1 blocker and 28 warnings, appended Start/Adopt/Validate Court Record entries, and returned the same project revision 4 through `inspect_project`. That path remained open-page-only and created no media upload, provider request, or cloud recovery receipt. Reload/recovery captures continue to use the repository's release Playwright runtime and exact E2E durable-storage shim against that local production preview. Reduced motion was enabled and the page settled for 1.5 seconds before capture.
 
 ## Automated release matrix
 
@@ -42,7 +42,7 @@ git diff --check
 
 Observed local results:
 
-- `pnpm verify` — pass: lint, all workspace typechecks, all package tests, 536 web unit tests, and 22 Worker-runtime tests. The Worker runtime printed known canceled-request diagnostics during negative-path coverage but exited successfully.
+- `pnpm verify` — pass: lint, all workspace typechecks, all package tests, 545 web unit tests, and 22 Worker-runtime tests. The Worker runtime printed known canceled-request diagnostics during negative-path coverage but exited successfully.
 - `pnpm --filter @cuebench/web e2e` — pass: 18 passed, 1 hosted-only test skipped, 0 failed. This includes automated accessibility, WebMCP collaboration, Human sample, export round-trip, recovery, upload-path lazy-chunk isolation, 320 px edge targets, mobile-first 3× recentering, mobile order, and no page-level horizontal overflow.
 - `cd services/media && source .venv/bin/activate && uv run pytest -q` — pass: 52 passed.
 - `git diff --check` — pass.
@@ -69,10 +69,10 @@ Repository tests assert:
 
 ## Deployed preview evidence
 
-- Clean `HEAD` `a690929` was redeployed to the preview origin above as Cloudflare version `a3ba1178-d0b9-4923-9aca-94fd0bd8de4c`. The repeatable hosted suite reran against that exact version and recorded **15 passed, 1 Human-processing test skipped** when Human mode was disabled. Preview and production deployment dry-runs both pass, but a production dry-run is not a production deployment.
+- Clean `HEAD` `a98b1b9` was redeployed to the preview origin above as Cloudflare version `1bedd0c6-c922-4ff5-960e-48eeba1c4f35`. The repeatable hosted suite reran against that exact version and recorded **15 passed, 1 Human-processing test skipped** when Human mode was disabled. Preview and production deployment dry-runs both pass, but a production dry-run is not a production deployment.
 - Authenticated Cloudflare R2 privacy preflight passed for the exact preview and production processing buckets: `r2.dev` is disabled and neither bucket has an enabled public custom domain.
-- The Browser plugin loaded the hosted app, its waveform/audio peak evidence, and its live WebMCP tools; `inspect_project` returned successfully.
-- A headed, real-Turnstile attempt reached the checkbox but did not receive a Human completion. It did not start processing or establish cancellation/deletion evidence, and is not counted as a hosted-processing pass.
+- The Browser plugin loaded the hosted app, its waveform/audio peak evidence, and its live WebMCP tools. The Temporary Session replay completed with 15 visible captions and current validation, and `inspect_project` returned project revision 4 with 1 blocker and 28 warnings.
+- A Human completed the real Turnstile challenge in the in-app Browser. That profile exposed only a Temporary Session Project, so cloud generation correctly remained disabled without a durable recovery receipt. It did not start processing or establish cancellation/deletion evidence and is not counted as a hosted-processing pass.
 
 ## Hosted evidence that remains blocked
 
@@ -83,6 +83,6 @@ The remaining gates require real Human interaction and, for production, a deploy
 - production deployment and no-redirect HTTPS/security-header smoke;
 - real bounded provider generation in production live OpenAI mode;
 - production hosted-safe Playwright suite with real Human Turnstile completion;
-- public repository/PR publication and final demo-video accessibility.
+- feature-branch push/PR publication and final demo-video accessibility.
 
 Run the exact gates in `docs/runbooks/deployment.md` and `scripts/smoke-hosted.sh`, then replace the placeholders and attach sanitized evidence only. Never include media, captions, frames, filenames, URLs containing capabilities, secrets, or raw provider output in operational evidence.
