@@ -195,6 +195,7 @@ const securityHeaders = (headers: Headers): void => {
   headers.set("referrer-policy", "no-referrer");
   headers.set("x-content-type-options", "nosniff");
   headers.set("permissions-policy", "camera=(), microphone=(), geolocation=(), payment=(), usb=()");
+  headers.set("strict-transport-security", "max-age=31536000");
 };
 
 // Cloudflare injects CF-Connecting-IP at the edge. A caller-controlled forwarding

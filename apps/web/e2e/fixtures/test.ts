@@ -1,6 +1,11 @@
 import { expect, test as base, type BrowserContext } from "@playwright/test";
 
 const loopbackHosts = new Set(["127.0.0.1", "localhost", "[::1]"]);
+const hostedOrigin = (() => {
+  const configured = process.env.CUEBENCH_BASE_URL?.trim();
+  if (configured === undefined || configured.length === 0) return null;
+  try { return new URL(configured).origin; } catch { return null; }
+})();
 
 export interface LoopbackNetworkGuard {
   /** Returns and acknowledges blocked probes so an intentional negative test can inspect them. */
@@ -26,7 +31,8 @@ const installHermeticContext = async (context: BrowserContext): Promise<{
   });
   await context.route("**/*", async (route) => {
     const url = new URL(route.request().url());
-    if ((url.protocol === "http:" || url.protocol === "https:") && !loopbackHosts.has(url.hostname)) {
+    const allowedHostedOrigin = hostedOrigin !== null && url.origin === hostedOrigin;
+    if ((url.protocol === "http:" || url.protocol === "https:") && !loopbackHosts.has(url.hostname) && !allowedHostedOrigin) {
       violations.push(url.href);
       await route.abort("blockedbyclient");
       return;
@@ -42,9 +48,9 @@ const installHermeticContext = async (context: BrowserContext): Promise<{
 };
 
 /**
- * Release tests are hermetic: every browser request is either a local asset,
- * a Blob/data URL, or a loopback runtime owned by this test process. A future
- * analytics tag, provider call, or unstubbed anti-abuse script fails the test.
+ * Local release tests are hermetic. Hosted release tests allow only the exact
+ * configured deployment origin; a future third-party analytics tag, provider
+ * call, or unrelated network request still fails the browser suite.
  */
 export const test = base.extend<{ loopbackNetworkGuard: LoopbackNetworkGuard }>({
   loopbackNetworkGuard: [async ({ context }, use) => {

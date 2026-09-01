@@ -2119,9 +2119,10 @@ describe("workerd hosted upload boundary", () => {
 
     expect(statuses).toEqual([200, 201]);
     expect(bodies[0]?.operationReceipt).toBe(bodies[1]?.operationReceipt);
-    expect(first.headers.get("content-security-policy")).toContain("https://challenges.cloudflare.com");
+    expect(first.headers.get("content-security-policy")).toBe("default-src 'self'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'; object-src 'none'; script-src 'self' https://challenges.cloudflare.com; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; media-src 'self' blob:; connect-src 'self' https://challenges.cloudflare.com; frame-src 'self' https://challenges.cloudflare.com");
     expect(first.headers.get("referrer-policy")).toBe("no-referrer");
     expect(first.headers.get("x-content-type-options")).toBe("nosniff");
+    expect(first.headers.get("strict-transport-security")).toBe("max-age=31536000");
 
     const capability = bodies[0]!.uploadCapability;
     const part = () => SELF.fetch(new Request("https://cuebench.test/api/uploads/workerd-operation/parts/1", {

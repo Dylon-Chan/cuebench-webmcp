@@ -1055,11 +1055,11 @@ describe("CueBench anonymous multipart Worker", () => {
 
     const response = await app.fetch(new Request("https://cuebench.test/api/health"));
 
-    expect(response.headers.get("content-security-policy")).toContain("https://challenges.cloudflare.com");
-    expect(response.headers.get("content-security-policy")).toContain("frame-src");
+    expect(response.headers.get("content-security-policy")).toBe("default-src 'self'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'; object-src 'none'; script-src 'self' https://challenges.cloudflare.com; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; media-src 'self' blob:; connect-src 'self' https://challenges.cloudflare.com; frame-src 'self' https://challenges.cloudflare.com");
     expect(response.headers.get("referrer-policy")).toBe("no-referrer");
     expect(response.headers.get("x-content-type-options")).toBe("nosniff");
     expect(response.headers.get("permissions-policy")).toContain("camera=()");
+    expect(response.headers.get("strict-transport-security")).toBe("max-age=31536000");
   });
 
   it("keeps telemetry on its strict allowlist", () => {

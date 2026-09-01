@@ -1,4 +1,8 @@
 import { defineConfig } from "@playwright/test";
+import { HOSTED_SAFE_SPECS } from "./e2e/hosted-suite";
+
+const hostedBaseUrl = process.env.CUEBENCH_BASE_URL?.trim();
+const hosted = hostedBaseUrl !== undefined && hostedBaseUrl.length > 0;
 
 export default defineConfig({
   testDir: "./e2e",
@@ -8,12 +12,13 @@ export default defineConfig({
   retries: process.env.CI ? 1 : 0,
   reporter: process.env.CI ? [["line"], ["html", { open: "never" }]] : "line",
   use: {
-    baseURL: "http://127.0.0.1:4173",
+    baseURL: hosted ? hostedBaseUrl : "http://127.0.0.1:4173",
+    headless: process.env.CUEBENCH_SMOKE_HEADLESS === "0" ? false : true,
     trace: "retain-on-failure",
     screenshot: "only-on-failure",
     video: "retain-on-failure",
   },
-  webServer: [
+  ...(hosted ? { testMatch: [...HOSTED_SAFE_SPECS] } : { webServer: [
     {
       command: "node e2e/fixtures/fake-hosted-worker.mjs --port 4174",
       url: "http://127.0.0.1:4174/__health",
@@ -27,5 +32,5 @@ export default defineConfig({
       reuseExistingServer: false,
       timeout: 120_000,
     },
-  ],
+  ] }),
 });
