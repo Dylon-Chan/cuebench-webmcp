@@ -120,7 +120,7 @@ export function ProjectStart({ store, onReloadCleanupStatus }: ProjectStartProps
       </section>
 
       <section className="project-start__measurements" aria-label="CueBench project workflow">
-        <div><strong>Source</strong><span>Choose media stored in this browser</span></div>
+        <div><strong>Source</strong><span>Choose media to verify before saving locally</span></div>
         <div><strong>Evidence</strong><span>Review visible evidence against time</span></div>
         <div><strong>Ruling</strong><span>Keep the final human decision explicit</span></div>
       </section>

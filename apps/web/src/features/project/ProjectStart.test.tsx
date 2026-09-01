@@ -22,9 +22,19 @@ import { formatDuration } from "../../app/routes";
 
 const databaseName = (): string => `cuebench-web-test-${crypto.randomUUID()}`;
 
-const browserStorage = (options: { readonly quota: number; readonly usage: number; readonly persisted: boolean }) => ({
-  estimate: vi.fn().mockResolvedValue({ quota: options.quota, usage: options.usage }),
-  persist: vi.fn().mockResolvedValue(options.persisted),
+const browserStorage = (options: {
+  readonly quota: number;
+  readonly usage: number;
+  readonly persisted: boolean;
+  readonly estimateError?: unknown;
+  readonly persistError?: unknown;
+}) => ({
+  estimate: options.estimateError === undefined
+    ? vi.fn().mockResolvedValue({ quota: options.quota, usage: options.usage })
+    : vi.fn().mockRejectedValue(options.estimateError),
+  persist: options.persistError === undefined
+    ? vi.fn().mockResolvedValue(options.persisted)
+    : vi.fn().mockRejectedValue(options.persistError),
 });
 
 const videoFile = (contents = "small lesson", name = "lesson.webm"): File => Object.assign(
@@ -93,9 +103,10 @@ describe("ProjectStart", () => {
     const database = new CueBenchDatabase(databaseName());
     databases.push(database);
     const urls = objectUrlLease();
+    const storage = browserStorage({ quota: 100_000_000, usage: 0, persisted: true });
     const store = new ProjectStore({
       database,
-      browserStorage: browserStorage({ quota: 100_000_000, usage: 0, persisted: true }),
+      browserStorage: storage,
       objectUrlLease: urls.lease,
       bundledSampleLoader: bundledSampleFile,
     });
@@ -116,6 +127,63 @@ describe("ProjectStart", () => {
     expect(saved?.blob.size).toBe(2_631_010);
     expect(saved?.contentType).toBe("video/mp4");
     expect(project?.media.sha256).toBe("5ee0de5b26fa550da40bf4806b7c2e38dd9ec7457eeda770273e2500c6d1204a");
+    expect(storage.persist).toHaveBeenCalledTimes(1);
+  });
+
+  it("uses verified IndexedDB and quota when the optional persistence request is declined", async () => {
+    const database = new CueBenchDatabase(databaseName());
+    databases.push(database);
+    const storage = browserStorage({ quota: 100_000_000, usage: 0, persisted: false });
+    const store = new ProjectStore({
+      database,
+      browserStorage: storage,
+      mediaDurationProbe: async () => 1_000,
+      objectUrlLease: objectUrlLease("persist-denied").lease,
+    });
+
+    await store.chooseFile(videoFile("durable after a declined persistence request"));
+
+    const projectId = store.getSnapshot().project?.projectId;
+    expect(store.getSnapshot()).toMatchObject({ route: "workbench", mode: "durable" });
+    expect(storage.persist).toHaveBeenCalledTimes(1);
+    expect(projectId).toBeDefined();
+    expect(await loadProject(database, projectId ?? "")).toBeDefined();
+    expect((await database.settings.toArray()).filter((setting) => setting.key.startsWith("storage-readiness:"))).toEqual([]);
+
+    const restored = new ProjectStore({
+      database,
+      browserStorage: storage,
+      objectUrlLease: objectUrlLease("persist-denied-restored").lease,
+    });
+    await restored.restoreLastDurableProject();
+
+    expect(restored.getSnapshot()).toMatchObject({
+      route: "workbench",
+      mode: "durable",
+      project: { projectId },
+    });
+  });
+
+  it("keeps the persistence request best-effort when IndexedDB and quota verify", async () => {
+    const database = new CueBenchDatabase(databaseName());
+    databases.push(database);
+    const storage = browserStorage({
+      quota: 100_000_000,
+      usage: 0,
+      persisted: false,
+      persistError: new DOMException("The optional persistence request was denied", "NotAllowedError"),
+    });
+    const store = new ProjectStore({
+      database,
+      browserStorage: storage,
+      mediaDurationProbe: async () => 1_000,
+      objectUrlLease: objectUrlLease("persist-rejected").lease,
+    });
+
+    await store.chooseFile(videoFile("best effort persistence"));
+
+    expect(store.getSnapshot()).toMatchObject({ route: "workbench", mode: "durable" });
+    expect(storage.persist).toHaveBeenCalledTimes(1);
   });
 
   it("keeps a deleted project's unconfirmed cloud cleanup visible from the start surface", async () => {
@@ -243,9 +311,10 @@ describe("ProjectStart", () => {
   it("requires an explicit current-page temporary choice when durable browser storage is inadequate", async () => {
     const database = new CueBenchDatabase(databaseName());
     databases.push(database);
+    const storage = browserStorage({ quota: 200, usage: 150, persisted: false });
     const store = new ProjectStore({
       database,
-      browserStorage: browserStorage({ quota: 200, usage: 150, persisted: false }),
+      browserStorage: storage,
       mediaDurationProbe: async () => 90_000,
       objectUrlLease: objectUrlLease().lease,
     });
@@ -259,6 +328,7 @@ describe("ProjectStart", () => {
     expect(screen.getAllByText(/reloading or closing this page loses the project/i)[0]).toBeVisible();
     expect(store.getSnapshot().project).toBeNull();
     expect(store.getSnapshot().sourceProvenance).toEqual({ sourceKind: "uploaded", audioPresence: "unknown" });
+    expect(storage.persist).toHaveBeenCalledTimes(1);
 
     await user.click(screen.getByRole("button", { name: "Continue temporarily" }));
 
@@ -268,6 +338,132 @@ describe("ProjectStart", () => {
     expect(store.getSnapshot().sourceProvenance).toEqual({ sourceKind: "uploaded", audioPresence: "unknown" });
     expect(await database.projectHeaders.count()).toBe(0);
     expect(await database.sourceBlobs.count()).toBe(0);
+  });
+
+  it("requires an explicit temporary choice when browser storage management is unavailable", async () => {
+    const database = new CueBenchDatabase(databaseName());
+    databases.push(database);
+    const store = new ProjectStore({
+      database,
+      browserStorage: null,
+      mediaDurationProbe: async () => 1_000,
+      objectUrlLease: objectUrlLease("storage-unavailable").lease,
+    });
+
+    await store.chooseFile(videoFile("no storage manager"));
+
+    expect(store.getSnapshot()).toMatchObject({
+      route: "temporary-choice",
+      project: null,
+      mode: null,
+    });
+    expect(await database.projectHeaders.count()).toBe(0);
+  });
+
+  it("requires an explicit temporary choice when the quota estimate fails", async () => {
+    const database = new CueBenchDatabase(databaseName());
+    databases.push(database);
+    const storage = browserStorage({
+      quota: 100_000_000,
+      usage: 0,
+      persisted: false,
+      estimateError: new DOMException("Storage disabled", "SecurityError"),
+    });
+    const store = new ProjectStore({
+      database,
+      browserStorage: storage,
+      mediaDurationProbe: async () => 1_000,
+      objectUrlLease: objectUrlLease("estimate-failed").lease,
+    });
+
+    await store.chooseFile(videoFile("estimate failed"));
+
+    expect(store.getSnapshot()).toMatchObject({ route: "temporary-choice", project: null, mode: null });
+    expect(storage.persist).toHaveBeenCalledTimes(1);
+  });
+
+  it("requires an explicit temporary choice when the IndexedDB probe detects unavailable private or ephemeral storage", async () => {
+    const database = new CueBenchDatabase(databaseName());
+    databases.push(database);
+    const storage = browserStorage({ quota: 100_000_000, usage: 0, persisted: false });
+    const settingsWrite = vi.spyOn(database.settings, "put").mockRejectedValueOnce(
+      new DOMException("IndexedDB is unavailable in this context", "InvalidStateError"),
+    );
+    const store = new ProjectStore({
+      database,
+      browserStorage: storage,
+      mediaDurationProbe: async () => 1_000,
+      objectUrlLease: objectUrlLease("ephemeral-storage").lease,
+    });
+
+    await store.chooseFile(videoFile("detect storage failure"));
+
+    expect(store.getSnapshot()).toMatchObject({ route: "temporary-choice", project: null, mode: null });
+    expect(storage.persist).toHaveBeenCalledTimes(1);
+    expect(await database.projectHeaders.count()).toBe(0);
+    expect(await database.sourceBlobs.count()).toBe(0);
+    settingsWrite.mockRestore();
+  });
+
+  it("keeps a fresh foreign readiness probe intact while this tab verifies durable storage", async () => {
+    const database = new CueBenchDatabase(databaseName());
+    databases.push(database);
+    const foreignMarker = "f".repeat(64);
+    const foreignKey = `storage-readiness:${foreignMarker}`;
+    await database.settings.put({ key: foreignKey, value: foreignMarker, updatedAtMs: Date.now() });
+    const store = new ProjectStore({
+      database,
+      browserStorage: browserStorage({ quota: 100_000_000, usage: 0, persisted: false }),
+      mediaDurationProbe: async () => 1_000,
+      objectUrlLease: objectUrlLease("foreign-probe").lease,
+    });
+
+    await store.chooseFile(videoFile("foreign probe"));
+
+    expect(store.getSnapshot()).toMatchObject({ route: "workbench", mode: "durable" });
+    expect(await database.settings.get(foreignKey)).toMatchObject({ key: foreignKey, value: foreignMarker });
+    expect((await database.settings.toArray()).filter((setting) => setting.key.startsWith("storage-readiness:")))
+      .toEqual([expect.objectContaining({ key: foreignKey, value: foreignMarker })]);
+  });
+
+  it("falls back to temporary when readiness-probe cleanup fails and sweeps the abandoned probe before a retry", async () => {
+    const database = new CueBenchDatabase(databaseName());
+    databases.push(database);
+    const storage = browserStorage({ quota: 100_000_000, usage: 0, persisted: false });
+    const originalDelete = database.settings.delete.bind(database.settings);
+    const cleanupDelete = vi.spyOn(database.settings, "delete").mockImplementation((key) => {
+      if (key.startsWith("storage-readiness:")) {
+        throw new DOMException("IndexedDB could not remove the readiness probe", "InvalidStateError");
+      }
+      return originalDelete(key);
+    });
+    const store = new ProjectStore({
+      database,
+      browserStorage: storage,
+      mediaDurationProbe: async () => 1_000,
+      objectUrlLease: objectUrlLease("probe-cleanup-failed").lease,
+    });
+
+    await store.chooseFile(videoFile("cleanup failure"));
+
+    expect(store.getSnapshot()).toMatchObject({ route: "temporary-choice", project: null, mode: null });
+    expect(await database.projectHeaders.count()).toBe(0);
+    expect(await database.sourceBlobs.count()).toBe(0);
+    const abandoned = (await database.settings.toArray()).filter((setting) => setting.key.startsWith("storage-readiness:"));
+    expect(abandoned).toHaveLength(1);
+    cleanupDelete.mockRestore();
+    await database.settings.put({ ...abandoned[0]!, updatedAtMs: 0 });
+
+    const retry = new ProjectStore({
+      database,
+      browserStorage: storage,
+      mediaDurationProbe: async () => 1_000,
+      objectUrlLease: objectUrlLease("probe-cleanup-retry").lease,
+    });
+    await retry.chooseFile(videoFile("cleanup recovery"));
+
+    expect(retry.getSnapshot()).toMatchObject({ route: "workbench", mode: "durable" });
+    expect((await database.settings.toArray()).filter((setting) => setting.key.startsWith("storage-readiness:"))).toEqual([]);
   });
 
   it("keeps a temporary project only in current-page memory and never restores it", async () => {
@@ -413,7 +609,11 @@ describe("ProjectStart", () => {
   it("rolls back project and media rows when a lifecycle pointer cannot be saved", async () => {
     const database = new CueBenchDatabase(databaseName());
     databases.push(database);
-    const pointerWrite = vi.spyOn(database.settings, "put").mockRejectedValue(new Error("settings unavailable"));
+    const originalPut = database.settings.put.bind(database.settings);
+    const pointerWrite = vi.spyOn(database.settings, "put").mockImplementation((row) => {
+      if (row.key === "last-durable-project") throw new Error("settings unavailable");
+      return originalPut(row);
+    });
     const store = new ProjectStore({
       database,
       browserStorage: browserStorage({ quota: 100_000_000, usage: 0, persisted: true }),
@@ -427,6 +627,20 @@ describe("ProjectStart", () => {
     expect(await database.projectHeaders.count()).toBe(0);
     expect(await database.sourceBlobs.count()).toBe(0);
     pointerWrite.mockRestore();
+  });
+
+  it("does not claim browser storage is durable before a project passes its check", () => {
+    const database = new CueBenchDatabase(databaseName());
+    databases.push(database);
+    const store = new ProjectStore({ database, objectUrlLease: objectUrlLease("start-disclosure").lease });
+
+    render(<ProjectStart store={store} />);
+
+    const disclosure = screen.getByRole("complementary", { name: "Browser storage check" });
+    expect(disclosure).toHaveClass("storage-disclosure--unchecked");
+    expect(disclosure).toHaveTextContent(/checked before saving/i);
+    expect(screen.queryByText("Stored in this browser")).toBeNull();
+    expect(screen.getByText(/verify before saving locally/i)).toBeVisible();
   });
 
   it("releases the active source URL when the workbench owner is disposed", async () => {

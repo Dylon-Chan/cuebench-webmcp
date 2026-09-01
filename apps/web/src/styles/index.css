@@ -126,6 +126,14 @@ button:disabled { cursor: not-allowed; }
   line-height: 1.45;
 }
 .storage-disclosure strong { color: #0f2d38; font-size: 0.78rem; }
+.storage-disclosure--unchecked {
+  padding: 0.72rem 0.8rem;
+  color: #4e636b;
+  border: 1px dashed #aebec4;
+  border-radius: 3px;
+  background: #f5f8f8;
+}
+.storage-disclosure--unchecked strong { color: #2a414a; }
 .storage-disclosure--temporary { color: #613f0e; border-color: #d5b763; background: #fffaf0; }
 .storage-disclosure--temporary strong { color: #704a08; }
 .project-start__limits { margin: 0.85rem 0 0; color: #61747d; font-size: 0.78rem; }

@@ -135,7 +135,11 @@ export interface ImportedProjectResult {
 
 export interface BrowserStorageManager {
   estimate: () => Promise<{ readonly quota?: number; readonly usage?: number }>;
-  persist: () => Promise<boolean>;
+  /**
+   * Requests protection from storage-pressure eviction when the browser
+   * supports it. A rejected request does not mean IndexedDB is unavailable.
+   */
+  persist?: () => Promise<boolean>;
 }
 
 export interface PendingUpload {
@@ -274,6 +278,9 @@ const pendingGenerationStartIntentKey = (projectId: string, operationId: string,
 const pendingGenerationStartIntentPrefix = (projectId: string): string => `pending-generation-start:${projectId}:`;
 /** A dangling pre-POST write-ahead entry is private recovery material, not durable project state. */
 const PENDING_GENERATION_START_INTENT_MAX_AGE_MS = 24 * 60 * 60 * 1_000;
+/** A readiness probe is short-lived and contains no project or media data. */
+const storageReadinessProbePrefix = "storage-readiness:";
+const storageReadinessProbeMaxAgeMs = 5 * 60 * 1_000;
 const importReplacementHash = (project: CaptionProject): string => canonicalHash("cuebench.web.import-replacement.v1", project);
 
 interface ReplacementImportExpectation {
@@ -327,6 +334,11 @@ interface ProjectInstanceOwnerCapability {
   readonly version: 1;
   readonly projectId: string;
   readonly capability: string;
+}
+
+interface StorageReadinessProbe {
+  readonly key: string;
+  readonly marker: string;
 }
 
 const createProjectInstanceOwnerCapability = (): string => {
@@ -742,10 +754,10 @@ const humanImportActor = { type: "Human" as const, id: "human" };
 
 const browserStorageManager = (): BrowserStorageManager | null => {
   const storage = globalThis.navigator?.storage;
-  if (storage?.estimate === undefined || storage.persist === undefined) return null;
+  if (storage?.estimate === undefined) return null;
   return {
     estimate: () => storage.estimate(),
-    persist: () => storage.persist(),
+    ...(storage.persist === undefined ? {} : { persist: () => storage.persist() }),
   };
 };
 
@@ -817,6 +829,8 @@ export class ProjectStore {
   private projectInstanceEpoch = 0;
   /** One-way identity of the durable capability captured by this page. */
   private projectInstanceCapabilityFingerprint: string | null = null;
+  /** Reused by this page so an interrupted probe leaves at most one row. */
+  private storageReadinessProbe: StorageReadinessProbe | null = null;
   /** Keeps page-originated domain writes ordered just like the durable CAS boundary. */
   private commandQueue: Promise<void> = Promise.resolve();
 
@@ -2066,7 +2080,7 @@ export class ProjectStore {
   }
 
   private async chooseStorageMode(pendingUpload: PendingUpload, epoch: number): Promise<void> {
-    const durable = await this.hasDurableStorage(pendingUpload.file.size);
+    const durable = await this.hasDurableStorage(pendingUpload);
     if (!this.isCurrent(epoch)) return;
     if (durable) {
       this.setSnapshot({ ...this.snapshot, pendingUpload, activity: "saving", error: null });
@@ -2269,16 +2283,115 @@ export class ProjectStore {
     return true;
   }
 
-  private async hasDurableStorage(sourceBytes: number): Promise<boolean> {
+  /**
+   * StorageManager.persist() asks a browser to protect an origin from
+   * eviction; it is not the durable-IndexedDB capability itself. Chrome may
+   * decline that optional protection for a new normal profile even though the
+   * origin has usable persistent IndexedDB and ample quota. We therefore
+   * request it without making its Boolean result a veto, then prove the
+   * actual IndexedDB path with a committed write/read probe before creating a
+   * durable project. The full media/project/receipt path remains separately
+   * fenced and is still the final authority for durable recovery.
+   */
+  private async hasDurableStorage(pendingUpload: PendingUpload): Promise<boolean> {
     if (this.storage === null) return false;
     try {
-      const [estimate, persisted] = await Promise.all([this.storage.estimate(), this.storage.persist()]);
+      const [estimate] = await Promise.all([
+        this.storage.estimate(),
+        this.requestPersistentStorageBestEffort(),
+      ]);
       const quota = estimate.quota;
       const usage = estimate.usage ?? 0;
-      return persisted && quota !== undefined && quota - usage >= sourceBytes + metadataReserveBytes;
+      const requiredBytes = pendingUpload.file.size + metadataReserveBytes;
+      if (
+        typeof quota !== "number"
+        || !Number.isFinite(quota)
+        || !Number.isFinite(usage)
+        || quota < 0
+        || usage < 0
+        || usage > quota
+        || quota - usage < requiredBytes
+      ) return false;
+      return await this.verifyIndexedDbStorage();
     } catch {
       return false;
     }
+  }
+
+  /** A storage-protection grant is useful, but explicitly optional for Core. */
+  private async requestPersistentStorageBestEffort(): Promise<void> {
+    try {
+      await this.storage?.persist?.();
+    } catch {
+      // A browser may reject this optional request while IndexedDB remains
+      // fully usable in a normal, durable profile. The verified write/read
+      // probe below decides whether CueBench can safely create a project.
+    }
+  }
+
+  /**
+   * Detect disabled/private/ephemeral IndexedDB where the browser exposes the
+   * failure, without attempting to infer private browsing from a denied
+   * persistence grant. Each page reuses one random ownership-bound key, so
+   * concurrent tabs never overwrite a fresh probe and an interrupted page
+   * leaves at most one stale row until a later age-bounded sweep.
+   */
+  private async verifyIndexedDbStorage(): Promise<boolean> {
+    const probe = this.storageReadinessProbeForCurrentPage();
+    const wroteAndRead = await this.writeAndReadStorageReadinessProbe(probe);
+    const cleaned = await this.cleanupStorageReadinessProbe(probe);
+    return wroteAndRead && cleaned;
+  }
+
+  private storageReadinessProbeForCurrentPage(): StorageReadinessProbe {
+    if (this.storageReadinessProbe !== null) return this.storageReadinessProbe;
+    const marker = createProjectInstanceOwnerCapability();
+    const probe = { key: `${storageReadinessProbePrefix}${marker}`, marker };
+    this.storageReadinessProbe = probe;
+    return probe;
+  }
+
+  private async writeAndReadStorageReadinessProbe(probe: StorageReadinessProbe): Promise<boolean> {
+    try {
+      const nowMs = Date.now();
+      await this.database.transaction("rw", [this.database.settings], async () => {
+        await this.sweepExpiredStorageReadinessProbes(nowMs);
+        const existing = await this.database.settings.get(probe.key);
+        if (existing !== undefined && existing.value !== probe.marker) {
+          throw new Error("CueBench could not safely reuse this browser-storage readiness probe.");
+        }
+        await this.database.settings.put({ key: probe.key, value: probe.marker, updatedAtMs: nowMs });
+      });
+      const stored = await loadSetting(this.database, probe.key);
+      return stored?.value === probe.marker;
+    } catch {
+      return false;
+    }
+  }
+
+  /** Cleanup is part of eligibility: a failed cleanup means no durable project starts. */
+  private async cleanupStorageReadinessProbe(probe: StorageReadinessProbe): Promise<boolean> {
+    try {
+      return await this.database.transaction("rw", [this.database.settings], async () => {
+        const stored = await this.database.settings.get(probe.key);
+        if (stored?.value !== probe.marker) return false;
+        await this.database.settings.delete(probe.key);
+        return true;
+      });
+    } catch {
+      return false;
+    }
+  }
+
+  /** Never removes a fresh foreign probe; an overlong probe safely falls back to temporary. */
+  private async sweepExpiredStorageReadinessProbes(nowMs: number): Promise<void> {
+    const staleKeys = (await this.database.settings.toArray())
+      .filter((setting) => (
+        setting.key.startsWith(storageReadinessProbePrefix)
+        && (!Number.isSafeInteger(setting.updatedAtMs) || setting.updatedAtMs <= nowMs - storageReadinessProbeMaxAgeMs)
+      ))
+      .map((setting) => setting.key);
+    await Promise.all(staleKeys.map(async (key) => { await this.database.settings.delete(key); }));
   }
 
   /** Claims a unique persistent owner before writing media, so a losing tab cannot roll back another tab. */

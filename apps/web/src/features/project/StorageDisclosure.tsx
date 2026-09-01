@@ -13,6 +13,14 @@ export function StorageDisclosure({ mode }: StorageDisclosureProps) {
       </aside>
     );
   }
+  if (mode === null) {
+    return (
+      <aside className="storage-disclosure storage-disclosure--unchecked" aria-label="Browser storage check">
+        <strong>Browser storage checked before saving</strong>
+        <span>CueBench verifies IndexedDB and available space before it describes a project as stored in this browser. If that check fails, it asks before starting a temporary session.</span>
+      </aside>
+    );
+  }
   return (
     <aside className="storage-disclosure" aria-label="Local storage notice">
       <strong>Stored in this browser</strong>
