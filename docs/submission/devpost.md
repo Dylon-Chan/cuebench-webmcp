@@ -84,5 +84,6 @@ CueBench treats the timeline as a shared Human-agent artifact rather than a tran
 
 - Preview app: [cuebench-web-preview.wengsiong22.workers.dev](https://cuebench-web-preview.wengsiong22.workers.dev) — deployed preview, not the production release
 - Live app: `{{CUEBENCH_PRODUCTION_URL}}` — **BLOCKED until the production verification gates pass**
-- Repository: [github.com/Dylon-Chan/cuebench-webmcp](https://github.com/Dylon-Chan/cuebench-webmcp) — public repository confirmed; feature branch and PR publication remain a final release step
+- Repository: [github.com/Dylon-Chan/cuebench-webmcp](https://github.com/Dylon-Chan/cuebench-webmcp)
+- Draft pull request: [#1 — build CueBench WebMCP caption collaboration studio](https://github.com/Dylon-Chan/cuebench-webmcp/pull/1) — remains draft until the durable preview, breaker, production, and demo-video gates pass
 - Demo video: `{{CUEBENCH_DEMO_VIDEO_URL}}` — **BLOCKED until the real hosted-generation recording is completed**

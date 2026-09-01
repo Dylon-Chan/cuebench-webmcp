@@ -9,7 +9,8 @@ This record separates repository-local evidence from hosted release evidence. A 
 | Branch | `codex/cuebench-core` | Recorded |
 | Preview URL | `https://cuebench-web-preview.wengsiong22.workers.dev` | Clean `HEAD` `a98b1b9` deployed as version `1bedd0c6-c922-4ff5-960e-48eeba1c4f35`; repeatable hosted Playwright recorded 15 passed, 1 Human-processing test skipped with Human mode disabled |
 | Production URL | `{{CUEBENCH_PRODUCTION_URL}}` | **BLOCKED — complete preview Human processing/cleanup and preview breaker restoration first; then deploy production and pass its live OpenAI/Human smoke** |
-| Repository URL | `https://github.com/Dylon-Chan/cuebench-webmcp` | Public repository confirmed through the authorized GitHub connector; feature branch and PR publication remain a final release step |
+| Repository URL | `https://github.com/Dylon-Chan/cuebench-webmcp` | Public repository confirmed; `codex/cuebench-core` is pushed and draft PR `#1` is open |
+| Pull request | `https://github.com/Dylon-Chan/cuebench-webmcp/pull/1` | Draft while the durable preview, breaker, production, and demo-video gates remain open |
 | Demo video URL | `{{CUEBENCH_DEMO_VIDEO_URL}}` | **BLOCKED — record only after real hosted generation passes** |
 | Approved composition | `.impeccable/mocks/decision/calibration-bench.png` | Approved Option 1 |
 
@@ -83,6 +84,6 @@ The remaining gates require real Human interaction and, for production, a deploy
 - production deployment and no-redirect HTTPS/security-header smoke;
 - real bounded provider generation in production live OpenAI mode;
 - production hosted-safe Playwright suite with real Human Turnstile completion;
-- feature-branch push/PR publication and final demo-video accessibility.
+- final demo-video accessibility.
 
 Run the exact gates in `docs/runbooks/deployment.md` and `scripts/smoke-hosted.sh`, then replace the placeholders and attach sanitized evidence only. Never include media, captions, frames, filenames, URLs containing capabilities, secrets, or raw provider output in operational evidence.
