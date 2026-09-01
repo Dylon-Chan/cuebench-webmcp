@@ -48,8 +48,9 @@ Observed local results:
 - `cd services/media && source .venv/bin/activate && uv run pytest -q` — pass: 52 passed.
 - `git diff --check` — pass.
 - Credential-pattern scan across repository text — pass: no credential-shaped matches.
+- GitHub Actions `Verify` run [33524128169](https://github.com/Dylon-Chan/cuebench-webmcp/actions/runs/33524128169) — pass in 2m25s for PR head `7fe73b0`, evaluated through GitHub's generated merge commit `dde40b3`. The read-only runner received no repository, environment, hosted-service, or deployment secrets; it repeated the frozen pnpm install, full `pnpm verify`, locked Python 3.12/uv setup, and all 52 media tests. Hosted, Human, deployment, and production gates are deliberately absent from this deterministic workflow.
 
-These local passes do not replace the hosted gates below.
+These deterministic local and CI passes do not replace the hosted gates below.
 
 The browser suite covers the Human sample flow, dynamic WebMCP collaboration, upload/recovery, accessibility, export round-trip, mobile order/touch targets, and absence of page-level horizontal overflow. The media suite covers deterministic probing/transforms and its security boundary.
 
