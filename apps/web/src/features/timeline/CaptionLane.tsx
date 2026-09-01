@@ -4,6 +4,8 @@ import type { TimeTransform } from "./time-transform";
 import { formatMediaTime } from "./time-transform";
 import type { TimelineEditEdge, TimelineEditPreview } from "./lane-types";
 
+const maximumHandleTargetPx = 44;
+
 export interface CaptionLaneProps {
   readonly cues: readonly CaptionCue[];
   readonly transform: TimeTransform;
@@ -47,6 +49,8 @@ export function CaptionLane({
           const timing = previewTiming(cue, editPreview);
           const left = transform.msToX(timing.startMs);
           const width = transform.msToX(timing.endMs) - left;
+          const startHandleMustInset = left < maximumHandleTargetPx;
+          const endHandleMustInset = left + width > transform.widthPx - maximumHandleTargetPx;
           const selected = selectedItemId === cue.itemId;
           const label = `Caption ${cue.itemId.toUpperCase()}: ${cue.current.text}`;
           return (
@@ -55,6 +59,8 @@ export function CaptionLane({
               className="timeline-item timeline-item--caption"
               data-selected={selected || undefined}
               data-preview={editPreview?.itemId === cue.itemId || undefined}
+              data-inset-start-handle={startHandleMustInset || undefined}
+              data-inset-end-handle={endHandleMustInset || undefined}
               style={{ left: `${left}px`, width: `${width}px` }}
             >
               <button

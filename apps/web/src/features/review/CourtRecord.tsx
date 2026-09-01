@@ -18,6 +18,42 @@ export interface CourtRecordProps {
 const compactRecordLength = 4;
 const actorKey = (actor: { readonly type: string; readonly id: string }): string => `${actor.type}:${actor.id}`;
 const recordEventId = (eventId: string): string => `court-record-event-${encodeURIComponent(eventId)}`;
+const eventDetail = (event: CaptionProject["courtRecord"][number]) => {
+  const { type, detail } = event;
+  if (
+    type === "VerifyItemEvidence"
+    && event.verificationPackageId !== undefined
+    && event.verificationMediaSha256 !== undefined
+  ) {
+    return (
+      <>
+        <p>Evidence package: {event.verificationPackageId}</p>
+        <p>
+          Verified media anchor: <span aria-hidden="true">sha256 {event.verificationMediaSha256.slice(0, 8)}…</span>
+          <span className="visually-hidden">SHA-256 {event.verificationMediaSha256}</span>
+        </p>
+      </>
+    );
+  }
+  if (detail === undefined) return null;
+  if (type === "VerifyItemEvidence" && detail.startsWith("verification:")) {
+    return <p>Evidence package: {detail.slice("verification:".length)}</p>;
+  }
+  if ((type === "AdoptCaptionGenerationResult" || type === "AdoptAudioDescriptionGenerationResult") && detail.startsWith("generation:")) {
+    return <p>Generation run: {detail.slice("generation:".length)}</p>;
+  }
+  if (type === "RelinkMedia") {
+    const transition = /^media:([0-9a-f]{64}):([0-9a-f]{64})$/iu.exec(detail);
+    if (transition !== null) {
+      const previous = transition[1]!.slice(0, 8).toLowerCase();
+      const next = transition[2]!.slice(0, 8).toLowerCase();
+      return previous === next
+        ? <p>Media content unchanged · sha256 {next}…</p>
+        : <p>Media content changed · sha256 {previous}… → {next}…</p>;
+    }
+  }
+  return <p>Reason: {detail}</p>;
+};
 
 /** Append-only event ledger; no event timestamp is invented when the domain has none. */
 export function CourtRecord({ project, onSelectItem, onFocusItemRevision }: CourtRecordProps) {
@@ -90,7 +126,7 @@ export function CourtRecord({ project, onSelectItem, onFocusItemRevision }: Cour
                     </button>
                   </div>
                 )}
-                {event.detail === undefined ? null : <p>Reason: {event.detail}</p>}
+                {eventDetail(event)}
               </li>
             );
           })}

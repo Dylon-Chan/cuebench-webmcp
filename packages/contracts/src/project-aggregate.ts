@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { LocalAudioDescriptionEvidencePackageSchema, LocalCaptionEvidencePackageSchema } from "./generation";
+import { VerificationPackageIdSchema } from "./envelope";
 
 /**
  * Strict wire schema for a complete CueBench project aggregate. It is shared
@@ -21,6 +22,7 @@ const boundedText = (maximum: number) => nonBlankText.max(maximum);
  * only after authenticating their aggregate relationships.
  */
 const sha256 = z.string().regex(/^[0-9a-f]{64}$/i, "Expected a SHA-256 hash.");
+const canonicalSha256 = z.string().regex(/^[0-9a-f]{64}$/, "Expected a canonical lowercase SHA-256 hash.");
 const hash = z.string().regex(/^sha256:[0-9a-f]{64}$/, "Expected a SHA-256 hash.");
 /** Includes authenticated legacy forms so the domain can deterministically upgrade them. */
 const certificationHash = z.string().regex(/^sha256(?::v2)?:[0-9a-f]{64}$/, "Expected a certification snapshot hash.");
@@ -297,6 +299,8 @@ const courtEvent = z.object({
   actor,
   itemId: identifier.optional(),
   detail: z.string().optional(),
+  verificationPackageId: VerificationPackageIdSchema.optional(),
+  verificationMediaSha256: canonicalSha256.optional(),
 }).strict();
 const exportRoundTrip = z.object({
   exportId: identifier,

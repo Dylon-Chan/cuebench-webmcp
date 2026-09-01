@@ -9,8 +9,13 @@ import {
   MAX_LOCAL_CAPTION_EVIDENCE_WORDS,
   MAX_LOCAL_AUDIO_DESCRIPTION_EVIDENCE_PACKAGES,
   MAX_PORTABLE_PROJECT_JSON_NODES,
+  isVerificationPackageId,
 } from "@cuebench/contracts";
-import type { Actor } from "@cuebench/contracts";
+import type {
+  Actor,
+  LocalAudioDescriptionEvidencePackage,
+  LocalCaptionEvidencePackage,
+} from "@cuebench/contracts";
 import { exportProjectBackup } from "./schema";
 import type {
   AudioDescriptionBeat,
@@ -191,7 +196,8 @@ const assertLocalEvidencePackages = (project: CaptionProject): void => {
         requireAggregate(
           words.has(evidenceId)
             && provenance !== undefined
-            && provenance.itemId === binding.itemId,
+            && provenance.itemId === binding.itemId
+            && provenance.itemRevision === binding.itemRevision,
           "Local Evidence Package word does not resolve through canonical cue provenance.",
         );
       }
@@ -318,6 +324,7 @@ const courtActors: Readonly<Record<string, readonly Actor["type"][]>> = {
   MarkItemAgentReady: ["BrowserAgent"],
   ObjectItem: ["Human"],
   SustainItem: ["Human"],
+  VerifyItemEvidence: ["Human"],
   ValidateProject: ["System"],
   RecordExportRoundTrip: ["System"],
   WaiveWarning: ["Human"],
@@ -353,6 +360,7 @@ const itemCourtEventTypes = new Set([
   "MarkItemAgentReady",
   "ObjectItem",
   "SustainItem",
+  "VerifyItemEvidence",
 ]);
 
 const revisionChangingCourtEventTypes = new Set([
@@ -372,6 +380,131 @@ const revisionChangingCourtEventTypes = new Set([
 
 const sameActor = (left: Actor, right: Actor): boolean => left.type === right.type && left.id === right.id;
 
+const mediaTransitionFor = (event: DomainEvent): { readonly oldSha256: string; readonly newSha256: string } | null => {
+  if (event.type !== "RelinkMedia" || event.detail === undefined) return null;
+  const match = /^media:([0-9a-f]{64}):([0-9a-f]{64})$/iu.exec(event.detail);
+  requireAggregate(match !== null, "Court Record media transition must retain exact old and new SHA-256 hashes.");
+  return { oldSha256: match[1]!.toLowerCase(), newSha256: match[2]!.toLowerCase() };
+};
+
+type VerificationMediaAnchors = ReadonlyMap<string, string>;
+
+interface VerificationEventBinding {
+  readonly packageId: string;
+  /** Absent only for authenticated pre-structured-field v1 events. */
+  readonly mediaSha256: string | null;
+}
+
+const verificationEventBindingFor = (event: DomainEvent): VerificationEventBinding => {
+  const hasPackageId = event.verificationPackageId !== undefined;
+  const hasMediaSha256 = event.verificationMediaSha256 !== undefined;
+  requireAggregate(
+    hasPackageId === hasMediaSha256,
+    "Court Record evidence verification must retain both its package id and exact media SHA-256.",
+  );
+  if (hasPackageId && hasMediaSha256) {
+    requireAggregate(
+      isVerificationPackageId(event.verificationPackageId),
+      "Court Record evidence verification must bind its exact verification package id.",
+    );
+    requireAggregate(
+      /^[0-9a-f]{64}$/u.test(event.verificationMediaSha256!),
+      "Court Record evidence verification must bind its canonical exact media SHA-256.",
+    );
+    requireAggregate(
+      event.detail === undefined,
+      "Structured Court Record evidence verification cannot carry an ambiguous detail binding.",
+    );
+    return {
+      packageId: event.verificationPackageId!,
+      mediaSha256: event.verificationMediaSha256!,
+    };
+  }
+
+  const packageId = event.detail?.startsWith("verification:") === true
+    ? event.detail.slice("verification:".length)
+    : null;
+  requireAggregate(
+    isVerificationPackageId(packageId),
+    "Legacy Court Record evidence verification must bind its exact verification package id.",
+  );
+  return { packageId, mediaSha256: null };
+};
+
+const assertMediaTransitionHistory = (
+  project: CaptionProject,
+  events: readonly DomainEvent[],
+  verificationMediaAnchors: VerificationMediaAnchors,
+): void => {
+  const firstVerificationRevision = events.find((event) => event.type === "VerifyItemEvidence")?.projectRevision;
+  let currentMediaAnchor: string | null = null;
+  let sawRelink = false;
+  let sawExplicitTransition = false;
+  for (const [eventIndex, event] of events.entries()) {
+    if (event.type === "VerifyItemEvidence") {
+      const anchor = verificationMediaAnchors.get(event.eventId);
+      requireAggregate(anchor !== undefined, "Court Record evidence verification does not establish an authenticated media anchor.");
+      if (currentMediaAnchor !== null) {
+        requireAggregate(
+          anchor === currentMediaAnchor,
+          "Court Record evidence verification does not match the authenticated current media anchor.",
+        );
+      } else {
+        const nextRelink = events.slice(eventIndex + 1).find((candidate) => candidate.type === "RelinkMedia");
+        const nextTransition = nextRelink === undefined ? null : mediaTransitionFor(nextRelink);
+        if (nextRelink !== undefined) {
+          requireAggregate(
+            nextTransition !== null,
+            "Court Record relinks at or after evidence verification require authenticated media transition hashes.",
+          );
+        }
+        const expectedAnchor = nextTransition?.oldSha256 ?? project.media.sha256.toLowerCase();
+        requireAggregate(
+          anchor === expectedAnchor,
+          "Court Record evidence verification does not establish the authenticated media anchor consumed by the next transition.",
+        );
+        currentMediaAnchor = expectedAnchor;
+      }
+      // A verification event is an authenticated observation of the current
+      // source. Any ambiguity inherited from pre-feature relinks ends here.
+      continue;
+    }
+    if (event.type !== "RelinkMedia") continue;
+    sawRelink = true;
+    const transition = mediaTransitionFor(event);
+    if (transition === null) {
+      // Pre-Task20 current-v1 events did not retain hashes. Their manifest and
+      // final-media fallback remain importable only when event order proves
+      // the relink predates the feature. Once verification appears in history,
+      // omitting hashes is a downgrade attempt rather than legacy ambiguity.
+      requireAggregate(
+        firstVerificationRevision === undefined || event.projectRevision < firstVerificationRevision,
+        "Court Record relinks at or after evidence verification require authenticated media transition hashes.",
+      );
+      requireAggregate(
+        !sawExplicitTransition,
+        "Detail-less Court Record relinks must form a legacy prefix before explicit media transitions.",
+      );
+      currentMediaAnchor = null;
+      continue;
+    }
+    sawExplicitTransition = true;
+    if (currentMediaAnchor !== null) {
+      requireAggregate(
+        transition.oldSha256 === currentMediaAnchor,
+        "Court Record media transition hashes do not form one ordered chain.",
+      );
+    }
+    currentMediaAnchor = transition.newSha256;
+  }
+  if (sawRelink && currentMediaAnchor !== null) {
+    requireAggregate(
+      currentMediaAnchor === project.media.sha256.toLowerCase(),
+      "Court Record media transition chain does not end at the current media hash.",
+    );
+  }
+};
+
 type ProjectItem = CaptionCue | AudioDescriptionBeat;
 type ProjectItemRevision = CaptionCue["revisions"][number] | AudioDescriptionBeat["revisions"][number];
 
@@ -389,6 +522,339 @@ const itemForCourtEvent = (project: CaptionProject, event: DomainEvent): Project
 
 const revisionClaim = (item: ProjectItem, itemRevision: number): string =>
   `${item.kind}\u0000${item.itemId}\u0000${itemRevision}`;
+
+type LegacyRulingClaims = ReadonlyMap<string, DomainEvent>;
+type VerificationEventClaims = ReadonlyMap<string, readonly DomainEvent[]>;
+
+const revisionVisibleAtCourtEvent = (
+  item: ProjectItem,
+  claimed: ReadonlySet<string>,
+): ProjectItemRevision => item.revisions.reduce((visible, revision) => (
+  revision.itemRevision === 1 || claimed.has(revisionClaim(item, revision.itemRevision)) ? revision : visible
+), item.revisions[0]!);
+
+const captionVerificationSourceMatches = (
+  candidate: LocalCaptionEvidencePackage,
+  source: LocalCaptionEvidencePackage,
+): boolean => {
+  const candidateBinding = candidate.cueBindings[0];
+  const sourceBinding = source.cueBindings.find((binding) => binding.itemId === candidateBinding?.itemId);
+  if (
+    candidateBinding === undefined
+    || sourceBinding === undefined
+    || source.packageId === candidate.packageId
+    || candidate.verification?.sourcePackageId !== source.packageId
+    || source.runId !== candidate.runId
+    || source.projectId !== candidate.projectId
+    || source.mediaSha256.toLowerCase() !== candidate.mediaSha256.toLowerCase()
+    || source.expectedProjectRevision >= candidate.expectedProjectRevision
+    || source.expectedQualityProfileRevision !== candidate.expectedQualityProfileRevision
+    || sourceBinding.evidenceIds.length !== candidateBinding.evidenceIds.length
+  ) return false;
+  const sourceWords = new Map(source.evidence.words.map((word) => [word.evidenceId, word]));
+  const candidateWords = new Map(candidate.evidence.words.map((word) => [word.evidenceId, word]));
+  const remappedIds = new Map(sourceBinding.evidenceIds.map((evidenceId, index) => (
+    [evidenceId, candidateBinding.evidenceIds[index]!] as const
+  )));
+  const expectedWords = sourceBinding.evidenceIds.map((evidenceId) => {
+    const word = sourceWords.get(evidenceId);
+    if (word === undefined) return undefined;
+    return { ...word, evidenceId: remappedIds.get(evidenceId)! };
+  });
+  if (
+    expectedWords.some((word) => word === undefined)
+    || candidateBinding.evidenceIds.some((evidenceId) => !candidateWords.has(evidenceId))
+    || candidate.evidence.words.length !== candidateBinding.evidenceIds.length
+    || !sameValue(candidate.evidence.words, expectedWords)
+  ) return false;
+  const referencedSpeakerSegments = new Set(expectedWords.flatMap((word) => word?.speakerSegmentIds ?? []));
+  const expectedSpeakerSegments = source.evidence.speakerSegments?.filter((segment) => referencedSpeakerSegments.has(segment.id));
+  const expectedUncertaintySpans = source.evidence.uncertaintySpans
+    .filter((span) => span.evidenceIds.every((evidenceId) => remappedIds.has(evidenceId)))
+    .map((span) => ({ ...span, evidenceIds: span.evidenceIds.map((evidenceId) => remappedIds.get(evidenceId)!) }));
+  const expectedEvidence = {
+    ...source.evidence,
+    words: expectedWords,
+    ...(source.evidence.speakerSegments === undefined ? {} : { speakerSegments: expectedSpeakerSegments }),
+    uncertaintySpans: expectedUncertaintySpans,
+  };
+  return sameValue(candidate.evidence, expectedEvidence);
+};
+
+const audioDescriptionVerificationSourceMatches = (
+  candidate: LocalAudioDescriptionEvidencePackage,
+  source: LocalAudioDescriptionEvidencePackage,
+): boolean => {
+  const candidateBinding = candidate.beatBindings[0];
+  const sourceBinding = source.beatBindings.find((binding) => binding.itemId === candidateBinding?.itemId);
+  if (
+    candidateBinding === undefined
+    || sourceBinding === undefined
+    || source.packageId === candidate.packageId
+    || candidate.verification?.sourcePackageId !== source.packageId
+    || source.runId !== candidate.runId
+    || source.projectId !== candidate.projectId
+    || source.mediaSha256.toLowerCase() !== candidate.mediaSha256.toLowerCase()
+    || source.expectedProjectRevision >= candidate.expectedProjectRevision
+    || source.expectedQualityProfileRevision !== candidate.expectedQualityProfileRevision
+    || source.captionEvidenceHash.toLowerCase() !== candidate.captionEvidenceHash.toLowerCase()
+    || sourceBinding.evidenceIds.length !== candidateBinding.evidenceIds.length
+  ) return false;
+  const sourceFrames = new Map(source.evidence.frames.map((frame) => [frame.evidenceId, frame]));
+  const expectedFrames = sourceBinding.evidenceIds.map((evidenceId, index) => {
+    const frame = sourceFrames.get(evidenceId);
+    if (frame === undefined) return undefined;
+    return { ...frame, evidenceId: candidateBinding.evidenceIds[index]! };
+  });
+  return !expectedFrames.some((frame) => frame === undefined)
+    && candidate.evidence.frames.length === candidateBinding.evidenceIds.length
+    && sameValue(candidate.evidence, { ...source.evidence, frames: expectedFrames });
+};
+
+const exactCanonicalEvidence = (
+  project: CaptionProject,
+  binding: { readonly itemId: string; readonly itemRevision: number; readonly evidenceIds: readonly string[] },
+): boolean => binding.evidenceIds.every((evidenceId) => project.evidence.some((entry) => (
+  entry.evidenceId === evidenceId
+    && entry.projectId === project.projectId
+    && entry.mediaSha256.toLowerCase() === project.media.sha256.toLowerCase()
+    && entry.itemId === binding.itemId
+    && entry.itemRevision === binding.itemRevision
+)));
+
+const assertVerificationEvidenceEvent = (
+  project: CaptionProject,
+  event: DomainEvent,
+  item: ProjectItem,
+  claimedRevisions: ReadonlySet<string>,
+  claimedPackageIds: Set<string>,
+  verificationEventClaims: Map<string, DomainEvent[]>,
+  verificationMediaAnchors: Map<string, string>,
+): void => {
+  const revision = revisionVisibleAtCourtEvent(item, claimedRevisions);
+  const binding = verificationEventBindingFor(event);
+  const packageId = binding.packageId;
+  requireAggregate(revision.state === "Sustained", "Court Record evidence verification must target the then-current Sustained revision.");
+  const verificationClaim = revisionClaim(item, revision.itemRevision);
+  verificationEventClaims.set(verificationClaim, [
+    ...(verificationEventClaims.get(verificationClaim) ?? []),
+    event,
+  ]);
+  const revisionEvidence = project.evidence.filter((evidence) => (
+    evidence.projectId === project.projectId
+      && evidence.itemId === item.itemId
+      && evidence.itemRevision === revision.itemRevision
+  ));
+  requireAggregate(revisionEvidence.length > 0, "Court Record evidence verification has no retained provenance record.");
+  if (binding.mediaSha256 !== null) {
+    requireAggregate(
+      revisionEvidence.every((evidence) => evidence.mediaSha256.toLowerCase() === binding.mediaSha256),
+      "Court Record evidence verification provenance does not match its immutable media anchor.",
+    );
+    verificationMediaAnchors.set(event.eventId, binding.mediaSha256);
+  }
+  const laterRelinks = project.courtRecord.filter((candidate) => (
+    candidate.type === "RelinkMedia" && candidate.projectRevision > event.projectRevision
+  ));
+  const replacedMediaTombstone = laterRelinks.some((candidate) => {
+    const transition = mediaTransitionFor(candidate);
+    return transition !== null && transition.oldSha256 !== transition.newSha256;
+  }) || (
+    laterRelinks.some((candidate) => candidate.detail === undefined)
+      && project.evidence.some((evidence) => (
+        evidence.itemId === item.itemId
+          && evidence.itemRevision === revision.itemRevision
+          && evidence.mediaSha256.toLowerCase() !== project.media.sha256.toLowerCase()
+      ))
+  );
+  if (item.kind === "CaptionCue") {
+    const candidates = project.localEvidencePackages.filter((entry) => {
+      const itemBinding = entry.cueBindings[0];
+      return entry.packageId === packageId
+        && entry.outputSha256 === undefined
+        && entry.verification?.kind === "HumanEvidenceVerification"
+        && entry.verification.eventId === event.eventId
+        && sameActor(entry.verification.actor, event.actor)
+        && entry.verification.itemId === item.itemId
+        && entry.verification.itemRevision === revision.itemRevision
+        && entry.expectedProjectRevision === event.projectRevision - 1
+        && entry.projectId === project.projectId
+        && (binding.mediaSha256 === null || entry.mediaSha256.toLowerCase() === binding.mediaSha256)
+        && entry.mediaSha256.toLowerCase() === project.media.sha256.toLowerCase()
+        && entry.cueBindings.length === 1
+        && itemBinding !== undefined
+        && itemBinding.itemId === item.itemId
+        && itemBinding.cueId === item.itemId
+        && itemBinding.itemRevision === revision.itemRevision
+        && itemBinding.evidenceIds.length === entry.evidence.words.length
+        && exactCanonicalEvidence(project, itemBinding)
+        && project.localEvidencePackages.some((source) => captionVerificationSourceMatches(entry, source));
+    });
+    if (candidates.length === 0 && replacedMediaTombstone) {
+      requireAggregate(
+        binding.mediaSha256 !== null,
+        "A tombstoned legacy evidence verification has no independently authenticated media anchor.",
+      );
+      return;
+    }
+    requireAggregate(candidates.length === 1, "Court Record evidence verification has no unique authenticated caption package and provenance set.");
+    if (binding.mediaSha256 === null) {
+      verificationMediaAnchors.set(event.eventId, candidates[0]!.mediaSha256.toLowerCase());
+    }
+    requireAggregate(!claimedPackageIds.has(`CaptionCue\u0000${candidates[0]!.packageId}`), "Court Record evidence verification reuses a verification package.");
+    claimedPackageIds.add(`CaptionCue\u0000${candidates[0]!.packageId}`);
+    return;
+  }
+  const candidates = project.localAudioDescriptionEvidencePackages.filter((entry) => {
+    const itemBinding = entry.beatBindings[0];
+    return entry.packageId === packageId
+      && entry.outputSha256 === undefined
+      && entry.verification?.kind === "HumanEvidenceVerification"
+      && entry.verification.eventId === event.eventId
+      && sameActor(entry.verification.actor, event.actor)
+      && entry.verification.itemId === item.itemId
+      && entry.verification.itemRevision === revision.itemRevision
+      && entry.expectedProjectRevision === event.projectRevision - 1
+      && entry.projectId === project.projectId
+      && (binding.mediaSha256 === null || entry.mediaSha256.toLowerCase() === binding.mediaSha256)
+      && entry.mediaSha256.toLowerCase() === project.media.sha256.toLowerCase()
+      && entry.beatBindings.length === 1
+      && entry.requirementBindings.length === 0
+      && itemBinding !== undefined
+      && itemBinding.itemId === item.itemId
+      && itemBinding.beatId === item.itemId
+      && itemBinding.itemRevision === revision.itemRevision
+      && itemBinding.evidenceIds.length === entry.evidence.frames.length
+      && exactCanonicalEvidence(project, itemBinding)
+      && project.localAudioDescriptionEvidencePackages.some((source) => audioDescriptionVerificationSourceMatches(entry, source));
+  });
+  if (candidates.length === 0 && replacedMediaTombstone) {
+    requireAggregate(
+      binding.mediaSha256 !== null,
+      "A tombstoned legacy evidence verification has no independently authenticated media anchor.",
+    );
+    return;
+  }
+  requireAggregate(candidates.length === 1, "Court Record evidence verification has no unique authenticated audio-description package and provenance set.");
+  if (binding.mediaSha256 === null) {
+    verificationMediaAnchors.set(event.eventId, candidates[0]!.mediaSha256.toLowerCase());
+  }
+  requireAggregate(!claimedPackageIds.has(`AudioDescriptionBeat\u0000${candidates[0]!.packageId}`), "Court Record evidence verification reuses a verification package.");
+  claimedPackageIds.add(`AudioDescriptionBeat\u0000${candidates[0]!.packageId}`);
+};
+
+const assertReverseVerificationClaims = (
+  project: CaptionProject,
+  claimedPackageIds: ReadonlySet<string>,
+  legacyRulingClaims: LegacyRulingClaims,
+  verificationEventClaims: VerificationEventClaims,
+  verificationMediaAnchors: VerificationMediaAnchors,
+): void => {
+  const captionVerificationPackages = project.localEvidencePackages.filter((entry) => entry.verification !== undefined);
+  const audioDescriptionVerificationPackages = project.localAudioDescriptionEvidencePackages.filter((entry) => entry.verification !== undefined);
+  for (const entry of captionVerificationPackages) {
+    requireAggregate(
+      claimedPackageIds.has(`CaptionCue\u0000${entry.packageId}`),
+      "Every retained caption verification package requires exactly one matching Human Court Record event.",
+    );
+  }
+  for (const entry of audioDescriptionVerificationPackages) {
+    requireAggregate(
+      claimedPackageIds.has(`AudioDescriptionBeat\u0000${entry.packageId}`),
+      "Every retained audio-description verification package requires exactly one matching Human Court Record event.",
+    );
+  }
+
+  unique(
+    project.localEvidencePackages.filter((entry) => entry.verification === undefined).map((entry) => entry.runId),
+    "Unverified generated caption package run ids",
+  );
+  unique(
+    project.localAudioDescriptionEvidencePackages.filter((entry) => entry.verification === undefined).map((entry) => entry.runId),
+    "Unverified generated audio-description package run ids",
+  );
+
+  for (const evidence of project.evidence) {
+    if (evidence.itemId === null || evidence.itemRevision === null || evidence.itemRevision <= 1) continue;
+    const evidenceItem = project.captions.items[evidence.itemId] ?? project.audioDescriptions.items[evidence.itemId];
+    const exactVerificationEvents = evidenceItem === undefined
+      ? []
+      : verificationEventClaims.get(revisionClaim(evidenceItem, evidence.itemRevision)) ?? [];
+    if (exactVerificationEvents.length > 0) {
+      const authenticatedMediaAnchors = exactVerificationEvents.map((event) => verificationMediaAnchors.get(event.eventId));
+      requireAggregate(
+        authenticatedMediaAnchors.every((anchor) => anchor !== undefined)
+          && authenticatedMediaAnchors.includes(evidence.mediaSha256.toLowerCase()),
+        "Successor-revision evidence does not match an authenticated verification-event media anchor.",
+      );
+    }
+    if (evidence.mediaSha256.toLowerCase() !== project.media.sha256.toLowerCase()) continue;
+    const authenticatedTombstone = exactVerificationEvents.some((verificationEvent) => (
+      project.courtRecord.some((candidate) => {
+        if (candidate.type !== "RelinkMedia" || candidate.projectRevision <= verificationEvent.projectRevision) return false;
+        const transition = mediaTransitionFor(candidate);
+        return transition !== null && transition.oldSha256 !== transition.newSha256;
+      })
+      || project.courtRecord.some((candidate) => (
+        candidate.type === "RelinkMedia"
+          && candidate.detail === undefined
+          && candidate.projectRevision > verificationEvent.projectRevision
+          && evidence.mediaSha256.toLowerCase() !== project.media.sha256.toLowerCase()
+      ))
+    ));
+    if (authenticatedTombstone) continue;
+    const captionMatches = captionVerificationPackages.filter((entry) => entry.cueBindings.some((binding) => (
+      binding.itemId === evidence.itemId
+        && binding.itemRevision === evidence.itemRevision
+        && binding.evidenceIds.includes(evidence.evidenceId)
+    )));
+    const audioDescriptionMatches = audioDescriptionVerificationPackages.filter((entry) => entry.beatBindings.some((binding) => (
+      binding.itemId === evidence.itemId
+        && binding.itemRevision === evidence.itemRevision
+        && binding.evidenceIds.includes(evidence.evidenceId)
+    )));
+    const item = project.captions.items[evidence.itemId] ?? project.audioDescriptions.items[evidence.itemId];
+    const rulingEvent = item === undefined ? undefined : legacyRulingClaims.get(revisionClaim(item, evidence.itemRevision));
+    const projectionEvidenceIds = project.evidence.filter((entry) => (
+      entry.projectId === project.projectId
+        && entry.mediaSha256.toLowerCase() === project.media.sha256.toLowerCase()
+        && entry.itemId === evidence.itemId
+        && entry.itemRevision === evidence.itemRevision
+    )).map((entry) => entry.evidenceId).sort();
+    const legacyCaptionMatches = rulingEvent?.actor.type === "Human" && item?.kind === "CaptionCue"
+      ? project.localEvidencePackages.filter((entry) => entry.verification === undefined && entry.expectedProjectRevision < rulingEvent.projectRevision && entry.cueBindings.some((binding) => (
+        binding.itemId === evidence.itemId
+          && binding.cueId === evidence.itemId
+          && binding.itemRevision === evidence.itemRevision
+          && sameValue([...binding.evidenceIds].sort(), projectionEvidenceIds)
+      )))
+      : [];
+    const legacyAudioDescriptionMatches = rulingEvent?.actor.type === "Human" && item?.kind === "AudioDescriptionBeat"
+      ? project.localAudioDescriptionEvidencePackages.filter((entry) => entry.verification === undefined && entry.expectedProjectRevision < rulingEvent.projectRevision && entry.beatBindings.some((binding) => (
+        binding.itemId === evidence.itemId
+          && binding.beatId === evidence.itemId
+          && binding.itemRevision === evidence.itemRevision
+          && sameValue([...binding.evidenceIds].sort(), projectionEvidenceIds)
+      )))
+      : [];
+    const verificationMatchCount = captionMatches.length + audioDescriptionMatches.length;
+    const legacyMatchCount = legacyCaptionMatches.length + legacyAudioDescriptionMatches.length;
+    requireAggregate(
+      verificationMatchCount === 1 || (verificationMatchCount === 0 && legacyMatchCount === 1),
+      "Every successor-revision evidence provenance record requires exactly one retained verification package or authenticated legacy state-only ruling projection.",
+    );
+    if (verificationMatchCount === 0) continue;
+    const captionPackage = captionMatches[0];
+    const audioDescriptionPackage = audioDescriptionMatches[0];
+    requireAggregate(
+      captionPackage !== undefined
+        ? claimedPackageIds.has(`CaptionCue\u0000${captionPackage.packageId}`)
+        : audioDescriptionPackage !== undefined
+          && claimedPackageIds.has(`AudioDescriptionBeat\u0000${audioDescriptionPackage.packageId}`),
+      "Every successor-revision evidence provenance record requires a matching Human verification event.",
+    );
+  }
+};
 
 const withoutRevisionFields = (
   revision: ProjectItemRevision,
@@ -468,6 +934,7 @@ const assertCurrentRevisionEvent = (
   project: CaptionProject,
   event: DomainEvent,
   claimed: Set<string>,
+  legacyRulingClaims: Map<string, DomainEvent>,
 ): void => {
   if (event.type === "AdoptCaptionGenerationResult") {
     const runId = event.detail?.startsWith("generation:") === true ? event.detail.slice("generation:".length) : null;
@@ -562,11 +1029,13 @@ const assertCurrentRevisionEvent = (
   }
   if (event.type === "ObjectItem") {
     requireAggregate(typeof event.detail === "string" && event.detail.trim().length > 0, "Court Record objection requires its durable reason.");
-    standard("Objected", event.detail);
+    const pair = standard("Objected", event.detail);
+    legacyRulingClaims.set(revisionClaim(item, pair.successor.itemRevision), event);
     return;
   }
   if (event.type === "SustainItem") {
-    standard("Sustained", event.type);
+    const pair = standard("Sustained", event.type);
+    legacyRulingClaims.set(revisionClaim(item, pair.successor.itemRevision), event);
     return;
   }
   if (event.type === "AdjustCueTiming") {
@@ -781,6 +1250,7 @@ const assertPreHistoryCompatibilityEvents = (project: CaptionProject, events: re
     "RecordExportRoundTrip",
     "WaiveWarning",
     "CertifyProject",
+    "VerifyItemEvidence",
   ]);
   const retainedValidationRevisions = new Set(project.validationHistory.map((run) => run.projectRevision));
   const oldestRetainedValidationRevision = project.validationHistory[0]?.projectRevision;
@@ -813,9 +1283,16 @@ const assertCurrentCourtRecord = (
     events.length === project.projectRevision - 1,
     "Current v1 Court Record must contain one event for every post-creation project revision.",
   );
-  if (events.length === 0) return;
-
   const claimed = new Set<string>();
+  const claimedVerificationPackageIds = new Set<string>();
+  const legacyRulingClaims = new Map<string, DomainEvent>();
+  const verificationEventClaims = new Map<string, DomainEvent[]>();
+  const verificationMediaAnchors = new Map<string, string>();
+  if (events.length === 0) {
+    assertReverseVerificationClaims(project, claimedVerificationPackageIds, legacyRulingClaims, verificationEventClaims, verificationMediaAnchors);
+    return;
+  }
+
   let projectedSelection: { readonly kind: "CaptionCue" | "AudioDescriptionBeat" | "AudioDescriptionGap"; readonly itemId: string } | null = null;
   for (let index = 0; index < events.length; index += 1) {
     const event = events[index]!;
@@ -827,7 +1304,19 @@ const assertCurrentCourtRecord = (
     const allowedActors = courtActors[event.type];
     requireAggregate(allowedActors !== undefined && event.type !== "LegacyItemRevisionPayloadHistoryUnavailable", `Court Record event type ${event.type} is not a current durable command.`);
     requireAggregate(allowedActors.includes(event.actor.type), `Court Record ${event.type} has invalid actor provenance.`);
-    if (event.type !== "ObjectItem" && event.type !== "AdoptCaptionGenerationResult" && event.type !== "AdoptAudioDescriptionGenerationResult") {
+    if (event.type !== "VerifyItemEvidence") {
+      requireAggregate(
+        event.verificationPackageId === undefined && event.verificationMediaSha256 === undefined,
+        `Court Record ${event.type} cannot carry evidence-verification provenance fields.`,
+      );
+    }
+    if (
+      event.type !== "ObjectItem"
+      && event.type !== "AdoptCaptionGenerationResult"
+      && event.type !== "AdoptAudioDescriptionGenerationResult"
+      && event.type !== "VerifyItemEvidence"
+      && event.type !== "RelinkMedia"
+    ) {
       requireAggregate(event.detail === undefined, `Court Record ${event.type} cannot carry arbitrary detail.`);
     }
 
@@ -843,7 +1332,19 @@ const assertCurrentCourtRecord = (
     } else if (["ValidateProject", "RecordExportRoundTrip", "WaiveWarning", "CertifyProject", "ApplyProfile", "RelinkMedia", "StartGenerationRun", "ReleaseGenerationRun"].includes(event.type)) {
       requireAggregate(event.itemId === undefined, `Court Record ${event.type} cannot target an item.`);
     }
-    assertCurrentRevisionEvent(project, event, claimed);
+    assertCurrentRevisionEvent(project, event, claimed, legacyRulingClaims);
+    if (event.type === "VerifyItemEvidence") {
+      requireAggregate(eventItem !== undefined, "Court Record evidence verification requires an item.");
+      assertVerificationEvidenceEvent(
+        project,
+        event,
+        eventItem,
+        claimed,
+        claimedVerificationPackageIds,
+        verificationEventClaims,
+        verificationMediaAnchors,
+      );
+    }
     if (eventItem !== undefined && (
       event.type === "SelectItem"
       || event.type === "FocusItem"
@@ -867,6 +1368,9 @@ const assertCurrentCourtRecord = (
       requireAggregate(claimed.has(revisionClaim(item, initial.itemRevision)), "Proposed-in-gap audio description is missing its Court Record event.");
     }
   }
+
+  assertMediaTransitionHistory(project, events, verificationMediaAnchors);
+  assertReverseVerificationClaims(project, claimedVerificationPackageIds, legacyRulingClaims, verificationEventClaims, verificationMediaAnchors);
 
   assertSideHistoryEvents(project, events, options);
   if (options.allowPreHistoryValidationReplay === true) {

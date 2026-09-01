@@ -1,4 +1,5 @@
 import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import type { LocalCaptionEvidencePackage } from "@cuebench/contracts";
 import {
   applyCommand,
   createProject,
@@ -74,9 +75,35 @@ const reviewProject = (): CaptionProject => {
       },
     ],
   });
-  const validationRun = validateProject(project);
+  const retainedEvidence: LocalCaptionEvidencePackage = {
+    packageId: "generation-review-source",
+    runId: "review-source",
+    projectId: project.projectId,
+    mediaSha256: project.media.sha256,
+    expectedProjectRevision: project.projectRevision,
+    expectedQualityProfileRevision: project.qualityProfile.revision,
+    retainedAtMs: 1_700_000_000_000,
+    evidence: {
+      contractVersion: 1,
+      runId: "review-source",
+      projectId: project.projectId,
+      mediaSha256: project.media.sha256,
+      preparedManifest: { key: "prepared/review/manifest.json", sha256: "b".repeat(64) },
+      normalizedAudio: { key: "prepared/review/audio.wav", sha256: "c".repeat(64), byteLength: 4, durationMs: 90_000, contentType: "audio/wav" },
+      words: [{ evidenceId: "evidence-c01-r1", sourceWordIndex: 0, startMs: 1_000, endMs: 2_000, text: "Nguyen", speaker: "Dr. Nguyen", speakerSegmentIds: ["speaker-review"] }],
+      speakerSegments: [{ id: "speaker-review", startMs: 1_000, endMs: 2_000, speaker: "Dr. Nguyen", text: "Nguyen" }],
+      uncertaintySpans: [],
+      provenance: [
+        { role: "diarization", model: "fixture", requestHash: "d".repeat(64), responseHash: "e".repeat(64), store: false, requestMetadata: {}, warnings: [] },
+        { role: "word-timestamps", model: "fixture", requestHash: "f".repeat(64), responseHash: "1".repeat(64), store: false, requestMetadata: {}, warnings: [] },
+      ],
+    },
+    cueBindings: [{ cueId: "c01", itemId: "c01", itemRevision: 1, evidenceIds: ["evidence-c01-r1"] }],
+  };
+  const evidencedProject: CaptionProject = { ...project, localEvidencePackages: [retainedEvidence] };
+  const validationRun = validateProject(evidencedProject);
   return {
-    ...project,
+    ...evidencedProject,
     validation: {
       status: "Current",
       blockerCount: validationRun.blockerCount,
@@ -110,6 +137,32 @@ const sustainedProject = (): CaptionProject => applyCommand(selectedProject(), {
   expectedItemRevision: 1,
   expectedProjectRevision: 2,
 }).project;
+
+const gapComposerProject = (): CaptionProject => createProject({
+  projectId: "gap-composer-project",
+  title: "Diagram description review",
+  media: {
+    sourceId: "gap-composer-video",
+    sha256: "9".repeat(64),
+    durationMs: 20_000,
+    relinkState: "Linked",
+  },
+  captions: [{
+    kind: "CaptionCue",
+    itemId: "c01",
+    state: "Proposed",
+    startMs: 1_000,
+    endMs: 3_000,
+    text: "The graph reaches equilibrium.",
+    speaker: "Teacher",
+    actor: { type: "CueBenchAI", id: "cuebench-ai" },
+    cause: "fixture",
+  }],
+  audioDescriptionGaps: [
+    { gapId: "diagram-one-gap", gapRevision: 1, state: "Available", startMs: 4_000, endMs: 6_000 },
+    { gapId: "diagram-two-gap", gapRevision: 1, state: "Available", startMs: 8_000, endMs: 10_000 },
+  ],
+});
 
 const largeReviewProject = (): CaptionProject => {
   const project = createProject({
@@ -231,6 +284,63 @@ const retainedFixtureEvidence: EvidenceContentResolver = {
 };
 
 describe("Review docket human-authority flow", () => {
+  it("preserves independent audio-description drafts across gap switches and external item focus", async () => {
+    render(<ReviewHarness initialProject={gapComposerProject()} />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Select audio-description gap DIAGRAM-ONE-GAP" }));
+    await screen.findByLabelText("Audio description for DIAGRAM-ONE-GAP");
+    fireEvent.change(screen.getByLabelText("Audio description for DIAGRAM-ONE-GAP"), {
+      target: { value: "A blue curve settles onto the horizontal axis." },
+    });
+    fireEvent.change(screen.getByLabelText("Start time in milliseconds"), { target: { value: "4250" } });
+    fireEvent.change(screen.getByLabelText("End time in milliseconds"), { target: { value: "5750" } });
+    fireEvent.change(screen.getByLabelText("Audio-description identifier"), { target: { value: "diagram-one-description" } });
+
+    fireEvent.click(screen.getByRole("button", { name: "Select audio-description gap DIAGRAM-TWO-GAP" }));
+    await waitFor(() => expect(screen.getByLabelText("Audio description for DIAGRAM-TWO-GAP")).toHaveValue(""));
+    fireEvent.change(screen.getByLabelText("Audio description for DIAGRAM-TWO-GAP"), {
+      target: { value: "The second panel highlights a red reaction arrow." },
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "Select audio-description gap DIAGRAM-ONE-GAP" }));
+    await waitFor(() => expect(screen.getByLabelText("Audio description for DIAGRAM-ONE-GAP")).toHaveValue("A blue curve settles onto the horizontal axis."));
+    expect(screen.getByLabelText("Start time in milliseconds")).toHaveValue(4250);
+    expect(screen.getByLabelText("End time in milliseconds")).toHaveValue(5750);
+    expect(screen.getByLabelText("Audio-description identifier")).toHaveValue("diagram-one-description");
+
+    fireEvent.click(screen.getByRole("button", { name: /select caption c01/i }));
+    await screen.findByRole("heading", { name: /selected caption c01/i });
+    fireEvent.click(screen.getByRole("button", { name: "Select audio-description gap DIAGRAM-ONE-GAP" }));
+    await waitFor(() => expect(screen.getByLabelText("Audio description for DIAGRAM-ONE-GAP")).toHaveValue("A blue curve settles onto the horizontal axis."));
+    expect(screen.getByLabelText("Audio-description identifier")).toHaveValue("diagram-one-description");
+  });
+
+  it("connects every audio-description validation error to its invalid field with stable ids", async () => {
+    render(<ReviewHarness initialProject={gapComposerProject()} />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Select audio-description gap DIAGRAM-ONE-GAP" }));
+    const description = await screen.findByLabelText("Audio description for DIAGRAM-ONE-GAP");
+    const start = screen.getByLabelText("Start time in milliseconds");
+    const end = screen.getByLabelText("End time in milliseconds");
+    const identifier = screen.getByLabelText("Audio-description identifier");
+
+    fireEvent.change(start, { target: { value: "3999" } });
+    fireEvent.change(end, { target: { value: "6001" } });
+    fireEvent.change(identifier, { target: { value: "" } });
+
+    expect(description).toHaveAttribute("aria-invalid", "true");
+    expect(description).toHaveAttribute("aria-describedby", "ad-gap-description-error-diagram-one-gap");
+    expect(start).toHaveAttribute("aria-invalid", "true");
+    expect(start).toHaveAttribute("aria-describedby", "ad-gap-timing-error-diagram-one-gap");
+    expect(end).toHaveAttribute("aria-invalid", "true");
+    expect(end).toHaveAttribute("aria-describedby", "ad-gap-timing-error-diagram-one-gap");
+    expect(identifier).toHaveAttribute("aria-invalid", "true");
+    expect(identifier).toHaveAttribute("aria-describedby", "ad-gap-id-error-diagram-one-gap");
+    expect(document.getElementById("ad-gap-description-error-diagram-one-gap")).toHaveTextContent(/description is required/i);
+    expect(document.getElementById("ad-gap-timing-error-diagram-one-gap")).toHaveTextContent(/integer milliseconds/i);
+    expect(document.getElementById("ad-gap-id-error-diagram-one-gap")).toHaveTextContent(/non-empty identifier/i);
+  });
+
   it("focuses a finding by selecting its item, seeking the shared video, and retaining stable focus", async () => {
     const onSeek = vi.fn();
     const onCommand = vi.fn();
@@ -299,6 +409,74 @@ describe("Review docket human-authority flow", () => {
     const record = screen.getByRole("region", { name: "Court Record" });
     expect(within(record).getByText("Sustain item")).toBeVisible();
     expect(within(record).getAllByText("Human · human").at(-1)).toBeVisible();
+  });
+
+  it("presents authenticated media transitions without exposing raw provenance syntax", () => {
+    const initial = reviewProject();
+    const relinked = applyCommand(initial, {
+      type: "RelinkMedia",
+      actor: human,
+      expectedProjectRevision: initial.projectRevision,
+      media: { sourceId: "replacement", sha256: "b".repeat(64), durationMs: initial.media.durationMs },
+    });
+    if (relinked.error !== undefined) throw new Error(relinked.error.message);
+    render(<CourtRecord project={relinked.project} />);
+
+    expect(screen.getByText("Media content changed · sha256 aaaaaaaa… → bbbbbbbb…")).toBeVisible();
+    expect(screen.queryByText(/media:[0-9a-f]{64}:/i)).not.toBeInTheDocument();
+  });
+
+  it("keeps a ruled semantic revision stale until the Human explicitly verifies retained evidence", async () => {
+    const selected = selectedProject();
+    const revised = applyCommand(selected, {
+      type: "ReviseCue",
+      actor: human,
+      itemId: "c01",
+      cueId: "c01",
+      expectedItemRevision: 1,
+      expectedProjectRevision: selected.projectRevision,
+      patch: { text: "Dr. Nguyen introduces Gibbs energy." },
+    });
+    if (revised.error !== undefined) throw new Error(revised.error.message);
+    const sustained = applyCommand(revised.project, {
+      type: "SustainItem",
+      actor: human,
+      itemId: "c01",
+      expectedItemRevision: 2,
+      expectedProjectRevision: revised.project.projectRevision,
+    });
+    if (sustained.error !== undefined) throw new Error(sustained.error.message);
+    expect(validateProject(sustained.project).findings).toEqual(expect.arrayContaining([
+      expect.objectContaining({ ruleId: "evidence.stale", severity: "blocker" }),
+    ]));
+    const historicalEvidence = structuredClone(sustained.project.evidence);
+    const historicalPackage = structuredClone(sustained.project.localEvidencePackages[0]);
+    const onCommand = vi.fn();
+    let current: (() => CaptionProject) | null = null;
+    render(<ReviewHarness initialProject={sustained.project} onCommand={onCommand} onProjectReady={(read) => { current = read; }} />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Verify retained evidence for selected revision" }));
+
+    await waitFor(() => expect(onCommand).toHaveBeenCalledWith(expect.objectContaining({
+      type: "VerifyItemEvidence",
+      actor: human,
+      itemId: "c01",
+      expectedItemRevision: 3,
+      expectedProjectRevision: sustained.project.projectRevision,
+      sourcePackageId: "generation-review-source",
+      verificationPackageId: expect.stringMatching(/^verification-/),
+      verificationEvidenceIds: [expect.stringMatching(/^verification-/)],
+    }), expect.anything()));
+    expect(current!().evidence[0]).toEqual(historicalEvidence[0]);
+    expect(current!().localEvidencePackages[0]).toEqual(historicalPackage);
+    expect(current!().evidence).toHaveLength(2);
+    expect(current!().localEvidencePackages).toHaveLength(2);
+    expect(validateProject(current!()).findings.some((finding) => finding.ruleId === "evidence.stale")).toBe(false);
+    expect(screen.getByRole("status")).toHaveTextContent("Verified retained evidence for Caption C01");
+    expect(screen.getByText(/^Evidence package: verification-/)).toBeVisible();
+    expect(screen.getByText(/^Verified media anchor:/)).toHaveTextContent("sha256 aaaaaaaa…");
+    expect(screen.getByText(`SHA-256 ${"a".repeat(64)}`)).toHaveClass("visually-hidden");
+    expect(screen.queryByText(/^Reason: verification:/)).not.toBeInTheDocument();
   });
 
   it("requires confirmation before revising a Sustained item and makes its new immutable revision Proposed", async () => {
@@ -484,6 +662,38 @@ describe("Review docket human-authority flow", () => {
     expect(accepted).toBe(true);
     expect(screen.getByRole("button", { name: "All" })).toHaveAttribute("aria-pressed", "true");
     expect(document.activeElement).toBe(document.getElementById("evidence-evidence-c01-r1"));
+  });
+
+  it("rebases a clean editor when a Browser Agent commits the selected item's next revision", async () => {
+    let focus: ((input: { readonly itemId: string; readonly itemRevision: number; readonly playheadMs: number }) => Promise<boolean>) | null = null;
+    let current: (() => CaptionProject) | null = null;
+    let replace: ((project: CaptionProject) => void) | null = null;
+    const initial = selectedProject();
+    render(<ReviewHarness
+      initialProject={initial}
+      onBrowserAgentFocusReady={(nextFocus) => { focus = nextFocus; }}
+      onProjectReady={(nextCurrent, nextReplace) => { current = nextCurrent; replace = nextReplace; }}
+    />);
+    await waitFor(() => expect(focus).not.toBeNull());
+
+    const revised = applyCommand(initial, {
+      type: "ReviseCue",
+      actor: { type: "BrowserAgent", id: "browser-agent" },
+      itemId: "c01",
+      cueId: "c01",
+      patch: { text: "Dr. Nguyen calibrates Gibbs free energy." },
+      expectedItemRevision: 1,
+      expectedSelectionId: "c01",
+      expectedProjectRevision: initial.projectRevision,
+    });
+    if (revised.error !== undefined || replace === null || current === null) throw new Error("Expected a Browser Agent revision and project adapter.");
+    act(() => replace!(revised.project));
+    await waitFor(() => expect(current!().captions.items.c01?.current.itemRevision).toBe(2));
+
+    const pending = focus!({ itemId: "c01", itemRevision: 2, playheadMs: 1_000 });
+    await waitFor(() => expect(screen.queryByRole("dialog", { name: /unsaved review draft/i })).not.toBeInTheDocument());
+    await expect(pending).resolves.toBe(true);
+    expect(screen.getByLabelText("Caption text for C01")).toHaveValue("Dr. Nguyen calibrates Gibbs free energy.");
   });
 
   it("runs Browser Agent focus preflight before selection, preserving the dirty draft and selected family on decline", async () => {

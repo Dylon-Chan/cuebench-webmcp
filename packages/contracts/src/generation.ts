@@ -3,6 +3,7 @@ import {
   ContractVersionSchema,
   DomainErrorCodeSchema,
   IdentifierSchema,
+  isVerificationPackageId,
   MAX_GENERATION_WARNINGS,
   ProjectRevisionSchema,
 } from "./envelope";
@@ -524,6 +525,44 @@ export const CueEvidenceBindingSchema = z.object({
 }).strict();
 
 /**
+ * Durable reverse link for a Human evidence reconciliation. Generated source
+ * packages omit it; every package created by VerifyItemEvidence must carry it.
+ */
+export const HumanEvidenceVerificationSchema = z.object({
+  kind: z.literal("HumanEvidenceVerification"),
+  eventId: IdentifierSchema,
+  sourcePackageId: IdentifierSchema,
+  actor: z.object({ type: z.literal("Human"), id: IdentifierSchema }).strict(),
+  itemId: IdentifierSchema,
+  itemRevision: ProjectRevisionSchema,
+}).strict();
+
+const assertVerificationArtifactIds = (
+  value: {
+    readonly packageId: string;
+    readonly verification?: unknown;
+    readonly bindings: readonly { readonly evidenceIds: readonly string[] }[];
+  },
+  context: z.RefinementCtx,
+): void => {
+  if (value.verification === undefined) return;
+  if (!isVerificationPackageId(value.packageId)) {
+    context.addIssue({ code: "custom", message: "Human verification package ids must use the canonical artifact grammar.", path: ["packageId"] });
+  }
+  for (const [bindingIndex, binding] of value.bindings.entries()) {
+    for (const [evidenceIndex, evidenceId] of binding.evidenceIds.entries()) {
+      if (!isVerificationPackageId(evidenceId)) {
+        context.addIssue({
+          code: "custom",
+          message: "Human verification evidence ids must use the canonical artifact grammar.",
+          path: ["bindings", bindingIndex, "evidenceIds", evidenceIndex],
+        });
+      }
+    }
+  }
+};
+
+/**
  * The browser's canonical, bounded evidence payload after human adoption.
  * It is intentionally part of the project aggregate (and therefore its
  * encrypted backup), unlike the short-lived Worker recovery receipt.
@@ -538,9 +577,11 @@ export const LocalCaptionEvidencePackageSchema = z.object({
   retainedAtMs: SafeTimestampSchema,
   /** Hash of the complete staged payload, retained after R2 artifact cleanup. */
   outputSha256: Sha256Schema.optional(),
+  verification: HumanEvidenceVerificationSchema.optional(),
   evidence: CaptionEvidenceBundleSchema,
   cueBindings: z.array(CueEvidenceBindingSchema).max(MAX_LOCAL_CAPTION_CUES),
 }).strict().superRefine((value, context) => {
+  assertVerificationArtifactIds({ packageId: value.packageId, verification: value.verification, bindings: value.cueBindings }, context);
   if (value.evidence.runId !== value.runId || value.evidence.projectId !== value.projectId || value.evidence.mediaSha256 !== value.mediaSha256) {
     context.addIssue({ code: "custom", message: "Local evidence must bind to its exact generation run, project, and media." });
   }
@@ -595,10 +636,12 @@ export const LocalAudioDescriptionEvidencePackageSchema = z.object({
   captionEvidenceHash: Sha256Schema,
   retainedAtMs: SafeTimestampSchema,
   outputSha256: Sha256Schema.optional(),
+  verification: HumanEvidenceVerificationSchema.optional(),
   evidence: AudioDescriptionEvidenceBundleSchema,
   beatBindings: z.array(AudioDescriptionEvidenceBindingSchema).max(MAX_STAGED_AUDIO_DESCRIPTIONS),
   requirementBindings: z.array(ExtendedDescriptionRequirementEvidenceBindingSchema).max(MAX_STAGED_EXTENDED_DESCRIPTION_REQUIREMENTS),
 }).strict().superRefine((value, context) => {
+  assertVerificationArtifactIds({ packageId: value.packageId, verification: value.verification, bindings: value.beatBindings }, context);
   if (
     value.evidence.runId !== value.runId
     || value.evidence.projectId !== value.projectId

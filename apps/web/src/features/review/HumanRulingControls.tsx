@@ -1,12 +1,12 @@
 import * as Dialog from "@radix-ui/react-dialog";
-import type { CommandResult, DomainCommand } from "@cuebench/domain";
+import type { CaptionProject, CommandResult, DomainCommand } from "@cuebench/domain";
 import { useEffect, useState } from "react";
 import type { ReviewableItem } from "./review-utils";
 import { humanReviewActor, itemAccessibleLabel } from "./review-utils";
 
 export interface HumanRulingControlsProps {
   readonly item: ReviewableItem | null;
-  readonly projectRevision: number;
+  readonly project: CaptionProject;
   readonly isCommandPending: boolean;
   /** The draft lives in ReviewDocket, which is the authority boundary. */
   readonly hasUnsavedDraft: boolean;
@@ -21,7 +21,7 @@ export interface HumanRulingControlsProps {
  */
 export function HumanRulingControls({
   item,
-  projectRevision,
+  project,
   isCommandPending,
   hasUnsavedDraft,
   commandError,
@@ -36,6 +36,24 @@ export function HumanRulingControls({
   }, [item?.itemId, item?.current.itemRevision]);
 
   const label = item === null ? null : itemAccessibleLabel(item);
+  const evidenceIsCurrent = item !== null && project.evidence.some((evidence) => (
+    evidence.projectId === project.projectId
+    && evidence.mediaSha256 === project.media.sha256
+    && evidence.itemId === item.itemId
+    && evidence.itemRevision === item.current.itemRevision
+  ));
+  const verificationSource = item === null ? null : item.kind === "CaptionCue"
+    ? [...project.localEvidencePackages].reverse().flatMap((entry) => {
+        const binding = entry.cueBindings.find((candidate) => candidate.itemId === item.itemId);
+        return binding === undefined ? [] : [{ packageId: entry.packageId, evidenceIds: binding.evidenceIds }];
+      }).at(0) ?? null
+    : [...project.localAudioDescriptionEvidencePackages].reverse().flatMap((entry) => {
+        const binding = entry.beatBindings.find((candidate) => candidate.itemId === item.itemId);
+        return binding === undefined ? [] : [{ packageId: entry.packageId, evidenceIds: binding.evidenceIds }];
+      }).at(0) ?? null;
+  const canVerifyEvidence = item?.current.state === "Sustained"
+    && !evidenceIsCurrent
+    && verificationSource !== null;
   const object = async () => {
     if (item === null || !reason.trim()) return;
     const result = await onExecuteCommand({
@@ -43,7 +61,7 @@ export function HumanRulingControls({
       actor: humanReviewActor,
       itemId: item.itemId,
       expectedItemRevision: item.current.itemRevision,
-      expectedProjectRevision: projectRevision,
+      expectedProjectRevision: project.projectRevision,
       reason: reason.trim(),
     }, `Objected ${label} as a Human ruling.`);
     if (result !== null && result.error === undefined) setObjectOpen(false);
@@ -56,8 +74,24 @@ export function HumanRulingControls({
       actor: humanReviewActor,
       itemId: item.itemId,
       expectedItemRevision: item.current.itemRevision,
-      expectedProjectRevision: projectRevision,
+      expectedProjectRevision: project.projectRevision,
     }, `Sustained ${label} as a Human ruling.`);
+  };
+
+  const verifyEvidence = () => {
+    if (item === null || verificationSource === null || !canVerifyEvidence) return;
+    const verificationId = `verification-${globalThis.crypto.randomUUID()}`;
+    void onExecuteCommand({
+      type: "VerifyItemEvidence",
+      actor: humanReviewActor,
+      itemId: item.itemId,
+      expectedItemRevision: item.current.itemRevision,
+      expectedProjectRevision: project.projectRevision,
+      sourcePackageId: verificationSource.packageId,
+      verificationPackageId: verificationId,
+      verificationEvidenceIds: verificationSource.evidenceIds.map((_, index) => `${verificationId}-${index + 1}`),
+      verifiedAtMs: Date.now(),
+    }, `Verified retained evidence for ${label} r${item.current.itemRevision}. Historical bindings remain unchanged.`);
   };
 
   return (
@@ -71,7 +105,7 @@ export function HumanRulingControls({
       ) : hasUnsavedDraft ? (
         <p id="ruling-draft-guard">Save or discard the draft before a human ruling. Rulings always bind the displayed saved revision.</p>
       ) : (
-        <p>Object records a reason. Sustain accepts this exact revision and records Human attribution.</p>
+        <p>Object or Sustain records the ruling. If this revision changed, verify its retained source evidence separately before certification.</p>
       )}
       <div className="ruling-panel__actions">
         <Dialog.Root open={objectOpen} onOpenChange={setObjectOpen}>
@@ -113,6 +147,18 @@ export function HumanRulingControls({
         >
           {item?.current.state === "Sustained" ? "Sustained" : "Sustain"}
         </button>
+        {item?.current.state !== "Sustained" || evidenceIsCurrent || verificationSource === null ? null : (
+          <button
+            className="button button--outline ruling-panel__verify"
+            type="button"
+            disabled={isCommandPending || hasUnsavedDraft}
+            aria-label="Verify retained evidence for selected revision"
+            aria-describedby={hasUnsavedDraft ? "ruling-draft-guard" : undefined}
+            onClick={verifyEvidence}
+          >
+            Verify retained evidence
+          </button>
+        )}
       </div>
     </section>
   );

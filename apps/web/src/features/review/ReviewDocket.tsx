@@ -19,6 +19,7 @@ import {
   type EvidenceContentResolver,
 } from "../evidence/EvidenceInspector";
 import { QualityFindings } from "../evidence/QualityFindings";
+import { AudioDescriptionGapComposer } from "./AudioDescriptionGapComposer";
 import { HumanRulingControls } from "./HumanRulingControls";
 import { SelectedItemPanel } from "./SelectedItemPanel";
 import type { NarrationPreviewGateway } from "./NarrationPreview";
@@ -245,6 +246,7 @@ export function ReviewDocket({ project, onCommand, onSeekToMediaTime, footer, ev
   const initialFocusRequested = useRef(false);
   const [draft, setDraft] = useState<ReviewDraft | null>(() => selectedItem === null ? null : reviewDraftForItem(selectedItem));
   const draftRef = useRef(draft);
+  const previousCanonicalProjectRef = useRef(project);
   const pendingTimelineRebaseRef = useRef<{ readonly itemId: string; readonly itemRevision: number; readonly projectRevision: number } | null>(null);
   const browserAgentNavigationSettlersRef = useRef(new Set<(accepted: boolean) => void>());
   draftRef.current = draft;
@@ -312,6 +314,34 @@ export function ReviewDocket({ project, onCommand, onSeekToMediaTime, footer, ev
       setFocusAfterSelection((current) => current ?? { itemId: selectedItem.itemId });
     }
   }, [selectedItem]);
+
+  useLayoutEffect(() => {
+    const previousProject = previousCanonicalProjectRef.current;
+    previousCanonicalProjectRef.current = project;
+    if (previousProject === project) return;
+    const currentDraft = draftRef.current;
+    if (currentDraft === null) return;
+    const previousItem = reviewItemForId(previousProject, currentDraft.itemId);
+    const canonicalItem = reviewItemForId(project, currentDraft.itemId);
+    const canonicalSelection = currentSelectedItem(project);
+    if (
+      previousItem === null
+      || canonicalItem === null
+      || canonicalSelection?.itemId !== canonicalItem.itemId
+      || previousItem.current.itemRevision === canonicalItem.current.itemRevision
+    ) return;
+    // Commands owned outside the docket (notably WebMCP) publish through the
+    // same store, but cannot call the timeline's eager rebase callback. A
+    // clean draft may follow its exact immutable successor; a Human-modified
+    // draft fails this comparison and remains protected by the normal guard.
+    if (!reviewDraftIsCleanForRevision(currentDraft, previousItem, previousItem.current)) return;
+    pendingTimelineRebaseRef.current = {
+      itemId: canonicalItem.itemId,
+      itemRevision: canonicalItem.current.itemRevision,
+      projectRevision: project.projectRevision,
+    };
+    replaceDraft(reviewDraftForItem(canonicalItem));
+  }, [project, replaceDraft]);
 
   useEffect(() => {
     if (timelineRebasePending) return;
@@ -814,6 +844,12 @@ export function ReviewDocket({ project, onCommand, onSeekToMediaTime, footer, ev
     return result;
   }, [executeCommand, syncDraftToCanonical]);
 
+  const acceptGapBeat = useCallback((result: CommandResult, beatId: string) => {
+    syncDraftToCanonical(result.project, beatId);
+    setFilter("all");
+    setFocusAfterSelection({ itemId: beatId });
+  }, [syncDraftToCanonical]);
+
   const renderDocketItem = (item: ReviewableItem, index: number) => {
     const findings = findingsForItem(indexes, item.itemId);
     const evidence = evidenceForItem(indexes, item.itemId);
@@ -864,6 +900,13 @@ export function ReviewDocket({ project, onCommand, onSeekToMediaTime, footer, ev
         ))}
       </div>
       <QualityFindings project={project} indexes={indexes} onFocusFinding={focusFinding} disabled={isCommandPending} />
+      <AudioDescriptionGapComposer
+        project={project}
+        isCommandPending={isCommandPending}
+        hasUnsavedDraft={hasUnsavedDraft}
+        onExecuteCommand={executeCommand}
+        onAcceptedBeat={acceptGapBeat}
+      />
       <div className={`docket-content${windowed ? " docket-content--windowed" : ""}`}>
         {filteredItems.length === 0 ? (
           <p className="empty-docket">{items.length === 0 ? "Caption generation will place proposed cues here for human review." : "No items match this review-state filter."}</p>
@@ -894,7 +937,7 @@ export function ReviewDocket({ project, onCommand, onSeekToMediaTime, footer, ev
         {...(evidenceContentResolver === undefined ? {} : { evidenceContentResolver })}
         {...(narrationPreviewGateway === undefined ? {} : { narrationPreviewGateway })}
       />
-      <HumanRulingControls item={selectedItem} projectRevision={project.projectRevision} isCommandPending={isCommandPending} hasUnsavedDraft={hasUnsavedDraft} commandError={errorAnnouncement} onExecuteCommand={executeRuling} />
+      <HumanRulingControls item={selectedItem} project={project} isCommandPending={isCommandPending} hasUnsavedDraft={hasUnsavedDraft} commandError={errorAnnouncement} onExecuteCommand={executeRuling} />
       {footer}
       {acceptedAnnouncement === null ? null : <p className="review-accepted-feedback" role="status" aria-live="polite">{acceptedAnnouncement}</p>}
       {errorAnnouncement === null ? null : <p className="review-command-feedback" role="alert" aria-live="assertive">{errorAnnouncement}</p>}

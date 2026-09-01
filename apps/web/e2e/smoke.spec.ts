@@ -1,8 +1,33 @@
-import { expect, test } from "@playwright/test";
+import { expect, test } from "./fixtures/test";
+
+test("the release preview serves the configured Cloudflare Worker runtime", async ({ request }) => {
+  const response = await request.get("/api/health");
+  expect(response.ok()).toBe(true);
+  expect(response.headers()["content-type"]).toContain("application/json");
+  expect(await response.json()).toEqual({ status: "ok" });
+});
+
+test("the configured browser page blocks and records every non-loopback request before transport", async ({ page, loopbackNetworkGuard }) => {
+  await page.setViewportSize({ width: 320, height: 720 });
+  await page.goto("/");
+  const result = await page.evaluate(async () => {
+    try {
+      await fetch("https://cuebench-hermetic-probe.invalid/never-leaves-the-browser");
+      return "unexpected-success";
+    } catch {
+      return "blocked";
+    }
+  });
+
+  expect(result).toBe("blocked");
+  expect(loopbackNetworkGuard.takeBlockedRequests()).toEqual([
+    "https://cuebench-hermetic-probe.invalid/never-leaves-the-browser",
+  ]);
+});
 
 const openWorkbench = async (page: import("@playwright/test").Page) => {
   await page.goto("/");
-  await page.getByRole("button", { name: "Open bundled media fixture" }).click();
+  await page.getByRole("button", { name: "Open Gibbs lesson" }).click();
   const temporaryChoice = page.getByRole("dialog", { name: "Temporary session required" });
   const video = page.getByLabel("Verified local source media");
   await expect(temporaryChoice.or(video)).toBeVisible();
@@ -16,7 +41,7 @@ test("the local project start remains usable without a Browser Agent", async ({ 
   await page.goto("/");
 
   await expect(page.getByRole("heading", { name: "Set the evidence on the bench." })).toBeVisible();
-  await expect(page.getByRole("button", { name: "Open bundled media fixture" })).toBeEnabled();
+  await expect(page.getByRole("button", { name: "Open Gibbs lesson" })).toBeEnabled();
   await expect(page.getByRole("button", { name: "Upload local video" })).toBeEnabled();
   await expect(page.getByLabel("Local storage notice")).toContainText("canonical project store");
 
@@ -29,7 +54,7 @@ test("the hardened timeline stays evidence-led in the first desktop viewport and
   await page.setViewportSize({ width: 1536, height: 1024 });
   await openWorkbench(page);
 
-  await expect(page.getByTestId("media-evidence-status")).toHaveText("No audio track in this source.");
+  await expect(page.getByTestId("media-evidence-status")).toHaveText("Waveform pending local evidence preparation.");
   await expect(page.getByRole("button", { name: "Mute source audio" })).toBeVisible();
   await expect(page.getByRole("slider", { name: "Source audio volume" })).toBeVisible();
   await expect(page.getByRole("heading", { name: "Shared timeline" })).toBeVisible();

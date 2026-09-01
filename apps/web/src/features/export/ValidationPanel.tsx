@@ -118,20 +118,28 @@ export function ValidationPanel({ project, onCommand, findings = project.validat
             <h3 id="validation-findings-heading">Current findings</h3>
             {findings.length === 0 ? <p>No findings are attached to the available validation run.</p> : (
               <ul className="validation-panel__list">
-                {findings.map((finding) => (
-                  <li key={finding.findingId} className={`validation-panel__finding validation-panel__finding--${finding.severity}`}>
-                    <div>
-                      <strong>{findingLabel(finding)}</strong>
-                      <p>{finding.message}</p>
-                      <span>{finding.ruleId} · {finding.findingId}</span>
-                    </div>
-                    {finding.severity === "warning" ? (
-                      <button className="button button--outline" type="button" disabled={pending} onClick={() => beginWaiver(finding)} aria-label={`Waive warning ${finding.findingId}`}>
-                        Waive warning
-                      </button>
-                    ) : <span className="validation-panel__cannot-waive">Resolve required</span>}
-                  </li>
-                ))}
+                {findings.map((finding) => {
+                  const waiver = project.warningWaivers[finding.findingId];
+                  return (
+                    <li key={finding.findingId} className={`validation-panel__finding validation-panel__finding--${finding.severity}`}>
+                      <div>
+                        <strong>{findingLabel(finding)}</strong>
+                        <p>{finding.message}</p>
+                        <span>{finding.ruleId} · {finding.findingId}</span>
+                      </div>
+                      {finding.severity === "warning" ? waiver === undefined ? (
+                        <button className="button button--outline" type="button" disabled={pending} onClick={() => beginWaiver(finding)} aria-label={`Waive warning ${finding.findingId}`}>
+                          Waive warning
+                        </button>
+                      ) : (
+                        <div className="validation-panel__waiver">
+                          <strong>Waived by Human</strong>
+                          <span>{waiver.reason}</span>
+                        </div>
+                      ) : <span className="validation-panel__cannot-waive">Resolve required</span>}
+                    </li>
+                  );
+                })}
               </ul>
             )}
           </section>

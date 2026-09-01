@@ -300,7 +300,7 @@ describe("CueBenchDatabase", () => {
     });
   });
 
-  it("persists AD evidence bindings through a human ruling and removes visual provenance after media relink", async () => {
+  it("keeps AD evidence history immutable, appends an explicit verification, and removes retained visual packages after media relink", async () => {
     const db = testDatabase();
     const initial = audioDescriptionAdoptionFixture();
     await initializeProject(db, initial);
@@ -332,13 +332,61 @@ describe("CueBenchDatabase", () => {
       expectedItemRevision: 1,
       expectedProjectRevision: adopted.project.projectRevision,
     });
-    expect(sustained.project.localAudioDescriptionEvidencePackages[0]?.beatBindings).toEqual(expect.arrayContaining([
-      expect.objectContaining({ itemId: "ad-generated-1", itemRevision: 2 }),
+    expect(sustained.error).toBeUndefined();
+    expect(sustained.project.localAudioDescriptionEvidencePackages).toHaveLength(1);
+    expect(sustained.project.localAudioDescriptionEvidencePackages[0]?.beatBindings).toEqual([
+      expect.objectContaining({ itemId: "ad-generated-1", itemRevision: 1 }),
+    ]);
+    expect(sustained.project.evidence).toContainEqual(expect.objectContaining({
+      evidenceId: "frame-1",
+      itemRevision: 1,
+    }));
+
+    const verified = await executePersistentCommand(db, initial.projectId, {
+      type: "VerifyItemEvidence",
+      actor: { type: "Human", id: "teacher" },
+      itemId: "ad-generated-1",
+      expectedItemRevision: 2,
+      expectedProjectRevision: sustained.project.projectRevision,
+      sourcePackageId: "ad-run-1",
+      verificationPackageId: "audio-description-ad-run-1-verified-r2",
+      verificationEvidenceIds: ["frame-1-verified-r2"],
+      verifiedAtMs: 1_700_000_001_000,
+    });
+    expect(verified.error).toBeUndefined();
+    expect(verified.project.localAudioDescriptionEvidencePackages).toHaveLength(2);
+    expect(verified.project.localAudioDescriptionEvidencePackages[0]?.beatBindings[0]).toMatchObject({
+      itemId: "ad-generated-1",
+      itemRevision: 1,
+      evidenceIds: ["frame-1"],
+    });
+    expect(verified.project.localAudioDescriptionEvidencePackages[1]?.beatBindings[0]).toMatchObject({
+      itemId: "ad-generated-1",
+      itemRevision: 2,
+      evidenceIds: ["frame-1-verified-r2"],
+    });
+    const persistedVerification = await loadProject(db, initial.projectId);
+    expect(persistedVerification?.evidence).toEqual(expect.arrayContaining([
+      expect.objectContaining({ evidenceId: "frame-1", itemRevision: 1 }),
+      expect.objectContaining({ evidenceId: "frame-1-verified-r2", itemRevision: 2 }),
     ]));
+    expect(persistedVerification?.localAudioDescriptionEvidencePackages[1]?.verification).toEqual({
+      kind: "HumanEvidenceVerification",
+      eventId: verified.project.courtRecord.at(-1)?.eventId,
+      sourcePackageId: "ad-run-1",
+      actor: { type: "Human", id: "teacher" },
+      itemId: "ad-generated-1",
+      itemRevision: 2,
+    });
+    expect(persistedVerification?.courtRecord.at(-1)).toMatchObject({
+      type: "VerifyItemEvidence",
+      verificationPackageId: "audio-description-ad-run-1-verified-r2",
+      verificationMediaSha256: "a".repeat(64),
+    });
     const relinked = await executePersistentCommand(db, initial.projectId, {
       type: "RelinkMedia",
       actor: { type: "Human", id: "teacher" },
-      expectedProjectRevision: sustained.project.projectRevision,
+      expectedProjectRevision: verified.project.projectRevision,
       media: { sourceId: "replacement-media", sha256: "b".repeat(64), durationMs: 30_000 },
     });
     expect(relinked.error).toBeUndefined();
@@ -596,7 +644,7 @@ describe("CueBenchDatabase", () => {
     expect(await db.courtRecord.where("projectId").equals("project-1").count()).toBe(1);
   });
 
-  it("appends versioned evidence and validation findings without replacing prior immutable rows", async () => {
+  it("retains evidence rows unchanged through rulings and appends validation findings", async () => {
     const db = testDatabase();
     const project = {
       ...fixtureProject(),
@@ -612,9 +660,9 @@ describe("CueBenchDatabase", () => {
 
     await executePersistentCommand(db, "project-1", humanSustainCommand());
     const evidenceHistory = await db.evidence.where("projectId").equals("project-1").toArray();
-    expect(evidenceHistory).toHaveLength(2);
-    expect(evidenceHistory.map((row) => row.version).sort()).toEqual([1, 2]);
-    expect((await loadProject(db, "project-1"))?.evidence[0]?.itemRevision).toBe(2);
+    expect(evidenceHistory).toHaveLength(1);
+    expect(evidenceHistory.map((row) => row.version)).toEqual([1]);
+    expect((await loadProject(db, "project-1"))?.evidence[0]?.itemRevision).toBe(1);
 
     const validation = await executePersistentCommand(db, "project-1", {
       type: "ValidateProject",
@@ -760,7 +808,7 @@ describe("CueBenchDatabase", () => {
     expect(await loadProject(upgraded, "project-1")).toEqual(aggregate);
     const result = await executePersistentCommand(upgraded, "project-1", humanSustainCommand());
     expect(result.error).toBeUndefined();
-    expect((await upgraded.evidence.where("projectId").equals("project-1").toArray()).map((row) => row.version).sort()).toEqual([1, 2]);
+    expect((await upgraded.evidence.where("projectId").equals("project-1").toArray()).map((row) => row.version)).toEqual([1]);
     expect(await loadProject(upgraded, "project-1")).toEqual(result.project);
   });
 

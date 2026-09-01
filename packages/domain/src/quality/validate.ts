@@ -434,14 +434,32 @@ export const validateProject = (project: CaptionProject): ValidationRun => {
   const currentItemsById = new Map<string, CaptionCue | AudioDescriptionBeat>(
     currentProjectItems(project).map((item) => [item.itemId, item]),
   );
+  const currentEvidenceItemIds = new Set(project.evidence.flatMap((evidence) => {
+    if (
+      evidence.projectId !== project.projectId
+      || evidence.mediaSha256 !== project.media.sha256
+      || evidence.itemId === null
+      || evidence.itemRevision === null
+    ) return [];
+    const item = currentItemsById.get(evidence.itemId);
+    return item?.current.itemRevision === evidence.itemRevision ? [evidence.itemId] : [];
+  }));
   for (const evidence of project.evidence) {
     const boundItem = evidence.itemId === null ? undefined : currentItemsById.get(evidence.itemId);
     const target = boundItem === undefined ? projectTarget : itemTarget(boundItem);
+    const revisionIsHistorical = evidence.itemId !== null
+      && evidence.itemRevision !== null
+      && boundItem !== undefined
+      && evidence.projectId === project.projectId
+      && evidence.mediaSha256 === project.media.sha256
+      && evidence.itemRevision !== boundItem.current.itemRevision
+      && boundItem.revisions.some((revision) => revision.itemRevision === evidence.itemRevision)
+      && currentEvidenceItemIds.has(evidence.itemId);
     const stale = evidence.projectId !== project.projectId
       || evidence.mediaSha256 !== project.media.sha256
       || (evidence.itemId === null) !== (evidence.itemRevision === null)
       || (evidence.itemId !== null && (
-        boundItem === undefined || boundItem.current.itemRevision !== evidence.itemRevision
+        boundItem === undefined || (boundItem.current.itemRevision !== evidence.itemRevision && !revisionIsHistorical)
       ));
     if (stale) {
       add("evidence.stale", "blocker", "Evidence provenance no longer matches the current project, media, or item revision.", target);
@@ -686,6 +704,29 @@ export const validateProject = (project: CaptionProject): ValidationRun => {
 const reviewStates = new Set<ReviewState>(["Proposed", "AgentReady", "Objected", "Sustained"]);
 
 /**
+ * Validation inputs intentionally carry only the current item payload, while
+ * evidence is append-only and may retain bindings to earlier revisions. Item
+ * revisions are a contiguous, positive sequence, so any positive revision
+ * below the current revision is historical without trusting it as current.
+ * Reconstruct only the referenced revisions needed by the evidence rule.
+ */
+const referencedHistoricalRevisions = (
+  input: ValidationInputSnapshot,
+  itemId: string,
+  currentItemRevision: number,
+): readonly number[] => [...new Set(input.evidence.flatMap((evidence) => (
+  evidence.projectId === input.projectId
+    && evidence.mediaSha256 === input.media.sha256
+    && evidence.itemId === itemId
+    && evidence.itemRevision !== null
+    && Number.isSafeInteger(evidence.itemRevision)
+    && evidence.itemRevision > 0
+    && evidence.itemRevision < currentItemRevision
+    ? [evidence.itemRevision]
+    : []
+)))].sort(compareNumber);
+
+/**
  * Rebuilds the minimum aggregate required by the deterministic rule engine
  * from an immutable validation input. This is intentionally pure: callers
  * can verify stored validation findings without trusting a serialized result.
@@ -715,7 +756,14 @@ const projectFromValidationInput = (input: ValidationInputSnapshot): CaptionProj
     captions[item.itemId] = {
       itemId: item.itemId,
       kind: "CaptionCue",
-      revisions: [revision],
+      revisions: [
+        ...referencedHistoricalRevisions(input, item.itemId, item.itemRevision).map((itemRevision) => ({
+          ...revision,
+          itemRevision,
+          cause: "Historical evidence revision reconstruction.",
+        })),
+        revision,
+      ],
       current: revision,
       mergedIntoItemId: item.mergedIntoItemId ?? null,
     };
@@ -739,7 +787,14 @@ const projectFromValidationInput = (input: ValidationInputSnapshot): CaptionProj
     audioDescriptions[item.itemId] = {
       itemId: item.itemId,
       kind: "AudioDescriptionBeat",
-      revisions: [revision],
+      revisions: [
+        ...referencedHistoricalRevisions(input, item.itemId, item.itemRevision).map((itemRevision) => ({
+          ...revision,
+          itemRevision,
+          cause: "Historical evidence revision reconstruction.",
+        })),
+        revision,
+      ],
       current: revision,
       supersededByRunId: item.supersededByRunId ?? null,
     };

@@ -1,12 +1,14 @@
 import "fake-indexeddb/auto";
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import {
+  applyCommand,
   createProject,
   exportProjectBackup,
   type CaptionProject,
   type ProjectImportDescriptor,
   type ProjectImportPreview,
 } from "@cuebench/domain";
+import type { LocalCaptionEvidencePackage } from "@cuebench/contracts";
 import { CueBenchDatabase, loadProject, saveNarrationBlob } from "@cuebench/storage";
 import {
   createActiveRunTools,
@@ -116,6 +118,94 @@ const bundledFile = (): File => Object.assign(new Blob(["fixture-media"], { type
   name: "fixture.mp4",
   lastModified: 0,
 }) as File;
+
+const verifiedBackupProject = (): CaptionProject => {
+  const project = createProject({
+    projectId: "verified-import-project",
+    title: "Verified evidence import",
+    media: {
+      sourceId: "verified-import-media",
+      sha256: "dac1fed13aa242918137de32273ba0b85544a6cf762c16d8fea8d5a3085b8f19",
+      durationMs: 90_000,
+      relinkState: "Linked",
+    },
+    captions: [{
+      kind: "CaptionCue",
+      itemId: "verified-cue",
+      state: "Proposed",
+      startMs: 1_000,
+      endMs: 3_000,
+      text: "Dr. Winn explains the result.",
+      speaker: "Teacher",
+      actor: { type: "BrowserAgent", id: "browser-agent" },
+      cause: "generated",
+    }],
+    evidence: [{
+      evidenceId: "verified-source-word",
+      projectId: "verified-import-project",
+      mediaSha256: "dac1fed13aa242918137de32273ba0b85544a6cf762c16d8fea8d5a3085b8f19",
+      itemId: "verified-cue",
+      itemRevision: 1,
+    }],
+  });
+  const sourcePackage: LocalCaptionEvidencePackage = {
+    packageId: "verified-source-package",
+    runId: "verified-source-run",
+    projectId: project.projectId,
+    mediaSha256: project.media.sha256,
+    expectedProjectRevision: project.projectRevision,
+    expectedQualityProfileRevision: project.qualityProfile.revision,
+    retainedAtMs: 1_700_000_000_000,
+    outputSha256: "8".repeat(64),
+    evidence: {
+      contractVersion: 1,
+      runId: "verified-source-run",
+      projectId: project.projectId,
+      mediaSha256: project.media.sha256,
+      preparedManifest: { key: "prepared/source/manifest.json", sha256: "a".repeat(64) },
+      normalizedAudio: { key: "prepared/source/audio.wav", sha256: "b".repeat(64), byteLength: 4, durationMs: 90_000, contentType: "audio/wav" },
+      words: [{ evidenceId: "verified-source-word", sourceWordIndex: 0, startMs: 1_000, endMs: 3_000, text: "caption", speaker: "Teacher", speakerSegmentIds: ["speaker-1"] }],
+      speakerSegments: [{ id: "speaker-1", startMs: 1_000, endMs: 3_000, speaker: "Teacher", text: "caption" }],
+      uncertaintySpans: [],
+      provenance: [
+        { role: "diarization", model: "fixture", requestHash: "c".repeat(64), responseHash: "d".repeat(64), store: false, requestMetadata: {}, warnings: [] },
+        { role: "word-timestamps", model: "fixture", requestHash: "e".repeat(64), responseHash: "f".repeat(64), store: false, requestMetadata: {}, warnings: [] },
+      ],
+    },
+    cueBindings: [{ cueId: "verified-cue", itemId: "verified-cue", itemRevision: 1, evidenceIds: ["verified-source-word"] }],
+  };
+  const sourced = { ...project, localEvidencePackages: [sourcePackage] };
+  const revised = applyCommand(sourced, {
+    type: "ReviseCue",
+    actor: { type: "BrowserAgent", id: "browser-agent" },
+    cueId: "verified-cue",
+    expectedItemRevision: 1,
+    expectedProjectRevision: sourced.projectRevision,
+    patch: { text: "Dr. Nguyen explains the result." },
+  });
+  if (revised.error !== undefined) throw new Error(revised.error.message);
+  const sustained = applyCommand(revised.project, {
+    type: "SustainItem",
+    actor: { type: "Human", id: "human" },
+    itemId: "verified-cue",
+    expectedItemRevision: 2,
+    expectedProjectRevision: revised.project.projectRevision,
+  });
+  if (sustained.error !== undefined) throw new Error(sustained.error.message);
+  const verified = applyCommand(sustained.project, {
+    type: "VerifyItemEvidence",
+    actor: { type: "Human", id: "human" },
+    itemId: "verified-cue",
+    expectedItemRevision: 3,
+    expectedProjectRevision: sustained.project.projectRevision,
+    sourcePackageId: "verified-source-package",
+    verificationPackageId: "verified-reconciliation-package",
+    verificationEvidenceIds: ["verified-reconciliation-word"],
+    verifiedAtMs: 1_700_000_001_000,
+  });
+  if (verified.error !== undefined) throw new Error(verified.error.message);
+  return verified.project;
+};
 
 const deferred = <Value,>() => {
   let resolve!: (value: Value) => void;
@@ -1154,5 +1244,42 @@ describe("Backup, relink, and deletion human workflows", () => {
     expect(importer.getSnapshot()).toMatchObject({ route: "workbench", mode: "durable", project: { projectId: imported.project.projectId } });
     await producerDatabase.delete();
     await importDatabase.delete();
+  });
+
+  it("exports, previews, relinks, and imports a verified evidence Court Record without rewriting history", async () => {
+    const source = verifiedBackupProject();
+    const portableText = JSON.stringify(exportProjectBackup(source));
+    const database = new CueBenchDatabase(`task-20-verified-import-${crypto.randomUUID()}`);
+    const importer = new ProjectStore({
+      database,
+      browserStorage: browserStorage(),
+      objectUrlLease: new ObjectUrlLease({ createObjectURL: vi.fn(() => "blob:cuebench:verified-import"), revokeObjectURL: vi.fn() }),
+      mediaDurationProbe: async () => 90_000,
+    });
+
+    const preview = await importer.previewBackupText(portableText);
+    expect(preview).toMatchObject({ mode: "preview", canImport: false, mediaRelink: { status: "required" } });
+    const relinked = await importer.relinkImportedMedia(bundledFile());
+    expect(relinked).toMatchObject({ mode: "preview", canImport: true, mediaRelink: { status: "verified" } });
+    const imported = await importer.importPreviewedBackup();
+
+    expect(imported.project.evidence).toEqual(source.evidence);
+    expect(imported.project.localEvidencePackages).toEqual(source.localEvidencePackages);
+    expect(imported.project.courtRecord).toEqual(source.courtRecord);
+    expect(imported.project.courtRecord.at(-1)).toMatchObject({
+      type: "VerifyItemEvidence",
+      actor: { type: "Human", id: "human" },
+      itemId: "verified-cue",
+    });
+    expect(imported.project.evidence).toEqual([
+      expect.objectContaining({ evidenceId: "verified-source-word", itemRevision: 1 }),
+      expect.objectContaining({ evidenceId: "verified-reconciliation-word", itemRevision: 3 }),
+    ]);
+    expect(await loadProject(database, source.projectId)).toMatchObject({
+      evidence: source.evidence,
+      localEvidencePackages: source.localEvidencePackages,
+      courtRecord: source.courtRecord,
+    });
+    await database.delete();
   });
 });

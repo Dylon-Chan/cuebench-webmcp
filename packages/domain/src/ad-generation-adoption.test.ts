@@ -364,7 +364,7 @@ describe("audio-description generation adoption", () => {
     ]));
   });
 
-  it("carries retained visual bindings through human state rulings and clears their provenance on media relink", () => {
+  it("keeps retained visual bindings immutable, appends explicit verification, and clears active packages on media relink", () => {
     const initial = projectWithCaptionEvidence();
     const leased = applyCommand(initial, {
       type: "StartGenerationRun", actor: ai, runId: "ad-run-1", targetTrack: "AudioDescriptions", expectedProjectRevision: initial.projectRevision,
@@ -396,14 +396,35 @@ describe("audio-description generation adoption", () => {
     });
     expect(sustained.error).toBeUndefined();
     expect(sustained.project.localAudioDescriptionEvidencePackages[0]?.beatBindings).toEqual(expect.arrayContaining([
-      expect.objectContaining({ itemId: "ad-generated-1", itemRevision: 3, evidenceIds: ["frame-1"] }),
+      expect.objectContaining({ itemId: "ad-generated-1", itemRevision: 1, evidenceIds: ["frame-1"] }),
     ]));
-    expect(sustained.project.evidence).toContainEqual(expect.objectContaining({ evidenceId: "frame-1", itemRevision: 3 }));
+    expect(sustained.project.evidence).toContainEqual(expect.objectContaining({ evidenceId: "frame-1", itemRevision: 1 }));
 
-    const relinked = applyCommand(sustained.project, {
+    const verified = applyCommand(sustained.project, {
+      type: "VerifyItemEvidence",
+      actor: human,
+      itemId: "ad-generated-1",
+      expectedItemRevision: 3,
+      expectedProjectRevision: sustained.project.projectRevision,
+      sourcePackageId: "ad-run-1",
+      verificationPackageId: "verification-ad-generated-1-r3",
+      verificationEvidenceIds: ["verification-frame-1"],
+      verifiedAtMs: 1_700_000_000_500,
+    });
+    expect(verified.error).toBeUndefined();
+    expect(verified.project.localAudioDescriptionEvidencePackages[0]).toEqual(sustained.project.localAudioDescriptionEvidencePackages[0]);
+    expect(verified.project.localAudioDescriptionEvidencePackages[1]).toMatchObject({
+      packageId: "verification-ad-generated-1-r3",
+      beatBindings: [{ itemId: "ad-generated-1", itemRevision: 3, evidenceIds: ["verification-frame-1"] }],
+      evidence: { frames: [{ evidenceId: "verification-frame-1" }] },
+    });
+    expect(verified.project.evidence).toContainEqual(expect.objectContaining({ evidenceId: "frame-1", itemRevision: 1 }));
+    expect(verified.project.evidence).toContainEqual(expect.objectContaining({ evidenceId: "verification-frame-1", itemRevision: 3 }));
+
+    const relinked = applyCommand(verified.project, {
       type: "RelinkMedia",
       actor: human,
-      expectedProjectRevision: sustained.project.projectRevision,
+      expectedProjectRevision: verified.project.projectRevision,
       media: { sourceId: "replacement", sha256: "b".repeat(64), durationMs: 30_000 },
     });
     expect(relinked.error).toBeUndefined();

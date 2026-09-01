@@ -7,6 +7,7 @@ import type {
 import {
   LocalAudioDescriptionEvidencePackageSchema,
   LocalCaptionEvidencePackageSchema,
+  VerificationPackageIdSchema,
 } from "@cuebench/contracts";
 import {
   applicableWarningWaivers,
@@ -326,6 +327,8 @@ const DomainEventSchema = z.object({
   actor: ActorStorageSchema,
   itemId: identifier.optional(),
   detail: z.string().optional(),
+  verificationPackageId: VerificationPackageIdSchema.optional(),
+  verificationMediaSha256: z.string().regex(/^[0-9a-f]{64}$/, "Expected a canonical lowercase SHA-256 hash.").optional(),
 }).strict();
 
 const ValidationInputItemSchema = z.object({

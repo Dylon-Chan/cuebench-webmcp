@@ -211,6 +211,10 @@ export interface DomainEvent {
   readonly actor: Actor;
   readonly itemId?: string;
   readonly detail?: string;
+  /** Immutable Human verification binding; present only on VerifyItemEvidence. */
+  readonly verificationPackageId?: string;
+  /** Exact media root independently retained after evidence packages are tombstoned. */
+  readonly verificationMediaSha256?: string;
 }
 
 /**
@@ -238,9 +242,9 @@ export interface CaptionProject {
   readonly title: string;
   readonly media: MediaSourceSnapshot;
   /**
-   * Current evidence-binding projection. State-only review transitions carry
-   * matching bindings to the next revision; semantic revisions leave them on
-   * their prior revision so validation requires fresh evidence.
+   * Append-only evidence-binding history. Item revisions never rewrite a
+   * binding. An explicit retained-evidence verification appends new provenance
+   * for the exact current revision while earlier bindings remain auditable.
    */
   readonly evidence: readonly EvidenceProvenance[];
   /** Bounded adopted transcript evidence, included in local backup and review. */

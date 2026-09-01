@@ -36,6 +36,8 @@ import {
   type ToolSuccess,
   ToolSuccessSchema,
   ValidationSnapshotSchema,
+  VerificationPackageIdSchema,
+  isVerificationPackageId,
 } from "./index";
 
 const SHA_256 = "a".repeat(64);
@@ -153,6 +155,25 @@ describe("versioned revision contracts", () => {
     expect(ItemRevisionSchema.safeParse(0).success).toBe(false);
     expect(IdentifierSchema.safeParse(" ").success).toBe(false);
     expect(ContractVersionSchema.safeParse(2).success).toBe(false);
+  });
+
+  it("preserves broad authored v1 identifiers while isolating verification artifact ids", () => {
+    const authored = "課程 / Dr. Nguyễn — draft № 1";
+    expect(IdentifierSchema.safeParse(authored)).toMatchObject({ success: true });
+    const maximum = `A${"._:-z9".repeat(40).slice(0, 199)}`;
+    expect(maximum).toHaveLength(200);
+    expect(VerificationPackageIdSchema.safeParse(maximum)).toMatchObject({ success: true });
+    expect(isVerificationPackageId(maximum)).toBe(true);
+    for (const invalid of [
+      "verification package",
+      " leading",
+      "trailing ",
+      "-leading-punctuation",
+      `A${"z".repeat(200)}`,
+    ]) {
+      expect(VerificationPackageIdSchema.safeParse(invalid).success, invalid).toBe(false);
+      expect(isVerificationPackageId(invalid), invalid).toBe(false);
+    }
   });
 });
 

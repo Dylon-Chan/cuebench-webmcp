@@ -49,6 +49,7 @@ import type {
   NarrationPreviewRequest,
 } from "../review/NarrationPreview";
 import {
+  BUNDLED_SAMPLE_AUDIO_DESCRIPTION_GAPS,
   BUNDLED_SAMPLE_DURATION_MS,
   createBundledSampleFile,
 } from "./bundled-sample";
@@ -2008,6 +2009,9 @@ export class ProjectStore {
           durationMs: pendingUpload.durationMs,
           relinkState: "TemporarySession",
         },
+        ...(pendingUpload.sourceProvenance.sourceKind === "bundled-fixture"
+          ? { audioDescriptionGaps: BUNDLED_SAMPLE_AUDIO_DESCRIPTION_GAPS }
+          : {}),
       });
       const sourceObjectUrl = objectUrlLease.replace(pendingUpload.file);
       this.setSnapshot({
@@ -2068,6 +2072,9 @@ export class ProjectStore {
           durationMs: media.durationMs,
           relinkState: "Linked",
         },
+        ...(pendingUpload.sourceProvenance.sourceKind === "bundled-fixture"
+          ? { audioDescriptionGaps: BUNDLED_SAMPLE_AUDIO_DESCRIPTION_GAPS }
+          : {}),
       });
       await initializeProject(this.database, project);
       if (!this.isCurrent(epoch)) {

@@ -108,6 +108,18 @@ export type DomainCommand =
       readonly reason: string;
     })
   | (ItemCommandBase & { readonly type: "SustainItem" })
+  | (ItemCommandBase & {
+      /**
+       * Human-only reconciliation of retained source evidence with one exact
+       * current Sustained revision. The reducer appends a new bounded package
+       * and new provenance ids; it never rewrites the historical binding.
+       */
+      readonly type: "VerifyItemEvidence";
+      readonly sourcePackageId: string;
+      readonly verificationPackageId: string;
+      readonly verificationEvidenceIds: readonly string[];
+      readonly verifiedAtMs: number;
+    })
   | (CommandBase & {
       /** Persists a complete deterministic validation run. Only System may execute it. */
       readonly type: "ValidateProject";

@@ -8,6 +8,7 @@ import {
   MAX_LOCAL_CAPTION_EVIDENCE_TOTAL_WORDS,
   MAX_LOCAL_CAPTION_EVIDENCE_WORDS,
   MAX_PORTABLE_PROJECT_JSON_NODES,
+  isVerificationPackageId,
   type Actor,
   type CaptionEvidenceWord,
   type CertificationSnapshot,
@@ -190,8 +191,19 @@ const retainLocalEvidencePackages = (
   requiredRunId: string,
 ): readonly LocalCaptionEvidencePackage[] | null => {
   const protectedIds = new Set(candidates
-    .filter((entry) => packageSupportsLiveSustainedCue(project, entry))
+    .filter((entry) => packageSupportsLiveSustainedCue(project, entry) || entry.verification !== undefined)
     .map((entry) => entry.packageId));
+  let expandedProtection = true;
+  while (expandedProtection) {
+    expandedProtection = false;
+    for (const entry of candidates) {
+      const sourcePackageId = entry.verification?.sourcePackageId;
+      if (protectedIds.has(entry.packageId) && sourcePackageId !== undefined && !protectedIds.has(sourcePackageId)) {
+        protectedIds.add(sourcePackageId);
+        expandedProtection = true;
+      }
+    }
+  }
   if (protectedIds.size > MAX_LOCAL_CAPTION_EVIDENCE_PACKAGES) return null;
   // Keep newer unreferenced history first, then evict it oldest-first until
   // every shared portable budget holds. A package referenced by a live
@@ -243,8 +255,19 @@ const retainLocalAudioDescriptionEvidencePackages = (
   requiredRunId: string,
 ): readonly LocalAudioDescriptionEvidencePackage[] | null => {
   const protectedIds = new Set(candidates
-    .filter((entry) => audioDescriptionPackageSupportsLiveSustainedBeat(project, entry))
+    .filter((entry) => audioDescriptionPackageSupportsLiveSustainedBeat(project, entry) || entry.verification !== undefined)
     .map((entry) => entry.packageId));
+  let expandedProtection = true;
+  while (expandedProtection) {
+    expandedProtection = false;
+    for (const entry of candidates) {
+      const sourcePackageId = entry.verification?.sourcePackageId;
+      if (protectedIds.has(entry.packageId) && sourcePackageId !== undefined && !protectedIds.has(sourcePackageId)) {
+        protectedIds.add(sourcePackageId);
+        expandedProtection = true;
+      }
+    }
+  }
   if (protectedIds.size > MAX_LOCAL_AUDIO_DESCRIPTION_EVIDENCE_PACKAGES) return null;
   const retained = [...candidates].sort((left, right) => (
     left.retainedAtMs - right.retainedAtMs || left.runId.localeCompare(right.runId)
@@ -276,12 +299,18 @@ const eventFor = (project: CaptionProject, command: DomainCommand, itemId?: stri
   type: command.type === "AppendCourtRecord" ? command.eventType : command.type,
   actor: clone(command.actor),
   ...(itemId === undefined ? {} : { itemId }),
+  ...(command.type === "VerifyItemEvidence" ? {
+    verificationPackageId: command.verificationPackageId,
+    verificationMediaSha256: project.media.sha256.toLowerCase(),
+  } : {}),
   ...(command.type === "ObjectItem"
     ? { detail: command.reason }
     : command.type === "AdoptCaptionGenerationResult" || command.type === "AdoptAudioDescriptionGenerationResult"
       // Persist the immutable run identity in Court Record rather than
       // relying on a short-lived Worker receipt to reconstruct a backup.
       ? { detail: `generation:${command.runId}` }
+      : command.type === "RelinkMedia"
+        ? { detail: `media:${project.media.sha256.toLowerCase()}:${command.media.sha256.toLowerCase()}` }
       : {}),
 });
 
@@ -541,50 +570,11 @@ const audioDescriptionBaseMatches = (
   );
 };
 
-/**
- * Evidence is a current binding projection rather than a mutable history.
- * A state-only review transition preserves the exact provenance by cloning
- * every binding that targeted the previous item revision onto the new one.
- * Semantic edits deliberately do not use this helper.
- */
-const carryEvidenceForReviewState = (
-  project: CaptionProject,
-  previous: CaptionCue | AudioDescriptionBeat,
-  revised: CaptionCue | AudioDescriptionBeat,
-): CaptionProject["evidence"] => project.evidence.map((evidence) => {
-  const copied = clone(evidence);
-  return evidence.itemId === previous.itemId && evidence.itemRevision === previous.current.itemRevision
-    ? { ...copied, itemRevision: revised.current.itemRevision }
-    : copied;
-});
-
-/** Keep canonical Local Evidence Package bindings resolvable after a state-only revision. */
-const carryLocalEvidenceForReviewState = (
-  project: CaptionProject,
-  previous: CaptionCue | AudioDescriptionBeat,
-  revised: CaptionCue | AudioDescriptionBeat,
-): CaptionProject["localEvidencePackages"] => project.localEvidencePackages.map((entry) => ({
-  ...entry,
-  cueBindings: entry.cueBindings.map((binding) => (
-    binding.itemId === previous.itemId && binding.itemRevision === previous.current.itemRevision
-      ? { ...binding, itemRevision: revised.current.itemRevision }
-      : binding
-  )),
-}));
-
-/** Keep retained visual evidence resolvable across a human state-only AD ruling. */
-const carryLocalAudioDescriptionEvidenceForReviewState = (
-  project: CaptionProject,
-  previous: AudioDescriptionBeat,
-  revised: AudioDescriptionBeat,
-): CaptionProject["localAudioDescriptionEvidencePackages"] => project.localAudioDescriptionEvidencePackages.map((entry) => ({
-  ...entry,
-  beatBindings: entry.beatBindings.map((binding) => (
-    binding.itemId === previous.itemId && binding.itemRevision === previous.current.itemRevision
-      ? { ...binding, itemRevision: revised.current.itemRevision }
-      : binding
-  )),
-}));
+const hasUniqueVerificationIdentifiers = (values: readonly string[]): boolean => (
+  values.length > 0
+  && values.every(isVerificationPackageId)
+  && new Set(values).size === values.length
+);
 
 export const applyCommand = (project: CaptionProject, command: DomainCommand): CommandResult => {
   // Generation adoption/release deliberately fence the leased target state,
@@ -1047,14 +1037,16 @@ export const applyCommand = (project: CaptionProject, command: DomainCommand): C
     if (project.activeGenerationRun !== null) return fail(project, "TARGET_TRACK_LEASE_CONFLICT", "Media cannot change while a generation run is active.");
     if (!isFiniteInteger(command.media.durationMs) || command.media.durationMs < 0) return fail(project, "INVALID_ARGUMENT", "Media duration must be a non-negative integer.");
     if (!allTimesFit(project, command.media.durationMs)) return fail(project, "INVALID_ARGUMENT", "Media duration must contain every stored item revision and gap.");
+    const sameMediaContent = command.media.sha256.toLowerCase() === project.media.sha256.toLowerCase();
     // Transcript words and visual frames are evidence of one exact source
-    // hash. Keep historical cue/beat revisions, but never carry canonical
-    // evidence packages, visual provenance, or EDRs across a replacement.
+    // hash. A source-id-only relink to the same content retains its authenticated
+    // package chain; replacement content tombstones every active binding while
+    // leaving immutable evidence history available for audit.
     return commit(project, command, {
       media: { ...clone(command.media), relinkState: "Linked" },
-      localEvidencePackages: [],
-      localAudioDescriptionEvidencePackages: [],
-      audioDescriptionRequirements: {},
+      localEvidencePackages: sameMediaContent ? project.localEvidencePackages : [],
+      localAudioDescriptionEvidencePackages: sameMediaContent ? project.localAudioDescriptionEvidencePackages : [],
+      audioDescriptionRequirements: sameMediaContent ? project.audioDescriptionRequirements : {},
       // Evidence rows are append-only audit history in durable storage. Their
       // old media hash makes them stale and non-resolvable for the relinked
       // source; clearing the local packages/EDRs above removes every active
@@ -1214,6 +1206,167 @@ export const applyCommand = (project: CaptionProject, command: DomainCommand): C
   const item = requireItem(project, expectedItemCommand);
   if ("code" in item) return { project, events: [], error: item };
 
+  if (command.type === "VerifyItemEvidence") {
+    if (!hasHumanAuthority(command.actor)) {
+      return fail(project, "HUMAN_AUTHORITY_REQUIRED", "Only a human may verify retained evidence for a reviewed revision.");
+    }
+    if (item.current.state !== "Sustained") {
+      return fail(project, "INVALID_ARGUMENT", "Retained evidence may be verified only for the exact current Sustained revision.");
+    }
+    if (
+      !isVerificationPackageId(command.verificationPackageId)
+      || !hasUniqueVerificationIdentifiers(command.verificationEvidenceIds)
+      || !isFiniteInteger(command.verifiedAtMs)
+      || command.verifiedAtMs <= 0
+      || project.localEvidencePackages.some((entry) => entry.packageId === command.verificationPackageId)
+      || project.localAudioDescriptionEvidencePackages.some((entry) => entry.packageId === command.verificationPackageId)
+      || command.verificationEvidenceIds.some((evidenceId) => project.evidence.some((entry) => entry.evidenceId === evidenceId))
+    ) return fail(project, "INVALID_ARGUMENT", "Evidence verification needs unique bounded package, provenance, and timestamp identifiers.");
+
+    if (item.kind === "CaptionCue") {
+      const sourcePackage = project.localEvidencePackages.find((entry) => entry.packageId === command.sourcePackageId);
+      const sourceBinding = sourcePackage?.cueBindings.find((binding) => binding.itemId === item.itemId);
+      if (
+        sourcePackage === undefined
+        || sourceBinding === undefined
+        || sourcePackage.projectId !== project.projectId
+        || sourcePackage.mediaSha256.toLowerCase() !== project.media.sha256.toLowerCase()
+        || sourceBinding.evidenceIds.length !== command.verificationEvidenceIds.length
+      ) return fail(project, "NOT_FOUND", "The retained caption evidence package cannot verify this revision.");
+      const wordsById = new Map(sourcePackage.evidence.words.map((word) => [word.evidenceId, word]));
+      const sourceWords = sourceBinding.evidenceIds.map((evidenceId) => wordsById.get(evidenceId));
+      if (sourceWords.some((word) => word === undefined)) {
+        return fail(project, "INVALID_ARGUMENT", "The retained caption evidence binding no longer resolves to its source words.");
+      }
+      const evidenceIdMap = new Map(sourceBinding.evidenceIds.map((sourceEvidenceId, index) => (
+        [sourceEvidenceId, command.verificationEvidenceIds[index]!] as const
+      )));
+      const verifiedWords = sourceWords.map((word) => ({
+        ...clone(word!),
+        evidenceId: evidenceIdMap.get(word!.evidenceId)!,
+      }));
+      const speakerSegmentIds = new Set(verifiedWords.flatMap((word) => word.speakerSegmentIds));
+      const uncertaintySpans = sourcePackage.evidence.uncertaintySpans
+        .filter((span) => span.evidenceIds.every((evidenceId) => evidenceIdMap.has(evidenceId)))
+        .map((span) => ({ ...clone(span), evidenceIds: span.evidenceIds.map((evidenceId) => evidenceIdMap.get(evidenceId)!) }));
+      const sourcePackageWithoutOutputHash = clone(sourcePackage);
+      Reflect.deleteProperty(sourcePackageWithoutOutputHash, "outputSha256");
+      const verificationPackage: LocalCaptionEvidencePackage = {
+        ...clone(sourcePackageWithoutOutputHash),
+        packageId: command.verificationPackageId,
+        expectedProjectRevision: project.projectRevision,
+        retainedAtMs: command.verifiedAtMs,
+        verification: {
+          kind: "HumanEvidenceVerification",
+          eventId: `${project.projectId}:${project.projectRevision + 1}:${project.courtRecord.length + 1}`,
+          sourcePackageId: command.sourcePackageId,
+          actor: { type: "Human", id: command.actor.id },
+          itemId: item.itemId,
+          itemRevision: item.current.itemRevision,
+        },
+        evidence: {
+          ...clone(sourcePackage.evidence),
+          words: verifiedWords,
+          ...(sourcePackage.evidence.speakerSegments === undefined ? {} : {
+            speakerSegments: sourcePackage.evidence.speakerSegments
+              .filter((segment) => speakerSegmentIds.has(segment.id))
+              .map(clone),
+          }),
+          uncertaintySpans,
+        },
+        cueBindings: [{
+          cueId: item.itemId,
+          itemId: item.itemId,
+          itemRevision: item.current.itemRevision,
+          evidenceIds: [...command.verificationEvidenceIds],
+        }],
+      };
+      const candidateProject: CaptionProject = {
+        ...project,
+        evidence: [...project.evidence, ...command.verificationEvidenceIds.map((evidenceId) => ({
+          evidenceId,
+          projectId: project.projectId,
+          mediaSha256: project.media.sha256.toLowerCase(),
+          itemId: item.itemId,
+          itemRevision: item.current.itemRevision,
+        }))],
+        localEvidencePackages: [...project.localEvidencePackages, verificationPackage],
+      };
+      if (
+        candidateProject.localEvidencePackages.length > MAX_LOCAL_CAPTION_EVIDENCE_PACKAGES
+        || !fitsPortableBackupEnvelope(candidateProject)
+      ) return fail(project, "INVALID_ARGUMENT", "The verified caption evidence would exceed CueBench's portable retained-evidence budget.");
+      return commit(project, command, {
+        evidence: candidateProject.evidence,
+        localEvidencePackages: candidateProject.localEvidencePackages,
+        ...withStaleArtifacts(project),
+      }, item.itemId);
+    }
+
+    const sourcePackage = project.localAudioDescriptionEvidencePackages.find((entry) => entry.packageId === command.sourcePackageId);
+    const sourceBinding = sourcePackage?.beatBindings.find((binding) => binding.itemId === item.itemId);
+    if (
+      sourcePackage === undefined
+      || sourceBinding === undefined
+      || sourcePackage.projectId !== project.projectId
+      || sourcePackage.mediaSha256.toLowerCase() !== project.media.sha256.toLowerCase()
+      || sourceBinding.evidenceIds.length !== command.verificationEvidenceIds.length
+    ) return fail(project, "NOT_FOUND", "The retained audio-description evidence package cannot verify this revision.");
+    const framesById = new Map(sourcePackage.evidence.frames.map((frame) => [frame.evidenceId, frame]));
+    const sourceFrames = sourceBinding.evidenceIds.map((evidenceId) => framesById.get(evidenceId));
+    if (sourceFrames.some((frame) => frame === undefined)) {
+      return fail(project, "INVALID_ARGUMENT", "The retained audio-description binding no longer resolves to its source frames.");
+    }
+    const verifiedFrames = sourceFrames.map((frame, index) => ({
+      ...clone(frame!),
+      evidenceId: command.verificationEvidenceIds[index]!,
+    }));
+    const sourcePackageWithoutOutputHash = clone(sourcePackage);
+    Reflect.deleteProperty(sourcePackageWithoutOutputHash, "outputSha256");
+    const verificationPackage: LocalAudioDescriptionEvidencePackage = {
+      ...clone(sourcePackageWithoutOutputHash),
+      packageId: command.verificationPackageId,
+      expectedProjectRevision: project.projectRevision,
+      retainedAtMs: command.verifiedAtMs,
+      verification: {
+        kind: "HumanEvidenceVerification",
+        eventId: `${project.projectId}:${project.projectRevision + 1}:${project.courtRecord.length + 1}`,
+        sourcePackageId: command.sourcePackageId,
+        actor: { type: "Human", id: command.actor.id },
+        itemId: item.itemId,
+        itemRevision: item.current.itemRevision,
+      },
+      evidence: { ...clone(sourcePackage.evidence), frames: verifiedFrames },
+      beatBindings: [{
+        beatId: item.itemId,
+        itemId: item.itemId,
+        itemRevision: item.current.itemRevision,
+        evidenceIds: [...command.verificationEvidenceIds],
+      }],
+      requirementBindings: [],
+    };
+    const candidateProject: CaptionProject = {
+      ...project,
+      evidence: [...project.evidence, ...command.verificationEvidenceIds.map((evidenceId) => ({
+        evidenceId,
+        projectId: project.projectId,
+        mediaSha256: project.media.sha256.toLowerCase(),
+        itemId: item.itemId,
+        itemRevision: item.current.itemRevision,
+      }))],
+      localAudioDescriptionEvidencePackages: [...project.localAudioDescriptionEvidencePackages, verificationPackage],
+    };
+    if (
+      candidateProject.localAudioDescriptionEvidencePackages.length > MAX_LOCAL_AUDIO_DESCRIPTION_EVIDENCE_PACKAGES
+      || !fitsPortableBackupEnvelope(candidateProject)
+    ) return fail(project, "INVALID_ARGUMENT", "The verified audio-description evidence would exceed CueBench's portable retained-evidence budget.");
+    return commit(project, command, {
+      evidence: candidateProject.evidence,
+      localAudioDescriptionEvidencePackages: candidateProject.localAudioDescriptionEvidencePackages,
+      ...withStaleArtifacts(project),
+    }, item.itemId);
+  }
+
   if (command.type === "MarkItemAgentReady") {
     const leaseError = assertMutable(project, item.kind === "CaptionCue" ? "Captions" : "AudioDescriptions");
     if (leaseError !== undefined) return { project, events: [], error: leaseError };
@@ -1223,8 +1376,6 @@ export const applyCommand = (project: CaptionProject, command: DomainCommand): C
       const revised = appendCaptionRevision(item, command.actor, "AgentReady", command.type);
       return commit(project, command, {
         captions: replaceCaption(project, revised),
-        evidence: carryEvidenceForReviewState(project, item, revised),
-        localEvidencePackages: carryLocalEvidenceForReviewState(project, item, revised),
         selectedItem: selectFor(revised),
         ...withStaleArtifacts(project),
       }, item.itemId);
@@ -1232,8 +1383,6 @@ export const applyCommand = (project: CaptionProject, command: DomainCommand): C
     const revised = appendAudioDescriptionRevision(item, command.actor, "AgentReady", command.type);
     return commit(project, command, {
       audioDescriptions: replaceAudioDescription(project, revised),
-      evidence: carryEvidenceForReviewState(project, item, revised),
-      localAudioDescriptionEvidencePackages: carryLocalAudioDescriptionEvidenceForReviewState(project, item, revised),
       selectedItem: selectFor(revised),
       ...withStaleArtifacts(project),
     }, item.itemId);
@@ -1249,8 +1398,6 @@ export const applyCommand = (project: CaptionProject, command: DomainCommand): C
       const revised = appendCaptionRevision(item, command.actor, state, cause);
       return commit(project, command, {
         captions: replaceCaption(project, revised),
-        evidence: carryEvidenceForReviewState(project, item, revised),
-        localEvidencePackages: carryLocalEvidenceForReviewState(project, item, revised),
         selectedItem: selectFor(revised),
         ...withStaleArtifacts(project),
       }, item.itemId);
@@ -1258,8 +1405,6 @@ export const applyCommand = (project: CaptionProject, command: DomainCommand): C
     const revised = appendAudioDescriptionRevision(item, command.actor, state, cause);
     return commit(project, command, {
       audioDescriptions: replaceAudioDescription(project, revised),
-      evidence: carryEvidenceForReviewState(project, item, revised),
-      localAudioDescriptionEvidencePackages: carryLocalAudioDescriptionEvidenceForReviewState(project, item, revised),
       selectedItem: selectFor(revised),
       ...withStaleArtifacts(project),
     }, item.itemId);

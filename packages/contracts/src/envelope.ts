@@ -6,15 +6,24 @@ export const MAX_CURSOR_LENGTH = 256 as const;
 export const MAX_TRACK_ITEMS_PER_PAGE = 100 as const;
 export const MAX_NEXT_ACTIONS = 12 as const;
 export const MAX_GENERATION_WARNINGS = 20 as const;
+export const VERIFICATION_PACKAGE_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$/u;
+
+/**
+ * Verification artifacts are bound by structured Court Record fields, so
+ * their machine ids use a deliberately narrow, non-transforming grammar.
+ * Authored v1 identifiers remain broad for backward compatibility.
+ */
+export const isVerificationPackageId = (value: unknown): value is string =>
+  typeof value === "string" && VERIFICATION_PACKAGE_ID_PATTERN.test(value);
 
 export const ContractVersionSchema = z.literal(CONTRACT_VERSION);
 export const NonNegativeIntegerSchema = z.number().int().nonnegative();
 export const PositiveIntegerSchema = z.number().int().positive();
-export const IdentifierSchema = z
-  .string()
-  .trim()
-  .min(1)
-  .max(MAX_IDENTIFIER_LENGTH);
+export const IdentifierSchema = z.string().trim().min(1).max(MAX_IDENTIFIER_LENGTH);
+export const VerificationPackageIdSchema = z.string().regex(
+  VERIFICATION_PACKAGE_ID_PATTERN,
+  "Verification artifact id must use 1-200 ASCII letters, digits, dots, underscores, colons, or hyphens and begin with a letter or digit.",
+);
 export const CursorSchema = z.string().trim().min(1).max(MAX_CURSOR_LENGTH);
 
 export const MediaTimeSchema = NonNegativeIntegerSchema;

@@ -3,6 +3,14 @@ const bundledSampleUrl = "/sample/gibbs-free-energy.mp4";
 /** The original, repository-authored Gibbs lesson emitted as a public Vite asset. */
 export const BUNDLED_SAMPLE_DURATION_MS = 90_000;
 export const BUNDLED_SAMPLE_FILE_NAME = "gibbs-free-energy.mp4";
+/** The checked-in silent diagram interval used for visible, bounded AD authoring. */
+export const BUNDLED_SAMPLE_AUDIO_DESCRIPTION_GAPS = [{
+  gapId: "gibbs-diagram-gap",
+  gapRevision: 1,
+  state: "Available" as const,
+  startMs: 52_000,
+  endMs: 62_000,
+}] as const;
 
 /**
  * Fetches the same-origin emitted fixture into a fresh Blob so it follows the

@@ -472,7 +472,7 @@ export function Timeline({
         data-viewport-start-ms={viewport.viewportStartMs}
         data-visible-end-ms={transform.visibleEndMs}
       >
-        <div className="timeline-waveform" aria-label="Waveform peak evidence">
+        <div className="timeline-waveform" role="img" aria-label="Waveform peak evidence">
           <WaveformCanvas height={TIMELINE_WAVEFORM_HEIGHT_PX} peakPyramid={peakPyramid} transform={transform} />
         </div>
         <svg className="timeline-scale" viewBox={`0 0 ${transform.widthPx} 26`} preserveAspectRatio="none" aria-hidden="true">

@@ -169,6 +169,26 @@ describe("Certification and export human workflows", () => {
     })));
   });
 
+  it("shows an existing Human waiver instead of offering the same warning again", async () => {
+    const project = {
+      ...projectFixture(),
+      warningWaivers: {
+        [warning.findingId]: {
+          findingId: warning.findingId,
+          reason: "Reviewed against the source video.",
+          actor: human,
+          projectRevision: 2,
+        },
+      },
+    } satisfies CaptionProject;
+    render(<ValidationPanel project={project} onCommand={async () => accepted(project)} findings={[warning]} />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Open validation" }));
+    expect(await screen.findByText("Waived by Human")).toBeVisible();
+    expect(screen.queryByRole("button", { name: `Waive warning ${warning.findingId}` })).not.toBeInTheDocument();
+    expect(screen.getByText("Reviewed against the source video.")).toBeVisible();
+  });
+
   it("renders a proposal as an immutable diff and applies it only with a Human command", async () => {
     const project = projectFixture();
     const onCommand = vi.fn(async () => accepted(project));

@@ -4,6 +4,8 @@ import type { TimeTransform } from "./time-transform";
 import { formatMediaTime } from "./time-transform";
 import type { TimelineEditEdge, TimelineEditPreview } from "./lane-types";
 
+const maximumHandleTargetPx = 44;
+
 export interface AdLaneProps {
   readonly beats: readonly AudioDescriptionBeat[];
   readonly transform: TimeTransform;
@@ -47,6 +49,8 @@ export function AdLane({
           const timing = previewTiming(beat, editPreview);
           const left = transform.msToX(timing.startMs);
           const width = transform.msToX(timing.endMs) - left;
+          const startHandleMustInset = left < maximumHandleTargetPx;
+          const endHandleMustInset = left + width > transform.widthPx - maximumHandleTargetPx;
           const selected = selectedItemId === beat.itemId;
           const label = `Audio description ${beat.itemId.toUpperCase()}: ${beat.current.description}`;
           return (
@@ -55,6 +59,8 @@ export function AdLane({
               className="timeline-item timeline-item--audio-description"
               data-selected={selected || undefined}
               data-preview={editPreview?.itemId === beat.itemId || undefined}
+              data-inset-start-handle={startHandleMustInset || undefined}
+              data-inset-end-handle={endHandleMustInset || undefined}
               style={{ left: `${left}px`, width: `${width}px` }}
             >
               <button

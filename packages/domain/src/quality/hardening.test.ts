@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import type { LocalCaptionEvidencePackage } from "@cuebench/contracts";
 import {
   applyCommand,
   createCertificationSnapshot,
@@ -8,6 +9,7 @@ import {
   prepareCertificationReview,
   sha256Hex,
   validateProject,
+  verifyCertificationSnapshot,
   type CaptionCue,
   type CaptionProject,
   type DomainCommand,
@@ -40,34 +42,62 @@ const sustainedProject = (): CaptionProject => createProject({
   }],
 });
 
-const generatedEvidenceProject = (): CaptionProject => createProject({
-  projectId: "generated-evidence-project",
-  title: "Generated evidence lesson",
-  media: {
-    sourceId: "generated-evidence-media",
-    sha256: "9".repeat(64),
-    durationMs: 60_000,
-    relinkState: "Linked",
-  },
-  captions: [{
-    kind: "CaptionCue",
-    itemId: "c01",
-    state: "Proposed",
-    startMs: 1_000,
-    endMs: 3_000,
-    text: "An evidence-grounded generated caption.",
-    speaker: "Teacher",
-    actor: { type: "BrowserAgent", id: "browser-agent" },
-    cause: "generated",
-  }],
-  evidence: [{
-    evidenceId: "generated-c01-evidence",
+const generatedEvidenceProject = (): CaptionProject => {
+  const project = createProject({
     projectId: "generated-evidence-project",
-    mediaSha256: "9".repeat(64),
-    itemId: "c01",
-    itemRevision: 1,
-  }],
-});
+    title: "Generated evidence lesson",
+    media: {
+      sourceId: "generated-evidence-media",
+      sha256: "9".repeat(64),
+      durationMs: 60_000,
+      relinkState: "Linked",
+    },
+    captions: [{
+      kind: "CaptionCue",
+      itemId: "c01",
+      state: "Proposed",
+      startMs: 1_000,
+      endMs: 3_000,
+      text: "Grounded caption.",
+      speaker: "Teacher",
+      actor: { type: "BrowserAgent", id: "browser-agent" },
+      cause: "generated",
+    }],
+    evidence: [{
+      evidenceId: "generated-c01-evidence",
+      projectId: "generated-evidence-project",
+      mediaSha256: "9".repeat(64),
+      itemId: "c01",
+      itemRevision: 1,
+    }],
+  });
+  const localEvidence: LocalCaptionEvidencePackage = {
+    packageId: "generation-caption-source",
+    runId: "caption-source",
+    projectId: project.projectId,
+    mediaSha256: project.media.sha256,
+    expectedProjectRevision: project.projectRevision,
+    expectedQualityProfileRevision: project.qualityProfile.revision,
+    retainedAtMs: 1_700_000_000_000,
+    evidence: {
+      contractVersion: 1,
+      runId: "caption-source",
+      projectId: project.projectId,
+      mediaSha256: project.media.sha256,
+      preparedManifest: { key: "prepared/source/manifest.json", sha256: "a".repeat(64) },
+      normalizedAudio: { key: "prepared/source/audio.wav", sha256: "b".repeat(64), byteLength: 4, durationMs: 60_000, contentType: "audio/wav" },
+      words: [{ evidenceId: "generated-c01-evidence", sourceWordIndex: 0, startMs: 1_000, endMs: 3_000, text: "caption", speaker: "Teacher", speakerSegmentIds: ["speaker-1"] }],
+      speakerSegments: [{ id: "speaker-1", startMs: 1_000, endMs: 3_000, speaker: "Teacher", text: "caption" }],
+      uncertaintySpans: [],
+      provenance: [
+        { role: "diarization", model: "fixture", requestHash: "c".repeat(64), responseHash: "d".repeat(64), store: false, requestMetadata: {}, warnings: [] },
+        { role: "word-timestamps", model: "fixture", requestHash: "e".repeat(64), responseHash: "f".repeat(64), store: false, requestMetadata: {}, warnings: [] },
+      ],
+    },
+    cueBindings: [{ cueId: "c01", itemId: "c01", itemRevision: 1, evidenceIds: ["generated-c01-evidence"] }],
+  };
+  return { ...project, localEvidencePackages: [localEvidence] };
+};
 
 const validate = (project: CaptionProject) => applyCommand(project, {
   type: "ValidateProject",
@@ -248,7 +278,7 @@ describe("quality hardening regressions", () => {
     })).toThrow();
   });
 
-  it("carries exact evidence bindings through state-only review transitions and can certify", () => {
+  it("keeps state-transition evidence immutable and requires explicit verification before certification", () => {
     const generated = generatedEvidenceProject();
     const originalBinding = generated.evidence[0];
     if (originalBinding === undefined) throw new Error("Expected generated evidence binding.");
@@ -262,8 +292,8 @@ describe("quality hardening regressions", () => {
     });
     expect(agentReady.error).toBeUndefined();
     expect(originalBinding.itemRevision).toBe(1);
-    expect(agentReady.project.evidence).toEqual([{ ...originalBinding, itemRevision: 2 }]);
-    expect(validateProject(agentReady.project).findings.some((finding) => finding.ruleId === "evidence.stale")).toBe(false);
+    expect(agentReady.project.evidence).toEqual([originalBinding]);
+    expect(validateProject(agentReady.project).findings.some((finding) => finding.ruleId === "evidence.stale")).toBe(true);
 
     const sustained = applyCommand(agentReady.project, {
       type: "SustainItem",
@@ -273,10 +303,25 @@ describe("quality hardening regressions", () => {
       expectedProjectRevision: agentReady.project.projectRevision,
     });
     expect(sustained.error).toBeUndefined();
-    expect(sustained.project.evidence).toEqual([{ ...originalBinding, itemRevision: 3 }]);
-    expect(validateProject(sustained.project).findings.some((finding) => finding.ruleId === "evidence.stale")).toBe(false);
+    expect(sustained.project.evidence).toEqual([originalBinding]);
+    expect(validateProject(sustained.project).findings.some((finding) => finding.ruleId === "evidence.stale")).toBe(true);
 
-    const validated = validate(sustained.project);
+    const verified = applyCommand(sustained.project, {
+      type: "VerifyItemEvidence",
+      actor: human,
+      itemId: "c01",
+      expectedItemRevision: 3,
+      expectedProjectRevision: sustained.project.projectRevision,
+      sourcePackageId: "generation-caption-source",
+      verificationPackageId: "state-review-verification",
+      verificationEvidenceIds: ["state-review-verification-word-1"],
+      verifiedAtMs: 1_700_000_000_000,
+    });
+    expect(verified.error).toBeUndefined();
+    expect(verified.project.evidence[0]).toEqual(originalBinding);
+    expect(verified.project.evidence[1]).toMatchObject({ itemId: "c01", itemRevision: 3 });
+
+    const validated = validate(verified.project);
     const readiness = prepareCertificationReview(validated.project);
     expect(readiness.canCertify).toBe(true);
     expect(applyCommand(validated.project, {
@@ -289,7 +334,7 @@ describe("quality hardening regressions", () => {
     }).error).toBeUndefined();
   });
 
-  it("carries each matching binding through an objection without changing its provenance", () => {
+  it("keeps each historical binding unchanged through an objection", () => {
     const generated = generatedEvidenceProject();
     const objected = applyCommand(generated, {
       type: "ObjectItem",
@@ -300,14 +345,12 @@ describe("quality hardening regressions", () => {
       reason: "The interpretation needs correction.",
     });
     expect(objected.error).toBeUndefined();
-    expect(objected.project.evidence).toEqual([{
-      ...generated.evidence[0]!,
-      itemRevision: 2,
-    }]);
+    expect(objected.project.evidence).toEqual(generated.evidence);
+    expect(objected.project.localEvidencePackages).toEqual(generated.localEvidencePackages);
     const evidenceFindings = validateProject(objected.project).findings.filter(
       (finding) => finding.ruleId === "evidence.stale",
     );
-    expect(evidenceFindings).toHaveLength(0);
+    expect(evidenceFindings).toHaveLength(1);
     expect(validateProject(objected.project).findings).toEqual(expect.arrayContaining([
       expect.objectContaining({ ruleId: "review.objected-revision", severity: "blocker" }),
     ]));
@@ -355,6 +398,120 @@ describe("quality hardening regressions", () => {
     expect(validateProject(timingRevised.project).findings).toEqual(expect.arrayContaining([
       expect.objectContaining({ ruleId: "evidence.stale", severity: "blocker" }),
     ]));
+  });
+
+  it("keeps semantic evidence stale through a Human ruling until an explicit retained-evidence verification appends new history", () => {
+    const generated = generatedEvidenceProject();
+    const revised = applyCommand(generated, {
+      type: "ReviseCue",
+      actor: human,
+      cueId: "c01",
+      expectedItemRevision: 1,
+      expectedProjectRevision: generated.projectRevision,
+      patch: { text: "Corrected caption." },
+    });
+    expect(revised.error).toBeUndefined();
+    expect(validateProject(revised.project).findings).toEqual(expect.arrayContaining([
+      expect.objectContaining({ ruleId: "evidence.stale", severity: "blocker" }),
+    ]));
+
+    const sustained = applyCommand(revised.project, {
+      type: "SustainItem",
+      actor: human,
+      itemId: "c01",
+      expectedItemRevision: 2,
+      expectedProjectRevision: revised.project.projectRevision,
+    });
+    expect(sustained.error).toBeUndefined();
+    expect(sustained.project.evidence).toEqual(generated.evidence);
+    expect(sustained.project.localEvidencePackages).toEqual(generated.localEvidencePackages);
+    expect(validateProject(sustained.project).findings).toEqual(expect.arrayContaining([
+      expect.objectContaining({ ruleId: "evidence.stale", severity: "blocker" }),
+    ]));
+
+    const verified = applyCommand(sustained.project, {
+      type: "VerifyItemEvidence",
+      actor: human,
+      itemId: "c01",
+      expectedItemRevision: 3,
+      expectedProjectRevision: sustained.project.projectRevision,
+      sourcePackageId: "generation-caption-source",
+      verificationPackageId: "verification-c01-r3",
+      verificationEvidenceIds: ["verification-c01-r3-word-1"],
+      verifiedAtMs: 1_700_000_001_000,
+    });
+    expect(verified.error).toBeUndefined();
+    expect(verified.project.evidence).toEqual([
+      generated.evidence[0],
+      {
+        evidenceId: "verification-c01-r3-word-1",
+        projectId: generated.projectId,
+        mediaSha256: generated.media.sha256,
+        itemId: "c01",
+        itemRevision: 3,
+      },
+    ]);
+    expect(verified.project.localEvidencePackages[0]).toEqual(generated.localEvidencePackages[0]);
+    expect(verified.project.localEvidencePackages[1]).toMatchObject({
+      packageId: "verification-c01-r3",
+      runId: "caption-source",
+      expectedProjectRevision: sustained.project.projectRevision,
+      retainedAtMs: 1_700_000_001_000,
+      cueBindings: [{
+        cueId: "c01",
+        itemId: "c01",
+        itemRevision: 3,
+        evidenceIds: ["verification-c01-r3-word-1"],
+      }],
+      evidence: { words: [{ evidenceId: "verification-c01-r3-word-1" }] },
+    });
+    expect(validateProject(verified.project).findings.some((finding) => finding.ruleId === "evidence.stale")).toBe(false);
+
+    const validated = validate(verified.project);
+    const readiness = prepareCertificationReview(validated.project);
+    expect(readiness.canCertify).toBe(true);
+    const certified = applyCommand(validated.project, {
+      type: "CertifyProject",
+      actor: human,
+      expectedProjectRevision: validated.project.projectRevision,
+      expectedReadinessHash: readiness.readinessHash,
+      certificationId: "verified-evidence-certification",
+      certifiedAtMs: 1_700_000_002_000,
+    });
+    expect(certified.error).toBeUndefined();
+    expect(certified.project.certifications[0]?.evidence).toEqual(verified.project.evidence);
+    expect(certified.project.certifications[0]).toBeDefined();
+    expect(verifyCertificationSnapshot(certified.project.certifications[0]!)).toBe(true);
+  });
+
+  it("rejects unsafe verification package and evidence identifiers before creating Court Record history", () => {
+    const generated = generatedEvidenceProject();
+    const sustained = applyCommand(generated, {
+      type: "SustainItem",
+      actor: human,
+      itemId: "c01",
+      expectedItemRevision: 1,
+      expectedProjectRevision: generated.projectRevision,
+    });
+    if (sustained.error !== undefined) throw new Error(sustained.error.message);
+    for (const identity of [
+      { verificationPackageId: "verification package", verificationEvidenceIds: ["safe-evidence"] },
+      { verificationPackageId: "safe-package", verificationEvidenceIds: ["evidence with spaces"] },
+    ]) {
+      const rejected = applyCommand(sustained.project, {
+        type: "VerifyItemEvidence",
+        actor: human,
+        itemId: "c01",
+        expectedItemRevision: 2,
+        expectedProjectRevision: sustained.project.projectRevision,
+        sourcePackageId: "generation-caption-source",
+        ...identity,
+        verifiedAtMs: 1_700_000_001_000,
+      });
+      expect(rejected.error?.code).toBe("INVALID_ARGUMENT");
+      expect(rejected.project).toBe(sustained.project);
+      expect(rejected.project.courtRecord).toHaveLength(sustained.project.courtRecord.length);
+    }
   });
 
   it("requires a current validation warning before a Human can waive it", () => {
