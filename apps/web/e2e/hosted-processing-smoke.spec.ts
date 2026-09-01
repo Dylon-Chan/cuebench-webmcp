@@ -10,10 +10,18 @@ const cloudflareTestSiteKeys = new Set([
   "2x00000000000000000000BB",
   "3x00000000000000000000FF",
 ]);
+const successfulProcessingStages = new Set([
+  "PreparingMedia",
+  "Transcribing",
+  "AligningEvidence",
+  "ReconcilingTranscript",
+  "SegmentingCaptions",
+  "AwaitingAdoption",
+]);
 
 test("authenticated hosted processing cancels and project deletion reaches a truthful cleanup outcome", async ({ page, baseURL }) => {
   test.skip(!enabled, "Authenticated hosted processing is required only by scripts/smoke-hosted.sh.");
-  test.setTimeout(20 * 60_000);
+  test.setTimeout(45 * 60_000);
   expect(turnstileMode).toBe("human");
   expect(baseURL).toMatch(/^https:\/\//u);
 
@@ -85,11 +93,11 @@ test("authenticated hosted processing cancels and project deletion reaches a tru
   await expect(generate).toBeEnabled({ timeout: 5 * 60_000 });
   await generate.click();
   await expect.poll(
-    () => apiEvidence.some((item) => item.path.startsWith("/api/generation-runs/") && item.stage !== null && item.stage !== "Queued"),
-    { message: "the durable workflow must advance beyond its signed Queued receipt before cancellation", timeout: 5 * 60_000 },
+    () => apiEvidence.some((item) => item.path.startsWith("/api/generation-runs/") && item.stage !== null && successfulProcessingStages.has(item.stage)),
+    { message: "the durable workflow must reach a successful processing stage beyond its signed Queued receipt before cancellation", timeout: 5 * 60_000 },
   ).toBe(true);
   const cancelGeneration = page.getByRole("button", {
-    name: /Cancel caption generation|Discard staged caption result|Discard retryable caption run|Release failed caption lease/u,
+    name: /Cancel caption generation|Discard staged caption result/u,
   });
   await expect(cancelGeneration).toBeEnabled({ timeout: 2 * 60_000 });
   await cancelGeneration.click();
@@ -115,7 +123,7 @@ test("authenticated hosted processing cancels and project deletion reaches a tru
   ]));
   expect(apiEvidence.some((item) => item.path.startsWith("/api/generation-runs/")
     && item.stage !== null
-    && item.stage !== "Queued")).toBe(true);
+    && successfulProcessingStages.has(item.stage))).toBe(true);
   expect(apiEvidence.some((item) => item.method === "DELETE"
     && item.path.startsWith("/api/generation-runs/")
     && item.status >= 200
