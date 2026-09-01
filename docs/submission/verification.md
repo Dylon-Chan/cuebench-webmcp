@@ -7,7 +7,7 @@ This record separates repository-local evidence from hosted release evidence. A 
 | Evidence | Value | Status |
 | --- | --- | --- |
 | Branch | `codex/cuebench-core` | Recorded |
-| Preview URL | `https://cuebench-web-preview.wengsiong22.workers.dev` | Clean `HEAD` `a98b1b9` deployed as version `1bedd0c6-c922-4ff5-960e-48eeba1c4f35`; repeatable hosted Playwright recorded 15 passed, 1 Human-processing test skipped with Human mode disabled |
+| Preview URL | `https://cuebench-web-preview.wengsiong22.workers.dev` | Clean runtime commit `c919999` deployed as version `f7713994-d09e-4046-8e80-f290c25df18f`; repeatable hosted Playwright recorded 15 passed, 1 Human-processing test skipped with Human mode disabled |
 | Production URL | `{{CUEBENCH_PRODUCTION_URL}}` | **BLOCKED — complete preview Human processing/cleanup and preview breaker restoration first; then deploy production and pass its live OpenAI/Human smoke** |
 | Repository URL | `https://github.com/Dylon-Chan/cuebench-webmcp` | Public repository confirmed; `codex/cuebench-core` is pushed and draft PR `#1` is open |
 | Pull request | `https://github.com/Dylon-Chan/cuebench-webmcp/pull/1` | Draft while the durable preview, breaker, production, and demo-video gates remain open |
@@ -28,7 +28,7 @@ This record separates repository-local evidence from hosted release evidence. A 
 | Impeccable finish review | Definitive fresh reviewer disposition after the detector finding was fixed and all three recaptures were opened | `ship`; full enclosure removed the side-tab ambiguity and mobile retained the centered 3× instrument without page overflow |
 | Design system document | `DESIGN.md` and `.impeccable/design.json` | Generated from the shipped render and actual CSS |
 
-The review screenshots use the repository's local production Vite/Cloudflare preview. Separately, the Browser plugin loaded deployed version `1bedd0c6-c922-4ff5-960e-48eeba1c4f35`, confirmed its audio peak evidence and live WebMCP tools, and ran the local Demonstration replay in CueBench's explicitly disclosed Temporary Session mode. The visible page adopted 15 caption cues, recorded 1 blocker and 28 warnings, appended Start/Adopt/Validate Court Record entries, and returned the same project revision 4 through `inspect_project`. That path remained open-page-only and created no media upload, provider request, or cloud recovery receipt. Reload/recovery captures continue to use the repository's release Playwright runtime and exact E2E durable-storage shim against that local production preview. Reduced motion was enabled and the page settled for 1.5 seconds before capture.
+The review screenshots use the repository's local production Vite/Cloudflare preview. Separately, the Browser plugin loaded deployed version `f7713994-d09e-4046-8e80-f290c25df18f`, confirmed its audio peak evidence and live WebMCP tools, and ran the local Demonstration replay in CueBench's explicitly disclosed Temporary Session mode. The Temporary Session panel exposed neither Turnstile nor an unusable cloud-start action; it explained that durable browser storage is required for recoverable cloud receipts. The visible page adopted 15 caption cues, recorded 1 blocker and 28 warnings, appended Start/Adopt/Validate Court Record entries, and returned the same project revision 4 through `inspect_project`. That path remained open-page-only and created no media upload, provider request, or cloud recovery receipt. Browser console warnings and errors were empty. Reload/recovery captures continue to use the repository's release Playwright runtime and exact E2E durable-storage shim against that local production preview. Reduced motion was enabled and the page settled for 1.5 seconds before capture.
 
 ## Automated release matrix
 
@@ -43,7 +43,7 @@ git diff --check
 
 Observed local results:
 
-- `pnpm verify` — pass: lint, all workspace typechecks, all package tests, 545 web unit tests, and 22 Worker-runtime tests. The Worker runtime printed known canceled-request diagnostics during negative-path coverage but exited successfully.
+- `pnpm verify` — pass: lint, all workspace typechecks, all package tests, 554 web unit tests, and 22 Worker-runtime tests. The Worker runtime printed known canceled-request diagnostics during negative-path coverage but exited successfully.
 - `pnpm --filter @cuebench/web e2e` — pass: 18 passed, 1 hosted-only test skipped, 0 failed. This includes automated accessibility, WebMCP collaboration, Human sample, export round-trip, recovery, upload-path lazy-chunk isolation, 320 px edge targets, mobile-first 3× recentering, mobile order, and no page-level horizontal overflow.
 - `cd services/media && source .venv/bin/activate && uv run pytest -q` — pass: 52 passed.
 - `git diff --check` — pass.
@@ -70,10 +70,10 @@ Repository tests assert:
 
 ## Deployed preview evidence
 
-- Clean `HEAD` `a98b1b9` was redeployed to the preview origin above as Cloudflare version `1bedd0c6-c922-4ff5-960e-48eeba1c4f35`. The repeatable hosted suite reran against that exact version and recorded **15 passed, 1 Human-processing test skipped** when Human mode was disabled. Preview and production deployment dry-runs both pass, but a production dry-run is not a production deployment.
+- Clean runtime commit `c919999` was redeployed to the preview origin above as Cloudflare version `f7713994-d09e-4046-8e80-f290c25df18f`. The repeatable hosted suite reran against that exact version and recorded **15 passed, 1 Human-processing test skipped** when Human mode was disabled. Preview and production deployment dry-runs both pass, but a production dry-run is not a production deployment.
 - Authenticated Cloudflare R2 privacy preflight passed for the exact preview and production processing buckets: `r2.dev` is disabled and neither bucket has an enabled public custom domain.
 - The Browser plugin loaded the hosted app, its waveform/audio peak evidence, and its live WebMCP tools. The Temporary Session replay completed with 15 visible captions and current validation, and `inspect_project` returned project revision 4 with 1 blocker and 28 warnings.
-- A Human completed the real Turnstile challenge in the in-app Browser. That profile exposed only a Temporary Session Project, so cloud generation correctly remained disabled without a durable recovery receipt. It did not start processing or establish cancellation/deletion evidence and is not counted as a hosted-processing pass.
+- A Human completed the real Turnstile challenge on the preceding preview while the in-app Browser exposed only a Temporary Session Project. It did not start processing or establish cancellation/deletion evidence and is not counted as a hosted-processing pass. The current preview removes that misleading Temporary Session challenge entirely and requires a durable browser profile before presenting Turnstile or cloud-start controls.
 
 ## Hosted evidence that remains blocked
 
