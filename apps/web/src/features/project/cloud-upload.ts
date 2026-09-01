@@ -30,6 +30,7 @@ export interface AnonymousCloudSession {
 
 export interface CreateAnonymousCloudSessionInput {
   readonly fetcher?: CloudUploadFetch;
+  readonly signal?: AbortSignal;
   readonly turnstileToken: string;
   readonly idempotencyKey: string;
   /** A cleanup-only session cannot resume upload or processing work. */
@@ -60,6 +61,7 @@ export interface PersistedCloudUpload {
 
 export interface UploadCloudProcessingCopyInput {
   readonly fetcher?: CloudUploadFetch;
+  readonly signal?: AbortSignal;
   /** A short-lived anonymous session returned by the same-origin Worker after Turnstile. */
   readonly session: string;
   readonly sessionExpiresAtMs?: number;
@@ -91,6 +93,7 @@ export type PersistedCloudUploadRecovery = Pick<PersistedCloudUpload, "operation
 
 export interface CancelCloudProcessingCopyInput {
   readonly fetcher?: CloudUploadFetch;
+  readonly signal?: AbortSignal;
   readonly session: string;
   readonly projectId: string;
   readonly operationId: string;
@@ -247,6 +250,7 @@ const persist = (store: CloudUploadReceiptStore | null, operation: PersistedClou
 const createOperation = async (input: UploadCloudProcessingCopyInput, fetcher: CloudUploadFetch): Promise<{ readonly operation: PersistedCloudUpload; readonly uploadedPartNumbers: readonly number[]; readonly status: string }> => {
   const response = await fetcher("/api/uploads", {
     method: "POST",
+    ...(input.signal === undefined ? {} : { signal: input.signal }),
     headers: { authorization: `Bearer ${input.session}`, "content-type": "application/json" },
     body: JSON.stringify({
       projectId: input.projectId,
@@ -365,6 +369,7 @@ export const clearPersistedCloudUpload = (projectId: string, store: CloudUploadR
 
 const refreshOperation = async (input: UploadCloudProcessingCopyInput, fetcher: CloudUploadFetch, operation: PersistedCloudUpload): Promise<{ readonly operation: PersistedCloudUpload; readonly uploadedPartNumbers: readonly number[]; readonly status: string }> => {
   const response = await fetcher(`/api/uploads/${encodeURIComponent(input.operationId)}`, {
+    ...(input.signal === undefined ? {} : { signal: input.signal }),
     headers: {
       authorization: `Bearer ${input.session}`,
       "x-cuebench-operation-receipt": operation.operationReceipt,
@@ -394,6 +399,7 @@ export const createAnonymousCloudSession = async (input: CreateAnonymousCloudSes
   const fetcher = input.fetcher ?? defaultFetcher();
   const response = await fetcher("/api/session", {
     method: "POST",
+    ...(input.signal === undefined ? {} : { signal: input.signal }),
     headers: { "content-type": "application/json" },
     body: JSON.stringify({ turnstileToken: input.turnstileToken, idempotencyKey: input.idempotencyKey, ...(input.purpose === undefined ? {} : { purpose: input.purpose }) }),
   });
@@ -457,6 +463,7 @@ export const uploadCloudProcessingCopy = async (input: UploadCloudProcessingCopy
     const part = input.source.slice(start, end, contentType);
     const response = await fetcher(`/api/uploads/${encodeURIComponent(input.operationId)}/parts/${index}`, {
       method: "PUT",
+      ...(input.signal === undefined ? {} : { signal: input.signal }),
       headers: {
         authorization: `Bearer ${input.session}`,
         "content-type": contentType,
@@ -478,6 +485,7 @@ export const uploadCloudProcessingCopy = async (input: UploadCloudProcessingCopy
   }
   const completion = await fetcher(`/api/uploads/${encodeURIComponent(input.operationId)}/complete`, {
     method: "POST",
+    ...(input.signal === undefined ? {} : { signal: input.signal }),
     headers: {
         authorization: `Bearer ${input.session}`,
         "content-type": "application/json",
@@ -501,6 +509,7 @@ export const cancelCloudProcessingCopy = async (input: CancelCloudProcessingCopy
   const fetcher = input.fetcher ?? defaultFetcher();
   const response = await fetcher(`/api/uploads/${encodeURIComponent(input.operationId)}`, {
     method: "DELETE",
+    ...(input.signal === undefined ? {} : { signal: input.signal }),
     headers: {
       authorization: `Bearer ${input.session}`,
       "x-cuebench-operation-receipt": input.receipt,

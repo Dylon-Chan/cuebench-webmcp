@@ -39,7 +39,7 @@ export const formatDuration = (durationMs: number): string => {
 
 interface WorkbenchShellProps {
   readonly project: CaptionProject;
-  readonly mode: ProjectMode | null;
+  readonly mode: ProjectMode;
   readonly sourceObjectUrl: string;
   readonly sourceProvenance: SourceProvenance;
   readonly webMcpAvailable: boolean;
@@ -340,6 +340,7 @@ export function WorkbenchShell({ project, mode, sourceObjectUrl, sourceProvenanc
         <HostedProcessingPanel
           projectId={project.projectId}
           durationMs={project.media.durationMs}
+          storageMode={mode}
           mediaSha256={project.media.sha256}
           sourceObjectUrl={sourceObjectUrl}
           resolveProjectOwnerCapability={generationStore.getCloudProjectOwnerCapability}
@@ -362,7 +363,7 @@ export function WorkbenchShell({ project, mode, sourceObjectUrl, sourceProvenanc
 
 function ProjectRoute({ store, webMcpAvailable, webMcpDebugEnabled = false }: AppRoutesProps) {
   const snapshot = useSyncExternalStore(store.subscribe, store.getSnapshot, store.getSnapshot);
-  if (snapshot.project === null || snapshot.sourceObjectUrl === null || snapshot.sourceProvenance === null) return <ProjectStart store={store} />;
+  if (snapshot.project === null || snapshot.mode === null || snapshot.sourceObjectUrl === null || snapshot.sourceProvenance === null) return <ProjectStart store={store} />;
   return <WorkbenchShell
     project={snapshot.project}
     mode={snapshot.mode}

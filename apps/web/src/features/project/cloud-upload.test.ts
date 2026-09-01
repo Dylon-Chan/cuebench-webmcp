@@ -63,6 +63,7 @@ describe("resumable cloud upload client", () => {
 
   it("slices the browser Blob into bounded same-origin multipart requests and persists opaque recovery receipts", async () => {
     const persisted = receiptStore();
+    const controller = new AbortController();
     const fetcher = vi.fn()
       .mockResolvedValueOnce(new Response(JSON.stringify(operation()), { status: 201 }))
       .mockResolvedValueOnce(new Response(JSON.stringify({ partReceipt: "opaque-part-1", partNumber: 1 }), { status: 201 }))
@@ -80,6 +81,7 @@ describe("resumable cloud upload client", () => {
       projectOwnerCapability,
       disclosureAccepted: true,
       receiptStore: persisted.store,
+      signal: controller.signal,
     });
 
     expect(result).toMatchObject({ receipt: "opaque-operation-receipt", status: "queued" });
@@ -89,6 +91,7 @@ describe("resumable cloud upload client", () => {
       "/api/uploads/operation-fixture/parts/2",
       "/api/uploads/operation-fixture/complete",
     ]);
+    expect(fetcher.mock.calls.every((call) => (call[1] as RequestInit).signal === controller.signal)).toBe(true);
     const firstPart = fetcher.mock.calls[1]?.[1] as RequestInit;
     const secondPart = fetcher.mock.calls[2]?.[1] as RequestInit;
     expect(firstPart.body).toBeInstanceOf(Blob);
@@ -277,9 +280,10 @@ describe("resumable cloud upload client", () => {
 
   it("uses a same-origin Turnstile token and opaque idempotency key to create its anonymous session", async () => {
     const fetcher = vi.fn().mockResolvedValue(new Response(JSON.stringify({ session: "signed-session", expiresAtMs: 9_999 }), { status: 201 }));
+    const controller = new AbortController();
 
-    await expect(createAnonymousCloudSession({ fetcher, turnstileToken: "turnstile-token", idempotencyKey: "opaque-idempotency" })).resolves.toEqual({ session: "signed-session", expiresAtMs: 9_999 });
-    expect(fetcher).toHaveBeenCalledWith("/api/session", expect.objectContaining({ method: "POST" }));
+    await expect(createAnonymousCloudSession({ fetcher, turnstileToken: "turnstile-token", idempotencyKey: "opaque-idempotency", signal: controller.signal })).resolves.toEqual({ session: "signed-session", expiresAtMs: 9_999 });
+    expect(fetcher).toHaveBeenCalledWith("/api/session", expect.objectContaining({ method: "POST", signal: controller.signal }));
   });
 
   it("can request a narrowly scoped fresh Turnstile session solely for cleanup", async () => {
@@ -294,6 +298,7 @@ describe("resumable cloud upload client", () => {
     const persisted = receiptStore();
     persisted.store.save("cuebench-cloud-upload:project-fixture", { operationReceipt: "opaque-receipt" });
     const fetcher = vi.fn().mockResolvedValue(new Response(null, { status: 204 }));
+    const controller = new AbortController();
 
     await cancelCloudProcessingCopy({
       fetcher,
@@ -303,10 +308,12 @@ describe("resumable cloud upload client", () => {
       receipt: "opaque-receipt",
       projectOwnerCapability,
       receiptStore: persisted.store,
+      signal: controller.signal,
     });
 
     expect(fetcher).toHaveBeenCalledWith("/api/uploads/operation-fixture", expect.objectContaining({
       method: "DELETE",
+      signal: controller.signal,
       headers: expect.objectContaining({ "x-cuebench-operation-receipt": "opaque-receipt" }),
     }));
     expect(persisted.values.size).toBe(0);
