@@ -14,7 +14,7 @@ import {
   type DemonstrationReplayStore,
 } from "../project/replay-generation";
 import { ObjectUrlLease } from "../project/local-media";
-import { ProjectStore } from "../project/project-store";
+import { ProjectInstanceFenceError, ProjectStore } from "../project/project-store";
 import { CaptionGenerationClient, type GenerationProjectStore } from "./generation-client";
 import { GenerationStatus } from "./GenerationStatus";
 
@@ -39,12 +39,321 @@ const durableBrowserStorage = {
   persist: vi.fn().mockResolvedValue(true),
 };
 
+const temporaryBrowserStorage = {
+  estimate: vi.fn().mockResolvedValue({ quota: 200, usage: 150 }),
+  persist: vi.fn().mockResolvedValue(false),
+};
+
 const objectUrlLease = (label: string): ObjectUrlLease => new ObjectUrlLease({
   createObjectURL: vi.fn(() => `blob:cuebench:${label}`),
   revokeObjectURL: vi.fn(),
 });
 
 describe("GenerationStatus demonstration fallback", () => {
+  it("keeps real cloud generation unavailable but runs the local replay in a temporary current-page project", async () => {
+    const database = new CueBenchDatabase(`cuebench-temporary-replay-${crypto.randomUUID()}`);
+    try {
+      const store = new ProjectStore({
+        database,
+        browserStorage: temporaryBrowserStorage,
+        objectUrlLease: objectUrlLease("temporary"),
+        bundledSampleLoader: bundledSampleFile,
+      });
+      const providerRequest = vi.fn(async () => { throw new Error("the local replay must not call a provider"); });
+      const client = new CaptionGenerationClient({ fetcher: providerRequest });
+      const user = userEvent.setup();
+
+      await store.openSample();
+      expect(store.getSnapshot().route).toBe("temporary-choice");
+      await store.continueTemporarily();
+      const project = store.getSnapshot().project;
+      expect(store.getSnapshot().mode).toBe("temporary");
+      expect(project).not.toBeNull();
+      const generationStore = store.bindGenerationStore(store.getProjectInstanceFence()!);
+
+      render(<GenerationStatus project={project!} store={generationStore} client={client} demonstrationReplayStageDelayMs={0} />);
+
+      expect(screen.getByRole("button", { name: "Generate proposed captions" })).toBeDisabled();
+      const replay = screen.getByRole("button", { name: "Run demonstration replay" });
+      expect(replay).toBeEnabled();
+      expect(screen.getByText(/does not create a cloud recovery receipt/i)).toBeVisible();
+
+      await user.click(replay);
+
+      await waitFor(() => expect(store.getSnapshot().project?.validationRun).not.toBeNull());
+      expect(screen.getByRole("status", { name: /demonstration replay complete/i })).toBeVisible();
+      expect(await database.runReceipts.count()).toBe(0);
+      expect(providerRequest).not.toHaveBeenCalled();
+    } finally {
+      await database.delete();
+    }
+  });
+
+  it("rejects forged checkpoint and staged-result writes at the temporary ProjectStore boundary", async () => {
+    const database = new CueBenchDatabase(`cuebench-temporary-replay-proof-${crypto.randomUUID()}`);
+    try {
+      const store = new ProjectStore({
+        database,
+        browserStorage: temporaryBrowserStorage,
+        objectUrlLease: objectUrlLease("temporary-proof"),
+        bundledSampleLoader: bundledSampleFile,
+      });
+      await store.openSample();
+      await store.continueTemporarily();
+      const initial = store.getSnapshot().project;
+      expect(initial).not.toBeNull();
+      const replayStore = store.bindGenerationStore(store.getProjectInstanceFence()!);
+
+      let captured: Extract<DomainCommand, { readonly type: "AdoptCaptionGenerationResult" }> | null = null;
+      const intercept = vi.spyOn(store, "adoptStagedCaptionGenerationResult").mockImplementation(async (command) => {
+        captured = structuredClone(command);
+        throw new Error("hold temporary replay checkpoint");
+      });
+      await expect(createDemonstrationReplay({ project: initial!, store: replayStore })).rejects.toThrow(/hold temporary replay checkpoint/i);
+      intercept.mockRestore();
+
+      const leasedProject = store.getSnapshot().project;
+      const receipt = await replayStore.loadCaptionGenerationReceipt(DEMONSTRATION_REPLAY_RUN_ID);
+      expect(leasedProject).not.toBeNull();
+      expect(receipt).not.toBeNull();
+      expect(captured).not.toBeNull();
+
+      await expect(store.executeCommand(captured!)).rejects.toThrow(/target-specific receipt-verified method/i);
+      await expect(store.executeCommand({
+        type: "AdoptAudioDescriptionGenerationResult",
+      } as unknown as DomainCommand)).rejects.toThrow(/target-specific receipt-verified method/i);
+      await expect(store.adoptStagedCaptionGenerationResult(captured!)).rejects.toThrow(/durable browser storage/i);
+      await expect(store.deleteCaptionGenerationReceipt(DEMONSTRATION_REPLAY_RUN_ID)).rejects.toThrow(/durable browser storage/i);
+      await expect(replayStore.persistCaptionGenerationReceipt(DEMONSTRATION_REPLAY_RUN_ID, {
+        ...(receipt as Record<string, unknown>),
+        demonstrationReplay: {
+          ...((receipt as { readonly demonstrationReplay: Record<string, unknown> }).demonstrationReplay),
+          stagedResultSha256: "0".repeat(64),
+        },
+      })).rejects.toThrow(/durable browser storage/i);
+      await expect(replayStore.adoptStagedCaptionGenerationResult({
+        ...captured!,
+        result: { ...captured!.result, outputSha256: "0".repeat(64) },
+      })).rejects.toThrow(/durable browser storage/i);
+      expect(store.getSnapshot().project?.captions.order).toHaveLength(0);
+      expect(await database.runReceipts.count()).toBe(0);
+    } finally {
+      await database.delete();
+    }
+  });
+
+  it("rejects generic caption and AD adoption before a durable project reducer can mutate state", async () => {
+    const database = new CueBenchDatabase(`cuebench-durable-generic-adoption-${crypto.randomUUID()}`);
+    try {
+      const store = new ProjectStore({
+        database,
+        browserStorage: durableBrowserStorage,
+        objectUrlLease: objectUrlLease("durable-generic-adoption"),
+        bundledSampleLoader: bundledSampleFile,
+      });
+      await store.openSample();
+      const before = store.getSnapshot().project;
+      expect(before).not.toBeNull();
+
+      for (const command of [
+        { type: "AdoptCaptionGenerationResult" },
+        { type: "AdoptAudioDescriptionGenerationResult" },
+      ] as const) {
+        await expect(store.executeCommand(command as unknown as DomainCommand)).rejects.toThrow(/target-specific receipt-verified method/i);
+      }
+
+      const after = store.getSnapshot().project;
+      expect(after?.projectRevision).toBe(before!.projectRevision);
+      expect(after?.courtRecord).toEqual(before!.courtRecord);
+      expect(await database.runReceipts.count()).toBe(0);
+    } finally {
+      await database.delete();
+    }
+  });
+
+  it("keeps temporary replay checkpoints scoped to the one fixed caption run ID", async () => {
+    const database = new CueBenchDatabase(`cuebench-temporary-replay-run-id-${crypto.randomUUID()}`);
+    try {
+      const store = new ProjectStore({
+        database,
+        browserStorage: temporaryBrowserStorage,
+        objectUrlLease: objectUrlLease("temporary-run-id"),
+        bundledSampleLoader: bundledSampleFile,
+      });
+      await store.openSample();
+      await store.continueTemporarily();
+      const initial = store.getSnapshot().project;
+      expect(initial).not.toBeNull();
+      const replayStore = store.bindGenerationStore(store.getProjectInstanceFence()!);
+
+      const intercept = vi.spyOn(store, "adoptStagedCaptionGenerationResult").mockRejectedValueOnce(
+        new Error("hold the temporary replay checkpoint"),
+      );
+      await expect(createDemonstrationReplay({ project: initial!, store: replayStore })).rejects.toThrow(/hold the temporary replay checkpoint/i);
+      intercept.mockRestore();
+
+      const project = store.getSnapshot().project;
+      const receipt = await replayStore.loadCaptionGenerationReceipt(DEMONSTRATION_REPLAY_RUN_ID);
+      expect(project).not.toBeNull();
+      expect(receipt).not.toBeNull();
+
+      const aliasRunId = "temporary-ad-alias";
+      await expect(replayStore.persistCaptionGenerationReceipt(aliasRunId, receipt)).rejects.toThrow(/fixed run ID/i);
+      await expect(replayStore.persistAudioDescriptionGenerationReceipt(aliasRunId, receipt)).rejects.toThrow(/durable browser storage/i);
+      await expect(replayStore.persistAudioDescriptionGenerationReceipt(DEMONSTRATION_REPLAY_RUN_ID, receipt)).rejects.toThrow(/durable browser storage/i);
+      expect(await replayStore.loadCaptionGenerationReceipt(aliasRunId)).toBeNull();
+      expect(await replayStore.loadAudioDescriptionGenerationReceipt(DEMONSTRATION_REPLAY_RUN_ID)).toBeNull();
+      await expect(replayStore.deleteCaptionGenerationReceipt(aliasRunId)).rejects.toThrow(/fixed run ID/i);
+      expect(await replayStore.listCaptionGenerationReceiptRunIds()).toEqual([DEMONSTRATION_REPLAY_RUN_ID]);
+      expect(await replayStore.listAudioDescriptionGenerationReceiptRunIds()).toEqual([]);
+      await expect(store.persistCaptionGenerationReceipt(DEMONSTRATION_REPLAY_RUN_ID, receipt)).rejects.toThrow(/durable browser storage/i);
+      expect(await store.loadCaptionGenerationReceipt(DEMONSTRATION_REPLAY_RUN_ID)).toBeNull();
+      expect(await store.listCaptionGenerationReceiptRunIds()).toEqual([]);
+    } finally {
+      await database.delete();
+    }
+  });
+
+  it("clears temporary replay evidence and fences stale work when the same project instance rotates", async () => {
+    const database = new CueBenchDatabase(`cuebench-temporary-replay-rotation-${crypto.randomUUID()}`);
+    try {
+      const store = new ProjectStore({
+        database,
+        browserStorage: temporaryBrowserStorage,
+        objectUrlLease: objectUrlLease("temporary-rotation"),
+        bundledSampleLoader: bundledSampleFile,
+      });
+      await store.openSample();
+      await store.continueTemporarily();
+      const initial = store.getSnapshot().project;
+      expect(initial).not.toBeNull();
+      const replayStore = store.bindGenerationStore(store.getProjectInstanceFence()!);
+
+      const intercept = vi.spyOn(store, "adoptStagedCaptionGenerationResult").mockRejectedValueOnce(
+        new Error("hold the temporary replay checkpoint"),
+      );
+      await expect(createDemonstrationReplay({ project: initial!, store: replayStore })).rejects.toThrow(/hold the temporary replay checkpoint/i);
+      intercept.mockRestore();
+
+      const beforeRotation = store.getSnapshot();
+      const staleFence = store.getProjectInstanceFence();
+      expect(beforeRotation.mode).toBe("temporary");
+      expect(staleFence).not.toBeNull();
+      expect(await replayStore.loadCaptionGenerationReceipt(DEMONSTRATION_REPLAY_RUN_ID)).not.toBeNull();
+
+      const internalStore = store as unknown as {
+        readonly setSnapshot: (snapshot: ReturnType<ProjectStore["getSnapshot"]>, options: { readonly rotateProjectInstance: true }) => void;
+      };
+      internalStore.setSnapshot(beforeRotation, { rotateProjectInstance: true });
+
+      const current = store.getSnapshot();
+      const currentFence = store.getProjectInstanceFence();
+      expect(current.mode).toBe("temporary");
+      expect(current.project?.projectId).toBe(beforeRotation.project?.projectId);
+      expect(currentFence?.projectInstanceEpoch).toBeGreaterThan(staleFence!.projectInstanceEpoch);
+      await expect(replayStore.loadCaptionGenerationReceipt(DEMONSTRATION_REPLAY_RUN_ID)).rejects.toBeInstanceOf(ProjectInstanceFenceError);
+      const currentStore = store.bindGenerationStore(currentFence!);
+      expect(await currentStore.loadCaptionGenerationReceipt(DEMONSTRATION_REPLAY_RUN_ID)).toBeNull();
+      expect(await currentStore.listCaptionGenerationReceiptRunIds()).toEqual([]);
+    } finally {
+      await database.delete();
+    }
+  });
+
+  it("rejects in-flight replay work that crosses a same-ID temporary instance rotation after its lease", async () => {
+    const database = new CueBenchDatabase(`cuebench-temporary-replay-in-flight-${crypto.randomUUID()}`);
+    try {
+      const store = new ProjectStore({
+        database,
+        browserStorage: temporaryBrowserStorage,
+        objectUrlLease: objectUrlLease("temporary-in-flight"),
+        bundledSampleLoader: bundledSampleFile,
+      });
+      await store.openSample();
+      await store.continueTemporarily();
+      const project = store.getSnapshot().project;
+      const fence = store.getProjectInstanceFence();
+      expect(project).not.toBeNull();
+      expect(fence).not.toBeNull();
+
+      const boundStore = store.bindGenerationStore(fence!);
+      const internalStore = store as unknown as {
+        readonly setSnapshot: (snapshot: ReturnType<ProjectStore["getSnapshot"]>, options: { readonly rotateProjectInstance: true }) => void;
+      };
+      let rotated = false;
+      const replayStore: DemonstrationReplayStore = {
+        ...boundStore,
+        executeCommand: async (command) => {
+          const result = await boundStore.executeCommand(command);
+          if (command.type === "StartGenerationRun") {
+            rotated = true;
+            internalStore.setSnapshot(store.getSnapshot(), { rotateProjectInstance: true });
+          }
+          return result;
+        },
+      };
+
+      await expect(createDemonstrationReplay({ project: project!, store: replayStore })).rejects.toThrow(/browser project instance changed/i);
+      expect(rotated).toBe(true);
+      expect(store.getSnapshot().project?.captions.order).toHaveLength(0);
+      expect(store.getSnapshot().project?.courtRecord.some((event) => event.type === "AdoptCaptionGenerationResult")).toBe(false);
+
+      const currentFence = store.getProjectInstanceFence();
+      expect(currentFence?.projectId).toBe(project!.projectId);
+      expect(currentFence?.projectInstanceEpoch).toBeGreaterThan(fence!.projectInstanceEpoch);
+      const currentStore = store.bindGenerationStore(currentFence!);
+      expect(await currentStore.loadCaptionGenerationReceipt(DEMONSTRATION_REPLAY_RUN_ID)).toBeNull();
+      expect(await currentStore.listCaptionGenerationReceiptRunIds()).toEqual([]);
+    } finally {
+      await database.delete();
+    }
+  });
+
+  it("fails closed before adoption when an unbound temporary replay crosses the same-ID rotation", async () => {
+    const database = new CueBenchDatabase(`cuebench-temporary-replay-raw-in-flight-${crypto.randomUUID()}`);
+    try {
+      const store = new ProjectStore({
+        database,
+        browserStorage: temporaryBrowserStorage,
+        objectUrlLease: objectUrlLease("temporary-raw-in-flight"),
+        bundledSampleLoader: bundledSampleFile,
+      });
+      await store.openSample();
+      await store.continueTemporarily();
+      const project = store.getSnapshot().project;
+      expect(project).not.toBeNull();
+
+      const internalStore = store as unknown as {
+        readonly setSnapshot: (snapshot: ReturnType<ProjectStore["getSnapshot"]>, options: { readonly rotateProjectInstance: true }) => void;
+      };
+      const rawReplayStore: DemonstrationReplayStore = {
+        getSnapshot: store.getSnapshot,
+        executeCommand: async (command, expectedProjectId) => {
+          const result = await store.executeCommand(command, expectedProjectId);
+          if (command.type === "StartGenerationRun") {
+            internalStore.setSnapshot(store.getSnapshot(), { rotateProjectInstance: true });
+          }
+          return result;
+        },
+        persistCaptionGenerationReceipt: store.persistCaptionGenerationReceipt.bind(store),
+        deleteCaptionGenerationReceipt: store.deleteCaptionGenerationReceipt.bind(store),
+        loadCaptionGenerationReceipt: store.loadCaptionGenerationReceipt.bind(store),
+        adoptStagedCaptionGenerationResult: store.adoptStagedCaptionGenerationResult.bind(store),
+        getCloudProjectOwnerCapability: store.getCloudProjectOwnerCapability,
+      };
+
+      await expect(createDemonstrationReplay({ project: project!, store: rawReplayStore })).rejects.toThrow(/durable browser storage/i);
+      expect(store.getSnapshot().project?.captions.order).toHaveLength(0);
+      expect(store.getSnapshot().project?.courtRecord.some((event) => event.type === "AdoptCaptionGenerationResult")).toBe(false);
+
+      const currentFence = store.getProjectInstanceFence();
+      const currentStore = store.bindGenerationStore(currentFence!);
+      expect(await currentStore.loadCaptionGenerationReceipt(DEMONSTRATION_REPLAY_RUN_ID)).toBeNull();
+    } finally {
+      await database.delete();
+    }
+  });
+
   it("visibly labels recorded fixture output and drives the real adoption and validation path without a provider client", async () => {
     let project = sampleProject();
     const receipts = new Map<string, unknown>();

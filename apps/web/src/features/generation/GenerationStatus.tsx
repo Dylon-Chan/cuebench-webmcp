@@ -204,6 +204,7 @@ export function GenerationStatus({
   const [localRecovery, setLocalRecovery] = useState<PersistedCloudUploadRecovery | null>(() => uploadRecovery ?? null);
   const recovery = uploadRecovery === undefined ? localRecovery : uploadRecovery;
   const hasProposed = hasProposedCaptions(project);
+  const durableStorage = store.getSnapshot().mode !== "temporary";
   const isDemonstrationSample = project.media.sha256.toLowerCase() === SAMPLE_MEDIA_SHA256
     && project.media.durationMs === SAMPLE_MEDIA_DURATION_MS;
   const replayCompleted = isDemonstrationSample && hasCompletedDemonstrationReplay(project);
@@ -517,10 +518,8 @@ export function GenerationStatus({
   const waitingForAdoption = stage === "AwaitingAdoption";
   const pendingCleanup = hasPendingCleanup(receipt);
   const missingRecovery = runId !== null && receipt === null;
-  const durableStorage = store.getSnapshot().mode !== "temporary";
   const canStart = durableStorage && !pendingCleanup && !busy && (runId === null || missingRecovery) && hasUploadAuthorization(recovery, project, projectOwnerCapability);
   const canReplay = isDemonstrationSample
-    && durableStorage
     && !busy
     && (project.activeGenerationRun === null || runId === DEMONSTRATION_REPLAY_RUN_ID)
     && (Object.keys(project.captions.items).length === 0 || replayResumeAvailable);
@@ -541,7 +540,10 @@ export function GenerationStatus({
   return (
     <section className="storage-disclosure generation-status" aria-label="Caption generation">
       <h2>Caption generation</h2>
-      <p>Private media preparation and model calls run only inside CueBench’s durable workflow. This browser retains the signed recovery receipt and remains the canonical project store.</p>
+      <p>{durableStorage
+        ? "Private media preparation and model calls run only inside CueBench’s durable workflow. This browser retains the signed recovery receipt and remains the canonical project store."
+        : "Cloud caption generation needs durable browser storage. This temporary session can still run CueBench’s local, explicitly non-live Demonstration replay while this page remains open."}
+      </p>
       <p
         data-testid="caption-generation-stage"
         {...(replayPresentation ? {} : { role: "status", "aria-live": "polite" as const })}
@@ -552,12 +554,13 @@ export function GenerationStatus({
       {recoveryState === null ? null : <RecoveryNotice state={recoveryState} track="captions" />}
       {notice === null ? null : <p role="status">{notice}</p>}
       {receipt === null ? null : <p className="generation-status__receipt">Recovery receipt retained for run {receipt.runId}.</p>}
-      {!durableStorage ? <p role="status">Caption generation is unavailable in this temporary browser session because CueBench cannot retain a recoverable signed receipt or safely hold the target-track lease.</p> : null}
+      {!durableStorage ? <p role="status">Cloud caption generation is unavailable in this temporary browser session because CueBench cannot retain a recoverable signed receipt or safely hold the target-track lease. The local Demonstration replay remains available and does not create a cloud recovery receipt.</p> : null}
       {otherRunActive ? <p role="status">Another generation target currently holds the project lease.</p> : null}
       {isDemonstrationSample ? (
         <section className="generation-status__replay" aria-labelledby="demonstration-replay-heading" aria-busy={replayRunning}>
           <h3 id="demonstration-replay-heading">{DEMONSTRATION_REPLAY_LABEL}</h3>
           <p>A recorded, deterministic fixture that uses CueBench’s real staged-adoption, revision, validation, and Court Record path. It is not live provider output.</p>
+          {!durableStorage ? <p>It stays entirely in this open temporary session: no media upload, provider request, or cloud recovery receipt is created.</p> : null}
           <p>The replay proposes deliberately imperfect captions for review; it cannot Sustain, Object, or certify them for you.</p>
           <button type="button" className="button button--outline" disabled={!canReplay} onClick={() => void runDemonstrationReplay()}>
             {replayRunning

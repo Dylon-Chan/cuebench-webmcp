@@ -82,6 +82,11 @@ import {
   type ProjectRunCleanupAuthorization,
   type ProjectUploadCleanupAuthorization,
 } from "./project-cloud-cleanup";
+import {
+  DEMONSTRATION_REPLAY_RUN_ID,
+  isExactTemporaryDemonstrationReplayAdoption,
+  isExactTemporaryDemonstrationReplayCheckpoint,
+} from "./replay-generation";
 
 export type ProjectMode = "durable" | "temporary";
 export type ProjectRoute = "start" | "temporary-choice" | "workbench";
@@ -768,6 +773,17 @@ const isQuotaExceeded = (error: unknown): boolean => error instanceof Error && e
 
 const titleForFile = (file: File): string => file.name.trim().length > 0 ? file.name : "Local video";
 
+const temporaryReplayReceiptKey = (projectId: string, runId: string): string => `${projectId}:${runId}`;
+const temporaryReplayRunIdError = (): Error => new Error(
+  "CueBench's temporary demonstration replay uses its fixed run ID only.",
+);
+const temporaryReplayDurableStorageError = (): Error => new Error(
+  "CueBench needs durable browser storage before it can retain a recoverable caption-generation receipt.",
+);
+const targetSpecificGenerationAdoptionError = (): Error => new Error(
+  "CueBench adopts staged generation results only through the target-specific receipt-verified method.",
+);
+
 /** Browser-canonical lifecycle with durable IndexedDB and truthful page-memory fallback. */
 export class ProjectStore {
   private readonly database: CueBenchDatabase;
@@ -784,6 +800,8 @@ export class ProjectStore {
   private snapshot: ProjectStoreSnapshot = emptySnapshot();
   private readonly listeners = new Set<() => void>();
   private readonly ownedProjectTokens = new Map<string, string>();
+  /** Local fixture checkpoints disappear with this page; they are never cloud-recovery receipts. */
+  private readonly temporaryDemonstrationReplayReceipts = new Map<string, unknown>();
   private pendingBackupImport: PendingBackupImport | null = null;
   private activeCleanupReceiptId: string | null = null;
   /** One browser store never sends overlapping hosted-cleanup requests for the same retained receipt. */
@@ -1043,6 +1061,9 @@ export class ProjectStore {
    */
   public executeCommand(command: DomainCommand, expectedProject?: string | ProjectInstanceFence): Promise<CommandResult> {
     const execute = async (): Promise<CommandResult> => {
+      if (command.type === "AdoptCaptionGenerationResult" || command.type === "AdoptAudioDescriptionGenerationResult") {
+        throw targetSpecificGenerationAdoptionError();
+      }
       const snapshot = this.snapshot;
       if (snapshot.project === null || snapshot.mode === null) {
         throw new Error("CueBench cannot edit a project before its media is available.");
@@ -1138,6 +1159,19 @@ export class ProjectStore {
       }
       if (snapshot.activity !== null) {
         throw new Error("CueBench cannot adopt caption evidence while another local operation is in progress.");
+      }
+      if (snapshot.mode === "temporary") {
+        if (expectedProject === undefined) throw temporaryReplayDurableStorageError();
+        this.assertExpectedProjectInstance(expectedProject);
+        const receipt = this.temporaryDemonstrationReplayReceipts.get(
+          temporaryReplayReceiptKey(snapshot.project.projectId, command.runId),
+        );
+        if (!isExactTemporaryDemonstrationReplayAdoption(snapshot.project, receipt, command)) {
+          throw new Error("CueBench needs durable browser storage before it can retain a recoverable caption-generation receipt.");
+        }
+        const result = applyCommand(snapshot.project, command);
+        this.setSnapshot({ ...this.snapshot, project: result.project, error: result.error?.message ?? null });
+        return result;
       }
       if (snapshot.mode !== "durable") {
         throw new Error("CueBench needs durable browser storage before it can retain a recoverable caption-generation receipt.");
@@ -1236,10 +1270,35 @@ export class ProjectStore {
     receipt: unknown,
     expectedProject?: ProjectInstanceFence,
   ): Promise<void> {
+    return this.enqueueGenerationReceiptPersistence(runId, receipt, expectedProject, true);
+  }
+
+  /** The only Temporary Session receipt exception is the bound Caption replay checkpoint. */
+  private enqueueGenerationReceiptPersistence(
+    runId: string,
+    receipt: unknown,
+    expectedProject: ProjectInstanceFence | undefined,
+    allowTemporaryDemonstrationReplay: boolean,
+  ): Promise<void> {
     const persist = async (): Promise<void> => {
       const snapshot = this.snapshot;
-      if (snapshot.project === null || snapshot.mode !== "durable") {
-        throw new Error("CueBench needs durable browser storage before it can retain a recoverable caption-generation receipt.");
+      if (snapshot.project === null || snapshot.mode === null) {
+        throw temporaryReplayDurableStorageError();
+      }
+      if (snapshot.mode === "temporary") {
+        if (!allowTemporaryDemonstrationReplay || expectedProject === undefined) {
+          throw temporaryReplayDurableStorageError();
+        }
+        this.assertExpectedProjectInstance(expectedProject);
+        if (runId !== DEMONSTRATION_REPLAY_RUN_ID) throw temporaryReplayRunIdError();
+        if (!isExactTemporaryDemonstrationReplayCheckpoint(snapshot.project, receipt)) {
+          throw temporaryReplayDurableStorageError();
+        }
+        this.temporaryDemonstrationReplayReceipts.set(
+          temporaryReplayReceiptKey(snapshot.project.projectId, runId),
+          structuredClone(receipt),
+        );
+        return;
       }
       await this.runFencedReceiptOperation(snapshot.project.projectId, expectedProject, async (options) => {
         await this.database.transaction("rw", [this.database.runReceipts, this.database.settings], async () => {
@@ -1265,10 +1324,24 @@ export class ProjectStore {
     const snapshot = this.snapshot;
     const capturedProject = snapshot.project;
     const operationFence = expectedProject ?? this.getProjectInstanceFence();
-    if (capturedProject === null || snapshot.mode !== "durable" || operationFence === null) {
+    if (capturedProject === null || snapshot.mode === null || operationFence === null) {
       return Promise.reject(new Error("CueBench needs durable browser storage before it can delete a caption-generation receipt."));
     }
     const remove = async (): Promise<void> => {
+      if (snapshot.mode === "temporary") {
+        if (expectedProject === undefined) throw temporaryReplayDurableStorageError();
+        this.assertExpectedProjectInstance(operationFence);
+        if (this.snapshot.project?.projectId !== capturedProject.projectId || this.snapshot.mode !== "temporary") {
+          throw new Error("CueBench's temporary browser project changed before it could clear the local replay checkpoint.");
+        }
+        if (runId !== DEMONSTRATION_REPLAY_RUN_ID) throw temporaryReplayRunIdError();
+        const receipt = this.temporaryDemonstrationReplayReceipts.get(temporaryReplayReceiptKey(capturedProject.projectId, runId));
+        if (!isExactTemporaryDemonstrationReplayCheckpoint(capturedProject, receipt)) {
+          throw temporaryReplayDurableStorageError();
+        }
+        this.temporaryDemonstrationReplayReceipts.delete(temporaryReplayReceiptKey(capturedProject.projectId, runId));
+        return;
+      }
       await this.runFencedReceiptOperation(capturedProject.projectId, operationFence, (options) => (
         deleteRunReceipt(this.database, capturedProject.projectId, runId, options)
       ));
@@ -1336,7 +1409,13 @@ export class ProjectStore {
   /** Reads only the recovery receipt belonging to the currently visible project. */
   public async loadCaptionGenerationReceipt(runId: string, expectedProject?: ProjectInstanceFence): Promise<unknown | null> {
     const snapshot = this.snapshot;
-    if (snapshot.project === null || snapshot.mode !== "durable") return null;
+    if (snapshot.project === null || snapshot.mode === null) return null;
+    if (snapshot.mode === "temporary") {
+      if (expectedProject === undefined) return null;
+      this.assertExpectedProjectInstance(expectedProject);
+      if (runId !== DEMONSTRATION_REPLAY_RUN_ID) return null;
+      return structuredClone(this.temporaryDemonstrationReplayReceipts.get(temporaryReplayReceiptKey(snapshot.project.projectId, runId)) ?? null);
+    }
     const row = await this.runFencedReceiptOperation(snapshot.project.projectId, expectedProject, (options) => (
       loadRunReceipt(this.database, snapshot.project!.projectId, runId, options)
     ));
@@ -1346,24 +1425,31 @@ export class ProjectStore {
   /** Lists opaque receipt ids so detached terminal cleanup can recover on reload. */
   public async listCaptionGenerationReceiptRunIds(expectedProject?: ProjectInstanceFence): Promise<readonly string[]> {
     const snapshot = this.snapshot;
-    if (snapshot.project === null || snapshot.mode !== "durable") return [];
+    if (snapshot.project === null || snapshot.mode === null) return [];
+    if (snapshot.mode === "temporary") {
+      if (expectedProject === undefined) return [];
+      this.assertExpectedProjectInstance(expectedProject);
+      const runId = DEMONSTRATION_REPLAY_RUN_ID;
+      return this.temporaryDemonstrationReplayReceipts.has(temporaryReplayReceiptKey(snapshot.project.projectId, runId))
+        ? [runId]
+        : [];
+    }
     return (await this.runFencedReceiptOperation(snapshot.project.projectId, expectedProject, (options) => (
       listRunReceipts(this.database, snapshot.project!.projectId, options)
     ))).map((row) => row.runId);
   }
 
   /**
-   * AD receipts use the same project-scoped browser table as caption receipts,
-   * but retain a distinct public surface so callers cannot accidentally treat
-   * an AD capability as a caption capability. The opaque row is shared only at
-   * this storage boundary; each client validates its own signed receipt shape.
+   * AD receipts share the durable browser table with captions, but Temporary
+   * Session Projects deliberately expose no AD receipt exception. The one
+   * local-only replay checkpoint belongs only to the Caption target.
    */
   public persistAudioDescriptionGenerationReceipt(
     runId: string,
     receipt: unknown,
     expectedProject?: ProjectInstanceFence,
   ): Promise<void> {
-    return this.persistCaptionGenerationReceipt(runId, receipt, expectedProject);
+    return this.enqueueGenerationReceiptPersistence(runId, receipt, expectedProject, false);
   }
 
   /** Reserve an AD write-ahead receipt slot before a potentially billable dispatch. */
@@ -1380,8 +1466,9 @@ export class ProjectStore {
     return this.releaseCaptionGenerationReceiptReservation(runId, expectedProject);
   }
 
-  /** Reads a project-scoped opaque AD recovery receipt. */
-  public loadAudioDescriptionGenerationReceipt(runId: string, expectedProject?: ProjectInstanceFence): Promise<unknown | null> {
+  /** Reads a durable project-scoped opaque AD recovery receipt. */
+  public async loadAudioDescriptionGenerationReceipt(runId: string, expectedProject?: ProjectInstanceFence): Promise<unknown | null> {
+    if (this.snapshot.mode === "temporary") return null;
     return this.loadCaptionGenerationReceipt(runId, expectedProject);
   }
 
@@ -1424,8 +1511,9 @@ export class ProjectStore {
     return queued;
   }
 
-  /** Lists opaque receipt ids for AD terminal-cleanup recovery after reload. */
-  public listAudioDescriptionGenerationReceiptRunIds(expectedProject?: ProjectInstanceFence): Promise<readonly string[]> {
+  /** Lists durable AD receipt ids; Temporary Session Projects never expose AD receipt state. */
+  public async listAudioDescriptionGenerationReceiptRunIds(expectedProject?: ProjectInstanceFence): Promise<readonly string[]> {
+    if (this.snapshot.mode === "temporary") return [];
     return this.listCaptionGenerationReceiptRunIds(expectedProject);
   }
 
@@ -3232,6 +3320,9 @@ export class ProjectStore {
     const priorProjectId = this.snapshot.project?.projectId ?? null;
     const nextProjectId = nextSnapshot.project?.projectId ?? null;
     const replacedInstance = options.rotateProjectInstance === true || priorProjectId !== nextProjectId;
+    if (this.snapshot.mode === "temporary" && (nextSnapshot.mode !== "temporary" || replacedInstance)) {
+      this.temporaryDemonstrationReplayReceipts.clear();
+    }
     if (replacedInstance) {
       this.projectInstanceEpoch += 1;
       this.projectInstanceCapabilityFingerprint = nextProjectId === null

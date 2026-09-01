@@ -7,6 +7,8 @@ import {
   SAMPLE_MEDIA_DURATION_MS,
   SAMPLE_MEDIA_SHA256,
   createDemonstrationReplay,
+  isExactTemporaryDemonstrationReplayAdoption,
+  isExactTemporaryDemonstrationReplayCheckpoint,
   type DemonstrationReplayStore,
 } from "./replay-generation";
 
@@ -175,7 +177,7 @@ describe("CueBench deterministic demonstration replay", () => {
     expect(firstHarness.receipt()).toBeUndefined();
   });
 
-  it("refuses temporary projects and a media hash that is not the checked-in lesson", async () => {
+  it("runs its local, explicitly non-live fixture in a temporary current-page project", async () => {
     const project = replayProject();
     const temporary = replayStore(project);
     const temporaryStore: DemonstrationReplayStore = {
@@ -183,8 +185,58 @@ describe("CueBench deterministic demonstration replay", () => {
       getSnapshot: () => ({ project, mode: "temporary" }),
     };
 
-    await expect(createDemonstrationReplay({ project, store: temporaryStore })).rejects.toThrow(/durable browser storage/i);
-    expect(temporary.executeCommand).not.toHaveBeenCalled();
+    const replay = await createDemonstrationReplay({ project, store: temporaryStore });
+
+    expect(replay.provider).toEqual({ kind: "deterministic-replay", live: false });
+    expect(replay.project.validationRun).not.toBeNull();
+    expect(temporary.executeCommand).toHaveBeenCalled();
+    expect(temporary.receipt()).toBeUndefined();
+  });
+
+  it("rejects a malformed temporary checkpoint, non-sample media, and staged-result hash or content substitution", async () => {
+    const harness = replayStore(replayProject("temporary-proof"));
+    const temporaryStore: DemonstrationReplayStore = {
+      ...harness.store,
+      getSnapshot: () => ({ project: harness.project(), mode: "temporary" }),
+    };
+    harness.failNextAdoption("hold the exact staged checkpoint for proof checks");
+
+    await expect(createDemonstrationReplay({ project: harness.project(), store: temporaryStore })).rejects.toThrow(/proof checks/i);
+
+    const project = harness.project();
+    const receipt = harness.receipt();
+    const command = harness.adoptStagedCaptionGenerationResult.mock.calls[0]?.[0];
+    expect(receipt).toBeDefined();
+    expect(command).toBeDefined();
+    expect(isExactTemporaryDemonstrationReplayCheckpoint(project, receipt)).toBe(true);
+    expect(isExactTemporaryDemonstrationReplayCheckpoint({
+      ...project,
+      media: { ...project.media, sha256: "0".repeat(64) },
+    }, receipt)).toBe(false);
+    expect(isExactTemporaryDemonstrationReplayCheckpoint(project, {
+      ...(receipt as Record<string, unknown>),
+      demonstrationReplay: {
+        ...((receipt as { readonly demonstrationReplay: Record<string, unknown> }).demonstrationReplay),
+        fixtureContentSha256: "0".repeat(64),
+      },
+    })).toBe(false);
+
+    const staged = command!.result;
+    expect(isExactTemporaryDemonstrationReplayAdoption(project, receipt, {
+      ...command!,
+      result: { ...staged, outputSha256: "0".repeat(64) },
+    })).toBe(false);
+    expect(isExactTemporaryDemonstrationReplayAdoption(project, receipt, {
+      ...command!,
+      result: {
+        ...staged,
+        captions: staged.captions.map((caption, index) => index === 0 ? { ...caption, text: `${caption.text} forged` } : caption),
+      },
+    })).toBe(false);
+  });
+
+  it("refuses a media hash that is not the checked-in lesson", async () => {
+    const project = replayProject();
 
     const mismatch = replayStore({ ...project, media: { ...project.media, sha256: "0".repeat(64) } });
     await expect(createDemonstrationReplay({

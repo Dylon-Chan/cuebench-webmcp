@@ -21,6 +21,11 @@ import type { GenerationClientReceipt } from "../generation/generation-client";
 const aiActor = { type: "CueBenchAI" as const, id: "cuebench-ai" };
 const systemActor = { type: "System" as const, id: "validator" };
 const maxRetentionMs = 24 * 60 * 60 * 1_000;
+/**
+ * This is deliberately not a cloud credential. It binds the exact local-only
+ * fixture checkpoint while a Temporary Session Project remains open.
+ */
+const localReplayCheckpointOwnerCapability = "demonstration-replay-local-checkpoint";
 
 export const DEMONSTRATION_REPLAY_LABEL = "Demonstration replay" as const;
 export const DEMONSTRATION_REPLAY_RUN_ID = "demonstration-replay-captions-v1" as const;
@@ -593,10 +598,90 @@ const isReplayCheckpointConsistent = (
     && adoption.adoptedProjectRevision <= project.projectRevision;
 };
 
-const assertReplayPreconditions = (input: DemonstrationReplayInput): void => {
+/**
+ * Reconstructs the one local-only staged payload that the checked-in sample
+ * is permitted to adopt. The Temporary Session Project never receives a
+ * generic staged-result capability: this proof binds the sample media, active
+ * lease, fixture checkpoint, full canonical content, and output hash together.
+ */
+const exactTemporaryReplayStagedResult = (
+  project: CaptionProject,
+  value: unknown,
+): { readonly receipt: DemonstrationReplayReceipt; readonly result: StagedGenerationResult } | null => {
+  if (
+    project.media.sha256.toLowerCase() !== SAMPLE_MEDIA_SHA256
+    || project.media.durationMs !== SAMPLE_MEDIA_DURATION_MS
+  ) return null;
+  const receipt = replayReceiptFrom(value, project, localReplayCheckpointOwnerCapability);
+  if (
+    receipt === null
+    || receipt.hostedArtifact !== false
+    || receipt.signedGenerationReceipt !== "demonstration-replay-no-cloud-receipt"
+    || receipt.session !== "demonstration-replay-no-cloud-session"
+    || receipt.retentionExpiresAtMs !== receipt.demonstrationReplay.stagedExpiresAtMs
+    || !Number.isSafeInteger(receipt.savedAtMs)
+    || !isReplayCheckpointConsistent(project, receipt)
+  ) return null;
+  let expected: StagedGenerationResult;
+  try {
+    expected = stagedResultFor(project, DEMONSTRATION_REPLAY_RUN_ID, {
+      expectedProjectRevision: receipt.expectedProjectRevision,
+      expectedQualityProfileRevision: receipt.expectedQualityProfileRevision,
+      createdAtMs: receipt.demonstrationReplay.stagedCreatedAtMs,
+      expiresAtMs: receipt.demonstrationReplay.stagedExpiresAtMs,
+    });
+  } catch {
+    return null;
+  }
+  return expected.outputSha256 === receipt.demonstrationReplay.stagedResultSha256
+    && fixtureContentSha256For(expected) === receipt.demonstrationReplay.fixtureContentSha256
+    ? { receipt, result: expected }
+    : null;
+};
+
+/** True only for the exact retained local replay checkpoint for the open sample project. */
+export const isExactTemporaryDemonstrationReplayCheckpoint = (
+  project: CaptionProject,
+  value: unknown,
+): boolean => exactTemporaryReplayStagedResult(project, value) !== null;
+
+/**
+ * Allows Temporary Session adoption only when the domain command is byte-for-
+ * byte equivalent to the exact fixture payload that the retained checkpoint
+ * authenticated. This deliberately rejects a forged hash as well as content
+ * substituted beneath a copied hash.
+ */
+export const isExactTemporaryDemonstrationReplayAdoption = (
+  project: CaptionProject,
+  value: unknown,
+  command: CaptionGenerationAdoptionCommand,
+): boolean => {
+  const checkpoint = exactTemporaryReplayStagedResult(project, value);
+  if (checkpoint === null || checkpoint.receipt.demonstrationReplay.phase !== "staged") return false;
+  if (
+    command.type !== "AdoptCaptionGenerationResult"
+    || command.actor.type !== "CueBenchAI"
+    || command.actor.id !== aiActor.id
+    || command.runId !== DEMONSTRATION_REPLAY_RUN_ID
+    || command.expectedProjectRevision !== checkpoint.receipt.expectedProjectRevision
+    || command.expectedQualityProfileRevision !== checkpoint.receipt.expectedQualityProfileRevision
+    || command.confirmedProposedReplacement !== false
+  ) return false;
+  const parsed = StagedGenerationResultSchema.safeParse(command.result);
+  if (!parsed.success) return false;
+  const actual = parsed.data;
+  const payload = structuredClone(actual) as unknown as Record<string, unknown>;
+  delete payload.outputSha256;
+  return actual.outputSha256 === sha256Hex(canonicalSerialize(payload))
+    && actual.outputSha256 === checkpoint.result.outputSha256
+    && canonicalSerialize(actual) === canonicalSerialize(checkpoint.result);
+};
+
+const assertReplayPreconditions = (input: DemonstrationReplayInput): "durable" | "temporary" => {
   const snapshot = input.store.getSnapshot();
-  if (snapshot.mode !== "durable") {
-    fail("Demonstration replay requires durable browser storage; temporary projects are not eligible.");
+  const storageMode = snapshot.mode;
+  if (storageMode !== "durable" && storageMode !== "temporary") {
+    return fail("Demonstration replay requires an open CueBench browser project.");
   }
   if (
     snapshot.project === null
@@ -619,23 +704,26 @@ const assertReplayPreconditions = (input: DemonstrationReplayInput): void => {
   fixtureStages();
   fixtureSegments();
   fixtureCaptions();
+  return storageMode;
 };
 
-/** True only for this exact unfinished local fixture checkpoint and owner capability. */
+/** True only for this exact unfinished fixture checkpoint in the current browser project. */
 export const hasResumableDemonstrationReplay = async (
   project: CaptionProject,
   store: DemonstrationReplayStore,
 ): Promise<boolean> => {
   const snapshot = store.getSnapshot();
   if (
-    snapshot.mode !== "durable"
+    (snapshot.mode !== "durable" && snapshot.mode !== "temporary")
     || snapshot.project?.projectId !== project.projectId
     || snapshot.project.projectRevision !== project.projectRevision
     || project.media.sha256.toLowerCase() !== SAMPLE_MEDIA_SHA256
     || project.media.durationMs !== SAMPLE_MEDIA_DURATION_MS
   ) return false;
-  const ownerCapability = await store.getCloudProjectOwnerCapability?.(project.projectId) ?? null;
-  if (ownerCapability === null || !/^[0-9a-f]{64}$/iu.test(ownerCapability)) return false;
+  const ownerCapability = snapshot.mode === "temporary"
+    ? localReplayCheckpointOwnerCapability
+    : await store.getCloudProjectOwnerCapability?.(project.projectId) ?? null;
+  if (ownerCapability === null || (snapshot.mode === "durable" && !/^[0-9a-f]{64}$/iu.test(ownerCapability))) return false;
   const receipt = replayReceiptFrom(
     await store.loadCaptionGenerationReceipt(DEMONSTRATION_REPLAY_RUN_ID),
     project,
@@ -666,15 +754,15 @@ const assertExpectedFindings = (project: CaptionProject, expectedFindingRuleIds:
 };
 
 /**
- * Replays the checked-in Gibbs lesson through the same durable domain and
- * storage adoption seams as live generation. It never contacts a provider,
+ * Replays the checked-in Gibbs lesson through the same domain lease,
+ * staged-adoption, validation, and Court Record seams as live generation. It never contacts a provider,
  * never claims live model work, and deliberately stops at Proposed captions:
  * Sustain, Object, and Certify remain Human-only UI decisions.
  */
 export const createDemonstrationReplay = async (
   input: DemonstrationReplayInput,
 ): Promise<DemonstrationReplayResult> => {
-  assertReplayPreconditions(input);
+  const storageMode = assertReplayPreconditions(input);
   const stageDelayMs = input.stageDelayMs ?? 0;
   if (!Number.isSafeInteger(stageDelayMs) || stageDelayMs < 0 || stageDelayMs > 2_000) {
     return fail("Demonstration replay stage pacing must be between zero and two seconds.");
@@ -683,9 +771,11 @@ export const createDemonstrationReplay = async (
   if (runId !== DEMONSTRATION_REPLAY_RUN_ID) {
     return fail("CueBench's demonstration replay run identity changed unexpectedly.");
   }
-  const ownerCapability = await input.store.getCloudProjectOwnerCapability?.(input.project.projectId) ?? null;
-  if (ownerCapability === null || !/^[0-9a-f]{64}$/iu.test(ownerCapability)) {
-    return fail("Demonstration replay requires the current durable browser-project owner capability.");
+  const ownerCapability = storageMode === "temporary"
+    ? localReplayCheckpointOwnerCapability
+    : await input.store.getCloudProjectOwnerCapability?.(input.project.projectId) ?? null;
+  if (ownerCapability === null || (storageMode === "durable" && !/^[0-9a-f]{64}$/iu.test(ownerCapability))) {
+    return fail("Demonstration replay requires the current browser-project checkpoint.");
   }
   const nowMs = (input.clock ?? Date.now)();
   if (!Number.isSafeInteger(nowMs) || nowMs < 0) return fail("Demonstration replay requires a valid current local time.");

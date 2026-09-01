@@ -92,12 +92,19 @@ export function WorkbenchShell({ project, mode, sourceObjectUrl, sourceProvenanc
     readonly evidenceId?: string;
     readonly signal?: AbortSignal;
   }) => Promise<boolean>>(async () => false);
+  const projectInstanceEpoch = store.getProjectInstanceEpoch();
   const projectInstanceCapabilityFingerprint = store.getProjectInstanceFence()?.projectInstanceCapabilityFingerprint ?? null;
+  /** The UI never hands a raw ProjectStore to an asynchronous generation lifecycle. */
+  const generationStore = useMemo(() => store.bindGenerationStore({
+    projectId: project.projectId,
+    projectInstanceEpoch,
+    ...(projectInstanceCapabilityFingerprint === null ? {} : { projectInstanceCapabilityFingerprint }),
+  }), [project.projectId, projectInstanceCapabilityFingerprint, projectInstanceEpoch, store]);
   const profileProposalMatchesProject = agentProfileProposal !== null
     && agentProfileProposal.projectId === project.projectId
     && agentProfileProposal.baseProjectRevision === project.projectRevision
     && agentProfileProposal.baseProfileRevision === project.qualityProfile.revision
-    && agentProfileProposal.projectInstanceEpoch === store.getProjectInstanceEpoch()
+    && agentProfileProposal.projectInstanceEpoch === projectInstanceEpoch
     && agentProfileProposal.projectInstanceCapabilityFingerprint === projectInstanceCapabilityFingerprint;
   const publishAgentProfileProposal = useCallback((proposal: BoundWebMcpProfileProposal, signal: AbortSignal): Promise<void> => new Promise((resolve, reject) => {
     if (signal.aborted) {
@@ -335,10 +342,10 @@ export function WorkbenchShell({ project, mode, sourceObjectUrl, sourceProvenanc
           durationMs={project.media.durationMs}
           mediaSha256={project.media.sha256}
           sourceObjectUrl={sourceObjectUrl}
-          resolveProjectOwnerCapability={store.getCloudProjectOwnerCapability}
+          resolveProjectOwnerCapability={generationStore.getCloudProjectOwnerCapability}
         />
-        <GenerationStatus project={project} store={store} />
-        <AdGenerationStatus project={project} store={store} />
+        <GenerationStatus project={project} store={generationStore} />
+        <AdGenerationStatus project={project} store={generationStore} />
         {webMcpAvailable || webMcpDebugEnabled ? <WebMcpBridge
           project={project}
           store={store}
