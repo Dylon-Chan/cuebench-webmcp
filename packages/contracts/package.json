@@ -1,0 +1,14 @@
+{
+  "name": "@cuebench/contracts",
+  "version": "0.0.0",
+  "type": "module",
+  "exports": "./src/index.ts",
+  "scripts": {
+    "test": "vitest run --exclude=**/dist/** --exclude=**/coverage/**",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "build": "tsc -p tsconfig.build.json"
+  },
+  "dependencies": {
+    "zod": "4.4.3"
+  }
+}

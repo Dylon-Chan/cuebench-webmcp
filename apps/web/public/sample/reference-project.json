@@ -1,0 +1,88 @@
+{
+  "schemaVersion": 1,
+  "sampleId": "gibbs-free-energy-sample-v1",
+  "title": "Gibbs free energy: a 90-second calibration",
+  "media": {
+    "fileName": "gibbs-free-energy.mp4",
+    "durationMs": 90000,
+    "byteLength": 2631010,
+    "sha256": "5ee0de5b26fa550da40bf4806b7c2e38dd9ec7457eeda770273e2500c6d1204a"
+  },
+  "buildInputs": {
+    "audioTrack": {
+      "path": "tools/sample/audio/gibbs-free-energy-narration-mix.flac",
+      "sha256": "fbb9f065707d140752c04b4e705ec63347056956b5ae7e5b79a5a85a56553222",
+      "byteLength": 1955693,
+      "codec": "flac",
+      "sampleRateHz": 48000,
+      "channels": 2,
+      "creationEnvironment": "macOS 26.5.1 (25F80), installed Samantha en-US and Daniel en-GB system voices; finalized into this exact lossless repository input. This records production facts only and makes no separate licensing representation."
+    },
+    "slideSvg": {
+      "path": "tools/sample/slides/lesson.svg",
+      "sha256": "88e01ccfaba9cf8b47e044d27e528d4a24e4382db57a83143b22c4d73df4f961"
+    },
+    "transcript": {
+      "path": "tools/sample/reference-transcript.json",
+      "sha256": "3ff17e7f3f71b981e9575457e3d36d432ee7ed787f7d5b2c98f21b8f5b00059b"
+    },
+    "replayEvents": {
+      "path": "tools/sample/replay-events.json",
+      "sha256": "b10c67a7db43644091543c16677365cb1848a24df7afbc76a7e0b5b21b05fa70"
+    },
+    "ffmpegImage": {
+      "image": "cuebench-media:selftest",
+      "imageId": "sha256:c120e84c76c0a759a91b3c0281bb08ce93c13acf7403fa13a30202e00eae6259",
+      "ffmpegVersion": "ffmpeg version 5.1.9-0+deb12u1 Copyright (c) 2000-2026 the FFmpeg developers",
+      "dockerfilePath": "services/media/Dockerfile",
+      "dockerfileSha256": "47505b2d707bd7dd7721c91d39e2e307b0ccabfce547a51833550f25269b41d2"
+    }
+  },
+  "provenance": {
+    "script": "Original CueBench demonstration script authored for this repository.",
+    "visuals": "Original SVG slides authored for this repository; no stock imagery.",
+    "voices": "The pinned lossless narration mix was produced offline with the macOS system voices and environment recorded in buildInputs.audioTrack; no recorded person is represented.",
+    "build": "Deterministic timeline assembly from the hashed SVG, transcript, replay record, lossless narration mix, Dockerfile, and exact cached FFmpeg image recorded in buildInputs.",
+    "playbackNetworkRequired": false,
+    "replayNetworkRequired": false,
+    "cleanBuildNetworkRequired": true,
+    "verifyRequiresCachedPinnedImage": true,
+    "providerAccountRequired": false
+  },
+  "expected": {
+    "replayLabel": "Demonstration replay",
+    "provider": { "kind": "deterministic-replay", "live": false },
+    "fixtureContentSha256": "ba6fd19490842e7b5979b7366b298af608a020a1a66deb06cbe5957e27b9cabc",
+    "recordedReplayEnvelope": {
+      "createdAtMs": 1787961600000,
+      "expiresAtMs": 1788048000000,
+      "usage": "provenance-only; adoption receives a fresh local 24-hour retention envelope"
+    },
+    "captionCount": 15,
+    "expectedFindingRuleIds": [
+      "caption.duration",
+      "caption.reading-speed",
+      "review.unreviewed-revision"
+    ],
+    "challengeMarkers": [
+      "proper-name-spelling",
+      "two-speaker-attribution",
+      "reading-speed",
+      "overlong-cue",
+      "joke-interpretation",
+      "equation-slide-text",
+      "silent-diagram-audio-description"
+    ],
+    "humanAuthority": {
+      "initialCueState": "Proposed",
+      "replayMaySustain": false,
+      "replayMayObject": false,
+      "replayMayCertify": false
+    },
+    "referenceAudioDescription": {
+      "startMs": 52000,
+      "endMs": 62000,
+      "text": "A reaction-progress curve climbs to an activation-energy crest, then settles lower; an arrow marks delta G as the energy difference."
+    }
+  }
+}

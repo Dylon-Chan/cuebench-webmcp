@@ -1,0 +1,287 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "cuebench-web",
+  "main": "worker/index.ts",
+  "compatibility_date": "2026-08-22",
+  "compatibility_flags": ["nodejs_compat"],
+  "assets": {
+    "directory": "./dist/client",
+    "binding": "ASSETS",
+    "not_found_handling": "single-page-application"
+  },
+  "r2_buckets": [
+    {
+      "binding": "PROCESSING_BUCKET",
+      "bucket_name": "cuebench-processing-local"
+    }
+  ],
+  "analytics_engine_datasets": [
+    {
+      "binding": "CUEBENCH_TELEMETRY",
+      "dataset": "cuebench_local"
+    }
+  ],
+  "triggers": {
+    "crons": ["*/5 * * * *"]
+  },
+  "workflows": [
+    {
+      "name": "cuebench-caption-generation-local",
+      "binding": "PROCESSING_WORKFLOW",
+      "class_name": "CaptionGenerationWorkflow"
+    },
+    {
+      "name": "cuebench-audio-description-generation-local",
+      "binding": "AUDIO_DESCRIPTION_PROCESSING_WORKFLOW",
+      "class_name": "AudioDescriptionGenerationWorkflow"
+    }
+  ],
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "QUOTA_LEDGER",
+        "class_name": "QuotaLedger"
+      },
+      {
+        "name": "UPLOAD_COORDINATOR",
+        "class_name": "UploadCoordinator"
+      },
+      {
+        "name": "MEDIA_PREPARER",
+        "class_name": "MediaPreparationContainer"
+      }
+    ]
+  },
+  "containers": [
+    {
+      "class_name": "MediaPreparationContainer",
+      "image": "../../services/media/Dockerfile",
+      "image_build_context": "../../services/media",
+      "instance_type": "basic",
+      "max_instances": 2,
+      "constraints": {
+        "regions": ["APAC"]
+      }
+    }
+  ],
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": ["QuotaLedger"]
+    },
+    {
+      "tag": "v2",
+      "new_sqlite_classes": ["UploadCoordinator"]
+    },
+    {
+      "tag": "v3",
+      "new_sqlite_classes": ["MediaPreparationContainer"]
+    }
+  ],
+  "vars": {
+    "CUEBENCH_ENVIRONMENT": "local",
+    "SESSION_HMAC_CURRENT_KEY_ID": "v1",
+    "MEDIA_JOB_HMAC_CURRENT_KEY_ID": "local-media-v1",
+    "MEDIA_JOB_TTL_SECONDS": "600",
+    "SESSION_TTL_SECONDS": "86400",
+    "UPLOAD_CAPABILITY_TTL_SECONDS": "600",
+    "RECOVERY_TTL_SECONDS": "86400",
+    "MAX_SESSION_MEDIA_MINUTES": "30",
+    "MAX_IP_MEDIA_MINUTES": "90",
+    "MAX_SESSION_GENERATIONS": "6",
+    "MAX_SESSION_TTS": "50",
+    "MAX_IP_GENERATIONS": "18",
+    "MAX_IP_TTS": "150",
+    "MAX_PENDING_SESSION_BYTES": "524288000",
+    "MAX_PENDING_IP_BYTES": "1048576000",
+    "MAX_PENDING_SESSION_OPERATIONS": "2",
+    "MAX_PENDING_IP_OPERATIONS": "8",
+    "GLOBAL_SPEND_LIMIT_CENTS": "10000",
+    "GLOBAL_SPEND_BREAKER_OPEN": "false",
+    "CUEBENCH_OPENAI_MODE": "fixture",
+    "CUEBENCH_RECONCILIATION_MODEL": "gpt-5.6-terra",
+    "GENERATION_RUN_TTL_SECONDS": "86400",
+    "MAX_WORKFLOW_PROVIDER_COST_CENTS": "100",
+    "MAX_MEDIA_PROBE_COST_CENTS": "1",
+    "MAX_TTS_PROVIDER_COST_CENTS": "10",
+    "MAX_AUDIO_DESCRIPTION_PROVIDER_COST_CENTS": "100",
+    "TURNSTILE_VERIFY_URL": "https://challenges.cloudflare.com/turnstile/v0/siteverify",
+    "TURNSTILE_EXPECTED_ACTION": "cuebench-upload"
+  },
+  "env": {
+    "preview": {
+      "r2_buckets": [
+        {
+          "binding": "PROCESSING_BUCKET",
+          "bucket_name": "cuebench-processing-preview"
+        }
+      ],
+      "analytics_engine_datasets": [
+        {
+          "binding": "CUEBENCH_TELEMETRY",
+          "dataset": "cuebench_preview"
+        }
+      ],
+      "triggers": {
+        "crons": ["*/5 * * * *"]
+      },
+      "workflows": [
+        {
+          "name": "cuebench-caption-generation-preview",
+          "binding": "PROCESSING_WORKFLOW",
+          "class_name": "CaptionGenerationWorkflow"
+        },
+        {
+          "name": "cuebench-audio-description-generation-preview",
+          "binding": "AUDIO_DESCRIPTION_PROCESSING_WORKFLOW",
+          "class_name": "AudioDescriptionGenerationWorkflow"
+        }
+      ],
+      "durable_objects": {
+        "bindings": [
+          {
+            "name": "QUOTA_LEDGER",
+            "class_name": "QuotaLedger"
+          },
+          {
+            "name": "UPLOAD_COORDINATOR",
+            "class_name": "UploadCoordinator"
+          },
+          {
+            "name": "MEDIA_PREPARER",
+            "class_name": "MediaPreparationContainer"
+          }
+        ]
+      },
+      "containers": [
+        {
+          "class_name": "MediaPreparationContainer",
+          "image": "../../services/media/Dockerfile",
+          "image_build_context": "../../services/media",
+          "instance_type": "basic",
+          "max_instances": 1,
+          "constraints": {
+            "regions": ["APAC"]
+          }
+        }
+      ],
+      "vars": {
+        "CUEBENCH_ENVIRONMENT": "preview",
+        "SESSION_HMAC_CURRENT_KEY_ID": "preview-v1",
+        "MEDIA_JOB_HMAC_CURRENT_KEY_ID": "preview-media-v1",
+        "MEDIA_JOB_TTL_SECONDS": "600",
+        "SESSION_TTL_SECONDS": "86400",
+        "UPLOAD_CAPABILITY_TTL_SECONDS": "600",
+        "RECOVERY_TTL_SECONDS": "86400",
+        "MAX_SESSION_MEDIA_MINUTES": "15",
+        "MAX_IP_MEDIA_MINUTES": "45",
+        "MAX_SESSION_GENERATIONS": "3",
+        "MAX_SESSION_TTS": "25",
+        "MAX_IP_GENERATIONS": "9",
+        "MAX_IP_TTS": "75",
+        "MAX_PENDING_SESSION_BYTES": "262144000",
+        "MAX_PENDING_IP_BYTES": "524288000",
+        "MAX_PENDING_SESSION_OPERATIONS": "1",
+        "MAX_PENDING_IP_OPERATIONS": "4",
+        "GLOBAL_SPEND_LIMIT_CENTS": "2500",
+        "GLOBAL_SPEND_BREAKER_OPEN": "false",
+        "CUEBENCH_OPENAI_MODE": "fixture",
+        "CUEBENCH_RECONCILIATION_MODEL": "gpt-5.6-terra",
+        "GENERATION_RUN_TTL_SECONDS": "86400",
+        "MAX_WORKFLOW_PROVIDER_COST_CENTS": "100",
+        "MAX_MEDIA_PROBE_COST_CENTS": "1",
+        "MAX_TTS_PROVIDER_COST_CENTS": "10",
+        "MAX_AUDIO_DESCRIPTION_PROVIDER_COST_CENTS": "100",
+        "TURNSTILE_VERIFY_URL": "https://challenges.cloudflare.com/turnstile/v0/siteverify",
+        "TURNSTILE_EXPECTED_ACTION": "cuebench-upload"
+      }
+    },
+    "production": {
+      "r2_buckets": [
+        {
+          "binding": "PROCESSING_BUCKET",
+          "bucket_name": "cuebench-processing-production"
+        }
+      ],
+      "analytics_engine_datasets": [
+        {
+          "binding": "CUEBENCH_TELEMETRY",
+          "dataset": "cuebench_production"
+        }
+      ],
+      "triggers": {
+        "crons": ["*/5 * * * *"]
+      },
+      "workflows": [
+        {
+          "name": "cuebench-caption-generation-production",
+          "binding": "PROCESSING_WORKFLOW",
+          "class_name": "CaptionGenerationWorkflow"
+        },
+        {
+          "name": "cuebench-audio-description-generation-production",
+          "binding": "AUDIO_DESCRIPTION_PROCESSING_WORKFLOW",
+          "class_name": "AudioDescriptionGenerationWorkflow"
+        }
+      ],
+      "durable_objects": {
+        "bindings": [
+          {
+            "name": "QUOTA_LEDGER",
+            "class_name": "QuotaLedger"
+          },
+          {
+            "name": "UPLOAD_COORDINATOR",
+            "class_name": "UploadCoordinator"
+          },
+          {
+            "name": "MEDIA_PREPARER",
+            "class_name": "MediaPreparationContainer"
+          }
+        ]
+      },
+      "containers": [
+        {
+          "class_name": "MediaPreparationContainer",
+          "image": "../../services/media/Dockerfile",
+          "image_build_context": "../../services/media",
+          "instance_type": "basic",
+          "max_instances": 2,
+          "constraints": {
+            "regions": ["APAC"]
+          }
+        }
+      ],
+      "vars": {
+        "CUEBENCH_ENVIRONMENT": "production",
+        "SESSION_HMAC_CURRENT_KEY_ID": "production-v1",
+        "MEDIA_JOB_HMAC_CURRENT_KEY_ID": "production-media-v1",
+        "MEDIA_JOB_TTL_SECONDS": "600",
+        "SESSION_TTL_SECONDS": "86400",
+        "UPLOAD_CAPABILITY_TTL_SECONDS": "600",
+        "RECOVERY_TTL_SECONDS": "86400",
+        "MAX_SESSION_MEDIA_MINUTES": "30",
+        "MAX_IP_MEDIA_MINUTES": "90",
+        "MAX_SESSION_GENERATIONS": "6",
+        "MAX_SESSION_TTS": "50",
+        "MAX_IP_GENERATIONS": "18",
+        "MAX_IP_TTS": "150",
+        "MAX_PENDING_SESSION_BYTES": "524288000",
+        "MAX_PENDING_IP_BYTES": "1048576000",
+        "MAX_PENDING_SESSION_OPERATIONS": "2",
+        "MAX_PENDING_IP_OPERATIONS": "8",
+        "GLOBAL_SPEND_LIMIT_CENTS": "10000",
+        "GLOBAL_SPEND_BREAKER_OPEN": "false",
+        "CUEBENCH_OPENAI_MODE": "live",
+        "CUEBENCH_RECONCILIATION_MODEL": "gpt-5.6-terra",
+        "GENERATION_RUN_TTL_SECONDS": "86400",
+        "MAX_WORKFLOW_PROVIDER_COST_CENTS": "100",
+        "MAX_MEDIA_PROBE_COST_CENTS": "1",
+        "MAX_TTS_PROVIDER_COST_CENTS": "10",
+        "MAX_AUDIO_DESCRIPTION_PROVIDER_COST_CENTS": "100",
+        "TURNSTILE_VERIFY_URL": "https://challenges.cloudflare.com/turnstile/v0/siteverify",
+        "TURNSTILE_EXPECTED_ACTION": "cuebench-upload"
+      }
+    }
+  }
+}

@@ -1,0 +1,62 @@
+import { describe, expect, it } from "vitest";
+import { WorkerConfigurationError, resolveWorkerSettings, type WorkerEnv } from "./env";
+
+const env = (overrides: Partial<WorkerEnv> = {}): WorkerEnv => ({
+  SESSION_HMAC_CURRENT_KEY_ID: "current",
+  SESSION_HMAC_CURRENT_KEY: "current-secret-with-at-least-thirty-two-bytes",
+  QUOTA_SALT: "quota-salt-with-at-least-thirty-two-bytes",
+  TURNSTILE_SECRET: "turnstile-secret-with-at-least-32-bytes",
+  TURNSTILE_EXPECTED_ACTION: "cuebench-upload",
+  ...overrides,
+});
+
+describe("Worker cryptographic configuration", () => {
+  it("rejects undersized secret bytes before the Worker can sign or verify", () => {
+    expect(() => resolveWorkerSettings(env({ SESSION_HMAC_CURRENT_KEY: "too-short" }))).toThrow(WorkerConfigurationError);
+    expect(() => resolveWorkerSettings(env({ TURNSTILE_SECRET: "also-too-short" }))).toThrow(/at least 32 bytes/i);
+  });
+
+  it("rejects a long but trivially low-entropy secret byte sequence", () => {
+    expect(() => resolveWorkerSettings(env({ SESSION_HMAC_CURRENT_KEY: "a".repeat(64) }))).toThrow(/diversity/i);
+  });
+
+  it("trims HMAC identifiers but preserves configured secret bytes exactly during key rotation", () => {
+    const previousSecret = " previous-secret-with-at-least-thirty-two-bytes ";
+    const settings = resolveWorkerSettings(env({
+      SESSION_HMAC_CURRENT_KEY_ID: " current ",
+      SESSION_HMAC_PREVIOUS_KEY_ID: " previous ",
+      SESSION_HMAC_PREVIOUS_KEY: previousSecret,
+    }));
+
+    expect(settings.keyRing.current.id).toBe("current");
+    expect(settings.keyRing.previous).toEqual({ id: "previous", secret: previousSecret });
+  });
+
+  it("treats a missing dedicated media-job key as unavailable and rejects partial rotation configuration", () => {
+    expect(resolveWorkerSettings(env()).mediaJobSigning).toBeUndefined();
+    expect(() => resolveWorkerSettings(env({ MEDIA_JOB_HMAC_CURRENT_KEY_ID: "media-current" }))).toThrow(/MEDIA_JOB_HMAC_CURRENT_KEY/i);
+    expect(() => resolveWorkerSettings(env({
+      MEDIA_JOB_HMAC_CURRENT_KEY_ID: "media-current",
+      MEDIA_JOB_HMAC_CURRENT_KEY: "media-job-current-secret-with-at-least-32-bytes",
+      MEDIA_JOB_HMAC_PREVIOUS_KEY_ID: "media-previous",
+    }))).toThrow(/previous media-job HMAC key/i);
+  });
+
+  it("parses a dedicated rotating media-job key ring without reusing session signing material", () => {
+    const settings = resolveWorkerSettings(env({
+      MEDIA_JOB_HMAC_CURRENT_KEY_ID: "media-current",
+      MEDIA_JOB_HMAC_CURRENT_KEY: "media-job-current-secret-with-at-least-32-bytes",
+      MEDIA_JOB_HMAC_PREVIOUS_KEY_ID: "media-previous",
+      MEDIA_JOB_HMAC_PREVIOUS_KEY: "media-job-previous-secret-with-at-least-32-bytes",
+      MEDIA_JOB_TTL_SECONDS: "600",
+    }));
+
+    expect(settings.mediaJobSigning).toEqual({
+      keyRing: {
+        current: { id: "media-current", secret: "media-job-current-secret-with-at-least-32-bytes" },
+        previous: { id: "media-previous", secret: "media-job-previous-secret-with-at-least-32-bytes" },
+      },
+      ttlMs: 600_000,
+    });
+  });
+});

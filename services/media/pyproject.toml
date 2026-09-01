@@ -1,0 +1,44 @@
+[project]
+name = "cuebench-media"
+version = "0.1.0"
+description = "Deterministic, private media preparation for CueBench"
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+  "fastapi==0.115.12",
+  "pydantic==2.11.3",
+  "python-multipart==0.0.20",
+  "uvicorn==0.34.2",
+]
+
+[dependency-groups]
+dev = [
+  "httpx==0.28.1",
+  "mypy==1.15.0",
+  "pytest==8.3.5",
+  "ruff==0.11.8",
+]
+
+[build-system]
+requires = ["hatchling==1.27.0"]
+build-backend = "hatchling.build"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+
+[tool.ruff]
+line-length = 120
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+files = ["src"]
+warn_unused_configs = true
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/cuebench_media"]

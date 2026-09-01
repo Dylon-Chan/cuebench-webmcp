@@ -1,0 +1,17 @@
+{
+  "name": "@cuebench/domain",
+  "version": "0.0.0",
+  "type": "module",
+  "exports": "./src/index.ts",
+  "scripts": {
+    "test": "vitest run --exclude=**/dist/** --exclude=**/coverage/**",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "build": "tsc -p tsconfig.build.json"
+  },
+  "dependencies": {
+    "@cuebench/contracts": "workspace:*"
+  },
+  "devDependencies": {
+    "fast-check": "4.9.0"
+  }
+}

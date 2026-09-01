@@ -2,3 +2,15 @@
 .impeccable/questions/
 cuebench-webmcp-tool-map*.png
 *.DS_Store
+node_modules/
+.pnpm-store/
+dist/
+.wrangler/
+.dev.vars
+.dev.vars.*
+.env
+.env.*
+# direnv may hold private Worker-to-Container media HMAC material during local runs.
+.envrc
+test-results/
+coverage/

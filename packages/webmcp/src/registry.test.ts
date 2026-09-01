@@ -1,0 +1,972 @@
+import { describe, expect, it, vi } from "vitest";
+import { domainError } from "@cuebench/domain";
+import { z } from "zod";
+import {
+  CueBenchToolRegistry,
+  DuplicateToolNameError,
+  executeTool,
+  featureDetectModelContext,
+  MAX_TOOL_RESULT_BYTES,
+  strictToolDataSchema,
+  ToolExecutionAbortedError,
+  toolDomainError,
+  toolSuccess,
+  type CueBenchTool,
+  type ModelContextLike,
+  type ModelContextTool,
+  type ModelContextInvocationClient,
+  type WebMcpDebugEvent,
+} from "./index";
+
+class FakeModelContext implements ModelContextLike {
+  public readonly events: string[] = [];
+  public readonly tools = new Map<string, ModelContextTool>();
+  public onToolAborted: ((toolName: string) => void) | undefined;
+
+  public registerTool(tool: ModelContextTool, options?: { readonly signal?: AbortSignal }): void {
+    this.events.push(`register:${tool.name}`);
+    this.tools.set(tool.name, tool);
+    options?.signal?.addEventListener("abort", () => {
+      this.events.push(`abort:${tool.name}`);
+      this.tools.delete(tool.name);
+      this.onToolAborted?.(tool.name);
+    }, { once: true });
+  }
+}
+
+class RejectingModelContext extends FakeModelContext {
+  public failName: string | null = null;
+
+  public override registerTool(tool: ModelContextTool, options?: { readonly signal?: AbortSignal }): void | Promise<void> {
+    if (tool.name === this.failName) {
+      this.events.push(`reject:${tool.name}`);
+      return Promise.reject(new Error("browser registration rejected"));
+    }
+    return super.registerTool(tool, options);
+  }
+}
+
+class DeferredRegistrationModelContext extends FakeModelContext {
+  public readonly deferredNames = new Set<string>();
+  public readonly rejectedNames = new Set<string>();
+  public readonly pending = new Map<string, {
+    readonly resolve: () => void;
+    readonly reject: (error: Error) => void;
+  }>();
+
+  public override registerTool(tool: ModelContextTool, options?: { readonly signal?: AbortSignal }): void | Promise<void> {
+    super.registerTool(tool, options);
+    if (this.rejectedNames.has(tool.name)) return Promise.reject(new Error(`browser registration rejected: ${tool.name}`));
+    if (!this.deferredNames.has(tool.name)) return;
+    return new Promise<void>((resolve, reject) => {
+      this.pending.set(tool.name, { resolve, reject });
+    });
+  }
+}
+
+const readTool = (name: string): CueBenchTool => ({
+  name,
+  description: `${name} description`,
+  inputSchema: { type: "object", additionalProperties: false },
+  resultDataSchema: strictToolDataSchema({ name: z.string().trim().min(1).max(128) }),
+  annotations: { readOnlyHint: true },
+  execute: async () => toolSuccess({
+    projectRevision: 1,
+    data: { name },
+    nextActions: ["inspect_project"],
+  }),
+});
+
+const selection = (scopeId: string, toolName: string) => ({
+  scopeId,
+  tools: [readTool(toolName)],
+});
+
+const noSignal: ModelContextInvocationClient = {};
+
+describe("CueBenchToolRegistry", () => {
+  it("emits bounded redacted registration and call metadata only for an opt-in observer", async () => {
+    const modelContext = new FakeModelContext();
+    const events: WebMcpDebugEvent[] = [];
+    const registry = new CueBenchToolRegistry(modelContext, {
+      debugObserver: { record: (event) => events.push(event) },
+    });
+    const tool: CueBenchTool = {
+      name: "revise_selected_cue",
+      description: "Revise one selected cue.",
+      inputSchema: { type: "object", additionalProperties: false },
+      resultDataSchema: strictToolDataSchema({ name: z.string().trim().min(1).max(128) }),
+      execute: async () => toolSuccess({
+        projectRevision: 7,
+        data: { name: "safe" },
+        nextActions: ["inspect_project"],
+      }),
+    };
+
+    await registry.select({ scopeId: "caption:cue-1", tools: [tool] });
+    const registered = modelContext.tools.get("revise_selected_cue");
+    await registered?.execute({
+      text: "Dr. Nguyen private caption text",
+      speaker: "Professor Private",
+      evidenceFrame: "data:image/png;base64,private",
+      sourceUrl: "https://private.example/video.mov",
+    });
+
+    expect(events).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        kind: "registration",
+        toolName: "revise_selected_cue",
+        group: "selection",
+        schemaVersion: 1,
+        status: "registered",
+      }),
+      expect.objectContaining({
+        kind: "call",
+        toolName: "revise_selected_cue",
+        group: "selection",
+        resultCode: "OK",
+        args: expect.objectContaining({ kind: "object", fieldCount: 4 }),
+      }),
+    ]));
+    expect(JSON.stringify(events)).not.toContain("Nguyen");
+    expect(JSON.stringify(events)).not.toContain("Professor");
+    expect(JSON.stringify(events)).not.toContain("private.example");
+  });
+
+  it("records an actual aborted scoped invocation as cancelled metadata", async () => {
+    const modelContext = new FakeModelContext();
+    const events: WebMcpDebugEvent[] = [];
+    const registry = new CueBenchToolRegistry(modelContext, {
+      debugObserver: { record: (event) => events.push(event) },
+    });
+
+    await registry.select(selection("caption:cue-1", "inspect_selected_cue_evidence"));
+    const retained = modelContext.tools.get("inspect_selected_cue_evidence");
+    if (retained === undefined) throw new Error("Expected the scoped tool registration.");
+    await registry.select(null);
+
+    await expect(retained.execute({}, noSignal)).resolves.toMatchObject({
+      ok: false,
+      code: "STALE_SELECTION",
+      changed: false,
+    });
+    expect(events).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        kind: "registration",
+        toolName: "inspect_selected_cue_evidence",
+        group: "selection",
+        status: "aborted",
+      }),
+      expect.objectContaining({
+        kind: "call",
+        toolName: "inspect_selected_cue_evidence",
+        group: "selection",
+        resultCode: "STALE_SELECTION",
+        cancelled: true,
+        revisions: { projectRevision: null, selectionRevision: null, itemRevision: null },
+      }),
+    ]));
+  });
+
+  it("marks an over-cap diagnostic duration as capped rather than exact", async () => {
+    const modelContext = new FakeModelContext();
+    const events: WebMcpDebugEvent[] = [];
+    const registry = new CueBenchToolRegistry(modelContext, {
+      debugObserver: { record: (event) => events.push(event) },
+    });
+    await registry.select(selection("caption:duration", "inspect_project"));
+    const tool = modelContext.tools.get("inspect_project");
+    if (tool === undefined) throw new Error("Expected the approved inspection tool.");
+    const now = vi.spyOn(Date, "now")
+      .mockReturnValueOnce(0)
+      .mockReturnValueOnce(700_000);
+
+    await expect(tool.execute({})).resolves.toMatchObject({ ok: true });
+    now.mockRestore();
+    expect(events).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        kind: "call",
+        toolName: "inspect_project",
+        durationMs: 600_000,
+        durationCapped: true,
+      }),
+    ]));
+  });
+
+  it("fails closed when diagnostic sampling receives a revoked Proxy without changing the tool result", async () => {
+    const modelContext = new FakeModelContext();
+    const events: WebMcpDebugEvent[] = [];
+    const registry = new CueBenchToolRegistry(modelContext, {
+      debugObserver: { record: (event) => events.push(event) },
+    });
+    await registry.select(selection("caption:proxy", "inspect_project"));
+    const tool = modelContext.tools.get("inspect_project");
+    if (tool === undefined) throw new Error("Expected the approved inspection tool.");
+    const { proxy, revoke } = Proxy.revocable({ expectedProjectRevision: 7 }, {});
+    revoke();
+
+    await expect(tool.execute(proxy)).resolves.toMatchObject({ ok: true });
+    expect(events).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        kind: "call",
+        toolName: "inspect_project",
+        args: { kind: "uninspectable", fieldCount: 0, valueKinds: [], truncated: false },
+      }),
+    ]));
+  });
+
+  it("bounds debug enumeration attempts even across a long inherited property chain", async () => {
+    const modelContext = new FakeModelContext();
+    const events: WebMcpDebugEvent[] = [];
+    const registry = new CueBenchToolRegistry(modelContext, {
+      debugObserver: { record: (event) => events.push(event) },
+    });
+    let prototype: Record<string, unknown> | null = null;
+    for (let index = 0; index < 256; index += 1) {
+      const next = Object.create(prototype) as Record<string, unknown>;
+      next[`inherited_${index}`] = index;
+      prototype = next;
+    }
+    const hostileInput = Object.create(prototype);
+    await registry.select(selection("caption:prototype", "inspect_project"));
+    const tool = modelContext.tools.get("inspect_project");
+    if (tool === undefined) throw new Error("Expected the approved inspection tool.");
+
+    await expect(tool.execute(hostileInput)).resolves.toMatchObject({ ok: true });
+    expect(events).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        kind: "call",
+        toolName: "inspect_project",
+        args: expect.objectContaining({ fieldCount: 0, truncated: true }),
+      }),
+    ]));
+  });
+
+  it("never places hostile args, result prose, or error prose in a debug event", async () => {
+    const modelContext = new FakeModelContext();
+    const events: WebMcpDebugEvent[] = [];
+    const registry = new CueBenchToolRegistry(modelContext, {
+      onUnexpectedError: () => undefined,
+      debugObserver: { record: (event) => events.push(event) },
+    });
+    const privateCaption = "Dr. Nguyen's private caption text.";
+    const privateSpeaker = "Professor Nguyen";
+    const privateFile = "private-lecture.mov";
+    const privateUrl = "https://private.example/media";
+    const privateFrame = "data:image/png;base64,private-frame";
+    const privateModelOutput = "The model's private untrusted output.";
+    const privateError = "Provider error: the private caption could not be generated.";
+    const successfulTool: CueBenchTool = {
+      name: "inspect_project",
+      description: "A test-only bounded inspection tool.",
+      inputSchema: { type: "object", additionalProperties: false },
+      resultDataSchema: strictToolDataSchema({ rawModelOutput: z.string().min(1).max(1_000) }),
+      execute: async () => toolSuccess({
+        projectRevision: 7,
+        data: { rawModelOutput: privateModelOutput },
+        nextActions: ["inspect_project"],
+      }),
+    };
+    const domainErrorTool: CueBenchTool = {
+      name: "inspect_timeline_window",
+      description: "A test-only domain-error tool.",
+      inputSchema: { type: "object", additionalProperties: false },
+      resultDataSchema: strictToolDataSchema({}),
+      execute: async () => toolDomainError(domainError("INVALID_ARGUMENT", privateError)),
+    };
+    const unexpectedErrorTool: CueBenchTool = {
+      name: "list_quality_findings",
+      description: "A test-only unexpected-error tool.",
+      inputSchema: { type: "object", additionalProperties: false },
+      resultDataSchema: strictToolDataSchema({}),
+      execute: async () => { throw new Error(privateError); },
+    };
+    const hostileInput = {
+      text: privateCaption,
+      speaker: privateSpeaker,
+      filename: privateFile,
+      url: privateUrl,
+      evidenceFrame: privateFrame,
+      rawModelOutput: privateModelOutput,
+    };
+
+    await registry.select({ scopeId: "caption:private", tools: [successfulTool] });
+    await expect(modelContext.tools.get(successfulTool.name)?.execute(hostileInput)).resolves.toMatchObject({ ok: true });
+    await registry.select({ scopeId: "caption:private-error", tools: [domainErrorTool] });
+    await expect(modelContext.tools.get(domainErrorTool.name)?.execute(hostileInput)).resolves.toMatchObject({
+      ok: false,
+      code: "INVALID_ARGUMENT",
+    });
+    await registry.select({ scopeId: "caption:private-throw", tools: [unexpectedErrorTool] });
+    await expect(modelContext.tools.get(unexpectedErrorTool.name)?.execute(hostileInput)).rejects.toMatchObject({
+      name: "CueBenchToolExecutionError",
+    });
+
+    const serialized = JSON.stringify(events);
+    for (const value of [privateCaption, privateSpeaker, privateFile, privateUrl, privateFrame, privateModelOutput, privateError]) {
+      expect(serialized).not.toContain(value);
+    }
+    expect(events).toEqual(expect.arrayContaining([
+      expect.objectContaining({ kind: "call", toolName: successfulTool.name, resultCode: "OK" }),
+      expect.objectContaining({ kind: "call", toolName: domainErrorTool.name, resultCode: "INVALID_ARGUMENT" }),
+      expect.objectContaining({ kind: "call", toolName: unexpectedErrorTool.name, resultCode: "UNEXPECTED_ERROR" }),
+    ]));
+  });
+
+  it("feature-detects WebMCP without mutating an unavailable host", async () => {
+    const host: { modelContext?: unknown } = {};
+    const registry = new CueBenchToolRegistry(featureDetectModelContext(host));
+
+    await expect(registry.registerAlways([readTool("inspect_project")])).resolves.toBeUndefined();
+
+    expect(host).toEqual({});
+    expect(registry.available).toBe(false);
+    expect(registry.snapshot().always.toolNames).toEqual(["inspect_project"]);
+    expect(registry.snapshot().always.registered).toBe(false);
+  });
+
+  it("aborts the old selection family before registering the new one", async () => {
+    const modelContext = new FakeModelContext();
+    const registry = new CueBenchToolRegistry(modelContext);
+
+    await registry.select(selection("caption:c05", "inspect_selected_cue_evidence"));
+    await registry.select(selection("ad:ad02", "inspect_selected_ad_evidence"));
+
+    expect(modelContext.events).toEqual([
+      "register:inspect_selected_cue_evidence",
+      "abort:inspect_selected_cue_evidence",
+      "register:inspect_selected_ad_evidence",
+    ]);
+    expect(registry.snapshot().selection.scopeId).toBe("ad:ad02");
+  });
+
+  it("replaces same-named groups when the page changes project instance at the same revision", async () => {
+    const modelContext = new FakeModelContext();
+    const registry = new CueBenchToolRegistry(modelContext);
+
+    await registry.registerAlways([readTool("inspect_project")], "project-a:r1:always");
+    await registry.select(selection("project-a:r1:CaptionCue:cue-1:r1", "inspect_selected_cue_evidence"));
+    await registry.setRun(null, { alwaysScopeId: "project-b:r1:always" });
+    await registry.select(selection("project-b:r1:CaptionCue:cue-1:r1", "inspect_selected_cue_evidence"));
+
+    expect(registry.snapshot()).toMatchObject({
+      always: { scopeId: "project-b:r1:always", toolNames: ["inspect_project"], registered: true },
+      selection: { scopeId: "project-b:r1:CaptionCue:cue-1:r1", toolNames: ["inspect_selected_cue_evidence"], registered: true },
+    });
+    expect(modelContext.events).toEqual(expect.arrayContaining([
+      "abort:inspect_project",
+      "abort:inspect_selected_cue_evidence",
+    ]));
+  });
+
+  it("keeps a reentrant newer selection when an outgoing abort listener selects it", async () => {
+    const modelContext = new FakeModelContext();
+    const registry = new CueBenchToolRegistry(modelContext);
+    let reentrantSelection: Promise<void> | undefined;
+    await registry.select(selection("caption:c05", "inspect_selected_cue_evidence"));
+    modelContext.onToolAborted = (toolName) => {
+      if (toolName === "inspect_selected_cue_evidence") {
+        reentrantSelection = registry.select(selection("caption:c07", "inspect_selected_c07_evidence"));
+      }
+    };
+
+    await registry.select(selection("ad:ad02", "inspect_selected_ad_evidence"));
+    await reentrantSelection;
+
+    expect([...modelContext.tools.keys()]).toEqual(["inspect_selected_c07_evidence"]);
+    expect(registry.snapshot().selection).toMatchObject({
+      scopeId: "caption:c07",
+      toolNames: ["inspect_selected_c07_evidence"],
+      registered: true,
+    });
+
+    await registry.select(null);
+    expect([...modelContext.tools.keys()]).toEqual([]);
+  });
+
+  it("starts every prevalidated family registration before awaiting any browser promise", async () => {
+    const modelContext = new DeferredRegistrationModelContext();
+    modelContext.deferredNames.add("inspect_timeline_window");
+    modelContext.deferredNames.add("inspect_project");
+    const registry = new CueBenchToolRegistry(modelContext);
+
+    const transition = registry.registerAlways([
+      readTool("inspect_timeline_window"),
+      readTool("inspect_project"),
+    ]);
+
+    expect(modelContext.events).toEqual([
+      "register:inspect_timeline_window",
+      "register:inspect_project",
+    ]);
+    for (const pending of modelContext.pending.values()) pending.resolve();
+    await transition;
+    expect(registry.snapshot().always.registered).toBe(true);
+  });
+
+  it("aborts a partially registered family immediately when a sibling registration rejects", async () => {
+    const modelContext = new DeferredRegistrationModelContext();
+    const registry = new CueBenchToolRegistry(modelContext);
+    await registry.registerAlways([readTool("inspect_old")]);
+    modelContext.deferredNames.add("inspect_first");
+    modelContext.rejectedNames.add("inspect_second");
+    let observedAbort: (() => void) | undefined;
+    const abortObserved = new Promise<void>((resolve) => { observedAbort = resolve; });
+    modelContext.onToolAborted = (toolName) => {
+      if (toolName === "inspect_first") observedAbort?.();
+    };
+
+    const transition = registry.registerAlways([
+      readTool("inspect_first"),
+      readTool("inspect_second"),
+    ]);
+    await abortObserved;
+    expect([...modelContext.tools.keys()]).toEqual([]);
+
+    modelContext.pending.get("inspect_first")?.resolve();
+    await expect(transition).rejects.toThrow("browser registration rejected: inspect_second");
+    expect([...modelContext.tools.keys()]).toEqual(["inspect_old"]);
+  });
+
+  it("does not let a deferred failed transition roll back a newer family started by its abort listener", async () => {
+    const modelContext = new DeferredRegistrationModelContext();
+    modelContext.deferredNames.add("inspect_a");
+    const registry = new CueBenchToolRegistry(modelContext);
+    let newerTransition: Promise<void> | undefined;
+    modelContext.onToolAborted = (toolName) => {
+      if (toolName === "inspect_a") {
+        newerTransition = registry.registerAlways([readTool("inspect_b")]);
+      }
+    };
+
+    const failedTransition = registry.registerAlways([readTool("inspect_a")]);
+    expect(modelContext.pending.has("inspect_a")).toBe(true);
+    modelContext.pending.get("inspect_a")?.reject(new Error("old registration failed"));
+    await expect(failedTransition).rejects.toThrow("old registration failed");
+    await newerTransition;
+
+    expect([...modelContext.tools.keys()]).toEqual(["inspect_b"]);
+    expect(registry.snapshot().always).toMatchObject({
+      toolNames: ["inspect_b"],
+      registered: true,
+    });
+
+    await registry.dispose();
+    expect([...modelContext.tools.keys()]).toEqual([]);
+  });
+
+  it("preempts active and queued registration claims when disposed, even if the host never settles", async () => {
+    const modelContext = new DeferredRegistrationModelContext();
+    modelContext.deferredNames.add("inspect_never_settles");
+    const registry = new CueBenchToolRegistry(modelContext);
+
+    const active = registry.registerAlways([readTool("inspect_never_settles")], "pending-scope");
+    // Attach handlers before disposal so the deliberately interrupted
+    // transition cannot become an unhandled rejection while the test verifies
+    // that cleanup is prompt.
+    const activeOutcome = active.then(
+      () => "resolved" as const,
+      (error) => error,
+    );
+    const queued = registry.select(selection("caption:queued", "inspect_queued_evidence"));
+    const queuedOutcome = queued.then(
+      () => "resolved" as const,
+      (error) => error,
+    );
+
+    expect(modelContext.pending.has("inspect_never_settles")).toBe(true);
+    await expect(registry.dispose()).resolves.toBeUndefined();
+    await expect(activeOutcome).resolves.toBeInstanceOf(Error);
+    await expect(queuedOutcome).resolves.toBeInstanceOf(Error);
+    expect(modelContext.events).toContain("abort:inspect_never_settles");
+    expect(modelContext.events).not.toContain("register:inspect_queued_evidence");
+    expect(registry.snapshot()).toEqual({
+      available: false,
+      always: { scopeId: null, toolNames: [], registered: false },
+      run: { scopeId: null, toolNames: [], registered: false },
+      selection: { scopeId: null, toolNames: [], registered: false },
+    });
+
+    // A late host acknowledgement belongs to the aborted generation. It may
+    // not revive metadata, a group owner, or any browser-visible tool.
+    modelContext.pending.get("inspect_never_settles")?.resolve();
+    await Promise.resolve();
+    expect([...modelContext.tools.keys()]).toEqual([]);
+    expect(registry.snapshot().always.toolNames).toEqual([]);
+  });
+
+  it("queues a newer same-scope surface until an older rejected transition has restored metadata", async () => {
+    const modelContext = new DeferredRegistrationModelContext();
+    const registry = new CueBenchToolRegistry(modelContext);
+    await registry.registerAlways([readTool("inspect_prior")], "prior-scope");
+    modelContext.deferredNames.add("inspect_old_pending");
+
+    const older = registry.registerAlways([readTool("inspect_old_pending")], "shared-scope");
+    expect(modelContext.pending.has("inspect_old_pending")).toBe(true);
+    const newer = registry.registerAlways([readTool("inspect_new_live")], "shared-scope");
+    // Metadata transitions are serialized: this newer family must not
+    // register against the old pending surface and then be overwritten by a
+    // late rollback from it.
+    expect(modelContext.events).not.toContain("register:inspect_new_live");
+
+    modelContext.pending.get("inspect_old_pending")?.reject(new Error("old same-scope registration failed"));
+    await expect(older).rejects.toThrow("old same-scope registration failed");
+    await newer;
+
+    expect(registry.snapshot().always).toEqual({
+      scopeId: "shared-scope",
+      toolNames: ["inspect_new_live"],
+      registered: true,
+    });
+    expect([...modelContext.tools.keys()]).toEqual(["inspect_new_live"]);
+  });
+
+  it("waits for a pending always/run transition before selecting against its settled metadata", async () => {
+    const modelContext = new DeferredRegistrationModelContext();
+    const registry = new CueBenchToolRegistry(modelContext);
+    await registry.registerAlways([readTool("inspect_selected_cue_evidence")], "idle-scope");
+
+    modelContext.deferredNames.add("inspect_pending_always");
+    modelContext.rejectedNames.add("inspect_generation_run");
+    const pendingRun = registry.setRun([readTool("inspect_generation_run")], {
+      alwaysTools: [readTool("inspect_pending_always")],
+      alwaysScopeId: "pending-run-scope",
+      runScopeId: "pending-run-scope",
+    });
+    await Promise.resolve();
+    expect(modelContext.pending.has("inspect_pending_always")).toBe(true);
+
+    // This name is absent from the pending replacement but belongs to the
+    // prior always surface that will be restored when registration rejects.
+    // select() must wait rather than register into that transient gap.
+    const pendingSelection = registry.select(selection("caption:c05", "inspect_selected_cue_evidence"));
+    expect(modelContext.events.filter((event) => event === "register:inspect_selected_cue_evidence")).toHaveLength(1);
+
+    modelContext.pending.get("inspect_pending_always")?.reject(new Error("pending always registration failed"));
+    await expect(pendingRun).rejects.toThrow("browser registration rejected: inspect_generation_run");
+    await expect(pendingSelection).rejects.toBeInstanceOf(DuplicateToolNameError);
+
+    expect(registry.snapshot()).toMatchObject({
+      always: { scopeId: "idle-scope", toolNames: ["inspect_selected_cue_evidence"], registered: true },
+      selection: { scopeId: null, toolNames: [], registered: false },
+    });
+    expect([...modelContext.tools.keys()]).toEqual(["inspect_selected_cue_evidence"]);
+  });
+
+  it("claims selection metadata atomically before a later always/run transition can fail", async () => {
+    const modelContext = new DeferredRegistrationModelContext();
+    const registry = new CueBenchToolRegistry(modelContext);
+    await registry.registerAlways([readTool("inspect_project")], "idle-scope");
+
+    // `select()` begins from a stable surface. Its first await used to leave
+    // a window for `setRun()` to claim metadata, then fail its browser
+    // registration after selection had claimed a newer epoch. Keep the
+    // selection registration pending so the interleaving is observable.
+    modelContext.deferredNames.add("inspect_selected_cue_evidence");
+    modelContext.deferredNames.add("inspect_pending_always");
+    modelContext.rejectedNames.add("inspect_generation_run");
+
+    const pendingSelection = registry.select(selection("caption:c05", "inspect_selected_cue_evidence"));
+    const pendingRun = registry.setRun([readTool("inspect_generation_run")], {
+      alwaysTools: [readTool("inspect_pending_always")],
+      alwaysScopeId: "pending-run-scope",
+      runScopeId: "pending-run-scope",
+    });
+
+    // A later run transition must wait for selection's atomic metadata claim;
+    // it cannot register (or later roll back) a competing always surface.
+    expect(modelContext.pending.has("inspect_selected_cue_evidence")).toBe(true);
+    expect(modelContext.pending.has("inspect_pending_always")).toBe(false);
+
+    modelContext.pending.get("inspect_selected_cue_evidence")?.resolve();
+    await pendingSelection;
+    await Promise.resolve();
+    expect(modelContext.pending.has("inspect_pending_always")).toBe(true);
+    modelContext.pending.get("inspect_pending_always")?.resolve();
+    await expect(pendingRun).rejects.toThrow("browser registration rejected: inspect_generation_run");
+
+    expect(registry.snapshot()).toMatchObject({
+      always: { scopeId: "idle-scope", toolNames: ["inspect_project"], registered: true },
+      run: { scopeId: null, toolNames: [], registered: false },
+      selection: { scopeId: "caption:c05", toolNames: ["inspect_selected_cue_evidence"], registered: true },
+    });
+    expect([...modelContext.tools.keys()].sort()).toEqual([
+      "inspect_project",
+      "inspect_selected_cue_evidence",
+    ]);
+  });
+
+  it("aborts and clears a selection family on deselection", async () => {
+    const modelContext = new FakeModelContext();
+    const registry = new CueBenchToolRegistry(modelContext);
+
+    await registry.select(selection("caption:c05", "inspect_selected_cue_evidence"));
+    await registry.select(null);
+
+    expect(modelContext.events).toEqual([
+      "register:inspect_selected_cue_evidence",
+      "abort:inspect_selected_cue_evidence",
+    ]);
+    expect(registry.snapshot().selection).toEqual({
+      scopeId: null,
+      toolNames: [],
+      registered: false,
+    });
+  });
+
+  it("replaces generation starters with the active-run family and restores them afterwards", async () => {
+    const modelContext = new FakeModelContext();
+    const registry = new CueBenchToolRegistry(modelContext);
+
+    await registry.registerAlways([
+      readTool("inspect_project"),
+      readTool("start_caption_generation"),
+      readTool("start_ad_generation"),
+    ]);
+    await registry.setRun([
+      readTool("inspect_generation_run"),
+      readTool("cancel_generation_run"),
+    ]);
+
+    expect([...modelContext.tools.keys()].sort()).toEqual([
+      "cancel_generation_run",
+      "inspect_generation_run",
+      "inspect_project",
+    ]);
+    expect(modelContext.events.indexOf("abort:start_caption_generation")).toBeLessThan(
+      modelContext.events.indexOf("register:inspect_generation_run"),
+    );
+
+    await registry.setRun(null);
+
+    expect([...modelContext.tools.keys()].sort()).toEqual([
+      "inspect_project",
+      "start_ad_generation",
+      "start_caption_generation",
+    ]);
+  });
+
+  it("rejects duplicate live names without tearing down the current family", async () => {
+    const modelContext = new FakeModelContext();
+    const registry = new CueBenchToolRegistry(modelContext);
+    await registry.registerAlways([readTool("inspect_project")]);
+    await registry.select(selection("caption:c05", "inspect_selected_cue_evidence"));
+
+    await expect(registry.select(selection("ad:ad02", "inspect_project"))).rejects.toBeInstanceOf(DuplicateToolNameError);
+
+    expect(registry.snapshot().selection.scopeId).toBe("caption:c05");
+    expect([...modelContext.tools.keys()].sort()).toEqual([
+      "inspect_project",
+      "inspect_selected_cue_evidence",
+    ]);
+  });
+
+  it("returns a structured stale-selection result when a dynamically removed tool finishes", async () => {
+    const modelContext = new FakeModelContext();
+    const registry = new CueBenchToolRegistry(modelContext);
+    let release: (() => void) | undefined;
+    let observedSignal: AbortSignal | undefined;
+    let started: (() => void) | undefined;
+    const startedPromise = new Promise<void>((resolve) => { started = resolve; });
+    const finished = new Promise<void>((resolve) => { release = resolve; });
+    const delayed: CueBenchTool = {
+      ...readTool("revise_selected_cue"),
+      annotations: { readOnlyHint: false },
+      execute: async (_input, client) => {
+        observedSignal = client.signal;
+        started?.();
+        await finished;
+        throw new Error("the agent cancelled this in-flight revision");
+      },
+    };
+
+    await registry.select({ scopeId: "caption:c05", tools: [delayed] });
+    const registered = modelContext.tools.get("revise_selected_cue");
+    expect(registered).toBeDefined();
+    const execution = registered?.execute({}, noSignal);
+    await startedPromise;
+    await registry.select(null);
+    release?.();
+
+    await expect(execution).resolves.toMatchObject({
+      ok: false,
+      code: "STALE_SELECTION",
+      changed: false,
+      retryable: true,
+    });
+    expect(observedSignal?.aborted).toBe(true);
+  });
+
+  it("preserves a successful scoped mutation that replaces its own selection family", async () => {
+    const modelContext = new FakeModelContext();
+    const registry = new CueBenchToolRegistry(modelContext);
+    const selfReplacing: CueBenchTool = {
+      ...readTool("revise_selected_cue"),
+      annotations: { readOnlyHint: false },
+      execute: async (_input, client) => {
+        client.markCommitted();
+        await registry.select(selection("caption:c06", "inspect_selected_cue_evidence"));
+        return toolSuccess({
+          projectRevision: 2,
+          data: { name: "revised-c05" },
+          nextActions: ["inspect_selected_cue_evidence"],
+        });
+      },
+    };
+
+    await registry.select({ scopeId: "caption:c05", tools: [selfReplacing] });
+    const registered = modelContext.tools.get("revise_selected_cue");
+
+    await expect(registered?.execute({}, noSignal)).resolves.toMatchObject({
+      ok: true,
+      projectRevision: 2,
+      data: { name: "revised-c05" },
+    });
+  });
+
+  it("reports conservative changed state when a committed scoped mutation is aborted before it can finalize", async () => {
+    const modelContext = new FakeModelContext();
+    const registry = new CueBenchToolRegistry(modelContext);
+    let release: (() => void) | undefined;
+    let started: (() => void) | undefined;
+    const startedPromise = new Promise<void>((resolve) => { started = resolve; });
+    const releasePromise = new Promise<void>((resolve) => { release = resolve; });
+    const committedThenCancelled: CueBenchTool = {
+      ...readTool("adjust_selected_cue_timing"),
+      annotations: { readOnlyHint: false },
+      execute: async (_input, client) => {
+        client.markCommitted();
+        started?.();
+        await releasePromise;
+        throw new Error("post-commit cancellation");
+      },
+    };
+
+    await registry.select({ scopeId: "caption:c05", tools: [committedThenCancelled] });
+    const registered = modelContext.tools.get("adjust_selected_cue_timing");
+    const execution = registered?.execute({}, noSignal);
+    await startedPromise;
+    await registry.select(null);
+    release?.();
+
+    await expect(execution).resolves.toMatchObject({
+      ok: false,
+      code: "STALE_SELECTION",
+      changed: true,
+      retryable: true,
+      nextActions: ["inspect_project"],
+    });
+  });
+
+  it("does not invoke a stale handle after its selection family was removed", async () => {
+    const modelContext = new FakeModelContext();
+    const registry = new CueBenchToolRegistry(modelContext);
+    let calls = 0;
+    const scoped: CueBenchTool = {
+      ...readTool("adjust_selected_cue_timing"),
+      annotations: { readOnlyHint: false },
+      execute: async () => {
+        calls += 1;
+        return toolSuccess({ projectRevision: 2, data: {}, nextActions: [] });
+      },
+    };
+
+    await registry.select({ scopeId: "caption:c05", tools: [scoped] });
+    const staleHandle = modelContext.tools.get("adjust_selected_cue_timing");
+    await registry.select(null);
+
+    await expect(staleHandle?.execute({}, noSignal)).resolves.toMatchObject({
+      ok: false,
+      code: "STALE_SELECTION",
+      changed: false,
+    });
+    expect(calls).toBe(0);
+  });
+
+  it("rejects malformed names, unbounded schemas, and unbranded result contracts before tearing down the live surface", async () => {
+    const modelContext = new FakeModelContext();
+    const registry = new CueBenchToolRegistry(modelContext);
+    await registry.registerAlways([readTool("inspect_project")]);
+    const cyclicSchema: Record<string, unknown> = { type: "object" };
+    cyclicSchema.self = cyclicSchema;
+    const cyclicTool: CueBenchTool = { ...readTool("inspect_timeline_window"), inputSchema: cyclicSchema };
+    const oversizedSchemaTool: CueBenchTool = {
+      ...readTool("inspect_timeline_window"),
+      inputSchema: { type: "object", description: "x".repeat(40 * 1024) },
+    };
+    const unbrandedResultSchemaTool: CueBenchTool = {
+      ...readTool("inspect_timeline_window"),
+      resultDataSchema: { schema: z.object({ name: z.string() }).strict() } as unknown as CueBenchTool["resultDataSchema"],
+    };
+
+    await expect(registry.registerAlways([readTool("bad tool name")])).rejects.toMatchObject({
+      name: "InvalidToolDefinitionError",
+    });
+    await expect(registry.registerAlways([cyclicTool])).rejects.toMatchObject({
+      name: "InvalidToolDefinitionError",
+    });
+    await expect(registry.registerAlways([oversizedSchemaTool])).rejects.toMatchObject({
+      name: "InvalidToolDefinitionError",
+    });
+    await expect(registry.registerAlways([unbrandedResultSchemaTool])).rejects.toMatchObject({
+      name: "InvalidToolDefinitionError",
+    });
+    expect([...modelContext.tools.keys()]).toEqual(["inspect_project"]);
+  });
+
+  it("rolls back browser registration failures to the prior live family", async () => {
+    const modelContext = new RejectingModelContext();
+    const registry = new CueBenchToolRegistry(modelContext);
+    await registry.registerAlways([readTool("inspect_project")]);
+    modelContext.failName = "inspect_timeline_window";
+
+    await expect(registry.registerAlways([readTool("inspect_timeline_window")])).rejects.toThrow("browser registration rejected");
+
+    expect([...modelContext.tools.keys()]).toEqual(["inspect_project"]);
+    expect(registry.snapshot().always.toolNames).toEqual(["inspect_project"]);
+  });
+
+  it("requires a strict tool-specific data schema and rejects unsafe outbound results without exposing secrets", async () => {
+    const modelContext = new FakeModelContext();
+    const faults: unknown[] = [];
+    const registry = new CueBenchToolRegistry(modelContext, { onUnexpectedError: (fault) => faults.push(fault) });
+    const secret = "Dr. Nguyen transcript must not escape";
+    const unsafeResult: CueBenchTool = {
+      ...readTool("inspect_selected_cue_evidence"),
+      resultDataSchema: strictToolDataSchema({ payload: z.object({}).strict() }),
+      execute: async () => toolSuccess({
+        projectRevision: 1,
+        data: { payload: { secret, count: BigInt(1) } },
+        nextActions: [],
+      }),
+    };
+
+    await registry.select({ scopeId: "caption:c05", tools: [unsafeResult] });
+    const registered = modelContext.tools.get("inspect_selected_cue_evidence");
+    const rejection = await Promise.resolve(registered?.execute({}, noSignal)).catch((error: unknown) => error);
+
+    expect(rejection).toMatchObject({ name: "CueBenchToolExecutionError" });
+    expect((rejection as Error).message).not.toContain(secret);
+    expect(faults).toEqual([{
+      event: "webmcp.unexpected_error",
+      toolName: "inspect_selected_cue_evidence",
+      errorType: "ToolResultSafetyError",
+    }]);
+  });
+
+  it("rejects cyclic and oversized outbound data through the same sanitized boundary", async () => {
+    const modelContext = new FakeModelContext();
+    const registry = new CueBenchToolRegistry(modelContext);
+    const cyclic: Record<string, unknown> = {};
+    cyclic.self = cyclic;
+    const cyclicTool: CueBenchTool = {
+      ...readTool("inspect_selected_cue_evidence"),
+      resultDataSchema: strictToolDataSchema({ payload: z.object({}).strict() }),
+      execute: async () => toolSuccess({ projectRevision: 1, data: { payload: cyclic }, nextActions: [] }),
+    };
+
+    await registry.select({ scopeId: "caption:c05", tools: [cyclicTool] });
+    const cyclicHandle = modelContext.tools.get("inspect_selected_cue_evidence");
+    await expect(cyclicHandle?.execute({}, noSignal)).rejects.toMatchObject({
+      name: "CueBenchToolExecutionError",
+    });
+
+    const oversizedTool: CueBenchTool = {
+      ...readTool("inspect_selected_ad_evidence"),
+      resultDataSchema: strictToolDataSchema({ payload: z.string() }),
+      execute: async () => toolSuccess({
+        projectRevision: 1,
+        data: { payload: "x".repeat(MAX_TOOL_RESULT_BYTES + 1) },
+        nextActions: [],
+      }),
+    };
+    await registry.select({ scopeId: "ad:ad02", tools: [oversizedTool] });
+    const oversizedHandle = modelContext.tools.get("inspect_selected_ad_evidence");
+    await expect(oversizedHandle?.execute({}, noSignal)).rejects.toMatchObject({
+      name: "CueBenchToolExecutionError",
+    });
+  });
+});
+
+describe("WebMCP tool result helpers", () => {
+  it("creates compact versioned success and domain-error envelopes", () => {
+    const success = toolSuccess({
+      projectRevision: 4,
+      data: { changedItem: { itemId: "c05", itemRevision: 2 } },
+      nextActions: ["inspect_project"],
+      selection: { kind: "CaptionCue", selectionId: "c05", selectionRevision: 2 },
+      changedItem: { kind: "CaptionCue", itemId: "c05", itemRevision: 2, state: "Proposed" },
+      findingDelta: {
+        addedFindingIds: ["finding-2"],
+        resolvedFindingIds: ["finding-1"],
+        blockerCount: 1,
+        warningCount: 2,
+      },
+      playheadMs: 12_400,
+    });
+
+    expect(success).toMatchObject({ ok: true, contractVersion: 1, projectRevision: 4 });
+    expect(success.data.verification).toEqual({
+      selection: { kind: "CaptionCue", selectionId: "c05", selectionRevision: 2 },
+      changedItem: { kind: "CaptionCue", itemId: "c05", itemRevision: 2, state: "Proposed" },
+      findingDelta: {
+        addedFindingIds: ["finding-2"],
+        resolvedFindingIds: ["finding-1"],
+        blockerCount: 1,
+        warningCount: 2,
+      },
+      playheadMs: 12_400,
+    });
+    expect(toolDomainError(domainError("STALE_SELECTION", "The selection changed."))).toMatchObject({
+      ok: false,
+      contractVersion: 1,
+      code: "STALE_SELECTION",
+      changed: false,
+      retryable: true,
+    });
+  });
+
+  it("rejects unexpected failures only after logging a sanitized fault", async () => {
+    const faults: unknown[] = [];
+    const secret = new Error("Dr. Nguyen transcript must not be logged");
+
+    const rejection = await executeTool(
+      async () => { throw secret; },
+      { toolName: "inspect_project", onUnexpectedError: (fault) => faults.push(fault) },
+    ).catch((error: unknown) => error);
+
+    expect(rejection).toMatchObject({ name: "CueBenchToolExecutionError" });
+    expect((rejection as Error).message).not.toContain(secret.message);
+    expect(faults).toEqual([{
+      event: "webmcp.unexpected_error",
+      toolName: "inspect_project",
+      errorType: "Error",
+    }]);
+  });
+
+  it("does not mistake an unconnected AbortError for agent cancellation", async () => {
+    const faults: unknown[] = [];
+    const rejection = await executeTool(
+      async () => { throw new DOMException("unconnected abort", "AbortError"); },
+      { toolName: "inspect_project", onUnexpectedError: (fault) => faults.push(fault) },
+    ).catch((error: unknown) => error);
+
+    expect(rejection).toMatchObject({ name: "CueBenchToolExecutionError" });
+    expect(faults).toEqual([{
+      event: "webmcp.unexpected_error",
+      toolName: "inspect_project",
+      errorType: "AbortError",
+    }]);
+  });
+
+  it("accepts CueBench's explicit cancellation sentinel", async () => {
+    await expect(executeTool(
+      async () => { throw new ToolExecutionAbortedError(); },
+      { toolName: "inspect_project" },
+    )).resolves.toMatchObject({
+      ok: false,
+      code: "STALE_SELECTION",
+      changed: false,
+    });
+  });
+});

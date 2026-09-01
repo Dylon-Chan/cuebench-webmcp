@@ -407,7 +407,7 @@ for (const format of ["vtt", "srt"] as const) {
 }
 ```
 
-Add tests for draft/certified filename labels, timestamp carry, multiline text, escaping, unsupported metadata, backup exclusion of video blobs, SHA-256 relink mismatch, safety backup, newer-schema read-only import, and an Impact Summary containing only project-local initial/resolved findings, state counts, human interventions, certification state, and round-trip result.
+Add tests for draft/certified filename labels, timestamp carry, multiline text, escaping, unsupported metadata, backup exclusion of video blobs, SHA-256 relink mismatch, safety backup, newer-schema read-only import, and an Impact Summary containing only project-local initial/resolved findings, state counts, human interventions, certification state, `timeToCertificationMs`, and round-trip result.
 
 - [ ] **Step 2: Run tests and verify failure**
 
@@ -423,7 +423,7 @@ Compare canonical integer milliseconds, normalized line endings, cue order, text
 
 Include structure, revisions, Local Evidence Package, findings, profiles, Court Record, certification snapshots, hashes, and export metadata. Exclude `Blob`, object URLs, narration audio, and source video.
 
-Implement `buildImpactSummary(project)` entirely from local project history. It must not calculate or display estimated time saved, compliance, accessibility score, or industry comparisons.
+Implement `buildImpactSummary(project)` entirely from local project history. Derive `timeToCertificationMs` only from the local project-created and current-certification timestamps; omit it when no current certification exists. It must not calculate or display estimated time saved, compliance, accessibility score, or industry comparisons.
 
 - [ ] **Step 5: Run tests**
 
@@ -807,7 +807,7 @@ git commit -m "feat: secure anonymous CueBench uploads"
 
 **Interfaces:**
 - Consumes: signed internal job, private input object, explicit output prefix.
-- Produces: probed metadata, normalized mono audio, 10 ms peak pyramid, scene timestamps, bounded WebP thumbnails, hashes, and a versioned preparation manifest.
+- Produces: probed metadata, normalized mono audio, a multi-resolution min/max waveform peak pyramid with a 10 ms base level, scene timestamps, bounded WebP thumbnails, hashes, and a versioned preparation manifest.
 
 - [ ] **Step 1: Initialize the Python 3.12 uv project and lock dependencies**
 
@@ -833,6 +833,8 @@ def test_prepare_returns_integer_millisecond_evidence(client, sample_mp4):
     assert result["contract_version"] == 1
     assert all(isinstance(scene["at_ms"], int) for scene in result["scenes"])
     assert result["waveform"]["bucket_ms"] == 10
+    assert len(result["waveform"]["levels"]) > 1
+    assert all("min" in bucket and "max" in bucket for level in result["waveform"]["levels"] for bucket in level["buckets"])
 ```
 
 Add tests for path traversal, unsupported codec, duration/size, thumbnail cap, command timeouts, sanitized stderr, expired internal job signature, and input/output-prefix tampering.
@@ -845,7 +847,7 @@ Expected: FAIL because the service is absent.
 
 - [ ] **Step 4: Implement safe FFprobe/FFmpeg adapters**
 
-Use argument arrays, fixed executable names, validated private object paths, explicit timeouts, bounded output, and no shell interpolation. Normalize audio for transcription and compute peaks deterministically.
+Use argument arrays, fixed executable names, validated private object paths, explicit timeouts, bounded output, and no shell interpolation. Normalize audio for transcription and compute deterministic signed min/max peak buckets at the 10 ms base level, then derive coarser levels without rereading the media.
 
 Require and verify an internal job signature covering operation ID, input key, output prefix, and expiry. Assert the container starts and tests pass without any OpenAI environment variable.
 
@@ -892,7 +894,7 @@ git commit -m "feat: prepare CueBench media evidence"
 
 - [ ] **Step 1: Write failing workflow tests with fake providers**
 
-Test stage persistence, idempotent resume, `chunking_strategy: auto` beyond 30 seconds, diarization plus word-timestamp calls, deterministic alignment, uncertainty spans, `store: false`, resolved provenance, cancellation, and no staged adoption on failure.
+Test stage persistence, idempotent resume, `chunking_strategy: auto` beyond 30 seconds, diarization plus word-timestamp calls, deterministic alignment, uncertainty spans, `store: false`, resolved provenance, cancellation, no staged adoption on failure, target-track lease exclusion, and rejection of media replacement or Quality Profile changes while any generation lease is active.
 
 - [ ] **Step 2: Run tests and verify failure**
 
@@ -902,7 +904,7 @@ Expected: FAIL because Workflow and client do not exist.
 
 - [ ] **Step 3: Implement provider ports and two-pass transcription**
 
-Keep OpenAI behind typed ports so tests use fixtures. Call `gpt-4o-transcribe-diarize` for speaker segments and `whisper-1` for word timestamps. Hash raw responses before transforming them.
+Keep OpenAI behind typed ports so automated tests and local replay use deterministic fixtures by default. Introduce an explicit `CUEBENCH_OPENAI_MODE=fixture|live` boundary; require an opt-in `live` value plus server-side credentials for real requests. Call `gpt-4o-transcribe-diarize` for speaker segments and `whisper-1` for word timestamps. Hash raw responses before transforming them.
 
 - [ ] **Step 4: Implement deterministic alignment and bounded reconciliation**
 
@@ -960,7 +962,7 @@ Use strict structured output with proposed text, essential-visual rationale, fra
 
 - [ ] **Step 4: Implement quota-controlled TTS preview**
 
-Call `gpt-4o-mini-tts` with default voice `marin`, `store: false`, and no model secrets in the browser. Cache audio and measured duration in IndexedDB. Do not treat TTS audio as certification evidence.
+Call `gpt-4o-mini-tts` with default voice `marin`, `store: false`, and no model secrets in the browser. Cache audio and measured duration in IndexedDB under a deterministic key covering the AD beat revision, text, resolved model, voice, instructions, format, speed, and all other request parameters. Do not treat TTS audio as certification evidence.
 
 - [ ] **Step 5: Run tests**
 

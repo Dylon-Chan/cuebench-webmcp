@@ -1,0 +1,20 @@
+{
+  "name": "@cuebench/storage",
+  "version": "0.0.0",
+  "type": "module",
+  "exports": "./src/index.ts",
+  "scripts": {
+    "test": "vitest run --exclude=**/dist/** --exclude=**/coverage/**",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "build": "tsc -p tsconfig.build.json"
+  },
+  "dependencies": {
+    "@cuebench/contracts": "workspace:*",
+    "@cuebench/domain": "workspace:*",
+    "dexie": "4.4.5",
+    "zod": "4.4.3"
+  },
+  "devDependencies": {
+    "fake-indexeddb": "6.2.5"
+  }
+}

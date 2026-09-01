@@ -1,0 +1,231 @@
+{
+  "schemaVersion": 2,
+  "generatedAt": "2026-09-01T04:34:28Z",
+  "title": "Design System: CueBench Calibration Bench",
+  "extensions": {
+    "colorMeta": {
+      "authority-ink": {
+        "role": "tertiary",
+        "displayName": "Human Authority Ink",
+        "canonical": "#633083",
+        "tonalRamp": [
+          "oklch(15% 0.13 315)",
+          "oklch(26% 0.13 315)",
+          "oklch(37% 0.13 315)",
+          "oklch(48% 0.13 315)",
+          "oklch(60% 0.13 315)",
+          "oklch(72% 0.13 315)",
+          "oklch(84% 0.13 315)",
+          "oklch(95% 0.13 315)"
+        ]
+      },
+      "authority-line": {
+        "role": "tertiary",
+        "displayName": "Human Authority Line",
+        "canonical": "#bda7ca",
+        "tonalRamp": [
+          "oklch(15% 0.06 315)",
+          "oklch(26% 0.06 315)",
+          "oklch(37% 0.06 315)",
+          "oklch(48% 0.06 315)",
+          "oklch(60% 0.06 315)",
+          "oklch(72% 0.06 315)",
+          "oklch(84% 0.06 315)",
+          "oklch(95% 0.06 315)"
+        ]
+      },
+      "authority-field": {
+        "role": "tertiary",
+        "displayName": "Human Authority Field",
+        "canonical": "#faf6fc",
+        "tonalRamp": [
+          "oklch(15% 0.015 315)",
+          "oklch(26% 0.015 315)",
+          "oklch(37% 0.015 315)",
+          "oklch(48% 0.015 315)",
+          "oklch(60% 0.015 315)",
+          "oklch(72% 0.015 315)",
+          "oklch(84% 0.015 315)",
+          "oklch(95% 0.015 315)"
+        ]
+      }
+    },
+    "typographyMeta": {
+      "display": {
+        "displayName": "Project Start Display",
+        "purpose": "Reserved for the opening project statement."
+      },
+      "measurement": {
+        "displayName": "Tabular Measurement",
+        "purpose": "Times, revisions, counts, hashes, and other calibrated readings."
+      }
+    },
+    "shadows": [
+      {
+        "name": "paper-surface",
+        "value": "inset 0 1px 0 #fff, 0 4px 12px rgb(24 50 59 / 8%)",
+        "purpose": "Faint etched lift for the Evidence Bay, Review Docket, and Court Record."
+      },
+      {
+        "name": "optical-specimen",
+        "value": "0 0 0 3px #dce4e5, 0 0 0 4px #9dabb0, inset 0 0 0 1px rgb(223 245 241 / 16%), inset 0 -22px 40px rgb(0 4 12 / 36%), 0 8px 18px rgb(25 49 59 / 18%)",
+        "purpose": "Layered glass and anodized framing around the verified source video."
+      },
+      {
+        "name": "timeline-instrument",
+        "value": "0 0 0 2px #d8e1e2, 0 0 0 3px #a9b7bb, inset 0 1px 0 rgb(223 247 241 / 13%), 0 8px 17px rgb(18 43 52 / 14%)",
+        "purpose": "Inset frame for the waveform and lane assembly."
+      },
+      {
+        "name": "dialog-lift",
+        "value": "0 22px 50px rgb(0 15 23 / 34%)",
+        "purpose": "Unmistakable floating elevation for blocking dialogs only."
+      }
+    ],
+    "motion": [
+      {
+        "name": "state-border",
+        "value": "160ms ease-out",
+        "purpose": "Border-color and box-shadow response on framed buttons."
+      },
+      {
+        "name": "reduced-motion",
+        "value": "0.01ms; animation-iteration-count: 1; scroll-behavior: auto",
+        "purpose": "Global prefers-reduced-motion override for transitions, animation, and scrolling."
+      }
+    ],
+    "breakpoints": [
+      {
+        "name": "compressed-desktop",
+        "value": "1180px"
+      },
+      {
+        "name": "single-column",
+        "value": "820px"
+      },
+      {
+        "name": "touch-workbench",
+        "value": "540px"
+      }
+    ]
+  },
+  "components": [
+    {
+      "name": "Instrument Header",
+      "kind": "nav",
+      "description": "Continuous dark rail for identity, calibrated readings, and workbench actions.",
+      "html": "<header class=\"ds-instrument-header\"><div class=\"ds-brand\"><span class=\"ds-brand-mark\" aria-hidden=\"true\"><i></i><i></i><i></i></span><strong>CueBench</strong></div><div class=\"ds-header-reading\"><span><b>PROJECT</b>Gibbs free energy</span><span><b>VALIDATION</b>0 blockers · 28 warnings</span></div></header>",
+      "css": ".ds-instrument-header { display:grid; grid-template-columns:auto minmax(0,1fr); min-height:68px; color:#eff9f8; background:linear-gradient(106deg,#010f1c 0%,#061923 58%,#000208 100%); border-bottom:1px solid #38515c; font-family:ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,\"Segoe UI\",sans-serif; } .ds-brand { display:flex; align-items:center; gap:.58rem; padding:.68rem .82rem; border-right:1px solid rgb(173 212 215 / 22%); font-size:1.25rem; letter-spacing:-.035em; } .ds-brand-mark { display:grid; grid-template-columns:repeat(3,3px); align-items:center; gap:2px; width:18px; height:20px; } .ds-brand-mark i { display:block; width:3px; background:#00b879; } .ds-brand-mark i:nth-child(1){height:7px}.ds-brand-mark i:nth-child(2){height:18px}.ds-brand-mark i:nth-child(3){height:11px} .ds-header-reading { display:grid; grid-template-columns:repeat(2,minmax(88px,1fr)); } .ds-header-reading span { display:grid; gap:.17rem; padding:.62rem .72rem; border-right:1px solid rgb(173 212 215 / 22%); color:#f6fbfb; font-size:.75rem; font-weight:680; } .ds-header-reading b { color:#a7bec4; font-size:.62rem; letter-spacing:.04em; text-transform:uppercase; }"
+    },
+    {
+      "name": "Signal Button",
+      "kind": "button",
+      "refersTo": "button-signal",
+      "description": "Verified completion action used when the system can safely advance.",
+      "html": "<button class=\"ds-btn-signal\" type=\"button\">Save changes</button>",
+      "css": ".ds-btn-signal { display:inline-flex; align-items:center; justify-content:center; min-height:38px; padding:.48rem .82rem; color:#f6fff9; border:1px solid #006836; border-radius:5px; background:#006836; box-shadow:0 6px 14px rgb(0 91 54 / 18%); font:720 .82rem/1 ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,\"Segoe UI\",sans-serif; transition:border-color 160ms ease-out,box-shadow 160ms ease-out; } .ds-btn-signal:hover { border-color:#005b36; background:#005b36; } .ds-btn-signal:focus-visible { outline:3px solid #006836; outline-offset:3px; }"
+    },
+    {
+      "name": "Outline Button",
+      "kind": "button",
+      "refersTo": "button-outline",
+      "description": "Quiet secondary workbench action on paper surfaces.",
+      "html": "<button class=\"ds-btn-outline\" type=\"button\">Open evidence</button>",
+      "css": ".ds-btn-outline { display:inline-flex; align-items:center; justify-content:center; min-height:38px; padding:.48rem .82rem; color:#0e3948; border:1px solid #77909a; border-radius:5px; background:#fbfbfb; font:720 .82rem/1 ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,\"Segoe UI\",sans-serif; transition:border-color 160ms ease-out,box-shadow 160ms ease-out; } .ds-btn-outline:hover { border-color:#0e3948; background:#eaf2f4; } .ds-btn-outline:focus-visible { outline:3px solid #006836; outline-offset:3px; }"
+    },
+    {
+      "name": "Human Ruling Field",
+      "kind": "custom",
+      "refersTo": "human-ruling-field",
+      "description": "Fully enclosed purple inset field that keeps Human-only authority, explanation, and Object/Sustain actions together.",
+      "html": "<section class=\"ds-ruling-field\" aria-labelledby=\"ds-ruling-heading\"><div class=\"ds-ruling-heading\"><h3 id=\"ds-ruling-heading\">Human rulings</h3><span>Human-only</span></div><p>Object or Sustain records the ruling for the displayed saved revision.</p><div class=\"ds-ruling-actions\"><button class=\"ds-btn-object\" type=\"button\" aria-label=\"Object selected revision\">Object</button><button class=\"ds-btn-sustain\" type=\"button\" aria-label=\"Sustain selected revision\">Sustain</button></div></section>",
+      "css": ".ds-ruling-field { padding:.72rem; color:#13212a; border:1px solid #bda7ca; border-radius:4px; background:linear-gradient(180deg,rgb(116 69 151 / 10%) 0 3px,#fff 3px,#faf6fc 100%); box-shadow:inset 0 1px 0 #fff,inset 0 0 0 1px rgb(116 69 151 / 7%); font-family:ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,\"Segoe UI\",sans-serif; } .ds-ruling-heading { display:flex; align-items:baseline; justify-content:space-between; gap:.75rem; } .ds-ruling-heading h3 { margin:0; color:#172f39; font-size:.82rem; } .ds-ruling-heading span { color:#633083; font-size:.65rem; font-weight:760; } .ds-ruling-field p { margin:.5rem 0 .7rem; color:#48616a; font-size:.75rem; line-height:1.4; } .ds-ruling-actions { display:grid; grid-template-columns:1fr 1fr; gap:.48rem; } .ds-ruling-actions button { min-height:38px; padding:.48rem .82rem; border:1px solid currentColor; border-radius:5px; font:720 .82rem/1 ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,\"Segoe UI\",sans-serif; transition:border-color 160ms ease-out,box-shadow 160ms ease-out; } .ds-btn-object { color:#fff9f5; border-color:#9b3d00 !important; background:#9b3d00; } .ds-btn-sustain { color:#fffaff; border-color:#8050b3 !important; background:#8050b3; } .ds-btn-object:hover { background:#873600; } .ds-btn-sustain:hover { background:#70439f; } .ds-ruling-actions button:focus-visible { outline:3px solid #006836; outline-offset:3px; } .ds-ruling-actions button:active { box-shadow:inset 0 2px 5px rgb(0 0 0 / 22%); }"
+    },
+    {
+      "name": "Review Field",
+      "kind": "input",
+      "refersTo": "review-field",
+      "description": "Compact readable editor field for caption prose and revision details.",
+      "html": "<label class=\"ds-review-field\"><span>CAPTION TEXT</span><textarea rows=\"3\">When delta G is negative, the change is</textarea></label>",
+      "css": ".ds-review-field { display:grid; gap:.25rem; color:#36545e; font:760 .64rem/1.2 ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,\"Segoe UI\",sans-serif; } .ds-review-field span { letter-spacing:.04em; text-transform:uppercase; } .ds-review-field textarea { width:100%; min-height:5.4rem; padding:.42rem .46rem; color:#152e38; border:1px solid #aebfc4; border-radius:3px; background:#fff; font:520 .72rem/1.4 ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,\"Segoe UI\",sans-serif; resize:vertical; } .ds-review-field textarea:hover { border-color:#9badb2; } .ds-review-field textarea:focus-visible { border-color:#006836; outline:3px solid #006836; outline-offset:3px; }"
+    },
+    {
+      "name": "Active Docket Filter",
+      "kind": "chip",
+      "refersTo": "docket-filter-active",
+      "description": "Pressed filter state with label, border, fill, and inset signal rule.",
+      "html": "<button class=\"ds-docket-filter\" type=\"button\" aria-pressed=\"true\">Proposed</button>",
+      "css": ".ds-docket-filter { min-height:30px; padding:.35rem .48rem; color:#005b36; border:1px solid #4fbd83; border-radius:4px; background:#edfff4; box-shadow:inset 0 -2px 0 #006836; font:700 .7rem/1 ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,\"Segoe UI\",sans-serif; } .ds-docket-filter:hover { border-color:#72989f; background:#f2f7f7; } .ds-docket-filter:focus-visible { outline:3px solid #006836; outline-offset:3px; }"
+    },
+    {
+      "name": "Selected Docket Item",
+      "kind": "card",
+      "description": "Current review item showing complete prose, timing, state, and revision provenance.",
+      "html": "<article class=\"ds-docket-item\"><button class=\"ds-docket-select\" type=\"button\" aria-current=\"true\"><span class=\"ds-docket-identity\"><strong>GIBBS-CUE-05</strong><em>CAPTION</em></span><span class=\"ds-docket-prose\">When delta G is negative, the change is</span></button><p class=\"ds-docket-facts\">Time 18000–22500 ms · State PROPOSED · Revision r1</p></article>",
+      "css": ".ds-docket-item { min-width:0; padding:.55rem .45rem; color:#102933; border:1px solid #68b88c; outline:2px solid #006836; outline-offset:-1px; border-radius:4px; background:#f0fbf4; font-family:ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,\"Segoe UI\",sans-serif; } .ds-docket-select { display:grid; gap:.25rem; width:100%; padding:0; color:#102933; border:0; background:transparent; text-align:left; } .ds-docket-select:hover .ds-docket-prose { color:#005b36; text-decoration:underline; text-underline-offset:.16em; } .ds-docket-select:focus-visible { outline:3px solid #006836; outline-offset:3px; } .ds-docket-identity { display:flex; align-items:baseline; gap:.42rem; color:#1d3b46; font-size:.67rem; font-weight:800; letter-spacing:.035em; } .ds-docket-identity em { color:#5b737b; font-size:.61rem; font-style:normal; font-weight:700; letter-spacing:0; } .ds-docket-prose { color:#172f39; font-size:.8rem; font-weight:680; line-height:1.34; } .ds-docket-facts { margin:.42rem 0 0; color:#49646d; font-size:.63rem; font-variant-numeric:tabular-nums; }"
+    },
+    {
+      "name": "Selected Caption Interval",
+      "kind": "custom",
+      "refersTo": "timeline-caption-selected",
+      "description": "Selected caption interval on the ruled timeline with visible ID and time range.",
+      "html": "<div class=\"ds-timeline-bed\"><button class=\"ds-caption-interval\" type=\"button\" aria-current=\"true\"><strong>GIBBS-CUE-05</strong><span>00:18.000 → 00:22.500</span></button><i class=\"ds-playhead\" aria-hidden=\"true\"></i></div>",
+      "css": ".ds-timeline-bed { position:relative; width:320px; height:74px; overflow:hidden; background:linear-gradient(90deg,rgb(179 210 204 / 11%) 1px,transparent 1px) 0 0/10% 100%,#071820; } .ds-caption-interval { position:absolute; top:17px; left:70px; display:grid; gap:.12rem; width:150px; height:40px; padding:.28rem .55rem; color:#eaf5f1; border:1px solid #67e59c; outline:2px solid #67e59c; outline-offset:1px; border-radius:3px; background:#075737; box-shadow:0 4px 10px rgb(0 0 0 / 28%),inset 0 1px 0 rgb(239 255 247 / 24%); text-align:left; } .ds-caption-interval strong { color:#d7f9e5; font:800 .64rem/1 ui-sans-serif,system-ui,sans-serif; letter-spacing:.025em; } .ds-caption-interval span { color:#b6d0c8; font:400 .56rem/1 ui-sans-serif,system-ui,sans-serif; font-variant-numeric:tabular-nums; } .ds-caption-interval:hover { background:#075737; box-shadow:0 4px 10px rgb(0 0 0 / 28%),inset 0 0 0 999px rgb(174 255 207 / 10%); } .ds-caption-interval:focus-visible { outline:3px solid #006836; outline-offset:3px; } .ds-playhead { position:absolute; top:0; bottom:0; left:145px; width:2px; background:#57ea96; box-shadow:0 0 0 1px rgb(0 91 54 / 50%); }"
+    },
+    {
+      "name": "Audio Description Gap",
+      "kind": "custom",
+      "description": "Dashed evidence-blue interval representing an available speech-safe description gap.",
+      "html": "<div class=\"ds-ad-bed\"><div class=\"ds-ad-gap\" role=\"img\" aria-label=\"Available audio-description gap, 00:52.000 to 01:02.000\"><strong>AD GAP</strong><span>00:52.000–01:02.000</span></div></div>",
+      "css": ".ds-ad-bed { position:relative; width:320px; height:64px; background:#071820; } .ds-ad-gap { position:absolute; top:12px; left:74px; display:grid; min-width:150px; height:38px; align-content:center; padding:.2rem .35rem; color:#c6e3f6; border:1px dashed #63a8d6; border-radius:3px; background:repeating-linear-gradient(135deg,rgb(35 101 143 / 32%) 0 6px,rgb(11 48 72 / 48%) 6px 12px); box-shadow:inset 0 1px 0 rgb(214 239 255 / 11%); } .ds-ad-gap strong { font:700 .58rem/1.2 ui-sans-serif,system-ui,sans-serif; letter-spacing:.04em; } .ds-ad-gap span { font:400 .53rem/1.2 ui-sans-serif,system-ui,sans-serif; font-variant-numeric:tabular-nums; }"
+    }
+  ],
+  "narrative": {
+    "northStar": "Calibration Bench",
+    "overview": "CueBench is a precision caption-certification instrument: a calm daylight workbench where a teacher and bounded agent calibrate captions and audio descriptions against visible media evidence. Cool paper surrounds deep teal-navy instrument wells; mint signal traces, amber diagnostics, evidence blue, and purple Human authority create a dense but controlled field whose hierarchy comes from measurement, not decoration.\n\nThe surface borrows optical glass, anodized edges, etched grids, and tabular readings without becoming literal laboratory scenery. Legal-review language is functional: the Review Docket organizes current review state, Human rulings bind saved revisions, and the Court Record preserves append-only provenance. It must never drift into a generic dashboard, an AI gradient, courtroom cosplay, a chat layout, or neon science fiction.",
+    "keyCharacteristics": [
+      "Dense, evidence-first composition with the artifact always visible.",
+      "Cool paper framing around inset graphite instruments.",
+      "Mint signal and selection; amber diagnosis; blue evidence; purple Human authority.",
+      "Shape plus label plus color for every consequential state.",
+      "Restrained 2–6 px corners, fine dividers, and tabular measurement readings."
+    ],
+    "rules": [
+      {
+        "name": "The Authority Color Rule",
+        "body": "Purple belongs to Human-only authority and sustained state; never use it to imply agent approval.",
+        "section": "colors"
+      },
+      {
+        "name": "The Signal Scarcity Rule",
+        "body": "Mint identifies the shared clock, verified evidence, active selection, or successful action; it is not ambient decoration.",
+        "section": "colors"
+      },
+      {
+        "name": "The Transcript Legibility Rule",
+        "body": "Caption and audio-description prose always uses the body voice; measurement styling is reserved for IDs, times, counts, and provenance.",
+        "section": "typography"
+      },
+      {
+        "name": "The Inset-First Rule",
+        "body": "Evidence surfaces are seated into the workbench; floating-card shadows are reserved for modal interruption.",
+        "section": "elevation"
+      }
+    ],
+    "dos": [
+      "Do keep source video, waveform, caption lane, audio-description lane, findings, selected revision, and the single playhead visibly connected.",
+      "Do use shape plus label plus color for selection, warning, actor, and review state.",
+      "Do preserve 44 px minimum touch targets and semantic alternatives on mobile.",
+      "Do keep Human-only rulings inside the fully enclosed purple inset field, with the orange Object and purple Sustain actions structurally separate from agent actions.",
+      "Do treat the Court Record as append-only provenance with exact actors and revisions."
+    ],
+    "donts": [
+      "Don't use generic dashboard cards, AI gradients, decorative glow, or a chat-centric layout.",
+      "Don't turn the Calibration Bench into literal laboratory scenery, neon science fiction, or courtroom ornament.",
+      "Don't use instrument lettering for transcript or audio-description prose.",
+      "Don't make waveform canvas interaction the only way to select, seek, or adjust timing.",
+      "Don't reduce Human rulings to a colored side tab, top rule, or detached pair of buttons; preserve the complete authority-field enclosure.",
+      "Don't imply that agent readiness, deterministic validation, or color alone is Human certification."
+    ]
+  }
+}

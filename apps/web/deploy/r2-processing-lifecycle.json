@@ -1,0 +1,45 @@
+{
+  "version": 1,
+  "bucketName": "cuebench-processing-local",
+  "rules": [
+    {
+      "id": "cuebench-processing-expire-24h",
+      "enabled": true,
+      "conditions": {
+        "prefix": "processing/"
+      },
+      "deleteObjectsTransition": {
+        "condition": {
+          "type": "Age",
+          "maxAge": 86400
+        }
+      }
+    },
+    {
+      "id": "cuebench-prepared-expire-24h",
+      "enabled": true,
+      "conditions": {
+        "prefix": "prepared/"
+      },
+      "deleteObjectsTransition": {
+        "condition": {
+          "type": "Age",
+          "maxAge": 86400
+        }
+      }
+    },
+    {
+      "id": "cuebench-processing-abort-multipart-24h",
+      "enabled": true,
+      "conditions": {
+        "prefix": "processing/"
+      },
+      "abortMultipartUploadsTransition": {
+        "condition": {
+          "type": "Age",
+          "maxAge": 86400
+        }
+      }
+    }
+  ]
+}
