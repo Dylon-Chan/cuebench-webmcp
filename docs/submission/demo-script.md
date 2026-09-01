@@ -1,6 +1,6 @@
 # CueBench sub-three-minute demonstration script
 
-> Target runtime: **2:48**. Rehearsal status: structure and local production paths verified; the real hosted-generation recording is **BLOCKED until Cloudflare authentication, Human Turnstile completion, and production smoke pass**. Use `{{CUEBENCH_PRODUCTION_URL}}` only after that gate.
+> Target runtime: **2:48**. Rehearsal status: structure and local production paths are verified, and the preview is deployed; its repeatable hosted Playwright run recorded 15 passed with 1 Human-processing test skipped when Human mode was disabled. The real hosted-generation recording remains **BLOCKED**. First complete preview Human processing with cancel-delete cleanup, then complete and restore the preview-only breaker drill; only then deploy production and complete live OpenAI/Human smoke against the production origin. The real Turnstile checkbox has not yet been completed. Use `{{CUEBENCH_PRODUCTION_URL}}` only after that sequence passes.
 
 ## 0:00–0:18 — Establish the artifact
 

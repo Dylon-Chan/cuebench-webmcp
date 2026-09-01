@@ -55,7 +55,9 @@ CueBench does not claim automated WCAG or legal conformance. Its deterministic Q
 
 ## Hackathon submission status
 
-The local production build, deterministic replay, WebMCP collaboration, accessibility, recovery, and export paths are documented in [the submission package](docs/submission/devpost.md). The public production release is intentionally represented by the token `{{CUEBENCH_PRODUCTION_URL}}` until Cloudflare authentication, Human Turnstile completion, the hosted Playwright/smoke matrix, real provider generation, and the cleanup drill pass against the exact origin. Current hosted status: **BLOCKED — external operator credentials and Human verification required**.
+The local production build, deterministic replay, WebMCP collaboration, accessibility, recovery, and export paths are documented in [the submission package](docs/submission/devpost.md). A preview is deployed at [cuebench-web-preview.wengsiong22.workers.dev](https://cuebench-web-preview.wengsiong22.workers.dev): authenticated Cloudflare preflight verified that both the preview and production processing buckets have no public R2 domain, the Browser plugin loaded the hosted workbench with its waveform and live WebMCP tools, and `inspect_project` succeeded. The repeatable hosted Playwright suite recorded **15 passed, 1 Human-processing test skipped** when Human mode was disabled.
+
+Those results do not certify hosted processing. The headed Human Turnstile run reached the real checkbox but did not proceed because it was left unchecked. Release verification proceeds in order: first complete preview Human processing with post-queue cancellation/project-deletion cleanup, then complete the preview-only spend-breaker/restoration drill. Only after both preview gates pass may production be deployed and smoke-tested with live OpenAI and real Human Turnstile completion against the production origin. The public production release therefore remains intentionally represented by `{{CUEBENCH_PRODUCTION_URL}}` until that sequence completes.
 
 - [Devpost draft](docs/submission/devpost.md)
 - [Sub-three-minute demo script](docs/submission/demo-script.md)

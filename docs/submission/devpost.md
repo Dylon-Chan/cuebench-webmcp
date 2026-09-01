@@ -1,6 +1,6 @@
 # CueBench — Devpost submission draft
 
-> Release evidence status: **BLOCKED — Cloudflare authentication and Human Turnstile completion are still required.** Replace `{{CUEBENCH_PRODUCTION_URL}}` only after the production smoke, hosted Playwright suite, real generation, and cleanup drill pass against that exact origin.
+> Release evidence status: **Preview deployed and repeatably verified; production remains BLOCKED.** The deployed preview is [cuebench-web-preview.wengsiong22.workers.dev](https://cuebench-web-preview.wengsiong22.workers.dev). Its authenticated R2 privacy preflight passed, and its repeatable hosted Playwright run recorded 15 passed with 1 Human-processing test skipped when Human mode was disabled. A real headed Turnstile run is still incomplete because the checkbox was not completed; no hosted-processing pass is claimed. Release sequencing is: preview Human processing/cancel-delete cleanup, then preview-only breaker/restoration, then production deployment plus live OpenAI/Human smoke against the production origin. Replace `{{CUEBENCH_PRODUCTION_URL}}` only after that sequence passes.
 
 ## One-line pitch
 
@@ -82,7 +82,7 @@ CueBench treats the timeline as a shared Human-agent artifact rather than a tran
 
 ## Links
 
-- Live app: `{{CUEBENCH_PRODUCTION_URL}}` — **BLOCKED until authenticated production verification passes**
-- Repository: `{{CUEBENCH_REPOSITORY_URL}}`
+- Preview app: [cuebench-web-preview.wengsiong22.workers.dev](https://cuebench-web-preview.wengsiong22.workers.dev) — deployed preview, not the production release
+- Live app: `{{CUEBENCH_PRODUCTION_URL}}` — **BLOCKED until the production verification gates pass**
+- Repository: `{{CUEBENCH_REPOSITORY_URL}}` — placeholder; GitHub CLI authentication is currently unavailable for publication/PR verification
 - Demo video: `{{CUEBENCH_DEMO_VIDEO_URL}}` — **BLOCKED until the real hosted-generation recording is completed**
-

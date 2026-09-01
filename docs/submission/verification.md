@@ -7,8 +7,9 @@ This record separates repository-local evidence from hosted release evidence. A 
 | Evidence | Value | Status |
 | --- | --- | --- |
 | Branch | `codex/cuebench-core` | Recorded |
-| Production URL | `{{CUEBENCH_PRODUCTION_URL}}` | **BLOCKED — Cloudflare authentication and production deployment required** |
-| Repository URL | `{{CUEBENCH_REPOSITORY_URL}}` | Placeholder |
+| Preview URL | `https://cuebench-web-preview.wengsiong22.workers.dev` | Deployed; repeatable hosted Playwright recorded 15 passed, 1 Human-processing test skipped with Human mode disabled |
+| Production URL | `{{CUEBENCH_PRODUCTION_URL}}` | **BLOCKED — complete preview Human processing/cleanup and preview breaker restoration first; then deploy production and pass its live OpenAI/Human smoke** |
+| Repository URL | `{{CUEBENCH_REPOSITORY_URL}}` | Placeholder; GitHub CLI authentication is currently unavailable for publication/PR verification |
 | Demo video URL | `{{CUEBENCH_DEMO_VIDEO_URL}}` | **BLOCKED — record only after real hosted generation passes** |
 | Approved composition | `.impeccable/mocks/decision/calibration-bench.png` | Approved Option 1 |
 
@@ -26,7 +27,7 @@ This record separates repository-local evidence from hosted release evidence. A 
 | Impeccable finish review | Definitive fresh reviewer disposition after the detector finding was fixed and all three recaptures were opened | `ship`; full enclosure removed the side-tab ambiguity and mobile retained the centered 3× instrument without page overflow |
 | Design system document | `DESIGN.md` and `.impeccable/design.json` | Generated from the shipped render and actual CSS |
 
-The review screenshots use the real production Vite/Cloudflare preview. Browser Use inspected that preview and its discovered WebMCP tools. The in-app Browser API cannot install the standards-shaped durable `StorageManager` boot shim needed for the replay-populated state, so the captures use the repository's release Playwright runtime and exact E2E durable-storage shim against the same production preview. Reduced motion was enabled and the page settled for 1.5 seconds before capture.
+The review screenshots use the repository's local production Vite/Cloudflare preview. Separately, the Browser plugin loaded the deployed hosted preview, confirmed its audio peak evidence and live WebMCP tools, and successfully called `inspect_project`. The in-app Browser API cannot install the standards-shaped durable `StorageManager` boot shim needed for the replay-populated state, so the captures use the repository's release Playwright runtime and exact E2E durable-storage shim against that local production preview. Reduced motion was enabled and the page settled for 1.5 seconds before capture.
 
 ## Automated release matrix
 
@@ -41,7 +42,7 @@ git diff --check
 
 Observed local results:
 
-- `pnpm verify` — pass: lint, all workspace typechecks, all package tests, 534 web unit tests, and 22 Worker-runtime tests. The Worker runtime printed known canceled-request diagnostics during negative-path coverage but exited successfully.
+- `pnpm verify` — pass: lint, all workspace typechecks, all package tests, 536 web unit tests, and 22 Worker-runtime tests. The Worker runtime printed known canceled-request diagnostics during negative-path coverage but exited successfully.
 - `pnpm --filter @cuebench/web e2e` — pass: 18 passed, 1 hosted-only test skipped, 0 failed. This includes automated accessibility, WebMCP collaboration, Human sample, export round-trip, recovery, upload-path lazy-chunk isolation, 320 px edge targets, mobile-first 3× recentering, mobile order, and no page-level horizontal overflow.
 - `cd services/media && source .venv/bin/activate && uv run pytest -q` — pass: 52 passed.
 - `git diff --check` — pass.
@@ -66,16 +67,23 @@ Repository tests assert:
 - a certified VTT downloads with 15 cues and parses back successfully;
 - the Court Record preserves distinct CueBench AI, Browser Agent, Human, validation-System, and export-System actors.
 
+## Deployed preview evidence
+
+- The preview origin above is deployed. Preview and production deployment dry-runs both pass, but a production dry-run is not a production deployment.
+- Authenticated Cloudflare R2 privacy preflight passed for the exact preview and production processing buckets: `r2.dev` is disabled and neither bucket has an enabled public custom domain.
+- The Browser plugin loaded the hosted app, its waveform/audio peak evidence, and its live WebMCP tools; `inspect_project` returned successfully.
+- The repeatable hosted Playwright suite against preview recorded **15 passed, 1 Human-processing test skipped** when Human mode was disabled.
+- A headed, real-Turnstile attempt reached the checkbox but did not receive a Human completion. It did not start processing or establish cancellation/deletion evidence, and is not counted as a hosted-processing pass.
+
 ## Hosted evidence that remains blocked
 
-The following require the operator's Cloudflare account/token, separate preview and production secrets, real Human Turnstile completion, and the exact public origins. They have not been inferred from local tests.
+The remaining gates require real Human interaction and, for production, a deployed production origin with its own secrets. Release order is strict: first finish preview Human processing with post-queue cancellation/project-deletion cleanup; second run the preview-only spend-breaker drill and restore it; only then deploy production and run its live OpenAI/Human hosted smoke against the production origin. They have not been inferred from local tests or preview dry-runs.
 
-- preview deploy and no-redirect HTTPS/security-header smoke;
-- authenticated proof that preview and production R2 buckets have no public domain;
-- real bounded provider generation in production live mode;
-- cancellation and project-deletion cleanup reaching `Deleted` or truthful `Lifecycle pending`;
+- preview Human-Turnstile processing, post-queue cancellation, and project-deletion cleanup reaching `Deleted` or truthful `Lifecycle pending`;
 - preview spend-breaker drill and restoration;
-- production hosted-safe Playwright suite;
-- public repository and final demo-video accessibility.
+- production deployment and no-redirect HTTPS/security-header smoke;
+- real bounded provider generation in production live OpenAI mode;
+- production hosted-safe Playwright suite with real Human Turnstile completion;
+- public repository/PR publication and final demo-video accessibility.
 
 Run the exact gates in `docs/runbooks/deployment.md` and `scripts/smoke-hosted.sh`, then replace the placeholders and attach sanitized evidence only. Never include media, captions, frames, filenames, URLs containing capabilities, secrets, or raw provider output in operational evidence.
