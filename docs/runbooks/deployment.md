@@ -119,6 +119,14 @@ Do not use `--containers-rollout=none` for a first deployment: that would publis
 
 Production follows only after preview smoke, a successful full local verification matrix, lifecycle-policy verification, and the manual breaker/cleanup drill below.
 
+From the repository root, verify production routing without publishing before the actual deployment:
+
+```bash
+node apps/web/scripts/deploy.mjs --dry-run --env production
+```
+
+The deploy wrapper rejects a literal `--` argument; pass deployment flags directly so the lifecycle policy and Wrangler receive the same arguments.
+
 ```bash
 VITE_TURNSTILE_SITE_KEY="$CUEBENCH_PRODUCTION_TURNSTILE_SITE_KEY" pnpm --filter @cuebench/web build
 pnpm --filter @cuebench/web wrangler deploy --env production

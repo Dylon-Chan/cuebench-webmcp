@@ -21,6 +21,7 @@ This record separates repository-local evidence from hosted release evidence. A 
 | Impeccable detector sequence | Initial detector returned `[]`; the surface was then rebuilt; an independent final detector found the one-sided `.ruling-panel` treatment at `index.css` and it was replaced by a fully enclosed inset/material treatment | Finding fixed; do not interpret the pre-rebuild `[]` as a final detector result |
 | Shipping-raster provenance scan | `apps/web/public`, `apps/web/src` → `0 rasters, 0 missing` | Pass |
 | Production build | `pnpm --filter @cuebench/web build` | Pass; 448.86 kB workbench chunk and separate 48.86 kB lazy waveform chunk; no client chunk exceeds 500 kB |
+| Production lifecycle/assets/container/binding dry-run | Exact source tree committed as `50ae4a0`, with `CUEBENCH_OPENAI_MODE=live` | Pass; verified the production lifecycle, assets, container, and bindings, then exited at `--dry-run` without publishing |
 | Waveform determinism | `pnpm --filter @cuebench/web waveform:verify` | Pass; exact repository MP4 SHA matched and an independent temporary regeneration was byte-for-byte equal to the checked-in 48,626-byte artifact |
 | Approved-size capture | `.impeccable/review/hero-repro.png` | 1536×1024; opened and visually checked |
 | Desktop capture | `.impeccable/review/desktop.png` | 1440×1844 full page; opened and visually checked |
@@ -43,7 +44,7 @@ git diff --check
 
 Observed local results:
 
-- `pnpm verify` — pass: lint, all workspace typechecks, all package tests, 554 web unit tests, and 22 Worker-runtime tests. The Worker runtime printed known canceled-request diagnostics during negative-path coverage but exited successfully.
+- `pnpm verify` — pass: lint, all workspace typechecks, all package tests, 556 web unit tests, and 22 Worker-runtime tests. The Worker runtime printed known canceled-request diagnostics during negative-path coverage but exited successfully.
 - `pnpm --filter @cuebench/web e2e` — pass: 18 passed, 1 hosted-only test skipped, 0 failed. This includes automated accessibility, WebMCP collaboration, Human sample, export round-trip, recovery, upload-path lazy-chunk isolation, 320 px edge targets, mobile-first 3× recentering, mobile order, and no page-level horizontal overflow.
 - `cd services/media && source .venv/bin/activate && uv run pytest -q` — pass: 52 passed.
 - `git diff --check` — pass.
