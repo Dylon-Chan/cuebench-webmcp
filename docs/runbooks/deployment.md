@@ -20,7 +20,7 @@ Do not paste secret values into commands that will be retained in shell history.
 | Binding / trigger | Local | Preview | Production |
 | --- | --- | --- | --- |
 | Worker | `cuebench-web` | `cuebench-web-preview` | `cuebench-web-production` |
-| `ASSETS` | `apps/web/dist` | `apps/web/dist` | `apps/web/dist` |
+| `ASSETS` | `apps/web/dist/client` | `apps/web/dist/client` | `apps/web/dist/client` |
 | `PROCESSING_BUCKET` | `cuebench-processing-local` | `cuebench-processing-preview` | `cuebench-processing-production` |
 | `CUEBENCH_TELEMETRY` | `cuebench_local` | `cuebench_preview` | `cuebench_production` |
 | `PROCESSING_WORKFLOW` | `cuebench-caption-generation-local` / `CaptionGenerationWorkflow` | `cuebench-caption-generation-preview` / same class | `cuebench-caption-generation-production` / same class |
