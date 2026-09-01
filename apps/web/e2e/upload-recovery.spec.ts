@@ -93,7 +93,7 @@ test("temporary hosted upload and generation receipts survive interruption, relo
   await openDurableUpload(page);
 
   await page.getByRole("checkbox", { name: "I accept temporary cloud processing" }).check();
-  await expect(page.getByText("Anti-abuse verification is ready.")).toBeVisible();
+  await expect(page.getByText("Anti-abuse verification is complete.")).toBeVisible();
   const hostedPanel = page.getByRole("region", { name: "Optional cloud processing" });
   const startCloud = page.getByRole("button", { name: "Start cloud processing" });
   await expect(startCloud).toBeEnabled();

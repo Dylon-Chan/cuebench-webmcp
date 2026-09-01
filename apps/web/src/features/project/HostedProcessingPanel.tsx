@@ -46,7 +46,9 @@ interface TurnstileGateProps {
 /** Renders the official challenge only when a configured public site key is present. */
 function TurnstileGate({ siteKey, disabled, onTokenChange }: TurnstileGateProps) {
   const host = useRef<HTMLDivElement | null>(null);
-  const [status, setStatus] = useState(siteKey.length === 0 ? "unavailable" : "loading");
+  const [status, setStatus] = useState<"unavailable" | "loading" | "awaiting" | "verified" | "expired" | "error">(
+    siteKey.length === 0 ? "unavailable" : "loading",
+  );
 
   useEffect(() => {
     onTokenChange(null);
@@ -58,13 +60,14 @@ function TurnstileGate({ siteKey, disabled, onTokenChange }: TurnstileGateProps)
     let widgetId: string | null = null;
     const render = () => {
       if (!active || host.current === null || window.turnstile === undefined) return;
+      setStatus("awaiting");
       widgetId = window.turnstile.render(host.current, {
         sitekey: siteKey,
         action: "cuebench-upload",
         callback: (token) => {
           if (!active) return;
           onTokenChange(token);
-          setStatus("ready");
+          setStatus("verified");
         },
         "expired-callback": () => {
           if (!active) return;
@@ -77,7 +80,6 @@ function TurnstileGate({ siteKey, disabled, onTokenChange }: TurnstileGateProps)
           setStatus("error");
         },
       });
-      setStatus("ready");
     };
     if (window.turnstile !== undefined) {
       render();
@@ -100,11 +102,17 @@ function TurnstileGate({ siteKey, disabled, onTokenChange }: TurnstileGateProps)
 
   if (siteKey.length === 0) return <p className="cloud-processing-panel__turnstile" role="status">Cloud processing is unavailable: anti-abuse verification is unavailable in this deployment.</p>;
   return (
-    <div className="cloud-processing-panel__turnstile" aria-label="Anti-abuse verification" aria-disabled={disabled}>
+    <div
+      className="cloud-processing-panel__turnstile"
+      aria-label="Anti-abuse verification"
+      aria-disabled={disabled}
+      data-turnstile-site-key={siteKey}
+    >
       <div ref={host} />
       <p role="status">
         {status === "loading" ? "Preparing anti-abuse verification…" : null}
-        {status === "ready" ? "Anti-abuse verification is ready." : null}
+        {status === "awaiting" ? "Anti-abuse check is ready. Complete it to enable cloud processing." : null}
+        {status === "verified" ? "Anti-abuse verification is complete." : null}
         {status === "expired" ? "Anti-abuse verification expired. Complete it again before upload." : null}
         {status === "error" ? "Anti-abuse verification could not load. Cloud processing remains unavailable." : null}
       </p>
